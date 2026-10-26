@@ -11,6 +11,7 @@
   import { untrack } from "svelte";
   import { api } from "./api";
   import LabelBadge from "./LabelBadge.svelte";
+  import { composing } from "./input";
   import {
     app,
     askPurgeChecked,
@@ -152,9 +153,8 @@
 
   /** ピッカー検索欄の Enter: 候補が 1 件ならそれをトグル、無ければ新規作成 */
   function onPickerKey(e: KeyboardEvent, kind: "folder" | "label") {
-    // IME の変換確定の Enter では作成・切替しない。WebKit（WKWebView）は確定の Enter を compositionend の後に
-    // isComposing=false・keyCode=229 で送るので両方を見る（word/cite-dialog.js と同じ）
-    if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+    // IME の変換確定の Enter では作成・切替しない
+    if (e.key !== "Enter" || composing(e)) return;
     e.preventDefault();
     if (kind === "folder") {
       if (folderCands.length === 1) void toggleFolder(folderCands[0].c.id);

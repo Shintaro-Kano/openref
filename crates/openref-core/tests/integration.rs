@@ -184,7 +184,7 @@ fn managed_attach_roundtrip() {
     let added = ingest::add_item(&mut db, &fake_resolved()).unwrap();
     let src = tmp.join("drop.pdf");
     std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
-    edit::attach_managed(&db, &added.key, &src).unwrap();
+    edit::attach_auto(&db, &added.key, &src).unwrap();
     let d = search::item_detail(&db, &added.key).unwrap().unwrap();
     assert_eq!(d.attachments.len(), 1);
     assert_eq!(d.attachments[0].mode, "managed");
@@ -326,7 +326,7 @@ fn annotation_crud() {
     let added = ingest::add_item(&mut db, &fake_resolved()).unwrap();
     let src = tmp.join("a.pdf");
     std::fs::write(&src, b"%PDF-1.4 x").unwrap();
-    edit::attach_managed(&db, &added.key, &src).unwrap();
+    edit::attach_auto(&db, &added.key, &src).unwrap();
 
     let k = annotate::add_annotation(
         &db,
@@ -346,8 +346,6 @@ fn annotation_crud() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].page, Some(3));
     assert_eq!(list[0].author, "claude:fable-5");
-
-    annotate::set_rects(&db, &k, "[[10,20,100,12]]").unwrap();
 
     // update_annotation: comment 変更 + date_modified 更新（sentinel を仕込んで検証・sleep 不要）
     db.conn
@@ -742,8 +740,8 @@ fn fulltext_search_hits_pdf_body() {
     let b = ingest::add_item(&mut db, &rb).unwrap();
     let pdf_b = tmp.join("b.pdf");
     std::fs::write(&pdf_b, pdftools::minimal_pdf("Pancreatic zebrafish xenograft model results and discussion", None)).unwrap();
-    // 添付直後に本文が索引される（attach_managed → attach_managed_bytes → fulltext::index_bytes_quietly = 手元のバイト列から）
-    edit::attach_managed(&db, &b.key, &pdf_b).unwrap();
+    // 添付直後に本文が索引される（attach_auto → write_managed → fulltext::index_bytes_quietly = 手元のバイト列から）
+    edit::attach_auto(&db, &b.key, &pdf_b).unwrap();
     let (status, n_fts): (String, i64) = db
         .conn
         .query_row(
@@ -857,7 +855,7 @@ fn fulltext_search_hits_pdf_body() {
     // スキャン PDF（テキスト層なし）: 空で記録（status='empty'）・検索に出ない・再実行はスキップ
     let pdf_a = tmp.join("a.pdf");
     std::fs::write(&pdf_a, pdftools::minimal_pdf("", None)).unwrap();
-    edit::attach_managed(&db, &a.key, &pdf_a).unwrap();
+    edit::attach_auto(&db, &a.key, &pdf_a).unwrap();
     let (status, text): (String, String) = db
         .conn
         .query_row(
@@ -894,7 +892,7 @@ fn fulltext_search_hits_pdf_body() {
 #[test]
 #[ignore]
 fn title_guard_survey() {
-    use openref_core::pdfingest::{find_dois_in_text, guard_first_candidate, lenient_reason, normalized_text, title_in_text, Guard};
+    use openref_core::pdfingest::{find_dois_in_text, guard_first_candidate, lenient_reason, normalize, title_in_text, Guard};
     use openref_core::{model, pdftools};
     let Some(p) = openref_core::env_os("TEST_DB") else {
         eprintln!("OPENREF_TEST_DB 未設定のためスキップ");
@@ -934,7 +932,7 @@ fn title_guard_survey() {
         if lenient {
             lenient_n += 1;
         }
-        let full = normalized_text(&text);
+        let full = normalize(&text);
         let guard = guard_first_candidate(&title, &text, lenient) != Guard::Reject;
         if guard {
             guard_ok += 1;
@@ -942,7 +940,7 @@ fn title_guard_survey() {
             guard_ng += 1;
         }
         // 変種の計測: 冒頭 3000 字 / 6000 字に絞った場合（実測: 3000 字では Springer 系で誤拒否が出る）
-        let pos = full.find(&openref_core::pdfingest::normalize(&title)).map(|i| i as i64).unwrap_or(-1);
+        let pos = full.find(&normalize(&title)).map(|i| i as i64).unwrap_or(-1);
         let head3: String = full.chars().take(3000).collect();
         let whole = title_in_text(&title, &head3);
         let head6: String = full.chars().take(6000).collect();

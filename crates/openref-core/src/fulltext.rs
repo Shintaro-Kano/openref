@@ -24,7 +24,6 @@ pub const HL_END: char = '\u{e001}';
 const SF_DATALESS: u32 = 0x4000_0000;
 
 pub struct FulltextResult {
-    pub attachment_id: i64,
     pub page_count: usize,
     pub text: String,
 }
@@ -330,26 +329,21 @@ pub fn get_or_extract(db: &Db, item_key: &str) -> Result<FulltextResult> {
         CoreError::NotFound(format!("item {item_key} に PDF 添付がありません"))
     })?;
 
-    let cached = db
-        .conn
-        .query_row(
+    let read_row = || {
+        db.conn.query_row(
             "SELECT text, status, detail FROM fulltext WHERE attachment_id = ?1",
             [att_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
         )
-        .optional()?;
-    let (text, status, detail) = match cached {
+    };
+    let (text, status, detail) = match read_row().optional()? {
         Some(c) => c,
         None => {
             // 単発なので未ダウンロードでも読む（File Provider に取得させる。旧 get_or_extract と同じ挙動）
             if let IndexOutcome::Skipped(r) = index_attachment_opts(&db.conn, att_id, true)? {
                 return Err(CoreError::NotFound(r));
             }
-            db.conn.query_row(
-                "SELECT text, status, detail FROM fulltext WHERE attachment_id = ?1",
-                [att_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
-            )?
+            read_row()?
         }
     };
     if status == "error" {
@@ -362,18 +356,19 @@ pub fn get_or_extract(db: &Db, item_key: &str) -> Result<FulltextResult> {
     let page_count = if text.is_empty() {
         page_count_hint.unwrap_or(1).max(1) as usize
     } else {
-        count_pages(&text)
+        pages(&text).len()
     };
-    Ok(FulltextResult { attachment_id: att_id, page_count, text })
+    Ok(FulltextResult { page_count, text })
 }
 
-fn count_pages(text: &str) -> usize {
-    text.trim_end_matches('\u{c}').split('\u{c}').count()
+/// 本文を頁に分ける（頁の区切り = \f。末尾の \f は落としてから分ける）
+fn pages(text: &str) -> Vec<&str> {
+    text.trim_end_matches('\u{c}').split('\u{c}').collect()
 }
 
 /// 1-based・両端 inclusive の頁範囲を切り出す。範囲は clamp。
 pub fn slice_pages(text: &str, from: usize, to: usize) -> (String, usize, usize) {
-    let pages: Vec<&str> = text.trim_end_matches('\u{c}').split('\u{c}').collect();
+    let pages = pages(text);
     let n = pages.len();
     let from = from.clamp(1, n);
     let to = to.clamp(from, n);

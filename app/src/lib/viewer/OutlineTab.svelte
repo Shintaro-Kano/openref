@@ -8,7 +8,7 @@
 
   let { doc, onJump }: { doc: any; onJump: (page: number) => void } = $props();
 
-  let loaded = $state(false);
+  let loaded = false; // getOutline は 1 回だけ（raw が null の間は「読み込み中」）
   let raw = $state<RawOutlineNode[] | null>(null);
   let collapsed = $state<Set<string>>(new Set());
   let err = $state("");
@@ -62,7 +62,7 @@
 </script>
 
 <div class="side-scroll">
-  {#if !loaded || raw === null}
+  {#if raw === null}
     <p class="dim hint">{t("目次を読み込み中…")}</p>
   {:else if rows.length === 0}
     <p class="dim hint">{t("この PDF に目次はありません。")}{err ? `${t("（")}${err}${t("）")}` : ""}</p>

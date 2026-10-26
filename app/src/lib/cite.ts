@@ -170,10 +170,9 @@ export async function formatBibliography(
   csl: any,
   styleId = "vancouver",
   lang = "",
-  doiAlways = false,
-  key = "ITEM"
+  doiAlways = false
 ): Promise<string> {
-  return formatBibliographyMany([{ key, csl }], styleId, lang, doiAlways);
+  return formatBibliographyMany([{ key: "ITEM", csl }], styleId, lang, doiAlways);
 }
 
 /** 複数件の文献リスト（一括コピー用）。番号付きスタイルは items の順で採番される */
@@ -199,7 +198,8 @@ export async function formatBibliographyMany(
 }
 
 /** 本文中の引用形（(1) / [1] / (Smith 2020) など。プレビュー用） */
-export async function formatCitation(csl: any, styleId = "vancouver", lang = "", key = "ITEM"): Promise<string> {
+export async function formatCitation(csl: any, styleId = "vancouver", lang = ""): Promise<string> {
+  const key = "ITEM";
   const eng = await engineFor(styleId, { [key]: csl }, lang);
   eng.updateItems([key]);
   return stripHtml(eng.makeCitationCluster([{ id: key }]));

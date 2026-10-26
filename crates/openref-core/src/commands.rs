@@ -46,16 +46,6 @@ pub fn call(db: &mut Db, name: &str, args: &Value) -> Result<Value> {
     (cmd.run)(db, args)
 }
 
-/// `schema` tool と docs が使う一覧（name / doc / args / writes / aliases）
-pub fn describe() -> Value {
-    Value::Array(
-        registry()
-            .iter()
-            .map(|c| json!({"name": c.name, "doc": c.doc, "args": c.args, "writes": c.writes, "aliases": c.aliases}))
-            .collect(),
-    )
-}
-
 /// 一覧の Markdown（`schema` tool の「コマンド一覧」節と、手引き文書の commands ブロック = 同じ文字列）
 pub fn markdown() -> String {
     let mut out = String::new();
@@ -231,15 +221,7 @@ pub fn resolve_collection(db: &Db, v: &Value) -> Result<i64> {
     }
     let mut parent: Option<i64> = None;
     for seg in &segs {
-        let found: Option<i64> = db
-            .conn
-            .query_row(
-                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2 AND deleted_at IS NULL",
-                rusqlite::params![seg, parent],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match found {
+        match collections::child_id(&db.conn, parent, seg)? {
             Some(id) => parent = Some(id),
             None => {
                 return Err(CoreError::NotFound(format!(
@@ -296,9 +278,13 @@ fn tag_arg(a: &Value, k: &str) -> Result<Value> {
     a.get(k).cloned().ok_or_else(|| bad(format!("引数 {k} は必須です")))
 }
 
+/// item の詳細（ゴミ箱の item も引く）。無ければ NotFound("item {key}")
+fn detail(db: &Db, key: &str) -> Result<search::ItemDetail> {
+    search::item_detail(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))
+}
+
 fn item_tags(db: &Db, key: &str) -> Result<Vec<String>> {
-    let d = search::item_detail(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
-    Ok(d.tags.into_iter().map(|t| t.name).collect())
+    Ok(detail(db, key)?.tags.into_iter().map(|t| t.name).collect())
 }
 
 /// MCP の list_items / quick_add の 1 行。**ここは json! で書く snake_case が契約**（エージェント向けの応答形式）。core の行型に付いている
@@ -341,15 +327,9 @@ fn collect_keys(db: &Db, a: &Value, limit: usize) -> Result<Vec<String>> {
 // ---------------- 読み ----------------
 
 fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
-    let collection_id = match a.get("collection").filter(|v| !v.is_null()) {
-        Some(v) => Some(resolve_collection(db, v)?),
-        None => None,
-    };
+    let collection_id = a.get("collection").filter(|v| !v.is_null()).map(|v| resolve_collection(db, v)).transpose()?;
     // ラベルは存在を確かめてから id で絞る（綴り違いを「0 件」と見分けられるように）
-    let tag_id = match a.get("tag").filter(|v| !v.is_null()) {
-        Some(v) => Some(resolve_tag(db, v)?.0),
-        None => None,
-    };
+    let tag_id = a.get("tag").filter(|v| !v.is_null()).map(|v| resolve_tag(db, v).map(|t| t.0)).transpose()?;
     let query = match opt_str(a, "query")? {
         Some(q) => Some(q),
         None => opt_str(a, "search")?,
@@ -375,14 +355,14 @@ fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
 
 fn get_item(db: &mut Db, a: &Value) -> Result<Value> {
     let key = req_str(a, "key")?;
-    let d = search::item_detail(db, &key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
+    let d = detail(db, &key)?;
     let (deleted_at, date_modified): (Option<String>, String) = db.conn.query_row(
         "SELECT deleted_at, date_modified FROM items WHERE id = ?1",
         [d.item.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let ann = annotate::list_annotations(db, &key)?;
-    let notes = annotate::list_notes(db, &key)?;
+    let notes = &d.notes;
     let cols: Vec<Value> = d.collections.iter().map(|c| collection_ref(db, c.id)).collect::<Result<_>>()?;
     Ok(json!({
         "key": d.item.key,
@@ -450,24 +430,12 @@ fn list_notes(db: &mut Db, a: &Value) -> Result<Value> {
 fn collections_tree(db: &mut Db, _a: &Value) -> Result<Value> {
     let rows = search::collections(db)?;
     let by_id: std::collections::HashMap<i64, &search::CollectionRow> = rows.iter().map(|r| (r.id, r)).collect();
-    let path_of = |id: i64| -> String {
-        let mut parts = Vec::new();
-        let mut cur = Some(id);
-        while let Some(r) = cur.and_then(|c| by_id.get(&c)) {
-            parts.push(r.name.clone());
-            cur = r.parent_id;
-            if parts.len() > 256 {
-                break;
-            }
-        }
-        parts.reverse();
-        parts.join("/")
-    };
+    let paths = search::collection_paths(&rows);
     Ok(Value::Array(
         rows.iter()
             .map(|r| {
                 json!({
-                    "key": r.key, "name": r.name, "path": path_of(r.id),
+                    "key": r.key, "name": r.name, "path": paths[&r.id],
                     "parent": r.parent_id.and_then(|p| by_id.get(&p)).map(|p| p.key.clone()),
                     "n_items": r.n_items
                 })
@@ -511,18 +479,12 @@ fn membership(db: &mut Db, a: &Value) -> Result<Value> {
 }
 
 fn bibtex_entries(db: &mut Db, a: &Value) -> Result<Value> {
-    let mut out = Vec::new();
-    for k in str_list(a, "keys")? {
-        if let Some(item) = search::get_by_key(db, &k)? {
-            out.push(json!({
-                "key": k,
-                "citekey": bibtex::citekey(&item.csl, &k),
-                "bibtex": bibtex::item_to_bibtex(&item.csl, &k),
-                "doi": model::s(&item.csl, "DOI")
-            }));
-        }
-    }
-    Ok(Value::Array(out))
+    Ok(Value::Array(
+        bibtex::entries(db, &str_list(a, "keys")?)?
+            .into_iter()
+            .map(|e| json!({"key": e.key, "citekey": e.citekey, "bibtex": e.bibtex, "doi": e.doi}))
+            .collect(),
+    ))
 }
 
 fn export_bibtex(db: &mut Db, a: &Value) -> Result<Value> {
@@ -564,7 +526,7 @@ fn item_types(_db: &mut Db, _a: &Value) -> Result<Value> {
                 json!({
                     "id": t.id, "label": t.label, "desc": t.desc,
                     "fields": t.fields.iter().map(|f| json!({
-                        "key": f.key, "label": f.label, "kind": f.kind.as_str(), "core": f.core
+                        "key": f.key, "label": f.label, "kind": f.kind, "core": f.core
                     })).collect::<Vec<_>>()
                 })
             })
@@ -645,14 +607,7 @@ fn quick_add(db: &mut Db, a: &Value) -> Result<Value> {
     let added = crate::ingest::add_item(db, &resolved)?;
     let d = search::item_detail(db, &added.key)?.ok_or_else(|| CoreError::NotFound("登録直後の item".into()))?;
     let pmcid = model::s(&d.item.csl, "PMCID").map(str::to_string);
-    let mut v = item_summary(&search::ListedItem {
-        has_pdf: !d.attachments.is_empty(),
-        retracted: d.retraction.is_some(),
-        has_note: false,
-        fulltext_snippet: None,
-        tags: d.tags,
-        item: d.item,
-    });
+    let mut v = item_summary(&d.into());
     v["pmcid"] = json!(pmcid);
     v["retraction_warning"] = json!(resolved.retracted);
     Ok(v)
@@ -797,8 +752,7 @@ fn col_arg(db: &Db, a: &Value, k: &str) -> Result<i64> {
 }
 
 fn item_collections(db: &Db, key: &str) -> Result<Vec<String>> {
-    let d = search::item_detail(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
-    d.collections.iter().map(|c| collection_path(db, c.id)).collect()
+    detail(db, key)?.collections.iter().map(|c| collection_path(db, c.id)).collect()
 }
 
 fn add_to_collection(db: &mut Db, a: &Value) -> Result<Value> {
@@ -818,10 +772,7 @@ fn remove_from_collection(db: &mut Db, a: &Value) -> Result<Value> {
 fn move_to_collection(db: &mut Db, a: &Value) -> Result<Value> {
     let key = req_str(a, "key")?;
     let to = col_arg(db, a, "to")?;
-    let from = match a.get("from").filter(|v| !v.is_null()) {
-        Some(v) => Some(resolve_collection(db, v)?),
-        None => None,
-    };
+    let from = a.get("from").filter(|v| !v.is_null()).map(|v| resolve_collection(db, v)).transpose()?;
     edit::add_to_collection(db, &key, to)?;
     if let Some(f) = from.filter(|&f| f != to) {
         edit::remove_from_collection(db, &key, f)?;
@@ -848,10 +799,7 @@ fn create_collection(db: &mut Db, a: &Value) -> Result<Value> {
 }
 
 fn create_collection_in(db: &mut Db, a: &Value) -> Result<Value> {
-    let parent = match a.get("parent").filter(|v| !v.is_null()) {
-        Some(p) => Some(resolve_collection(db, p)?),
-        None => None,
-    };
+    let parent = a.get("parent").filter(|v| !v.is_null()).map(|p| resolve_collection(db, p)).transpose()?;
     let id = collections::create_collection(db, &req_str(a, "name")?, parent)?;
     collection_ref(db, id)
 }
@@ -1289,8 +1237,6 @@ mod tests {
         for f in ["create_collection_in", "rename_collection", "delete_collection", "find_replace_collections"] {
             assert!(find(f).is_some_and(|c| c.writes), "{f}");
         }
-        let d = describe();
-        assert_eq!(d.as_array().unwrap().len(), registry().len());
         assert!(markdown().contains("`search_library`"));
     }
 

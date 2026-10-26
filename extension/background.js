@@ -14,6 +14,7 @@
 
 const TAB_KEY = "openref_hidden_tabs"; // {tabId: openedAt(ms)}
 const TAB_TTL_MS = 90 * 1000;
+const ALARM_PREFIX = "openref-hidden-tab-"; // + tabId
 
 /* storage.session の読み書きは 1 本の直列キューで行う（onRemoved / onAlarm / onMessage が同時に走っても
    read-modify-write が交差しない = 単一の書き手） */
@@ -43,7 +44,7 @@ function registerTab(tabId) {
     tabs[tabId] = Date.now();
     await saveTabs(tabs);
     try {
-      chrome.alarms.create("openref-hidden-tab-" + tabId, { when: Date.now() + TAB_TTL_MS });
+      chrome.alarms.create(ALARM_PREFIX + tabId, { when: Date.now() + TAB_TTL_MS });
     } catch (e) { /* alarms 不可 */ }
   });
 }
@@ -57,7 +58,7 @@ function unregisterTab(tabId, close) {
       await saveTabs(tabs);
     }
     try {
-      chrome.alarms.clear("openref-hidden-tab-" + tabId);
+      chrome.alarms.clear(ALARM_PREFIX + tabId);
     } catch (e) { /* noop */ }
     if (close && wasRegistered) chrome.tabs.remove(Number(tabId)).catch(() => {});
   });
@@ -68,7 +69,7 @@ function closeAllRegistered() {
     await saveTabs({});
     for (const id of Object.keys(tabs)) {
       try {
-        chrome.alarms.clear("openref-hidden-tab-" + id);
+        chrome.alarms.clear(ALARM_PREFIX + id);
       } catch (e) { /* noop */ }
       chrome.tabs.remove(Number(id)).catch(() => {});
     }
@@ -98,8 +99,8 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // (c) 期限（登録済みの id だけ閉じる）
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (!alarm.name.startsWith("openref-hidden-tab-")) return;
-  unregisterTab(alarm.name.slice("openref-hidden-tab-".length), true);
+  if (!alarm.name.startsWith(ALARM_PREFIX)) return;
+  unregisterTab(alarm.name.slice(ALARM_PREFIX.length), true);
 });
 
 // 背景タブが（ユーザー操作等で）閉じられたら登録を外す（閉じない）

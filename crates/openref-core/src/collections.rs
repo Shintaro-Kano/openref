@@ -44,6 +44,27 @@ fn sibling_taken(db: &Db, name: &str, parent: Option<i64>, except: Option<i64>) 
     )?)
 }
 
+/// 同じ親の下で大小無視の同名のフォルダ（soft-delete 済みは見ない・複数あれば最初の 1 行）。
+/// パスで辿る経路（MCP の resolve_collection・`edit::ensure_collection_path`・Paperpile 取込）の照合の基準
+pub(crate) fn child_id(conn: &rusqlite::Connection, parent: Option<i64>, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2 AND deleted_at IS NULL",
+            rusqlite::params![name, parent],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// フォルダの行を 1 つ作る（新しい key）。戻り値 = 行 id
+pub(crate) fn insert_child(conn: &rusqlite::Connection, parent: Option<i64>, name: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO collections (key, name, parent_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![keys::new_key(), name, parent],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// New folder / Create subfolder。parent = None なら root。同じ親の下に大小無視の同名があれば拒否
 /// （ensure_collection_path と違って既存を返さない = モーダルで「同名あり」を出すため）
 pub fn create_collection(db: &Db, name: &str, parent: Option<i64>) -> Result<i64> {
@@ -54,11 +75,7 @@ pub fn create_collection(db: &Db, name: &str, parent: Option<i64>) -> Result<i64
     if sibling_taken(db, name, parent, None)? {
         return Err(CoreError::BadInput(format!("同じ階層にフォルダ「{name}」が既にあります")));
     }
-    db.conn.execute(
-        "INSERT INTO collections (key, name, parent_id) VALUES (?1, ?2, ?3)",
-        rusqlite::params![keys::new_key(), name, parent],
-    )?;
-    Ok(db.conn.last_insert_rowid())
+    insert_child(&db.conn, parent, name)
 }
 
 /// Rename folder。自分と同名（大小だけ違う改名を含む）は可、兄弟と同名は拒否
@@ -101,55 +118,19 @@ pub fn delete_collection(db: &Db, id: i64) -> Result<usize> {
     Ok(n)
 }
 
-/// フォルダ名の検索置換（Manage folders → Find and replace。`tags::find_replace_tags` の写し）。
+/// フォルダ名の検索置換（Manage folders → Find and replace。判定と書込は `tags::find_replace` をラベルと共有）。
 /// 大小無視で `find` を含む名前の該当部分をすべて `replace` に置き換える。同名の判定は**兄弟の中だけ**
 /// （別の親の下の同名は衝突しない）。status = "renamed"（dry_run では予定）/ "conflict"（兄弟に同名）/
 /// "empty"（置換後が空）/ "invalid"（置換後が `/` を含む）。conflict / empty / invalid は飛ばす。dry_run は書かない
 pub fn find_replace_collections(db: &Db, find: &str, replace: &str, dry_run: bool) -> Result<Vec<RenameOutcome>> {
-    if find.is_empty() {
-        return Err(CoreError::BadInput("検索する文字列が空です".into()));
-    }
-    let re = regex::RegexBuilder::new(&regex::escape(find))
-        .case_insensitive(true)
-        .build()
-        .map_err(|e| CoreError::BadInput(e.to_string()))?;
-    let all: Vec<(i64, String, Option<i64>)> = {
+    // 同名を数える範囲 = 同じ親（parent_id）
+    crate::tags::find_replace(db, "collections", find, replace, dry_run, true, || {
         let mut stmt = db.conn.prepare(
             "SELECT id, name, parent_id FROM collections WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE, id",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    // 同名判定は DB の COLLATE NOCASE と同じ畳み方（ASCII だけ大小無視。tags と同じ理由）で、キーに親を含める
-    let key = |parent: Option<i64>, s: &str| (parent, s.to_ascii_lowercase());
-    let mut taken: std::collections::HashMap<(Option<i64>, String), i64> =
-        all.iter().map(|(id, name, parent)| (key(*parent, name), *id)).collect();
-    let mut out = Vec::new();
-    for (id, name, parent) in all.iter().filter(|(_, name, _)| re.is_match(name)) {
-        let new = re.replace_all(name, regex::NoExpand(replace)).trim().to_string();
-        let status = if new.is_empty() {
-            "empty"
-        } else if new.contains('/') {
-            "invalid"
-        } else if taken.get(&key(*parent, &new)).is_some_and(|other| other != id) {
-            "conflict"
-        } else {
-            "renamed"
-        };
-        if status == "renamed" {
-            taken.remove(&key(*parent, name));
-            taken.insert(key(*parent, &new), *id);
-        }
-        out.push(RenameOutcome { id: *id, old: name.clone(), new, status });
-    }
-    if !dry_run {
-        let tx = db.conn.unchecked_transaction()?;
-        for o in out.iter().filter(|o| o.status == "renamed" && o.old != o.new) {
-            tx.execute("UPDATE collections SET name = ?1 WHERE id = ?2", rusqlite::params![o.new, o.id])?;
-        }
-        tx.commit()?;
-    }
-    Ok(out)
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    })
 }
 
 #[cfg(test)]

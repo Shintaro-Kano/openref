@@ -5,7 +5,7 @@
      見た目は SelectionPopover と同じ .sel-pop を共用し、差分は .hl-pop で上書き（app.css）。
      Claude 注釈（author が claude 系）は色を purple 固定のまま変更不可（サイドバーの編集と同じ規則）。 */
   import type { AnnotationRow } from "../api";
-  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, type PopoverPos } from "./util";
+  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, isClaudeAuthor, normalizedColor, type PopoverPos } from "./util";
 
   let {
     pos,
@@ -27,8 +27,8 @@
     onClose: () => void;
   } = $props();
 
-  const isClaude = $derived(a.author.startsWith("claude"));
-  const curColor = $derived(a.color && ANNOT_PALETTE[a.color] ? a.color : isClaude ? "purple" : USER_COLOR_CHOICES[0]);
+  const isClaude = $derived(isClaudeAuthor(a.author));
+  const curColor = $derived(normalizedColor(a.color, a.author));
 </script>
 
 <div

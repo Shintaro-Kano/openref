@@ -44,21 +44,20 @@ async function api(path, opts) {
   return body;
 }
 
-function sendToTab(msg, tabId) {
+/* callback 版の sendMessage を Promise にする: lastError → {ok:false, error}・応答なし → "no response" */
+function reply(send) {
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId == null ? tab.id : tabId, msg, (res) => {
+    send((res) => {
       if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
       else resolve(res || { ok: false, error: "no response" });
     });
   });
 }
+function sendToTab(msg, tabId) {
+  return reply((cb) => chrome.tabs.sendMessage(tabId == null ? tab.id : tabId, msg, cb));
+}
 function sendToBg(msg) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(msg, (res) => {
-      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-      else resolve(res || { ok: false, error: "no response" });
-    });
-  });
+  return reply((cb) => chrome.runtime.sendMessage(msg, cb));
 }
 
 /* PDF ビューア等で content script が注入できない場合の URL-only 解析 */
@@ -68,12 +67,17 @@ function urlOnlyAnalyze(url) {
   if (mp) out.pmid = mp[1];
   const md = url.match(/\/doi\/(?:full\/|abs\/|pdf\/|epdf\/|pdfdirect\/)?(10\.\d{4,9}\/[^\s?#]+)/);
   if (md) out.doi = decodeURIComponent(md[1]).replace(/[).,;\]]+$/, "");
-  if (/\.pdf(\?|$)/i.test(url) || /\/doi\/(e?)pdf\//.test(url) || /\/pdfft\b/.test(url)) {
+  if (/\.pdf(\?|$)/i.test(url) || /\/doi\/e?pdf\//.test(url) || /\/pdfft\b/.test(url)) {
     out.pdfUrl = url;
     out.pdfSource = "self";
     out.isPdf = true;
   }
   return out;
+}
+
+/* タブ自体が PDF（取込経路の判定とバッジ表示で同じ判定を使う） */
+function isPdfTab() {
+  return page.isPdf || (page.pdfUrl && page.pdfUrl === page.url);
 }
 
 /* PDF の中身から識別子を取る経路（/capture/pdf）に回すべきか。
@@ -82,8 +86,8 @@ function urlOnlyAnalyze(url) {
    ここで拾う。中身が PDF かどうかは fetch したバイト列で判定し、違えば⑤へ落ちる）のいずれか。
    ページ上のリンク拾い（pdfSource "link" / "atypon"）は検索結果ページで無関係な論文を登録し得るので回さない */
 function shouldIngestPdf() {
-  if (!page || page.pmid || page.doi) return false;
-  if (page.isPdf || (page.pdfUrl && page.pdfUrl === page.url)) return true;
+  if (page.pmid || page.doi) return false;
+  if (isPdfTab()) return true;
   if (page.pdfSource === "meta") return true;
   return !contentScriptOk;
 }
@@ -94,7 +98,7 @@ function renderPage() {
   if (page.pmid) bits.push("PMID " + page.pmid);
   if (page.doi) bits.push("DOI " + page.doi);
   let badge;
-  if (page.isPdf || (page.pdfUrl && page.pdfUrl === page.url)) badge = '<span class="badge ok">PDF タブ</span>';
+  if (isPdfTab()) badge = '<span class="badge ok">PDF タブ</span>';
   else if (page.pdfUrl) badge = '<span class="badge ok">PDF あり</span>';
   else if (!contentScriptOk && !page.pmid && !page.doi) badge = '<span class="badge ok">PDF タブ？</span>';
   else badge = '<span class="badge no">PDF リンクなし</span>';
@@ -198,9 +202,20 @@ function oaReason(e) {
   return i > 0 ? m.slice(0, i) : m;
 }
 
-/* 識別子ありの item に PDF を付ける: ブラウザ fetch → /capture/attachment → 駄目なら OA 経路。
-   hasIds = false（識別子なしの document）なら OA 経路は対象外（PMCID/DOI が無いので無駄打ちしない） */
-async function attachPdf(key, hasIds) {
+/* /capture/attachment が添付を拒否した: 409 = 別論文（connectd の同一性照合・found_doi）/
+   422 unverified = リンク拾いの PDF で目的 DOI を確認できない（照合不能を含む）。どちらも error は connectd の文をそのまま見せる */
+const refused = (e) => e.status === 409 || (e.status === 422 && e.body && e.body.status === "unverified");
+
+/* PDF のバイト列を /capture/attachment へ（source = PDF URL の出どころ・via = 取った経路 page / doi-tab） */
+const postAttachment = (key, bytes, source, via) =>
+  api("/capture/attachment?key=" + encodeURIComponent(key) + "&source=" + encodeURIComponent(source || "") + "&via=" + via, {
+    method: "POST",
+    headers: { "Content-Type": "application/pdf" },
+    body: bytes,
+  });
+
+/* 識別子ありの item に PDF を付ける: ブラウザ fetch → /capture/attachment → 駄目なら OA 経路 */
+async function attachPdf(key) {
   $("keepopen").style.display = "block";
   let note;
   if (page.pdfUrl) {
@@ -208,23 +223,15 @@ async function attachPdf(key, hasIds) {
     if (got.bytes) {
       setStatus("PDF を OpenRef へ転送中…（" + kb(got.bytes.length) + "）");
       try {
-        const res = await api(
-          "/capture/attachment?key=" + encodeURIComponent(key) + "&source=" + encodeURIComponent(page.pdfSource || "") + "&via=page",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/pdf" },
-            body: got.bytes,
-          }
-        );
+        const res = await postAttachment(key, got.bytes, page.pdfSource, "page");
         const mark = res.doi_check === "unknown" ? "・DOI 未確認" : "";
         if (res.status === "attached") return "PDF 添付 ✓（" + got.how + " fetch・" + kb(res.bytes) + mark + "）";
         if (res.status === "attached_additional") return "PDF を 2 本目として添付 ✓（既存添付と別ファイル・" + kb(res.bytes) + mark + "）";
         if (res.status === "skipped") return "PDF は既に添付済み（同一ファイル）";
         note = "転送結果 " + res.status;
       } catch (e) {
-        // 409 = 別論文（connectd の同一性照合）/ 422 unverified = リンク拾いの PDF に DOI が無い → ここで止める
-        //（OA 経路や層 2 に進んで成功すると「別論文だった」事実が表示から消えるため）
-        if (e.status === 409 || (e.status === 422 && e.body && e.body.status === "unverified")) {
+        // 拒否されたらここで止める（OA 経路や層 2 に進んで成功すると「別論文だった」事実が表示から消えるため）
+        if (refused(e)) {
           return "書誌は保存済み。PDF は添付しませんでした — " + String(e.message || e);
         }
         note = "転送失敗（" + String(e.message || e) + "・" + kb(got.bytes.length) + "）";
@@ -235,10 +242,6 @@ async function attachPdf(key, hasIds) {
   } else {
     // PubMed ページ等: PDF リンクが無いので即 OA 経路へ
     note = "ページに PDF リンクなし";
-  }
-  if (!hasIds) {
-    return "PDF は取得できませんでした — " + note + "（識別子なしのため OA 経路は対象外）\n" +
-      "PDF を開いた状態でもう一度 Capture するか、DL して OpenRef へドロップしてください";
   }
   setStatus(note + " → OpenRef 側で取得を試行…（PMC / Unpaywall / Crossref / DOI 着地ページ）");
   try {
@@ -252,6 +255,12 @@ async function attachPdf(key, hasIds) {
     // 層 2（DOI ページの背景タブ）はここ 1 箇所から呼ぶ
     return await afterOaFailure(key, note, e);
   }
+}
+
+/* /capture/save・/capture/pdf の応答（同形）: 題名欄を書き、「著者 (年) · 誌名」を返す（ids 欄は呼び手が書く） */
+function showItem(res) {
+  $("title").textContent = plain(res.title) || page.title || "";
+  return (res.first_author || "?") + (res.year ? " (" + res.year + ")" : "") + (res.journal ? " · " + res.journal : "");
 }
 
 /* 識別子なし・PDF タブ: バイト列を /capture/pdf へ（本文の DOI/PMID で書誌確定）。
@@ -274,10 +283,7 @@ async function ingestPdfFlow() {
     headers: { "Content-Type": "application/pdf" },
     body: got.bytes,
   });
-  const label =
-    (res.first_author || "?") + (res.year ? " (" + res.year + ")" : "") +
-    (res.journal ? " · " + res.journal : "");
-  $("title").textContent = plain(res.title) || page.title || "";
+  const label = showItem(res);
   $("ids").textContent = res.trashed ? "（ゴミ箱内の item）" : label;
   const k = res.key;
   const why = res.reason ? "\n" + res.reason : "";
@@ -331,28 +337,15 @@ async function afterOaFailure(key, note, oaErr) {
   return lines.join("\n");
 }
 
-/* base64 の PDF を /capture/attachment へ。成功なら表示用メッセージ、失敗なら throw。
-   409 = connectd の同一性照合で別論文と判定（found_doi）→ 添付されない */
+/* base64 の PDF を /capture/attachment へ。成功なら表示用メッセージ、失敗なら throw（拒否は connectd の error 文のまま） */
 async function postPdf(key, b64, how, source) {
   setStatus("PDF を OpenRef へ転送中…（" + how + "）");
   const bytes = b64ToBytes(b64);
   let res;
   try {
-    res = await api(
-      "/capture/attachment?key=" + encodeURIComponent(key) + "&source=" + encodeURIComponent(source || "") + "&via=doi-tab",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/pdf" },
-        body: bytes,
-      }
-    );
+    res = await postAttachment(key, bytes, source, "doi-tab");
   } catch (e) {
-    if (e.status === 409 && e.body && e.body.found_doi) {
-      throw new Error("取得した PDF は別論文（DOI " + e.body.found_doi + "）でした。意図的なら OpenRef へドロップして取り込んでください");
-    }
-    if (e.status === 422 && e.body && e.body.status === "unverified") {
-      throw new Error(String(e.message || e));
-    }
+    if (refused(e)) throw e;
     throw new Error("転送失敗（" + String(e.message || e) + "・" + kb(bytes.length) + "）");
   }
   const mark = res.doi_check === "unknown" ? "・DOI 未確認" : "";
@@ -503,7 +496,7 @@ async function viaDoiTab(key, doi) {
    保存クリック（= ユーザージェスチャ）の直後に 1 度だけ求める。後段の await の後では gesture が切れて request できない。
    拒否は chrome.storage.local に記録し、以後は聞かない（chrome://extensions のサイトへのアクセスで後から許可できる）。 */
 async function maybeRequestAllSites() {
-  if (allSites || allSitesDeclined || !page || !(page.doi || page.pmid)) return;
+  if (allSites || allSitesDeclined || !(page.doi || page.pmid)) return;
   // ここまで await を挟まない（permissions.request はユーザージェスチャの直後でないと拒否される。拒否記録は init で読み済み）
   setStatus(
     "初回のみ: PDF が取れないとき DOI ページを背景タブで開いて探すため、全サイトへのアクセス許可を求めます（拒否しても書誌は保存され、以後は聞きません）"
@@ -544,29 +537,25 @@ $("save").addEventListener("click", async () => {
         collection_id: $("collection").value ? Number($("collection").value) : null,
       }),
     });
-    const label =
-      (saved.first_author || "?") + (saved.year ? " (" + saved.year + ")" : "") +
-      (saved.journal ? " · " + saved.journal : "");
-    $("title").textContent = plain(saved.title) || page.title || "";
-    $("ids").textContent = label + (saved.status === "existing" ? "（既存）" : "（新規登録）");
+    $("ids").textContent = showItem(saved) + (saved.status === "existing" ? "（既存）" : "（新規登録）");
 
     let pdfMsg = "";
     // 層 2 用の DOI: 応答に doi キーがあれば resolver の値（null でも）を正とし、ページ抽出の DOI へは fallback しない
     savedDoi = "doi" in saved ? saved.doi || null : page.doi || null;
     const hasIds = !!(saved.doi || page.doi || page.pmid);
-    // 識別子なしページでは、PDF タブ自体か citation_pdf_url 由来の PDF だけを本体とみなす（リンク拾いは添付もしない）
-    const pdfTrusted = !!(page.isPdf || (page.pdfUrl && page.pdfUrl === page.url) || page.pdfSource === "meta");
     if (saved.has_pdf) {
       pdfMsg = "PDF は既に添付済み";
     } else if (pdfFetchError !== null) {
       // PDF タブだったが取れなかった（再 fetch はしない）
       pdfMsg = "PDF は取得できませんでした（" + pdfFetchError + "）。DL して OpenRef へドロップしてください";
-    } else if (!hasIds && !pdfTrusted) {
+    } else if (!hasIds) {
+      // 識別子なしで本体の PDF があり得るページ（shouldIngestPdf()）は ingestPdfFlow で済んでいる（取れなければ上の枝）。
+      // ここに来るのはページ上のリンク拾いか PDF なし = 添付しない
       pdfMsg = page.pdfUrl
         ? "ページ上の PDF リンクは論文本体とは限らないため添付しません（識別子なし）。PDF を開いた状態で Capture してください"
         : "PDF リンクなし（識別子なしのため OA 経路は対象外）";
     } else {
-      pdfMsg = await attachPdf(saved.key, hasIds);
+      pdfMsg = await attachPdf(saved.key);
     }
     let msg = "✓ " + (saved.status === "existing" ? "既存 " : "登録 ") + saved.key + " — " + pdfMsg;
     if (saved.retraction) msg += "\n⚠ 撤回論文の可能性: " + saved.retraction;

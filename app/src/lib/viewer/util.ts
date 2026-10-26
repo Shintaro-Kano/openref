@@ -52,18 +52,16 @@ export function absRotation(pageRotate: number, userRotation: number): number {
 }
 
 export interface FitInput {
-  mode: ZoomMode;
+  mode: Exclude<ZoomMode, "custom">; // custom は呼び手が持つ倍率をそのまま使う（ここでは測らない）
   containerW: number; // scroller clientWidth
   containerH: number; // scroller clientHeight
   pageW: number; // 基準（scale=1・現 rotation）のページ幅
   pageH: number; // 同・高さ
   pad?: number; // 片側 padding（既定 PAGE_PAD）
-  customPct?: number; // custom モード時の %
 }
 
-/** モードに応じた実効 scale ratio を返す。custom 以外は container 実寸から算出。 */
+/** モードに応じた実効 scale ratio を container 実寸から算出する。 */
 export function fitScale(inp: FitInput): number {
-  if (inp.mode === "custom") return clampZoomPct(inp.customPct ?? 100) / 100;
   const pad = inp.pad ?? PAGE_PAD;
   const availW = Math.max(1, inp.containerW - pad * 2);
   const availH = Math.max(1, inp.containerH - pad * 2);
@@ -80,32 +78,8 @@ export interface Match {
   occ: number; // そのページ内での 0-based 出現順（非重複）
 }
 
-/** 各ページの正規化済み full に対し normQuery の全出現を列挙。
-    ページ昇順・ページ内は出現順。占有は非重複（i + query.length で前進）。
-    highlight 側も同じ刻みでページ内 occ 番目を数えれば index が一致する。 */
-export function buildMatches(
-  pages: { page: number; full: string }[],
-  normQuery: string
-): Match[] {
-  const out: Match[] = [];
-  if (!normQuery) return out;
-  const step = Math.max(1, normQuery.length);
-  for (const p of pages) {
-    let from = 0;
-    let occ = 0;
-    for (;;) {
-      const i = p.full.indexOf(normQuery, from);
-      if (i < 0) break;
-      out.push({ page: p.page, occ });
-      occ++;
-      from = i + step;
-    }
-  }
-  return out;
-}
-
-/** 正規化テキスト full 内の q の全出現（非重複・buildMatches と同じ前進刻み）の開始 index 列。
-    スニペット生成用（nthMatchIndex を occ ごとに呼ぶと occ² になるため 1 走査で出す）。 */
+/** 正規化テキスト full 内の q の全出現の開始 index 列。占有は非重複（i + q.length で前進）。
+    検索一覧（ページ内の occ 番目）とページ上のヒット帯（allMatchIndexes(geom.flat, q)[occ]）が同じ列を引く。 */
 export function allMatchIndexes(full: string, q: string): number[] {
   const out: number[] = [];
   if (!q) return out;
@@ -187,22 +161,6 @@ export function buildSnippet(
   return { before, hit: sec.hit.replace(/\s+/g, " "), after };
 }
 
-/** 正規化テキスト flat 内で q の occ 番目（0-based・非重複）の開始 index を返す。無ければ -1。
-    buildMatches と同じ前進刻みを使うことで DOM 側 index と対応が取れる。 */
-export function nthMatchIndex(flat: string, q: string, occ: number): number {
-  if (!q) return -1;
-  const step = Math.max(1, q.length);
-  let from = 0;
-  let seen = 0;
-  for (;;) {
-    const i = flat.indexOf(q, from);
-    if (i < 0) return -1;
-    if (seen === occ) return i;
-    seen++;
-    from = i + step;
-  }
-}
-
 // ---------- ハイライト幾何（位置ずれ根治） ----------
 //
 // 旧実装は「正規化 index → 元 index → DOM Range → getClientRects」で矩形を得ていた。
@@ -259,6 +217,15 @@ export function buildSquash(flat: string): { squash: string; sqMap: number[] } {
   return { squash, sqMap };
 }
 
+/** q（normText 済みから空白を除いた照合文字列）を geom.squash で探し、一致した区間を flat の [start, end) で返す。
+    end = 最終一致文字の flat 位置 + 1（行境界の空白を範囲末尾に含めない）。q が空・不一致は null。 */
+export function squashFlatSpan(geom: GeomIndex, q: string): [number, number] | null {
+  if (!q) return null;
+  const i = geom.squash.indexOf(q);
+  if (i < 0) return null;
+  return [geom.sqMap[i], geom.sqMap[i + q.length - 1] + 1];
+}
+
 export interface Rect {
   left: number;
   top: number;
@@ -270,8 +237,8 @@ export interface Rect {
     ox,oy = ベースライン起点（tx[4],tx[5]）／(dx,dy)=字送り単位方向／fa=全字送り長／fh=フォント高。
     font = 実グリフ幅校正（advanceOffset）に使う fontFamily（textContent.styles[fontName].fontFamily）。
     不在なら校正は等分近似へフォールバックする。
-    ascent/descent = styles のフォントメトリクス（em 比・descent は正値で保持）。fragmentRects の
-    charBox モードが使う（塗りハイライト帯を文字ボックスへ合わせ descender 欠けを断つ）。 */
+    ascent/descent = styles のフォントメトリクス（em 比・descent は正値で保持）。fragmentRects が
+    帯の上下に使う（塗りハイライト帯を文字ボックスへ合わせ descender 欠けを断つ）。 */
 export interface GeomItem {
   str: string;
   start: number; // full 内の元 index
@@ -354,15 +321,12 @@ export function advanceOffset(it: GeomItem, k: number, measure?: MeasureFn): num
     item 内文字位置は advanceOffset で決める（measure 指定時は実グリフ幅比で校正、無指定なら等分近似）。
     回転・傾き item も 4 隅から AABB を取る。矩形は必ず item の字送り範囲内 → 余白に幽霊矩形は出ない。
     行（item）跨ぎは item ごとに 1 矩形。
-    charBox=true は塗りハイライト用の文字ボックス帯: 上 = ascent·fh（不在は fh）・下 = descent·fh
-    （不在は 0）。既定 false は従来帯 [baseline−fh, baseline]（下線=ベースライン・取消線=帯中央の
-    意味を保つため underline/strikethrough はこちらを使い続ける）。 */
+    帯は文字ボックス: 上 = ascent·fh（不在は fh）・下 = descent·fh（不在は 0）。 */
 export function fragmentRects(
   items: GeomItem[],
   oStart: number,
   oEnd: number,
-  measure?: MeasureFn,
-  charBox = false
+  measure?: MeasureFn
 ): Rect[] {
   const out: Rect[] = [];
   if (oEnd <= oStart) return out;
@@ -382,8 +346,8 @@ export function fragmentRects(
     // 上方向（ascender 側）= 字送り方向を +90° 回した (dy, -dx)
     const ux = it.dy;
     const uy = -it.dx;
-    const up = charBox && it.ascent ? it.ascent * it.fh : it.fh;
-    const dn = charBox && it.descent ? it.descent * it.fh : 0;
+    const up = it.ascent ? it.ascent * it.fh : it.fh;
+    const dn = it.descent ? it.descent * it.fh : 0;
     // 下端（descender 側）= ベースラインから dn だけ上方向の逆へ
     const sDx = sBx - dn * ux;
     const sDy = sBy - dn * uy;
@@ -691,7 +655,7 @@ export function buildGeom(pt: PageText | undefined, viewport: { transform: numbe
       const tx = transform(viewport.transform, it.transform);
       // fontFamily は manualTextLayer と同じ流儀（styles[fontName].fontFamily）。
       // グリフ幅校正（advanceOffset）はこの font を測定に使い、行途中ヒットの横ずれを断つ。
-      // ascent/descent は charBox 帯（塗りハイライトの descender 欠け解消）に使う。
+      // ascent/descent は帯の上下（塗りハイライトの descender 欠け解消）に使う。
       const st = styles?.[it.fontName];
       items.push(makeGeomItem(s, start, tx, it.width, viewport.scale, st?.fontFamily, st?.ascent, st?.descent));
       start += s.length;
@@ -971,8 +935,6 @@ export function bodyTextOf(geom: GeomIndex, oStart: number, oEnd: number): strin
 
 // ---------- 注釈 v2 ----------
 
-export type AnnotKind = "highlight" | "underline" | "strikethrough" | "note";
-
 /** 注釈の色パレット。user 4 色 + purple（Claude 予約）。
     highlight は multiply 合成前提なので彩度高めの値を選ぶ。 */
 export const ANNOT_PALETTE: Record<string, string> = {
@@ -986,12 +948,20 @@ export const ANNOT_PALETTE: Record<string, string> = {
 /** ポップオーバーで user に提示する色（purple を除く 4 種）。既定は先頭の yellow。 */
 export const USER_COLOR_CHOICES = ["yellow", "green", "blue", "red"] as const;
 
-const AUTHOR_FALLBACK = { user: "#f5c518", claude: "#a855f7" };
+/** Claude の注釈か（author が claude で始まる）。Claude 注釈は色を purple 固定のまま変更不可（予約色の意味を守る）。 */
+export function isClaudeAuthor(author: string): boolean {
+  return author.startsWith("claude");
+}
 
-/** a.color がパレットにあればその hex、無ければ author フォールバック（旧 colorOf 互換）。DOM 非依存。 */
+/** 注釈の色名: color がパレットにあればそれ、無ければ Claude は purple・それ以外は USER_COLOR_CHOICES の先頭。
+    表示（colorForAnnotation）・色ドットの選択中・編集 draft の初期値が同じ規則を使う（未変更なら patch を送らない判定が一致する）。 */
+export function normalizedColor(color: string | null | undefined, author: string): string {
+  return color && ANNOT_PALETTE[color] ? color : isClaudeAuthor(author) ? "purple" : USER_COLOR_CHOICES[0];
+}
+
+/** 注釈の表示色（hex）。DOM 非依存。 */
 export function colorForAnnotation(color: string | null | undefined, author: string): string {
-  if (color && ANNOT_PALETTE[color]) return ANNOT_PALETTE[color];
-  return author.startsWith("claude") ? AUTHOR_FALLBACK.claude : AUTHOR_FALLBACK.user;
+  return ANNOT_PALETTE[normalizedColor(color, author)];
 }
 
 // ---------- 目次 ----------

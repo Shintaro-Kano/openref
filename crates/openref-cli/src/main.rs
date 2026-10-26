@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use openref_core::{datadir, ingest, model, resolver, search, CoreError, Db};
+use openref_core::{datadir, fulltext, ingest, model, pdffetch, resolver, search, sync, CoreError, Db};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -192,7 +192,7 @@ fn main() -> anyhow::Result<()> {
                     println!("(なし)");
                 }
                 for r in &rows {
-                    print_rows(std::slice::from_ref(&r.item));
+                    print_row(&r.item);
                     if !r.tags.is_empty() {
                         let names: Vec<String> =
                             r.tags.iter().map(|t| format!("{}({})", t.name, t.color.as_deref().unwrap_or("-"))).collect();
@@ -211,12 +211,12 @@ fn main() -> anyhow::Result<()> {
                 println!("(hit なし: {q})");
             }
             for r in &rows {
-                print_rows(std::slice::from_ref(&r.item));
+                print_row(&r.item);
                 if let Some(snip) = &r.fulltext_snippet {
                     // 一致箇所のマーカー（U+E000/U+E001）は端末では [ ] に
                     let snip = snip
-                        .replace(openref_core::fulltext::HL_START, "[")
-                        .replace(openref_core::fulltext::HL_END, "]");
+                        .replace(fulltext::HL_START, "[")
+                        .replace(fulltext::HL_END, "]");
                     println!("              本文: {snip}");
                 }
             }
@@ -267,7 +267,7 @@ fn main() -> anyhow::Result<()> {
             let m = mount
                 .or_else(openref_core::mount::detect)
                 .context("Paperpile mount が見つかりません（--mount で指定してください）")?;
-            let rep = openref_core::sync::scan(&db, &m)?;
+            let rep = sync::scan(&db, &m)?;
             println!("mount: {}", m.display());
             if rep.enumeration_blocked {
                 println!(
@@ -474,9 +474,9 @@ fn cmd_add(db: &mut Db, input: &str) -> anyhow::Result<()> {
             if !jl.is_empty() {
                 println!("  {jl}");
             }
-            let ids: Vec<String> = [("DOI", "DOI"), ("PMID", "PMID"), ("PMCID", "PMCID")]
+            let ids: Vec<String> = ["DOI", "PMID", "PMCID"]
                 .iter()
-                .filter_map(|(l, k)| model::s(c, k).map(|v| format!("{l} {v}")))
+                .filter_map(|k| model::s(c, k).map(|v| format!("{k} {v}")))
                 .collect();
             if !ids.is_empty() {
                 println!("  {}", ids.join(" · "));
@@ -532,9 +532,9 @@ fn cmd_show(db: &Db, key: &str, as_json: bool) -> anyhow::Result<()> {
     if !line.is_empty() {
         println!("掲載    : {line}");
     }
-    for (label, k) in [("DOI", "DOI"), ("PMID", "PMID"), ("PMCID", "PMCID")] {
+    for k in ["DOI", "PMID", "PMCID"] {
         if let Some(v) = model::s(c, k) {
-            println!("{label:<7}: {v}");
+            println!("{k:<7}: {v}");
         }
     }
     if let Some(kw) = model::s(c, "keyword") {
@@ -578,7 +578,7 @@ fn cmd_fetch_pdf(db: &Db, key: Option<&str>, missing: bool) -> anyhow::Result<()
     }
     println!("対象 {} 件", keys.len());
     for k in keys {
-        match openref_core::pdffetch::fetch_pdf(db, &k) {
+        match pdffetch::fetch_pdf(db, &k) {
             Ok(f) => println!("✓ {k}  {} ({} bytes, {})", f.filename, f.bytes_len, f.source),
             Err(e) => println!("✗ {k}  {e}"),
         }
@@ -616,19 +616,19 @@ fn cmd_refresh(
     for (i, k) in keys.iter().enumerate() {
         if i > 0 {
             // NCBI への礼儀（3 req/sec 制限）
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(NCBI_INTERVAL);
         }
-        match openref_core::ingest::refresh_item(db, k) {
-            Ok(openref_core::ingest::RefreshOutcome::Updated) => {
+        match ingest::refresh_item(db, k) {
+            Ok(ingest::RefreshOutcome::Updated) => {
                 upd += 1;
                 let t = search::get_by_key(db, k)?
                     .and_then(|it| model::s(&it.csl, "title").map(|s| s.to_string()))
                     .unwrap_or_default();
                 println!("✓ {k}  更新  {}", model::truncate_chars(&t, 56));
             }
-            Ok(openref_core::ingest::RefreshOutcome::Unchanged) => same += 1,
-            Ok(openref_core::ingest::RefreshOutcome::NoIdentifier) => skip += 1,
-            Ok(openref_core::ingest::RefreshOutcome::Rejected(msg)) => {
+            Ok(ingest::RefreshOutcome::Unchanged) => same += 1,
+            Ok(ingest::RefreshOutcome::NoIdentifier) => skip += 1,
+            Ok(ingest::RefreshOutcome::Rejected(msg)) => {
                 skip += 1;
                 println!("⚠ {k}  {msg}");
             }
@@ -717,8 +717,7 @@ fn cmd_fulltext(db: &Db, action: FulltextAction) -> anyhow::Result<()> {
                     BackfillStep::Done(IndexOutcome::Failed(r)) => format!("✗ 抽出失敗（空で記録）: {r}"),
                     BackfillStep::Done(IndexOutcome::Skipped(r)) => format!("… スキップ（未記録）: {r}"),
                 };
-                println!("[{i}/{n}] {name}
-    {line}");
+                println!("[{i}/{n}] {name}\n    {line}");
             })?;
             println!(
                 "=== 添付 {} / 索引 {} / テキスト層なし {} / 失敗 {} / 索引済みスキップ {} / 未ダウンロード等スキップ {} / {:.1} 秒 ===",
@@ -744,18 +743,26 @@ fn print_rows(rows: &[model::ItemRow]) {
         return;
     }
     for r in rows {
-        let c = &r.csl;
-        let star = if r.starred { "★" } else { " " };
-        println!(
-            "{} {}  {}  {:<18}  {}",
-            star,
-            r.key,
-            model::year(c).map(|y| y.to_string()).unwrap_or_else(|| "----".into()),
-            model::truncate_chars(&model::first_author_family(c), 18),
-            model::truncate_chars(model::s(c, "title").unwrap_or("(no title)"), 70)
-        );
+        print_row(r);
     }
 }
+
+/// 一覧の 1 行（★・key・年・筆頭著者・題名）
+fn print_row(r: &model::ItemRow) {
+    let c = &r.csl;
+    let star = if r.starred { "★" } else { " " };
+    println!(
+        "{} {}  {}  {:<18}  {}",
+        star,
+        r.key,
+        model::year(c).map(|y| y.to_string()).unwrap_or_else(|| "----".into()),
+        model::truncate_chars(&model::first_author_family(c), 18),
+        model::truncate_chars(model::s(c, "title").unwrap_or("(no title)"), 70)
+    );
+}
+
+/// 連続して NCBI（E-utilities・3 req/s）を引くときの間隔
+const NCBI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// PDF 一括登録。1 件ごとに結果を出し、最後に内訳を集計（GUI の取込モーダルと同じ分類）。
 fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
@@ -764,7 +771,7 @@ fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
     for (i, p) in paths.iter().enumerate() {
         if i > 0 {
             // NCBI 3 req/s（1 件 = esearch + efetch）を超えないよう間隔を空ける
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(NCBI_INTERVAL);
         }
         let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         // 理由（要確認の根拠・Drive → managed 降格）も出す

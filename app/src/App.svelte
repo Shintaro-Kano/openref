@@ -305,7 +305,9 @@
       <ItemList />
       <ItemDetail />
     </main>
-    {#each app.tabs as t (t.id)}
+    <!-- id 順で回す（タブの並びには依らない）: 並べ替え（moveTab）で keyed each がビューアの DOM を動かすと、動いた要素の
+         scrollTop が 0 に戻りフォーカスも外れる。id は増える一方なので、開く = 末尾に足す・閉じる = 抜くだけで DOM は動かない -->
+    {#each [...app.tabs].sort((a, b) => a.id - b.id) as t (t.id)}
       {#if t.viewer && (t.id === app.tab || viewerSeen.has(t.id))}
         {#key t.viewer?.attachmentId}
           <PdfViewer viewer={t.viewer} front={t.id === app.tab} onClose={() => void closeTab(t.id)} />

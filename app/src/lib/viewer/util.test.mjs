@@ -2,7 +2,8 @@
    **Node 22.18+ が要る**: .ts を直接 import し、Node の type stripping（型注釈を消すだけ・22.18+ / 23.6+ で既定）に依存する。
    util.ts は型を消すだけで動く TS（enum・namespace・parameter property を使わない）であることが前提。
    入力は手組みの小さな item 列。PdfViewer.svelte から移した ブロック分割・柱検出・読み順・本文組立・索引 の既存の挙動と、
-   その閾値（行送り 0.5 / 2.2・文字高比 0.88 / 1.14・本文比 0.95 / 0.97・同行 0.45・meta 4 行・読み順 8 item・柱 2 ページ）を固定する。 */
+   その閾値（行送り 0.5 / 2.2・文字高比 0.88 / 1.14・本文比 0.95 / 0.97・同行 0.45・meta 4 行・読み順 8 item・柱 2 ページ）を固定する。
+   あわせて 文書内検索の出現列・ハイライト矩形（fragmentRects）・注釈の色・注釈 quote の照合（squash 空間）を固定する。 */
 import assert from "node:assert/strict";
 import {
   makePageText,
@@ -18,6 +19,16 @@ import {
   bodyTextOf,
   buildGeom,
   transform,
+  allMatchIndexes,
+  makeGeomItem,
+  fragmentRects,
+  colorForAnnotation,
+  normalizedColor,
+  isClaudeAuthor,
+  normText,
+  squashFlatSpan,
+  fitScale,
+  AUTO_MAX,
 } from "./util.ts";
 
 let n = 0;
@@ -298,6 +309,231 @@ test("applyReadingOrder: 回転ページ・8 item 未満・整列済みは元順
   const none = { items: null };
   applyReadingOrder({ rotate: 0 }, none);
   assert.equal(none.items, null);
+});
+
+// ---------- 文書内検索 ----------
+/** 決定論の擬似乱数（線形合同法 mod 2^31。下位ビットは周期が短いので上位 15 bit を使う） */
+function lcg(seed) {
+  let s = seed;
+  return (k) => {
+    s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
+    return (s >>> 16) % k;
+  };
+}
+
+test("allMatchIndexes: 重ならない出現の開始 index（i + q.length で前進）・空の q は []", () => {
+  assert.deepEqual(allMatchIndexes("aaaa", "aa"), [0, 2]);
+  assert.deepEqual(allMatchIndexes("aaa", "aa"), [0]);
+  assert.deepEqual(allMatchIndexes("abcabc", "bc"), [1, 4]);
+  assert.deepEqual(allMatchIndexes("abc", ""), []);
+  assert.deepEqual(allMatchIndexes("", "a"), []);
+  assert.deepEqual(allMatchIndexes("ab", "abc"), []);
+  // 1 文字ずつ見る素朴な走査（一致したら q.length 進む）と同じ列
+  const rnd = lcg(7);
+  for (let k = 0; k < 20000; k++) {
+    let s = "";
+    for (let i = rnd(40); i > 0; i--) s += "ab a"[rnd(4)];
+    let q = "";
+    for (let i = 1 + rnd(3); i > 0; i--) q += "ab "[rnd(3)];
+    const naive = [];
+    for (let i = 0; i + q.length <= s.length; ) {
+      if (s.startsWith(q, i)) {
+        naive.push(i);
+        i += q.length;
+      } else i++;
+    }
+    assert.deepEqual(allMatchIndexes(s, q), naive, JSON.stringify([s, q]));
+  }
+});
+
+// ---------- ハイライト矩形 ----------
+/** 横書き（ascent/descent あり・なし）・回転 90°・斜め 30°（ascent だけ）の 4 item。viewport は scale 1.5・高さ 800 */
+function rectItems() {
+  const vp = [1.5, 0, 0, -1.5, 0, 1200];
+  return [
+    makeGeomItem("Prostate cancer", 0, transform(vp, [10, 0, 0, 10, 72, 700]), 75, 1.5, "serif", 0.9, -0.22),
+    makeGeomItem("is common", 15, transform(vp, [10, 0, 0, 10, 160, 700]), 45, 1.5),
+    makeGeomItem("rotated", 24, transform(vp, [0, 10, -10, 0, 300, 500]), 35, 1.5, "serif", 0.8, -0.2),
+    makeGeomItem("slanted", 31, transform(vp, [8.660254037844387, 5, -5, 8.660254037844387, 100, 400]), 35, 1.5, undefined, 1.0),
+  ];
+}
+const RECT_CASES = [[0, 38], [3, 12], [9, 20], [26, 33], [0, 15], [15, 24], [31, 38], [5, 5]];
+const R = (left, top, width, height) => ({ left, top, width, height });
+
+test("fragmentRects: 文字ボックス帯（上 = ascent·fh / 無ければ fh・下 = descent·fh / 無ければ 0）・回転と斜めは 4 隅の AABB", () => {
+  const items = rectItems();
+  const whole = [R(108, 136.5, 112.5, 16.80000000000001), R(240, 135, 67.5, 15), R(438, 397.5, 15, 52.5), R(142.5, 560.7596189432334, 52.96633369868303, 39.24038105676664)];
+  assert.deepEqual(
+    RECT_CASES.map(([a, b]) => fragmentRects(items, a, b)),
+    [
+      whole,
+      [R(130.5, 136.5, 67.5, 16.80000000000001)],
+      [R(175.5, 136.5, 45, 16.80000000000001), R(240, 135, 37.5, 15)],
+      [R(438, 397.5, 15, 37.5), R(142.5, 579.5096189432334, 20.49038105676658, 20.490381056766637)],
+      [whole[0]],
+      [whole[1]],
+      [whole[3]],
+      [],
+    ]
+  );
+  // グリフ幅の校正（measure）は item 内の文字境界だけを動かす（item 境界は同じ）
+  const measure = (it, s) => s.length * 7 + (s.includes("o") ? 3 : 0);
+  assert.deepEqual(
+    RECT_CASES.map(([a, b]) => fragmentRects(items, a, b, measure)),
+    [
+      whole,
+      [R(133, 136.5, 65.625, 16.80000000000001)],
+      [R(176.75, 136.5, 43.75, 16.80000000000001), R(240, 135, 38.863636363636374, 15)],
+      [R(438, 397.5, 15, 35.33653846153845), R(142.5, 579.5096189432334, 20.49038105676658, 20.490381056766637)],
+      [whole[0]],
+      [whole[1]],
+      [whole[3]],
+      [],
+    ]
+  );
+});
+
+// ---------- 注釈の色 ----------
+test("注釈の色（colorForAnnotation / normalizedColor / isClaudeAuthor）: パレットの色はそのまま・それ以外は author で決まる（claude で始まる = 紫・他 = 黄）", () => {
+  const hex = { yellow: "#f5c518", green: "#34a853", blue: "#4285f4", red: "#ea4335", purple: "#a855f7" };
+  const authors = ["user", "claude", "claude-opus", "Claude", ""];
+  const table = [
+    [null, "yellow purple purple yellow yellow"],
+    [undefined, "yellow purple purple yellow yellow"],
+    ["", "yellow purple purple yellow yellow"],
+    ["yellow", "yellow yellow yellow yellow yellow"],
+    ["green", "green green green green green"],
+    ["blue", "blue blue blue blue blue"],
+    ["red", "red red red red red"],
+    ["purple", "purple purple purple purple purple"],
+    ["pink", "yellow purple purple yellow yellow"],
+    ["Yellow", "yellow purple purple yellow yellow"],
+  ];
+  for (const [c, names] of table) {
+    names.split(" ").forEach((name, i) => {
+      assert.equal(colorForAnnotation(c, authors[i]), hex[name], `${c} × ${authors[i]}`);
+      assert.equal(normalizedColor(c, authors[i]), name, `${c} × ${authors[i]}`); // 色ドットの選択中・編集 draft の初期値
+    });
+  }
+  assert.deepEqual(authors.map(isClaudeAuthor), [false, true, true, false, false]);
+});
+
+// ---------- 注釈 quote の照合（squash 空間） ----------
+/** 照合の参照: quote 区間 seg を squash（空白除去）空間で探し、無ければ（headFallback のとき）先頭 40 文字で探して、一致した区間を flat の [start, end) で返す */
+function refQuoteSpan(geom, seg, headFallback) {
+  const q = normText(seg).replace(/ /g, "");
+  if (q.length < 1) return null;
+  let i = geom.squash.indexOf(q);
+  let len = q.length;
+  if (i < 0) {
+    if (!headFallback) return null;
+    const head = q.slice(0, 40);
+    i = geom.squash.indexOf(head);
+    if (i < 0) return null;
+    len = head.length;
+  }
+  len = Math.min(len, geom.squash.length - i);
+  if (len <= 0) return null;
+  return [geom.sqMap[i], geom.sqMap[i + len - 1] + 1];
+}
+
+function quoteGeom() {
+  // 行末に空白を持たない item 連結（"theUnited"）+ 行末空白あり + 語中の改行ハイフン
+  return geomOf([
+    item("Prostate cancer is the most common cancer in men in the", 72, 700, 10, { hasEOL: true }),
+    item("United States and the second leading cause of cancer ", 72, 688, 10, { hasEOL: true }),
+    item("death. Imaging plays a central role in staging and re-", 72, 676, 10, { hasEOL: true }),
+    item("staging of the disease.", 72, 664, 10),
+  ]);
+}
+
+test("quote の照合: 行境界の空白の有無を無視・一致は最終一致文字の直後まで・40 文字超は先頭 40 文字・不一致は null", () => {
+  const g = quoteGeom();
+  const flatOf = (sp) => g.flat.slice(sp[0], sp[1]);
+  // 選択の改行（<br> 由来）と item 連結（行末空白なし）の差
+  assert.deepEqual(refQuoteSpan(g, "in the\nUnited States", false), [49, 68]);
+  assert.equal(flatOf(refQuoteSpan(g, "in the\nUnited States", false)), "in theunited states");
+  assert.deepEqual(refQuoteSpan(g, "in theUnited States", false), [49, 68]);
+  assert.deepEqual(refQuoteSpan(g, "IN  THE \t united\n\nSTATES", false), [49, 68]);
+  // 行末空白ありの境界: 末尾の空白は範囲に含めない
+  assert.equal(flatOf(refQuoteSpan(g, "cause of cancer\n", false)), "cause of cancer");
+  // 40 文字超で後半が不一致: 先頭 40 文字（squash）だけ
+  const long = "the second leading cause of cancer death. Imaging plays a central role in NOTHERE";
+  assert.equal(refQuoteSpan(g, long, false), null);
+  const sp = refQuoteSpan(g, long, true);
+  assert.equal(flatOf(sp).replace(/ /g, ""), normText(long).replace(/ /g, "").slice(0, 40));
+  // 40 文字以下の不一致は先頭で探しても同じく不一致
+  assert.equal(refQuoteSpan(g, "the second leading cause of cancers", true), null);
+  assert.equal(refQuoteSpan(g, "no such words", true), null);
+  // 空 / 空白だけ
+  assert.equal(refQuoteSpan(g, "", false), null);
+  assert.equal(refQuoteSpan(g, " \n ", true), null);
+  // 行末ハイフンの改行
+  assert.equal(flatOf(refQuoteSpan(g, "re-\nstaging", false)), "re-staging");
+  // 先に出る方へ一致する（"the" は 1 行目）
+  assert.deepEqual(refQuoteSpan(g, "the", false), [19, 22]);
+});
+
+test("squashFlatSpan: 選択（全体だけ）と注釈（全体 → 先頭 40 文字）の照合が参照と一致（固定例 + 乱択）", () => {
+  // PdfViewer の 2 経路と同じ組み立て: selectionOrigSpans（domAligned でないページ）/ drawAnnotations
+  // （drawAnnotations が 4 文字未満の区間を飛ばすのは呼び手の判定なので、ここでは短い q も突き合わせる）
+  const sel = (g, seg) => squashFlatSpan(g, normText(seg).replace(/ /g, ""));
+  const ann = (g, seg) => {
+    const q = normText(seg).replace(/ /g, "");
+    return squashFlatSpan(g, q) ?? squashFlatSpan(g, q.slice(0, 40));
+  };
+  const g = quoteGeom();
+  const fixed = [
+    "in the\nUnited States",
+    "in theUnited States",
+    "IN  THE \t united\n\nSTATES",
+    "cause of cancer\n",
+    "the second leading cause of cancer death. Imaging plays a central role in NOTHERE",
+    "the second leading cause of cancers",
+    "no such words",
+    "",
+    " \n ",
+    "re-\nstaging",
+    "the",
+  ];
+  for (const seg of fixed) {
+    assert.deepEqual(sel(g, seg), refQuoteSpan(g, seg, false), seg);
+    assert.deepEqual(ann(g, seg), refQuoteSpan(g, seg, true), seg);
+  }
+  // 乱択: 語を並べた行（行末空白あり / なし）から切り出した quote に、空白の揺れと後半の書き換えを加える
+  const rnd = lcg(3);
+  const words = ["the", "PSMA", "cancer", "prostate", "of", "in", "İstanbul", "ΟΣ", "and", "a", "re-", "staging"];
+  let found = 0;
+  for (let k = 0; k < 3000; k++) {
+    const items = [];
+    for (let li = 0, lines = 1 + rnd(6); li < lines; li++) {
+      let str = "";
+      for (let w = 0, m = 1 + rnd(8); w < m; w++) str += (w ? " " : "") + words[rnd(words.length)];
+      if (rnd(2)) str += " ";
+      items.push(item(str, 72, 700 - 12 * li, 10, { hasEOL: true }));
+    }
+    const gg = geomOf(items);
+    const a = rnd(gg.full.length + 1);
+    let seg = gg.full.slice(a, a + rnd(80)).replace(/ /g, () => [" ", "  ", "\n", "", " \t "][rnd(5)]);
+    if (rnd(3) === 0 && seg.length > 10) seg = seg.slice(0, -5) + "zzzzz";
+    const want = refQuoteSpan(gg, seg, true);
+    if (want) found++;
+    assert.deepEqual(sel(gg, seg), refQuoteSpan(gg, seg, false), JSON.stringify(seg));
+    assert.deepEqual(ann(gg, seg), want, JSON.stringify(seg));
+  }
+  assert.ok(found > 1500, `found ${found}`);
+});
+
+// ---------- ズーム ----------
+test("fitScale: 幅 / ページ全体 / 自動（幅フィットを AUTO_MAX で上限クリップ）・片側 padding 16・寸法 0 は 1", () => {
+  const base = { containerW: 800, containerH: 600, pageW: 612, pageH: 792 };
+  assert.equal(fitScale({ ...base, mode: "width" }), 768 / 612);
+  assert.equal(fitScale({ ...base, mode: "page" }), 568 / 792);
+  assert.equal(fitScale({ ...base, mode: "auto" }), AUTO_MAX);
+  assert.equal(fitScale({ ...base, mode: "auto", containerW: 500 }), 468 / 612);
+  assert.equal(fitScale({ ...base, mode: "width", pad: 0 }), 800 / 612);
+  assert.equal(fitScale({ ...base, mode: "width", containerW: 10 }), 1 / 612); // 使える幅は 1px 未満にしない
+  assert.equal(fitScale({ ...base, mode: "page", pageW: 0 }), 1);
 });
 
 console.log(`${n} tests passed`);

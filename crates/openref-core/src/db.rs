@@ -27,7 +27,7 @@ impl Db {
 
     /// managed 添付の保存先（DB と同階層の `storage/`）
     pub fn storage_root(&self) -> Option<std::path::PathBuf> {
-        Some(self.path.as_ref()?.parent()?.join("storage"))
+        Some(self.app_dir()?.join("storage"))
     }
 
     /// settings テーブルの読み出し（未設定は None）

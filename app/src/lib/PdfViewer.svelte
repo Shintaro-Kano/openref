@@ -46,11 +46,10 @@
     normRotation,
     fitScale,
     stepZoomPct,
-    buildMatches,
-    nthMatchIndex,
     allMatchIndexes,
     buildSnippet,
     buildGeom,
+    squashFlatSpan,
     fragmentRects,
     makePageText,
     applyReadingOrder,
@@ -61,13 +60,12 @@
     runningIndexes,
     bodyTextOf,
     colorForAnnotation,
+    isClaudeAuthor,
+    normalizedColor,
     popoverPosition,
-    ANNOT_PALETTE,
-    USER_COLOR_CHOICES,
     type ZoomMode,
     type Match,
     type PopoverPos,
-    type GeomItem,
     type GeomIndex,
     type TextBlock,
     type PageText,
@@ -112,12 +110,10 @@
 
   let scale = $state(1); // 実効 scale ratio
   let zoomMode = $state<ZoomMode>("auto");
-  let customPct = $state(100);
   let userRotation = $state(0); // 0/90/180/270
   let currentPage = $state(1);
 
   let searchQuery = $state("");
-  let matchTotal = $state(0);
   let matchIdx = $state(-1);
   let searchHits = $state<SearchHit[]>([]); // サイドバー一覧（matches と同順）
   let searchPending = $state(false); // 入力中（デバウンス / prefetch 待ち）
@@ -189,10 +185,6 @@
   let searchDebounceTimer = 0; // runSearch 入力デバウンス（150ms）
   let disposed = false; // unmount 後の非同期継続（prefetch/render の reject）を診断に流さないための旗
   let fitStale = false; // 隠れている間に .pages の大きさが変わった（前面に戻ったときに合わせ直す）
-
-  function colorOf(a: AnnotationRow) {
-    return colorForAnnotation(a.color, a.author);
-  }
 
   // ---------- ロード ----------
   async function load() {
@@ -471,15 +463,13 @@
       rendered.delete(n);
       layers.delete(n);
       failed.add(n);
-      if (wrap) {
-        wrap.classList.remove("placeholder");
-        const err = document.createElement("div");
-        err.className = "pageerr";
-        err.dataset.page = String(n);
-        err.dataset.err = String(e);
-        pageErrText(err);
-        wrap.replaceChildren(err);
-      }
+      wrap.classList.remove("placeholder");
+      const err = document.createElement("div");
+      err.className = "pageerr";
+      err.dataset.page = String(n);
+      err.dataset.err = String(e);
+      pageErrText(err);
+      wrap.replaceChildren(err);
     }
   }
 
@@ -504,22 +494,17 @@
     }
   }
 
+  /** 描画済みページを全部解放し（in-flight の RenderTask も打ち切る）、描画待ちも空にする（描き直すページは reconcile が帯から積み直す） */
+  function releaseAllRendered() {
+    for (const n of [...rendered]) releasePage(n);
+    pending.clear();
+  }
+
   /** ズーム/回転変更: 全プレースホルダ寸法を更新し、描画済みを破棄して可視ページのみ再描画 */
   function invalidateAll() {
     renderGen++;
     failed.clear(); // ズーム/回転で条件が変わるので失敗ページも再試行対象へ
-    pending.clear(); // 世代跨ぎの詰まり防止（reconcile が現行 active から積み直す）
-    const prev = [...rendered];
-    rendered.clear();
-    for (const n of prev) {
-      layers.delete(n);
-      cancelRenderTask(n); // in-flight の RenderTask を打ち切り CPU 浪費を防ぐ
-      const el = pageEls[n];
-      if (el) {
-        el.replaceChildren();
-        el.classList.add("placeholder");
-      }
-    }
+    releaseAllRendered(); // 描画待ちも空にする = 世代跨ぎの詰まり防止（reconcile が現行 active から積み直す）
     for (let n = 1; n <= pageCount; n++) applyPlaceholderSize(n);
     reconcile();
   }
@@ -692,7 +677,7 @@
         Range.toString はテキストノードの連結のみで <br> を含まない（Selection.toString とは別物）。
         textLayer の文字連結 = item.str 連結 = geom.full であることは描画時に実検査して domAligned に持つ。
         文字列照合をしないので、どこを選んでも帯は native selection と同じ場所に出る。
-        domAligned でないページだけ旧 squash 照合へフォールバックする。
+        domAligned でないページだけ squash 照合へフォールバックする。
      2) DOM の使い回し: 毎 selectionchange に innerHTML="" → 再生成していたのをやめ、矩形キーが同じなら
         DOM に触らず、変わったときも既存 div の style だけ更新する（120Hz のドラッグで合成レイヤの
         生成/破棄を繰り返さない。帯の mix-blend-mode も外した = app.css）。mouseup（onSelect）でも
@@ -775,22 +760,12 @@
     selAC = new AbortController();
     const signal = selAC.signal;
     document.addEventListener("pointerdown", () => (selPointerDown = true), { signal });
-    document.addEventListener(
-      "pointerup",
-      () => {
-        selPointerDown = false;
-        resetSelectionGuards();
-      },
-      { signal }
-    );
-    window.addEventListener(
-      "blur",
-      () => {
-        selPointerDown = false;
-        resetSelectionGuards();
-      },
-      { signal }
-    );
+    const release = () => {
+      selPointerDown = false;
+      resetSelectionGuards();
+    };
+    document.addEventListener("pointerup", release, { signal });
+    window.addEventListener("blur", release, { signal });
     document.addEventListener(
       "keyup",
       () => {
@@ -915,7 +890,7 @@
       let rects: Rect[] = [];
       if (range && L.geom && range.intersectsNode(L.textLayer)) {
         for (const [s0, e0] of selectionOrigSpans(L, n, range)) {
-          rects.push(...fragmentRects(L.geom.items, s0, e0, glyphMeasure, true)); // charBox 帯（保存ハイライトと同じ）
+          rects.push(...fragmentRects(L.geom.items, s0, e0, glyphMeasure)); // 保存ハイライトと同じ帯
         }
       }
       applySelBands(L, rects);
@@ -923,7 +898,7 @@
   }
 
   /** Range をこのページの textLayer 内へクランプし、geom.full 上の元 index 区間の列を返す。
-      domAligned なら DOM 位置から直算（文字列照合なし）。そうでなければ旧 squash 照合。
+      domAligned なら DOM 位置から直算（文字列照合なし）。そうでなければ squash 照合（squashFlatSpan）。
       区間の決め方（ブロック規則・帯 / quote / コピー / 注釈描画の全経路で同一）:
       - 選択の起点ブロックと終点ブロック（user が実際に指した場所）は、その中の選択範囲をそのまま採用
       - その間にある（起点でも終点でもない）ブロックは kind === "body" のものだけ採用し、
@@ -952,16 +927,10 @@
       oStart = head.toString().length;
       oEnd = oStart + text.length;
     } else {
-      const q = normText(text).replace(/ /g, "");
-      if (q.length < 1) return [];
-      const i = geom.squash.indexOf(q);
-      if (i < 0) return [];
-      const len = Math.min(q.length, geom.squash.length - i);
-      if (len <= 0) return [];
-      const flatStart = geom.sqMap[i];
-      const flatEnd = geom.sqMap[i + len - 1] + 1;
-      oStart = geom.posMap[flatStart];
-      oEnd = geom.posMap[Math.min(flatEnd, geom.posMap.length - 1)];
+      const span = squashFlatSpan(geom, normText(text).replace(/ /g, ""));
+      if (!span) return [];
+      oStart = geom.posMap[span[0]];
+      oEnd = geom.posMap[Math.min(span[1], geom.posMap.length - 1)];
       if (oStart == null || oEnd == null) return [];
     }
     if (oEnd <= oStart) return [];
@@ -1045,15 +1014,22 @@
   function selectionBodyText(sel: Selection | null): string | null {
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
     const range = sel.getRangeAt(0);
-    const pages = [...layers.keys()].filter((n) => layers.get(n)!.geom && range.intersectsNode(layers.get(n)!.textLayer));
+    const pages = [...layers].filter(([, L]) => L.geom && range.intersectsNode(L.textLayer));
     if (pages.length < 1) return null;
-    pages.sort((a, b) => a - b);
+    pages.sort((a, b) => a[0] - b[0]);
     const parts: string[] = [];
-    for (const n of pages) {
-      const L = layers.get(n)!;
+    for (const [n, L] of pages) {
       for (const [s0, e0] of selectionOrigSpans(L, n, range)) parts.push(bodyTextOf(L.geom!, s0, e0).trim());
     }
     return parts.filter((p) => p).join("\n\n");
+  }
+
+  /** 絶対配置の div を矩形 r（px）に置く */
+  function setBox(div: HTMLElement, r: Rect) {
+    div.style.left = r.left + "px";
+    div.style.top = r.top + "px";
+    div.style.width = r.width + "px";
+    div.style.height = r.height + "px";
   }
 
   /** sel-layer の帯を rects に合わせる。矩形キーが同じなら何もしない。既存 div を使い回し、余りだけ外す。 */
@@ -1072,10 +1048,7 @@
         div.className = "selband";
         layer.appendChild(div);
       }
-      div.style.left = r.left + "px";
-      div.style.top = r.top + "px";
-      div.style.width = r.width + "px";
-      div.style.height = r.height + "px";
+      setBox(div, r);
     }
     while (layer.children.length > rects.length) layer.lastElementChild!.remove();
   }
@@ -1099,20 +1072,16 @@
     geom: GeomIndex,
     flatStart: number,
     flatLen: number,
-    style: (div: HTMLElement, r: { left: number; top: number; width: number; height: number }) => void,
-    charBox = false
+    style: (div: HTMLElement) => void
   ) {
     const endIdx = Math.min(flatStart + flatLen, geom.posMap.length - 1);
     const oStart = geom.posMap[flatStart];
     const oEnd = geom.posMap[endIdx];
     if (oStart == null || oEnd == null) return;
-    for (const r of fragmentRects(geom.items, oStart, oEnd, glyphMeasure, charBox)) {
+    for (const r of fragmentRects(geom.items, oStart, oEnd, glyphMeasure)) {
       const div = document.createElement("div");
-      div.style.left = r.left + "px";
-      div.style.top = r.top + "px";
-      div.style.width = r.width + "px";
-      div.style.height = r.height + "px";
-      style(div, r);
+      setBox(div, r);
+      style(div);
       layer.appendChild(div);
     }
   }
@@ -1126,37 +1095,21 @@
       // ページ間）。区間ごとに照合して描く。旧来の quote（区切りなし）は区間 1 つで従来どおり。
       // 照合は squash（空白除去）空間で行う。選択 quote は行境界に <br> 由来の空白を含むが、
       // geom.flat は行末空白なしの無区切り連結になり得るため（buildSquash の注記参照）。
-      const col = colorOf(a);
+      const col = colorForAnnotation(a.color, a.author);
       for (const seg of a.quote!.split(/\n[ \t]*\n/)) {
-      const q = normText(seg).replace(/ /g, "");
-      if (q.length < 4) continue;
-      let i = geom.squash.indexOf(q);
-      let len = q.length;
-      if (i < 0) {
-        const head = q.slice(0, 40);
-        i = geom.squash.indexOf(head);
-        if (i < 0) continue;
-        len = head.length; // 部分一致時は一致した接頭辞のみを描く（余分な後続を着色しない）
-      }
-      len = Math.min(len, geom.squash.length - i);
-      if (len <= 0) continue;
-      const flatStart = geom.sqMap[i];
-      const flatEnd = geom.sqMap[i + len - 1] + 1; // 最終一致文字の flat 位置 + 1（行境界の空白を範囲末尾に含めない）
-      // 種別はハイライトのみ（charBox 帯 = descender まで塗る + 背景のみ）。下線 / 取消線は扱わない
-      // （線が文字位置とずれる + 機能過剰）。DB に残る旧 kind もハイライトとして描く。
-      placeRects(
-        hlLayer,
-        geom,
-        flatStart,
-        flatEnd - flatStart,
-        (div) => {
+        const q = normText(seg).replace(/ /g, "");
+        if (q.length < 4) continue;
+        // 全体が無ければ先頭 40 文字で探す（部分一致時は一致した接頭辞のみを描く = 余分な後続を着色しない）
+        const span = squashFlatSpan(geom, q) ?? squashFlatSpan(geom, q.slice(0, 40));
+        if (!span) continue;
+        // 種別はハイライトのみ（descender まで塗る帯 + 背景のみ）。下線 / 取消線は扱わない
+        // （線が文字位置とずれる + 機能過剰）。DB に残る旧 kind もハイライトとして描く。
+        placeRects(hlLayer, geom, span[0], span[1] - span[0], (div) => {
           div.className = "hl";
           div.dataset.kind = "highlight";
           div.dataset.key = a.key; // ページ上クリックで編集対象を引くため
           div.style.background = col + "59";
-        },
-        true
-      );
+        });
       }
     }
     if (hlEdit) markHighlightSelected(hlEdit.key); // 編集中のハイライトの破線枠を描き直す（色変更後など）
@@ -1166,10 +1119,11 @@
     searchLayer.innerHTML = "";
     const q = normText(searchQuery);
     if (!q || !geom.flat) return;
+    const idxs = allMatchIndexes(geom.flat, q); // geom.flat = pageTexts の full（runSearch が数えた文字列）
     for (let gi = 0; gi < matches.length; gi++) {
       const m = matches[gi];
       if (m.page !== pageNo) continue;
-      const start = nthMatchIndex(geom.flat, q, m.occ);
+      const start = idxs[m.occ] ?? -1;
       if (start < 0) continue;
       const cur = gi === matchIdx;
       placeRects(
@@ -1179,8 +1133,7 @@
         q.length,
         (div) => {
           div.className = cur ? "hit current" : "hit";
-        },
-        true // 検索も塗り帯 = charBox（descender 欠けを出さない）
+        }
       );
     }
   }
@@ -1193,7 +1146,7 @@
   }
 
   /** 注釈を取り直し、描画済みページの hl-layer だけ描き直す（追加 / 更新 / 削除の後に共通。全再描画はしない）。
-      失敗は投げたままにする = 呼び出し側の try / toast（従来どおり）。古い応答が新しい anns を上書きしない（世代）・
+      失敗は投げたままにする（toast に出すのは呼び手の mutateAnn）。古い応答が新しい anns を上書きしない（世代）・
       unmount 後に state を触らない（disposed・load() と同じ流儀）。 */
   let annGen = 0;
   async function reloadAnnotations() {
@@ -1272,26 +1225,17 @@
     }
   }
 
+  /** custom は recomputeFit が何もしない（倍率はそのまま） */
   function setMode(m: ZoomMode) {
     zoomMode = m;
-    if (m !== "custom") recomputeFit(true);
+    recomputeFit(true);
   }
 
   function zoomStep(dir: 1 | -1) {
     const pct = stepZoomPct(scale, dir);
-    customPct = pct;
     zoomMode = "custom";
     scale = pct / 100;
     withAnchor(invalidateAll);
-  }
-  function zoomIn() {
-    zoomStep(1);
-  }
-  function zoomOut() {
-    zoomStep(-1);
-  }
-  function resetZoom() {
-    setMode("auto");
   }
 
   function rotate(dir: 1 | -1) {
@@ -1310,7 +1254,7 @@
   }
 
   // ---------- 検索（サイドバー「検索」タブ・Paperpile の Search document 相当） ----------
-  /** 入力由来の再計算のみ 150ms デバウンス（Enter 巡回・Esc は即応: 別ハンドラで runSearch を経由しない） */
+  /** 入力由来の再計算のみ 150ms デバウンス（Enter 巡回と Esc / × のクリアは即応 = デバウンスを経ない） */
   function onSearchInput(v: string) {
     searchQuery = v; // 入力欄の表示は即時
     searchPending = !!normText(v);
@@ -1322,14 +1266,14 @@
   }
 
   /** 全ページを網羅検索し、ページ上のヒット帯（search-layer）と一覧（スニペット）を更新する。
-      matches（page, occ）と searchHits は同じ走査刻み・同じ順なので index が一致する。 */
+      matches（page, occ）と searchHits は同じループで 1 件ずつ積むので index が一致する。 */
   async function runSearch(v: string) {
     searchQuery = v;
     const q = normText(v);
+    // 空語は最初の await より前で終える（clearSearch はこれを同期の消去として使う）
     if (!q) {
       matches = [];
       searchHits = [];
-      matchTotal = 0;
       matchIdx = -1;
       searchPending = false;
       refreshSearchOverlays();
@@ -1337,24 +1281,23 @@
     }
     if (prefetchPromise) await prefetchPromise; // 全ページのテキストが揃ってから検索
     if (normText(searchQuery) !== q) return; // 待っている間に入力が進んだ: 古い検索は捨てる
-    const pages: { page: number; full: string }[] = [];
+    const ms: Match[] = [];
     const hits: SearchHit[] = [];
     for (let n = 1; n <= pageCount; n++) {
       const t = pageTexts.get(n);
       if (!t) continue;
-      pages.push({ page: n, full: t.full });
       const idxs = allMatchIndexes(t.full, q);
       for (let occ = 0; occ < idxs.length; occ++) {
+        ms.push({ page: n, occ });
         hits.push({ page: n, occ, ...buildSnippet(t.raw, t.posMap, t.itemStarts, idxs[occ], q.length) });
       }
     }
-    matches = buildMatches(pages, q);
+    matches = ms;
     searchHits = hits;
-    matchTotal = matches.length;
     matchIdx = matches.length ? 0 : -1;
     searchPending = false;
-    refreshSearchOverlays();
-    if (matches.length) goToMatch(0);
+    if (matches.length) goToMatch(0); // goToMatch がヒット帯を描き直す
+    else refreshSearchOverlays();
   }
 
   function goToMatch(i: number) {
@@ -1376,19 +1319,13 @@
     if (matches.length) goToMatch((matchIdx - 1 + matches.length) % matches.length);
   }
 
-  /** 検索語と結果を消す（タブは開いたまま） */
+  /** 検索語と結果を消す（タブは開いたまま）。runSearch の空語の分岐は最初の await より前 = 同期で消える */
   function clearSearch() {
     if (searchDebounceTimer) {
       clearTimeout(searchDebounceTimer);
       searchDebounceTimer = 0;
     }
-    searchQuery = "";
-    matches = [];
-    searchHits = [];
-    matchTotal = 0;
-    matchIdx = -1;
-    searchPending = false;
-    refreshSearchOverlays();
+    void runSearch("");
   }
   /** ⌘F / ツールバー ⌕: サイドバーの検索タブを開いて入力欄にフォーカス */
   function openSearch() {
@@ -1414,9 +1351,14 @@
     return null;
   }
 
+  /** 全ページの破線枠（.hl-selbox）を外す */
+  function clearHighlightSelboxes() {
+    for (const [, L] of layers) L.hlLayer.querySelectorAll(".hl-selbox").forEach((e) => e.remove());
+  }
+
   /** key のハイライト矩形群を破線枠（.hl-selbox）で囲み、その枠の client rect を返す。再描画後も呼び直せる（冪等） */
   function markHighlightSelected(key: string): DOMRect | null {
-    for (const [, L] of layers) L.hlLayer.querySelectorAll(".hl-selbox").forEach((e) => e.remove());
+    clearHighlightSelboxes();
     for (const [, L] of layers) {
       const els = [...L.hlLayer.querySelectorAll<HTMLElement>(`.hl[data-key="${CSS.escape(key)}"]`)];
       if (!els.length) continue;
@@ -1436,14 +1378,23 @@
       }
       const box = document.createElement("div");
       box.className = "hl-selbox";
-      box.style.left = l - 3 + "px";
-      box.style.top = t - 3 + "px";
-      box.style.width = r - l + 6 + "px";
-      box.style.height = b - t + 6 + "px";
+      setBox(box, { left: l - 3, top: t - 3, width: r - l + 6, height: b - t + 6 });
       L.hlLayer.appendChild(box);
       return box.getBoundingClientRect(); // 注釈は 1 ページに閉じる（複数ページ描画は未対応）
     }
     return null;
+  }
+
+  /** client 座標の矩形の近くに置くポップオーバーの位置（pages-wrap 相対）。呼び手が pagesWrap の存在を確かめてから呼ぶ */
+  function popAt(r: { left: number; top: number; right: number; bottom: number }): PopoverPos {
+    const wr = pagesWrap!.getBoundingClientRect();
+    return popoverPosition(
+      { left: r.left - wr.left, top: r.top - wr.top, right: r.right - wr.left, bottom: r.bottom - wr.top },
+      wr.width,
+      wr.height,
+      POP_W,
+      POP_H
+    );
   }
 
   function openHighlightEdit(key: string) {
@@ -1451,14 +1402,7 @@
     if (!a || !pagesWrap) return;
     const box = markHighlightSelected(key);
     if (!box) return;
-    const wr = pagesWrap.getBoundingClientRect();
-    const pos = popoverPosition(
-      { left: box.left - wr.left, top: box.top - wr.top, right: box.right - wr.left, bottom: box.bottom - wr.top },
-      wr.width,
-      wr.height,
-      POP_W,
-      POP_H
-    );
+    const pos = popAt(box);
     hlComment = a.comment ?? "";
     hlEdit = { key, pos };
     editingKey = null; // サイドバー側の編集と二重にしない
@@ -1467,19 +1411,25 @@
   function closeHighlightEdit() {
     hlEdit = null;
     hlComment = "";
-    for (const [, L] of layers) L.hlLayer.querySelectorAll(".hl-selbox").forEach((e) => e.remove());
+    clearHighlightSelboxes();
+  }
+
+  /** 注釈の書き換え → 取り直し → 成功なら ok() の文を toast（訳は完了時に引く）。失敗は「✗ …」を toast */
+  async function mutateAnn(fn: () => Promise<unknown>, ok?: () => string) {
+    try {
+      await fn();
+      await reloadAnnotations();
+      if (ok) toast(ok());
+    } catch (e) {
+      toast("✗ " + String(e));
+    }
   }
 
   /** 色ドット: 即適用（Paperpile と同じ）。ポップオーバーは開いたまま */
   async function hlSetColor(c: string) {
     if (!hlEdit) return;
     const key = hlEdit.key;
-    try {
-      await api.updateAnnotation(key, { color: c });
-      await reloadAnnotations(); // drawAnnotations が hlEdit を見て破線枠を描き直す
-    } catch (e) {
-      toast("✗ " + String(e));
-    }
+    await mutateAnn(() => api.updateAnnotation(key, { color: c })); // drawAnnotations が hlEdit を見て破線枠を描き直す
   }
 
   /** コメント保存（空にして保存 = コメント削除）。変更が無ければ API を呼ばない */
@@ -1491,25 +1441,14 @@
     const cur = a?.comment ?? "";
     closeHighlightEdit();
     if (!a || trimmed === cur) return;
-    try {
-      await api.updateAnnotation(key, { comment: trimmed === "" ? null : trimmed });
-      await reloadAnnotations();
-      toast(t("✓ 注釈を更新"));
-    } catch (e) {
-      toast("✗ " + String(e));
-    }
+    await mutateAnn(() => api.updateAnnotation(key, { comment: trimmed === "" ? null : trimmed }), () => t("✓ 注釈を更新"));
   }
 
   async function hlDelete() {
     if (!hlEdit) return;
     const key = hlEdit.key;
     closeHighlightEdit();
-    try {
-      await removeAnnotation(key);
-      toast(t("✓ ハイライトを削除"));
-    } catch (e) {
-      toast("✗ " + String(e));
-    }
+    await mutateAnn(() => api.deleteAnnotation(key), () => t("✓ ハイライトを削除"));
   }
 
   // ---------- 注釈（選択ポップオーバー/保存/削除/ジャンプ） ----------
@@ -1538,11 +1477,9 @@
       return;
     }
     closeHighlightEdit();
-    let node = sel!.anchorNode as HTMLElement | null;
-    while (node && !(node instanceof HTMLElement && node.classList?.contains("pdfpage"))) {
-      node = node.parentElement;
-    }
-    const page = node ? Number((node as HTMLElement).dataset.page) : 1;
+    const an = sel!.anchorNode;
+    const pageEl = (an instanceof Element ? an : an?.parentElement)?.closest<HTMLElement>(".pdfpage");
+    const page = pageEl ? Number(pageEl.dataset.page) : 1;
 
     // 選択矩形 → pages-wrap 相対でポップオーバー位置を確定
     let rect: DOMRect | null = null;
@@ -1555,19 +1492,7 @@
       clearSelection();
       return;
     }
-    const wr = pagesWrap.getBoundingClientRect();
-    popPos = popoverPosition(
-      {
-        left: rect.left - wr.left,
-        top: rect.top - wr.top,
-        right: rect.right - wr.left,
-        bottom: rect.bottom - wr.top,
-      },
-      wr.width,
-      wr.height,
-      POP_W,
-      POP_H
-    );
+    popPos = popAt(rect);
     // 新規選択ごとに既定へリセット（yellow / コメント空）
     selColor = "yellow";
     commentDraft = "";
@@ -1575,23 +1500,20 @@
   }
 
   async function saveAnnotation() {
-    if (!selInfo) return;
-    try {
+    const sel = selInfo;
+    if (!sel) return;
+    await mutateAnn(async () => {
       await api.addAnnotation({
         key: itemKey,
-        quote: selInfo.text,
-        page: selInfo.page,
+        quote: sel.text,
+        page: sel.page,
         kind: "highlight",
         comment: commentDraft.trim() || null,
         color: selColor,
       });
       clearSelection();
       window.getSelection()?.removeAllRanges();
-      await reloadAnnotations();
-      toast(t("✓ ハイライトを保存"));
-    } catch (e) {
-      toast("✗ " + String(e));
-    }
+    }, () => t("✓ ハイライトを保存"));
   }
 
   async function removeAnnotation(key: string) {
@@ -1599,21 +1521,9 @@
     await reloadAnnotations();
   }
 
-  /** Claude 注釈は色を purple 固定のまま変更不可（予約色の意味を守る）。 */
-  function isClaudeAuthor(a: AnnotationRow): boolean {
-    return a.author.startsWith("claude");
-  }
-
-  /** 現在の a から draft の初期値（正規化済み色を含む）を組む。start/save で同じ規則を使うことで
-      「未変更なら patch を送らない」判定を一致させる。 */
-  function normalizedColor(a: AnnotationRow): string {
-    if (a.color && ANNOT_PALETTE[a.color]) return a.color;
-    return isClaudeAuthor(a) ? "purple" : USER_COLOR_CHOICES[0];
-  }
-
   function startAnnotationEdit(a: AnnotationRow) {
     editingKey = a.key; // 別カードが編集中でも代入するだけで自動的に排他される（draft は単一）
-    editColor = normalizedColor(a);
+    editColor = normalizedColor(a.color, a.author);
     editComment = a.comment ?? "";
   }
 
@@ -1622,33 +1532,23 @@
   }
 
   async function saveAnnotationEdit(a: AnnotationRow) {
-    const curColor = normalizedColor(a);
+    const curColor = normalizedColor(a.color, a.author);
     const curComment = a.comment ?? "";
     const trimmed = editComment.trim();
 
     const patch: AnnotationPatch = {};
     if (trimmed !== curComment) patch.comment = trimmed === "" ? null : trimmed;
-    if (!isClaudeAuthor(a) && editColor !== curColor) patch.color = editColor;
+    if (!isClaudeAuthor(a.author) && editColor !== curColor) patch.color = editColor;
 
     editingKey = null; // 保存中も UI は即閉じ、連打による二重送信の的を作らない
     if (Object.keys(patch).length === 0) return; // 変更なし: API 呼び出し不要
-
-    try {
-      await api.updateAnnotation(a.key, patch);
-      await reloadAnnotations();
-      toast(t("✓ 注釈を更新"));
-    } catch (e) {
-      toast("✗ " + String(e));
-    }
+    await mutateAnn(() => api.updateAnnotation(a.key, patch), () => t("✓ 注釈を更新"));
   }
 
+  /** 注釈のページへ（page が範囲外なら何もしない = 端のページへ寄せない） */
   function jumpTo(a: AnnotationRow) {
     const p = a.page ?? 1;
-    const el = pageEls[p];
-    if (!el) return;
-    active.add(p);
-    void ensureRendered(p);
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (pageEls[p]) gotoPage(p);
   }
 
   // ---------- キーボード ----------
@@ -1699,13 +1599,13 @@
     }
     if (meta && (e.key === "=" || e.key === "+")) {
       e.preventDefault();
-      zoomIn();
+      zoomStep(1);
     } else if (meta && e.key === "-") {
       e.preventDefault();
-      zoomOut();
+      zoomStep(-1);
     } else if (meta && e.key === "0") {
       e.preventDefault();
-      resetZoom();
+      setMode("auto");
     }
   }
 
@@ -1717,7 +1617,6 @@
       scale,
       zoomPct,
       zoomMode,
-      customPct,
       userRotation,
       currentPage,
       pageCount,
@@ -1787,10 +1686,6 @@
       ⌘1 ⌘2 の往復（読み直しの待ちが無い）を壊さないため即時ではなく遅延。1 ページ約 12.5MB（DPR 2・A4・自動ズーム上限
       1.25）× 帯 4〜6 ページ = 約 50〜75MB / タブが、放置したタブの分だけ戻る */
   const HIDDEN_RELEASE_MS = 30_000;
-  function releaseAllRendered() {
-    for (const n of [...rendered]) releasePage(n);
-    pending.clear();
-  }
 
   // 前面になった: 隠れている間に止めていた描画とフィットを追いつかせ、ページにフォーカスする（Space / ↑↓ でスクロール。
   // フォーカスが見えない一覧の検索欄などに残っていると、キーがそこへ入る）。
@@ -1870,8 +1765,8 @@
         page={currentPage}
         {pageCount}
         searchOpen={sideTab === "search"}
-        onZoomIn={zoomIn}
-        onZoomOut={zoomOut}
+        onZoomIn={() => zoomStep(1)}
+        onZoomOut={() => zoomStep(-1)}
         onSetMode={setMode}
         onRotate={rotate}
         onGoto={gotoPage}

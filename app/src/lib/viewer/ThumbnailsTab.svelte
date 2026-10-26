@@ -25,8 +25,7 @@
   let scroller = $state<HTMLDivElement | null>(null);
   const thumbEls: (HTMLElement[] | null)[] = []; // 1-indexed（[wrap, canvasHolder]）
   const rendered = new Set<number>();
-  const queued = new Set<number>();
-  const order: number[] = [];
+  const queued = new Set<number>(); // 描画待ち（挿入順 = FIFO）
   let running = false;
   let io: IntersectionObserver | null = null;
   let built = false;
@@ -107,7 +106,6 @@
       const n = Number((e.target as HTMLElement).dataset.page);
       if (rendered.has(n) || queued.has(n)) continue;
       queued.add(n);
-      order.push(n);
     }
     void pump();
   }
@@ -116,10 +114,9 @@
     if (running) return;
     running = true;
     try {
-      while (order.length) {
-        const n = order.shift()!;
+      while (queued.size) {
+        const n = queued.values().next().value!;
         queued.delete(n);
-        if (rendered.has(n)) continue;
         await renderThumb(n);
       }
     } finally {

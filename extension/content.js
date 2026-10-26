@@ -56,11 +56,12 @@
       if (mt) doi = cleanDoi(mt[1]);
     }
 
+    var isPdf = document.contentType === "application/pdf";
     // pdfSource = PDF URL の出どころ（popup が「本文から識別子を取る経路」に回すかの判断に使う:
     // 識別子の無いページでは meta / self 由来だけを論文本体とみなし、ページ上のリンク拾いは信用しない）
     var pdfUrl = meta("citation_pdf_url");
     var pdfSource = pdfUrl ? "meta" : null;
-    if (!pdfUrl && document.contentType === "application/pdf") {
+    if (!pdfUrl && isPdf) {
       pdfUrl = location.href;
       pdfSource = "self";
     }
@@ -95,7 +96,7 @@
       title: title,
       url: location.href,
       // タブ自体が PDF（Chrome の PDF ビューアには注入できないので通常 false。pdf.js 系ビューア用）
-      isPdf: document.contentType === "application/pdf",
+      isPdf: isPdf,
     };
   }
 

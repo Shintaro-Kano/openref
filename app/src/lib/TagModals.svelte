@@ -120,9 +120,11 @@
 
   /** 確定中の改名の名前と同じか（まだ一覧に無い名前。同名で作ると core の create_tag は既存として色だけ書き換えて返す） */
   const pendingName = (n: string) => [...m.sending.values()].some((s) => s.toLowerCase() === n.trim().toLowerCase());
+  /** ＋ New label 欄の名前が既存のラベル・確定中の改名と同じか */
+  const inlineTaken = $derived(labelNameTaken(m.newName) || pendingName(m.newName));
   async function createInline() {
     m.flushRename();
-    if (!m.newName.trim() || labelNameTaken(m.newName) || pendingName(m.newName)) return;
+    if (!m.newName.trim() || inlineTaken) return;
     const id = await createLabel(m.newName, newColor);
     if (id !== null) {
       m.newName = "";
@@ -190,6 +192,27 @@
       stroke-linejoin="round" /><circle cx="5.2" cy="5.2" r="1.1" fill="currentColor" /></svg>
 {/snippet}
 
+<!-- 色ボタン + パレット（New label・Manage labels の ＋ New label 欄）。value = 今の色・open = パレットの開閉 -->
+{#snippet colorPicker(value: string, open: boolean, toggle: () => void, pick: (c: string) => void)}
+  <span class="nl-colorwrap">
+    <button
+      class="nl-color lbadge"
+      class:solid={isSolid(value)}
+      style={labelVars(value)}
+      title={t("色を選ぶ")}
+      aria-label={t("色を選ぶ")}
+      onclick={(e) => {
+        e.stopPropagation();
+        toggle();
+      }}>{@render tagIcon()}</button>
+    {#if open}
+      <div class="nl-pal">
+        <LabelPalette {value} onpick={pick} />
+      </div>
+    {/if}
+  </span>
+{/snippet}
+
 {#if app.modal === "newLabel"}
   <div class="overlay" onclick={(e) => e.target === e.currentTarget && close()} role="presentation">
     <div class="modal nl-modal" onclick={() => (palOpen = false)} role="dialog" aria-modal="true" aria-label="New label">
@@ -199,29 +222,11 @@
       </div>
       <div class="modal-body nl-body">
         <div class="nl-row">
-          <span class="nl-colorwrap">
-            <button
-              class="nl-color lbadge"
-              class:solid={isSolid(color)}
-              style={labelVars(color)}
-              title={t("色を選ぶ")}
-              aria-label={t("色を選ぶ")}
-              onclick={(e) => {
-                e.stopPropagation();
-                palOpen = !palOpen;
-              }}>{@render tagIcon()}</button>
-            {#if palOpen}
-              <div class="nl-pal">
-                <LabelPalette
-                  value={color}
-                  onpick={(c) => {
-                    color = c;
-                    palOpen = false;
-                    nameEl?.focus();
-                  }} />
-              </div>
-            {/if}
-          </span>
+          {@render colorPicker(color, palOpen, () => (palOpen = !palOpen), (c) => {
+            color = c;
+            palOpen = false;
+            nameEl?.focus();
+          })}
           <input
             bind:this={nameEl}
             class="nl-name"
@@ -279,32 +284,16 @@
         <div class="ml-panel">
           {#if m.panel === "new"}
             <div class="nl-row">
-              <span class="nl-colorwrap">
-                <button
-                  class="nl-color lbadge"
-                  class:solid={isSolid(newColor)}
-                  style={labelVars(newColor)}
-                  title={t("色を選ぶ")}
-                  aria-label={t("色を選ぶ")}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    newPal = !newPal;
-                  }}>{@render tagIcon()}</button>
-                {#if newPal}
-                  <div class="nl-pal">
-                    <LabelPalette value={newColor} onpick={(c) => { newColor = c; newPal = false; }} />
-                  </div>
-                {/if}
-              </span>
+              {@render colorPicker(newColor, newPal, () => (newPal = !newPal), (c) => { newColor = c; newPal = false; })}
               <input
                 class="nl-name"
                 placeholder="Label name"
                 use:focusMe
                 bind:value={m.newName}
                 onkeydown={(e) => onEnter(e, createInline)} />
-              <button class="ml-btn primary" disabled={!m.newName.trim() || labelNameTaken(m.newName) || pendingName(m.newName)} onclick={createInline}>Create label</button>
+              <button class="ml-btn primary" disabled={!m.newName.trim() || inlineTaken} onclick={createInline}>Create label</button>
             </div>
-            {#if labelNameTaken(m.newName) || pendingName(m.newName)}<div class="nl-err">{t("同名のラベルが既にあります")}</div>{/if}
+            {#if inlineTaken}<div class="nl-err">{t("同名のラベルが既にあります")}</div>{/if}
           {:else if m.panel === "color"}
             <div class="ml-ptitle">{t("選択した")} {tn(m.sel.size, "個の色を変える")}</div>
             <LabelPalette

@@ -108,6 +108,13 @@ header {
 }
 .tabs-item:hover .tabs-x, .tabs-item.front .tabs-x { display: flex; }
 .tabs-x:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+/* ドラッグ（並べ替え）中のタブ: 隣の上に浮かせる（位置は TabStrip が transform で指に追わせる）。両脇の区切りは消す */
+.tabs-item.tabs-drag { z-index: 2; }
+.tabs-item.tabs-drag .tabs-tab {
+  background: var(--panel); color: var(--text); box-shadow: 0 1px 6px rgba(0, 0, 0, 0.22);
+  cursor: grabbing;
+}
+.tabs-item.tabs-drag::before, .tabs-item.tabs-drag + .tabs-item::before { display: none; }
 .tabs-new {
   flex: none; width: 26px; height: 26px; margin: 0 0 1px 2px; border-radius: 6px;
   color: var(--dim); font-size: 15px; line-height: 1;
@@ -829,7 +836,7 @@ main { display: grid; grid-template-columns: 230px minmax(360px, 1fr) 380px; fle
 .pdfpage canvas::selection,
 .pdfpage::selection,
 .pdfpage ::selection { background: transparent; }
-/* 選択プレビュー帯（charBox 幾何・pending 選択の間だけ存在・PdfViewer.paintSelection）。
+/* 選択プレビュー帯（pending 選択の間だけ存在・PdfViewer.paintSelection）。
    mix-blend-mode は外した: 120Hz のドラッグで帯が毎フレーム更新される合成レイヤに blend を掛けるのは
    WebKit で描画落ち（帯が一瞬消える）の温床で、αブレンドだけで native 選択と同じ見え方になる */
 .sel-layer { position: absolute; inset: 0; pointer-events: none; z-index: 3; }

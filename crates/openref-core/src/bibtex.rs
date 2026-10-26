@@ -1,8 +1,33 @@
-//! CSL-JSON → BibTeX の決定論変換（export 用・最小十分）。
+//! CSL-JSON → BibTeX の決定論変換（export 用・最小十分）と、item から引用用の 1 件（BibTeX・引用キー・DOI）を作る `entries`。
 //! citekey は Paperpile の citekey を優先し、なければ FamilyYYYY-<item key 下4桁> を生成。
 
-use crate::model;
+use crate::{model, search, Db, Result};
 use serde_json::Value;
+
+/// item 1 件の BibTeX・引用キー・DOI（GUI の引用メニューと MCP の bibtex_entries）
+#[derive(Debug, serde::Serialize)]
+pub struct Entry {
+    pub key: String,
+    pub citekey: String,
+    pub bibtex: String,
+    pub doi: Option<String>,
+}
+
+/// keys の順に返す（見つからない key・ゴミ箱の item は飛ばす）
+pub fn entries(db: &Db, keys: &[String]) -> Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    for k in keys {
+        if let Some(item) = search::get_by_key(db, k)? {
+            out.push(Entry {
+                citekey: citekey(&item.csl, k),
+                bibtex: item_to_bibtex(&item.csl, k),
+                doi: model::s(&item.csl, "DOI").map(str::to_string),
+                key: k.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
 
 /// 引用キー（BibTeX の citekey・LaTeX の \cite{} に使う）
 pub fn citekey(csl: &Value, item_key: &str) -> String {

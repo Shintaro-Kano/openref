@@ -111,7 +111,8 @@ pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
     Ok(())
 }
 
-fn item_id(db: &Db, key: &str) -> Result<i64> {
+/// item key → id（ゴミ箱の item も引く）。無ければ NotFound("item {key}")
+pub(crate) fn item_id(db: &Db, key: &str) -> Result<i64> {
     db.conn
         .query_row("SELECT id FROM items WHERE key = ?1", [key], |r| r.get(0))
         .optional()?
@@ -164,10 +165,11 @@ pub struct Purged {
 /// - ファイル: mode='managed'（DB 同階層 storage/ 配下）のみ削除し、空になった `storage/<添付key>/` も畳む。
 ///   mode='linked'（Paperpile の Drive フォルダ等）は**触らない**（cutover 前は Paperpile が SSOT）
 pub fn purge(db: &Db, key: &str) -> Result<Purged> {
-    let id = item_id(db, key)?;
-    let deleted_at: Option<String> = db
+    let (id, deleted_at): (i64, Option<String>) = db
         .conn
-        .query_row("SELECT deleted_at FROM items WHERE id = ?1", [id], |r| r.get(0))?;
+        .query_row("SELECT id, deleted_at FROM items WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
     if deleted_at.is_none() {
         return Err(CoreError::BadInput(format!(
             "item {key} はゴミ箱に無いので完全削除できません（先にゴミ箱へ移動してください）"
@@ -282,23 +284,12 @@ pub fn ensure_collection_path(db: &Db, path: &str) -> Result<(i64, Vec<String>)>
     let mut parent: Option<i64> = None;
     let mut created = Vec::new();
     for seg in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        let found: Option<i64> = db
-            .conn
-            .query_row(
-                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2 AND deleted_at IS NULL",
-                rusqlite::params![seg, parent],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let id = match found {
+        let id = match crate::collections::child_id(&db.conn, parent, seg)? {
             Some(id) => id,
             None => {
-                db.conn.execute(
-                    "INSERT INTO collections (key, name, parent_id) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![keys::new_key(), seg, parent],
-                )?;
+                let id = crate::collections::insert_child(&db.conn, parent, seg)?;
                 created.push(seg.to_string());
-                db.conn.last_insert_rowid()
+                id
             }
         };
         parent = Some(id);
@@ -352,73 +343,39 @@ pub fn attach_auto_with_md5(db: &Db, key: &str, filename: &str, bytes: &[u8], md
     if bytes.is_empty() {
         return Err(CoreError::BadInput("空のファイル".into()));
     }
-    if db.pdf_write_mode() != "drive" {
+    let (id, placement) = if db.pdf_write_mode() != "drive" {
         let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
-        return Ok(Attached { id: att_id, md5: md5.to_string(), placement: Placement::Managed(path) });
-    }
-    let id = item_id(db, key)?;
-    let csl_s: String = db
-        .conn
-        .query_row("SELECT csl FROM items WHERE id = ?1", [id], |r| r.get(0))?;
-    let csl: Value = serde_json::from_str(&csl_s)?;
-    let Some(mount) = crate::mount::detect() else {
-        let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
-        return Ok(Attached {
-            id: att_id,
-            md5: md5.to_string(),
-            placement: Placement::ManagedFallback {
-                path,
-                reason: "Drive mount 未検出（cutover モードだが managed へ降格）".into(),
-            },
-        });
+        (att_id, Placement::Managed(path))
+    } else {
+        let item = item_id(db, key)?;
+        let csl_s: String = db
+            .conn
+            .query_row("SELECT csl FROM items WHERE id = ?1", [item], |r| r.get(0))?;
+        let csl: Value = serde_json::from_str(&csl_s)?;
+        // Drive に置けなければ（mount 未検出・書込失敗）理由を添えて managed へ降格
+        let placed = match crate::mount::detect() {
+            None => Err("Drive mount 未検出（cutover モードだが managed へ降格）".to_string()),
+            Some(mount) => crate::drive_layout::place_bytes(&mount, &csl, bytes)
+                .map_err(|e| format!("Drive 書込失敗のため managed へ降格: {e}")),
+        };
+        match placed {
+            Ok(dest) => {
+                db.conn.execute(
+                    "INSERT INTO attachments (key, item_id, kind, mode, path, md5) VALUES (?1, ?2, 'pdf', 'linked', ?3, ?4)",
+                    rusqlite::params![keys::new_key(), item, dest.to_string_lossy(), md5],
+                )?;
+                let att_id = db.conn.last_insert_rowid();
+                // 本文の全文索引（失敗しても添付は成立させる）。手元のバイト列から作る = 書いたファイルを読み直さない
+                crate::fulltext::index_bytes_quietly(&db.conn, att_id, bytes, &dest, md5);
+                (att_id, Placement::Drive(dest))
+            }
+            Err(reason) => {
+                let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
+                (att_id, Placement::ManagedFallback { path, reason })
+            }
+        }
     };
-    match crate::drive_layout::place_bytes(&mount, &csl, bytes) {
-        Ok(dest) => {
-            db.conn.execute(
-                "INSERT INTO attachments (key, item_id, kind, mode, path, md5) VALUES (?1, ?2, 'pdf', 'linked', ?3, ?4)",
-                rusqlite::params![keys::new_key(), id, dest.to_string_lossy(), md5],
-            )?;
-            let att_id = db.conn.last_insert_rowid();
-            // 本文の全文索引（失敗しても添付は成立させる）。手元のバイト列から作る = 書いたファイルを読み直さない
-            crate::fulltext::index_bytes_quietly(&db.conn, att_id, bytes, &dest, md5);
-            Ok(Attached { id: att_id, md5: md5.to_string(), placement: Placement::Drive(dest) })
-        }
-        Err(e) => {
-            let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
-            Ok(Attached {
-                id: att_id,
-                md5: md5.to_string(),
-                placement: Placement::ManagedFallback {
-                    path,
-                    reason: format!("Drive 書込失敗のため managed へ降格: {e}"),
-                },
-            })
-        }
-    }
-}
-
-/// PDF を managed storage（DB と同階層の storage/<添付key>/<filename>）へコピーして添付する。ファイルは 1 度だけ読む
-pub fn attach_managed(db: &Db, key: &str, src: &Path) -> Result<Attached> {
-    if !src.exists() {
-        return Err(CoreError::NotFound(format!("file {}", src.display())));
-    }
-    let fname = src
-        .file_name()
-        .ok_or_else(|| CoreError::BadInput(format!("ファイル名が取れません: {}", src.display())))?
-        .to_string_lossy()
-        .to_string();
-    let bytes = std::fs::read(src)?;
-    attach_managed_bytes(db, key, &fname, &bytes)
-}
-
-/// バイト列から managed 添付を作る（cutover 前の既定経路・drive モードの降格先）
-pub fn attach_managed_bytes(db: &Db, key: &str, filename: &str, bytes: &[u8]) -> Result<Attached> {
-    if bytes.is_empty() {
-        return Err(CoreError::BadInput("空のファイル".into()));
-    }
-    let md5 = crate::pdffetch::md5_hex(bytes);
-    let (id, path) = write_managed(db, key, filename, bytes, &md5)?;
-    Ok(Attached { id, md5, placement: Placement::Managed(path) })
+    Ok(Attached { id, md5: md5.to_string(), placement })
 }
 
 /// managed 添付の本体: storage/<添付key>/<filename> へ書き、行を入れ、手元のバイト列から本文を索引する。

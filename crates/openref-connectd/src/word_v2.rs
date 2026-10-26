@@ -10,7 +10,7 @@
 use crate::{jsc, St};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,8 +28,9 @@ macro_rules! word_src {
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../word/", $p))
     };
 }
-const CITEPROC_JS: &str = word_src!("vendor/citeproc.js");
-const CITE_CORE_JS: &str = word_src!("cite-core.js");
+// static = バイナリに 1 コピー（Office JS 版の配信 word.rs もこれを返す。const だと使う場所ごとに埋め込まれる）
+pub(crate) static CITEPROC_JS: &str = word_src!("vendor/citeproc.js");
+pub(crate) static CITE_CORE_JS: &str = word_src!("cite-core.js");
 const DOTM_RENDER_JS: &str = word_src!("dotm-render.js");
 
 const DEFAULT_FONT: &str = "Century";
@@ -66,10 +67,18 @@ impl V2 {
     fn dialogs(&self) -> std::sync::MutexGuard<'_, Dialogs> {
         self.dialogs.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// アプレットを起動する（[`launch_applet`] を spawn_blocking で）
+    async fn launch(&self) -> Result<(), UserErr> {
+        let (app, base) = (self.app.clone(), self.base.clone());
+        tokio::task::spawn_blocking(move || launch_applet(&app, &base))
+            .await
+            .unwrap_or_else(|e| Err(UserErr::new("ダイアログを表示できません。", Some(e.to_string()))))
+    }
 }
 
-pub fn router(st: Arc<St>, word_port: u16) -> Router {
-    let app = dialog_app(&st);
+pub fn router(st: Arc<St>, word_port: u16, app_dir: &Path) -> Router {
+    let app = dialog_app(app_dir);
     routes(Arc::new(V2 {
         st,
         dialogs: Mutex::new(Dialogs::default()),
@@ -97,25 +106,17 @@ fn routes(v2: Arc<V2>) -> Router {
         .with_state(v2)
 }
 
-fn dialog_app(st: &St) -> PathBuf {
-    if let Some(p) = openref_core::env_os("DIALOG_APP") {
-        return PathBuf::from(p);
+fn dialog_app(app_dir: &Path) -> PathBuf {
+    match openref_core::env_os("DIALOG_APP") {
+        Some(p) => PathBuf::from(p),
+        None => app_dir.join("word").join("OpenRef Dialog.app"),
     }
-    st.db()
-        .app_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("word")
-        .join("OpenRef Dialog.app")
 }
 
 // ---------- ヘッダ ----------
 
-pub fn header_ok(h: &HeaderMap) -> bool {
-    h.get("x-openref").map(|v| v.as_bytes() == b"word").unwrap_or(false)
-}
-
 async fn require_header(req: Request, next: Next) -> Response {
-    if header_ok(req.headers()) {
+    if req.headers().get("x-openref").is_some_and(|v| v.as_bytes() == b"word") {
         next.run(req).await
     } else {
         (
@@ -291,6 +292,16 @@ fn num(v: Option<&Value>) -> Option<f64> {
 
 fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(|x| x.as_str())
+}
+
+/// フォントの大きさ（数値 / parseFloat できる文字列で、正の有限の数のときだけ）
+fn font_size_of(v: Option<&Value>) -> Option<f64> {
+    num(v).filter(|x| x.is_finite() && *x > 0.0)
+}
+
+/// 要求の style（無い・文字列でない・空なら既定のスタイル）
+fn style_of(req: &Value) -> &str {
+    str_of(req, "style").filter(|s| !s.is_empty()).unwrap_or(citestyle::DEFAULT_STYLE)
 }
 
 /// フォントの大きさ等の数値 → 文字列（JS の Number の toString と同じ形: 10.5 / 12）
@@ -548,9 +559,9 @@ pub fn legacy_vars(xml: &str) -> Vec<(String, String)> {
                     Some(s) if !s.trim().is_empty() => s.to_string(),
                     _ => continue,
                 },
-                "refract-font-size" => match num(Some(&v)) {
-                    Some(x) if x.is_finite() && x > 0.0 => fmt_num(x),
-                    _ => continue,
+                "refract-font-size" => match font_size_of(Some(&v)) {
+                    Some(x) => fmt_num(x),
+                    None => continue,
                 },
                 _ => continue,
             }
@@ -715,9 +726,9 @@ async fn render(State(v2): State<Arc<V2>>, body: Bytes) -> Response {
         return err(&UserErr::new(format!("スタイル id が不正です: {style}"), None));
     }
     let doi_always = truthy(req.get("doiAlways"));
-    let raw = match req.get("cites") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(a)) => a.clone(),
+    let raw: &[Value] = match req.get("cites") {
+        None | Some(Value::Null) => &[],
+        Some(Value::Array(a)) => a,
         Some(_) => return err(&bad_request("cites が配列ではありません")),
     };
     let mut cites = Vec::with_capacity(raw.len());
@@ -803,7 +814,7 @@ pub struct Spec {
     pub d: Value,
     pub width: u32,
     pub height: u32,
-    pub title: String,
+    pub title: &'static str,
 }
 
 fn style_title(st: &St, id: &str) -> String {
@@ -830,7 +841,7 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
                     Vec::new()
                 }),
             };
-            let style = str_of(req, "style").filter(|s| !s.is_empty()).unwrap_or(citestyle::DEFAULT_STYLE);
+            let style = style_of(req);
             let items: Vec<Value> = if edit {
                 snapshot.iter().map(|(k, c)| json!({"key": k, "label": label_of(c)})).collect()
             } else {
@@ -851,15 +862,15 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
                 d,
                 width: SIZE_CITE.0,
                 height: SIZE_CITE.1,
-                title: "OpenRef — 引用".into(),
+                title: "OpenRef — 引用",
             })
         }
         "settings" => {
             let tab = if str_of(req, "tab") == Some("doc") { "doc" } else { "style" };
-            let style = str_of(req, "style").filter(|s| !s.is_empty()).unwrap_or(citestyle::DEFAULT_STYLE).to_string();
+            let style = style_of(req).to_string();
             let doi_always = truthy(req.get("doiAlways"));
             let font_name = str_of(req, "fontName").map(str::trim).filter(|s| !s.is_empty()).unwrap_or(DEFAULT_FONT);
-            let font_size = num(req.get("fontSize")).filter(|x| x.is_finite() && *x > 0.0).unwrap_or(DEFAULT_SIZE);
+            let font_size = font_size_of(req.get("fontSize")).unwrap_or(DEFAULT_SIZE);
             let cites = num(req.get("cites")).filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(0.0) as i64;
             let d = json!({
                 "style": style,
@@ -876,7 +887,7 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
                 d,
                 width: SIZE_SETTINGS.0,
                 height: SIZE_SETTINGS.1,
-                title: if tab == "doc" { "OpenRef — 文書の設定" } else { "OpenRef — 引用スタイル" }.into(),
+                title: if tab == "doc" { "OpenRef — 文書の設定" } else { "OpenRef — 引用スタイル" },
             })
         }
         "notice" => {
@@ -899,7 +910,7 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
                 "info" => SIZE_INFO,
                 _ => SIZE_NOTICE,
             };
-            Ok(Spec { kind: Kind::Notice, page: "notice.html", tab: None, d, width: w, height: h, title: "OpenRef".into() })
+            Ok(Spec { kind: Kind::Notice, page: "notice.html", tab: None, d, width: w, height: h, title: "OpenRef" })
         }
         "" => Err(bad_request("kind がありません")),
         other => Err(bad_request(format!("不明なダイアログの種類: {other}"))),
@@ -983,7 +994,7 @@ pub fn result_text(db: &Db, kind: &Kind, msg: &Value) -> String {
                 Some(v) => v.to_string(),
             };
             let name = if name.is_empty() { DEFAULT_FONT.to_string() } else { name };
-            let size = num(msg.get("fontSize")).filter(|x| x.is_finite() && *x > 0.0).unwrap_or(DEFAULT_SIZE);
+            let size = font_size_of(msg.get("fontSize")).unwrap_or(DEFAULT_SIZE);
             r(&["apply", &style, if doi { "1" } else { "0" }, &name, &fmt_num(size)])
         }
         Kind::Notice => match ty {
@@ -1205,8 +1216,7 @@ async fn dialog_create(State(v2): State<Arc<V2>>, body: Bytes) -> Response {
         Ok(v) => v,
         Err(e) => return err(&e),
     };
-    let st = v2.st.clone();
-    let spec = match dialog_spec(&req, &|id| style_title(&st, id)) {
+    let spec = match dialog_spec(&req, &|id| style_title(&v2.st, id)) {
         Ok(s) => s,
         Err(e) => return err(&e),
     };
@@ -1214,11 +1224,7 @@ async fn dialog_create(State(v2): State<Arc<V2>>, body: Bytes) -> Response {
     let url = dialog_url(&v2.base, &sid, &spec);
     let page = spec.page;
     v2.dialogs().create(sid.clone(), spec, url, Instant::now());
-    let (app, base) = (v2.app.clone(), v2.base.clone());
-    let res = tokio::task::spawn_blocking(move || launch_applet(&app, &base))
-        .await
-        .unwrap_or_else(|e| Err(UserErr::new("ダイアログを表示できません。", Some(e.to_string()))));
-    if let Err(e) = res {
+    if let Err(e) = v2.launch().await {
         v2.dialogs().remove(&sid);
         eprintln!("word v2 dialog: {page} を開けません: {}", e.detail.as_deref().unwrap_or(""));
         return err(&e);
@@ -1257,10 +1263,7 @@ async fn dialog_poll(
             Poll::Done(t) => return text(t),
             Poll::Relaunch => {
                 eprintln!("word v2 dialog: {sid} をアプレットが取りに来ない → 起動し直す");
-                let (app, base) = (v2.app.clone(), v2.base.clone());
-                let res = tokio::task::spawn_blocking(move || launch_applet(&app, &base))
-                    .await
-                    .unwrap_or_else(|e| Err(UserErr::new("ダイアログを表示できません。", Some(e.to_string()))));
+                let res = v2.launch().await;
                 v2.dialogs().relaunched(&sid, Instant::now(), res);
             }
             Poll::Pending | Poll::Probe => {}
@@ -1275,8 +1278,7 @@ async fn dialog_poll(
 /// `POST /word/v2/dialog/focus` → 結果待ちのダイアログがあればアプレットを前面へ（`open -a`）
 async fn dialog_focus(State(v2): State<Arc<V2>>) -> Response {
     if v2.dialogs().has_active() {
-        let (app, base) = (v2.app.clone(), v2.base.clone());
-        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || launch_applet(&app, &base)).await {
+        if let Err(e) = v2.launch().await {
             eprintln!("word v2 dialog: 前面に出せません: {}", e.detail.as_deref().unwrap_or(""));
         }
     }

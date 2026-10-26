@@ -145,7 +145,8 @@ pub fn fetch_pdf_download(plan: &FetchPlan) -> Result<Downloaded> {
     )))
 }
 
-/// ③ 添付して照合結果を添付行に記録する。② の間にロックを離しているので、別経路で添付済みになっていたら拒否する
+/// ③ 添付して照合結果（`doi_check` = 'match' / 'unknown' / None = 印なし）を添付行に記録する。
+/// ② の間にロックを離しているので、別経路で添付済みになっていたら拒否する
 pub fn fetch_pdf_attach(db: &Db, plan: &FetchPlan, dl: Downloaded) -> Result<Fetched> {
     let item = search::get_by_key(db, &plan.key)?
         .ok_or_else(|| CoreError::NotFound(format!("item {}", plan.key)))?;
@@ -157,7 +158,12 @@ pub fn fetch_pdf_attach(db: &Db, plan: &FetchPlan, dl: Downloaded) -> Result<Fet
             dl.bytes.len()
         )));
     }
-    attach_fetched(db, &plan.key, &plan.csl, dl.bytes, dl.source, dl.doi_check)
+    let filename = suggest_filename(&plan.csl);
+    let attached = edit::attach_auto_bytes(db, &plan.key, &filename, &dl.bytes)?;
+    if let Some(mark) = dl.doi_check {
+        mark_doi_check(db, attached.id, mark);
+    }
+    Ok(Fetched { source: dl.source, filename, bytes_len: dl.bytes.len() })
 }
 
 /// 便宜関数: ①②③を続けて行う（CLI / MCP など Mutex を持たない呼び手向け）
@@ -373,7 +379,7 @@ fn aws_fetch_pdf(key: &str, expect_md5: Option<&str>) -> std::result::Result<Vec
         return Err(format!("{key}: PDF ではない応答（{} bytes）", bytes.len()));
     }
     if let Some(want) = expect_md5 {
-        let got = format!("{:x}", md5::compute(&bytes));
+        let got = md5_hex(&bytes);
         if got != want {
             return Err(format!("{key}: md5 不一致（期待 {want}・実際 {got}・転送破損の可能性）"));
         }
@@ -559,24 +565,6 @@ pub fn verdict(kind: LocationKind, check: &IdentityCheck) -> Verdict {
     }
 }
 
-/// 添付して `doi_check`（'match' / 'unknown' / None = 印なし）を添付行に永続化する。
-fn attach_fetched(
-    db: &Db,
-    key: &str,
-    csl: &Value,
-    bytes: Vec<u8>,
-    source: String,
-    doi_check: Option<&str>,
-) -> Result<Fetched> {
-    let filename = suggest_filename(csl);
-    let bytes_len = bytes.len();
-    let attached = edit::attach_auto_bytes(db, key, &filename, &bytes)?;
-    if let Some(mark) = doi_check {
-        mark_doi_check(db, attached.id, mark);
-    }
-    Ok(Fetched { source, filename, bytes_len })
-}
-
 /// 添付ファイルの md5（16 進）。取込・添付・索引はこれを 1 度だけ取って使い回す（md5 crate は core の依存）
 pub fn md5_hex(bytes: &[u8]) -> String {
     format!("{:x}", md5::compute(bytes))
@@ -608,15 +596,6 @@ pub enum IdentityCheck {
     /// 照合そのものができなかった: item に DOI が無い / 一時ファイルに書けない / 抽出できない・テキスト層なし
     /// → 添付行は NULL（未照合）のまま。「別論文の可能性」の警告は出さない
     Unchecked { reason: String },
-}
-
-/// 一時 PDF（Drop で必ず消す。`fs::write` の途中失敗・panic でも残さない）。手元のバイト列を pdftotext（poppler）に
-/// 渡すときだけ使う（`pdftools` の fallback。内蔵解析はバイト列から行うので通常は作らない）。
-pub struct TempPdf(pub std::path::PathBuf);
-impl Drop for TempPdf {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// 取得した PDF が目的の論文かを、冒頭 2 頁の本文で照合する。PMC 経路・`/capture/attachment` からも呼べる共通ヘルパ。
@@ -719,14 +698,11 @@ fn contains_doi(page: &str, target: &str) -> bool {
     false
 }
 
-/// 生テキスト（空白あり）から DOI 候補を全部拾う（`find_ids_in_text` は先頭 1 件しか返さないので使わない）
+/// 生テキスト（空白あり）から DOI 候補を全部拾う（正規表現は取込と同じ `pdfingest::doi_re`。
+/// `pdfingest::find_dois_in_text` は件数の上限と正規化が違うので使わない）
 fn dois_in_text(text: &str) -> Vec<String> {
-    use regex::Regex;
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)").unwrap());
     let mut out: Vec<String> = Vec::new();
-    for c in re.captures_iter(text) {
+    for c in crate::pdfingest::doi_re().captures_iter(text) {
         let d = normalize_doi(&c[1]);
         let Some((_, suffix)) = d.split_once('/') else { continue };
         if suffix.len() < 2 || out.iter().any(|x| x == &d) {
@@ -986,7 +962,6 @@ pub fn select_crossref_pdf_links(v: &Value) -> Vec<String> {
 /// 経路 4 の結果。`kind` = 所在の種類（`LocationKind::Declared` = メタタグ / link、`Heuristic` = .pdf リンク 1 本規則）
 pub struct LandingPdf {
     pub bytes: Vec<u8>,
-    pub pdf_url: String,
     pub host: String,
     pub kind: LocationKind,
 }
@@ -1007,19 +982,18 @@ pub fn landing_page_pdf(doi: &str) -> std::result::Result<LandingPdf, String> {
         let host = host_of(&page.url);
         if page.body.starts_with(b"%PDF") {
             // DOI が PDF そのものに解決した（content-type が違って HTML の上限で切れていたら取り直す。PDF の上限超過は `pdf_body` が拒否）
-            let pdf_url = page.url.clone();
             let bytes = if page.truncated && page.content_type != "application/pdf" {
-                download_pdf(&pdf_url, None, false)?
+                download_pdf(&page.url, None, false)?
             } else {
                 pdf_body(page)?
             };
-            return Ok(LandingPdf { bytes, pdf_url, host, kind: LocationKind::Declared });
+            return Ok(LandingPdf { bytes, host, kind: LocationKind::Declared });
         }
         let html = String::from_utf8_lossy(&page.body);
         match locate_pdf(&html, &page.url) {
             Located::Pdf(pdf_url, kind) => {
                 return match download_pdf(&pdf_url, Some(&page.url), false) {
-                    Ok(bytes) => Ok(LandingPdf { bytes, pdf_url, host, kind }),
+                    Ok(bytes) => Ok(LandingPdf { bytes, host, kind }),
                     Err(e) => Err(format!("{host} の {} → {e}", truncate_url(&pdf_url))),
                 };
             }
@@ -1122,12 +1096,6 @@ pub fn locate_pdf(html: &str, page_url: &str) -> Located {
 
 /// `<meta http-equiv="refresh" content="N; url=...">` の飛び先（linkinghub.elsevier.com 等）。
 /// 遅延 N が META_REFRESH_MAX_DELAY 秒を超えるもの（logout タイマー等）は中継とみなさない。
-pub fn meta_refresh_url(html: &str, base: &str) -> Option<String> {
-    let html = strip_comments(html);
-    let html = strip_blocks(&html, &["script", "style", "noscript"]);
-    meta_refresh_url_in(&scan_tags(&html), base)
-}
-
 fn meta_refresh_url_in(tags: &[(String, Vec<(String, String)>)], base: &str) -> Option<String> {
     for (name, attrs) in tags {
         if name == "meta"
@@ -1711,6 +1679,13 @@ mod doi_tests {
         }
     }
 
+    /// 生の HTML から meta refresh の飛び先を読む（`locate_pdf` と同じ前処理 → `meta_refresh_url_in`）
+    fn meta_refresh_url(html: &str, base: &str) -> Option<String> {
+        let html = strip_comments(html);
+        let html = strip_blocks(&html, &["script", "style", "noscript"]);
+        meta_refresh_url_in(&scan_tags(&html), base)
+    }
+
     #[test]
     fn meta_refresh_parsing() {
         // linkinghub.elsevier.com の実応答: 単引用符・&amp;・相対パス
@@ -1951,7 +1926,7 @@ mod doi_tests {
         assert!(lp.bytes.len() > 100_000, "{} bytes", lp.bytes.len());
         assert_eq!(lp.host, "www.annaliitalianidichirurgia.it");
         assert_eq!(lp.kind, LocationKind::Declared);
-        eprintln!("AIC: {} bytes from {}", lp.bytes.len(), lp.pdf_url);
+        eprintln!("AIC: {} bytes from {}", lp.bytes.len(), lp.host);
         let id = check_pdf_identity(&lp.bytes, &json!({"DOI": "10.62713/aic.4729"}));
         eprintln!("AIC identity: {id:?}");
         assert_eq!(id, IdentityCheck::Match);
@@ -1961,7 +1936,7 @@ mod doi_tests {
         assert!(matches!(other, IdentityCheck::Mismatch { .. }));
 
         match landing_page_pdf("10.1016/j.radcr.2026.08.005") {
-            Ok(lp) => eprintln!("Elsevier: {} bytes from {}", lp.bytes.len(), lp.pdf_url),
+            Ok(lp) => eprintln!("Elsevier: {} bytes from {}", lp.bytes.len(), lp.host),
             Err(e) => eprintln!("Elsevier: {e}"),
         }
         assert!(crossref_pdf_links("10.62713/aic.4729").unwrap().is_empty());

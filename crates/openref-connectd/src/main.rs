@@ -46,6 +46,13 @@ fn zjson(status: StatusCode, v: Value) -> impl IntoResponse {
     (status, ZHEADERS, Json(v))
 }
 
+/// 蔵書の件数（ゴミ箱外）。読めなければ 0（/capture/status の接続確認と Word の /api/status の診断表示）
+fn live_item_count(db: &Db) -> i64 {
+    db.conn
+        .query_row("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() {
     // ureq(ring) と axum-server(aws-lc-rs) が両方 rustls の provider feature を有効化するため、
@@ -113,20 +120,13 @@ async fn main() {
         db_path.display()
     );
 
-    // Word アドイン配信（HTTPS :23120）。cert 準備に失敗しても connector（:23119）は生かす。
-    let word_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        match word_https(st.clone(), &db_path) {
-            Ok(fut) => Box::pin(fut),
-            Err(e) => {
-                eprintln!("openref-connectd: Word 配信（:23120）を起動できません: {e}");
-                Box::pin(std::future::pending())
-            }
-        };
-
     let connector_fut = async move {
         axum::serve(listener, app).await.unwrap();
     };
-    tokio::join!(connector_fut, word_fut);
+    // Word アドイン配信（HTTPS :23120）を先頭に置く。join! は初回を先頭の future から poll するので（tokio の実装。docs に明記は無い）、
+    // cert の準備・router の構築は connector の最初の poll より前に走る。
+    // Word 配信が失敗して先に終わっても、join! は connector（:23119）の終わりまで待つ
+    tokio::join!(word_https(st.clone(), &db_path), connector_fut);
 }
 
 fn env_port(name: &str, default: u16) -> u16 {
@@ -135,35 +135,33 @@ fn env_port(name: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-fn word_https(
-    st: Arc<St>,
-    db_path: &std::path::Path,
-) -> Result<impl std::future::Future<Output = ()> + Send, String> {
-    let app_dir = db_path
-        .parent()
-        .ok_or("DB パスから親ディレクトリを解決できません")?
-        .to_path_buf();
-    let tls = word::ensure_cert(&app_dir)?;
+/// Word アドイン配信（HTTPS）。cert・TLS の準備に失敗したらログを残して終わる（connector は止めない）
+async fn word_https(st: Arc<St>, db_path: &std::path::Path) {
+    let unavailable = |e: &str| eprintln!("openref-connectd: Word 配信（:23120）を起動できません: {e}");
+    let Some(app_dir) = db_path.parent() else {
+        return unavailable("DB パスから親ディレクトリを解決できません");
+    };
+    let tls = match word::ensure_cert(app_dir) {
+        Ok(t) => t,
+        Err(e) => return unavailable(&e),
+    };
     let word_port = env_port("WORD_PORT", 23120);
-    let router = word::router(st, word_port);
-    Ok(async move {
-        let cfg = match axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("openref-connectd: TLS 設定に失敗（Word 配信は無効）: {e}");
-                return;
-            }
-        };
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], word_port));
-        eprintln!("openref-connectd: Word add-in ready on https://localhost:{word_port}");
-        if let Err(e) = axum_server::bind_rustls(addr, cfg)
-            .serve(router.into_make_service())
-            .await
-        {
-            eprintln!("openref-connectd: Word 配信エラー: {e}");
+    let router = word::router(st, word_port, app_dir);
+    let cfg = match axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("openref-connectd: TLS 設定に失敗（Word 配信は無効）: {e}");
+            return;
         }
-    })
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], word_port));
+    eprintln!("openref-connectd: Word add-in ready on https://localhost:{word_port}");
+    if let Err(e) = axum_server::bind_rustls(addr, cfg)
+        .serve(router.into_make_service())
+        .await
+    {
+        eprintln!("openref-connectd: Word 配信エラー: {e}");
+    }
 }
 
 async fn ping_get() -> impl IntoResponse {
@@ -200,32 +198,23 @@ async fn get_selected_collection(State(st): State<Arc<St>>) -> impl IntoResponse
     let db = st.db();
     let mut targets = vec![json!({ "id": "L1", "name": "OpenRef", "level": 0 })];
     if let Ok(rows) = search::collections(&db) {
-        // 親→子の順に並べる（深さ計算）
-        fn depth(rows: &[search::CollectionRow], id: Option<i64>) -> usize {
-            match id {
-                None => 0,
-                Some(i) => rows
-                    .iter()
-                    .find(|r| r.id == i)
-                    .map(|r| 1 + depth(rows, r.parent_id))
-                    .unwrap_or(1),
-            }
-        }
+        // 親→子の順に並べる（level = 根からの深さ。根のフォルダが 1）
         fn push_children(
             rows: &[search::CollectionRow],
             parent: Option<i64>,
+            level: usize,
             out: &mut Vec<Value>,
         ) {
             for r in rows.iter().filter(|r| r.parent_id == parent) {
                 out.push(json!({
                     "id": format!("C{}", r.id),
                     "name": r.name,
-                    "level": depth(rows, Some(r.id))
+                    "level": level
                 }));
-                push_children(rows, Some(r.id), out);
+                push_children(rows, Some(r.id), level + 1, out);
             }
         }
-        push_children(&rows, None, &mut targets);
+        push_children(&rows, None, 1, &mut targets);
     }
     zjson(
         StatusCode::OK,
@@ -301,10 +290,7 @@ async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse
         saved += 1;
 
         if let Some(cid) = target_collection {
-            let db = st.db();
-            if let Err(e) = edit::add_to_collection(&db, &key, cid) {
-                eprintln!("connector: {} をフォルダ(id {})へ追加できず: {}", key, cid, e);
-            }
+            add_to_folder(&st.db(), &key, cid, "connector");
         }
         if let Some(cid_str) = &ci.connector_id {
             st.sessions()
@@ -353,16 +339,8 @@ async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let _ = tokio::task::spawn_blocking(move || {
-                    let has_attachment = |db: &Db| -> bool {
-                        db.conn
-                            .query_row(
-                                "SELECT COUNT(*) FROM attachments a JOIN items i ON i.id = a.item_id WHERE i.key = ?1",
-                                [key3.as_str()],
-                                |r| r.get::<_, i64>(0),
-                            )
-                            .unwrap_or(1)
-                            > 0
-                    };
+                    // 読めなければ「添付あり」とみなす（DL も添付もしない）
+                    let has_attachment = |db: &Db| attachment_count(db, &key3).unwrap_or(1) > 0;
                     let (csl, filename) = {
                         let db = st3.db();
                         if has_attachment(&db) {
@@ -435,6 +413,33 @@ fn parse_collection_target(t: &str) -> Option<i64> {
     t.strip_prefix('C').and_then(|s| s.parse::<i64>().ok())
 }
 
+/// item をフォルダへ入れる。失敗はログだけ（保存・取込そのものは成功のまま）。who = ログの接頭辞
+fn add_to_folder(db: &Db, key: &str, cid: i64, who: &str) {
+    if let Err(e) = edit::add_to_collection(db, key, cid) {
+        eprintln!("{who}: {key} をフォルダ(id {cid})へ追加できず: {e}");
+    }
+}
+
+/// key の item の添付数（PDF に限らない）。None = 読めない（そのときの扱いは呼び手が決める）
+fn attachment_count(db: &Db, key: &str) -> Option<i64> {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) FROM attachments a JOIN items i ON i.id = a.item_id WHERE i.key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+/// Connector が添付に付ける X-Metadata ヘッダ（JSON）。無い・JSON として読めなければ {}
+fn x_metadata(headers: &HeaderMap) -> Value {
+    headers
+        .get("X-Metadata")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
 async fn save_attachment(
     State(st): State<Arc<St>>,
     Query(q): Query<HashMap<String, String>>,
@@ -442,11 +447,7 @@ async fn save_attachment(
     body: Bytes,
 ) -> impl IntoResponse {
     let session = q.get("sessionID").cloned().unwrap_or_else(|| "default".into());
-    let meta: Value = headers
-        .get("X-Metadata")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
+    let meta = x_metadata(&headers);
     let content_type = meta
         .get("contentType")
         .and_then(|v| v.as_str())
@@ -466,30 +467,12 @@ async fn save_attachment(
     let parent = meta
         .get("parentItemID")
         .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())));
-    let key = {
-        let sessions = st.sessions();
-        let map = sessions.get(&session);
-        match (map, &parent) {
-            (Some(m), Some(p)) => m.get(p).cloned(),
-            // parent 不明なら直近 session の唯一 item に付ける（単数保存の一般ケース）
-            (Some(m), None) if m.len() == 1 => m.values().next().cloned(),
-            _ => None,
-        }
-    };
-    let Some(key) = key else {
+    let Some(key) = key_for(&st, &session, parent.as_deref()) else {
         eprintln!("saveAttachment: parent item を解決できず skip（session={session}）");
         return zjson(StatusCode::CREATED, json!({}));
     };
     let db = st.db();
-    let has: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM attachments a JOIN items i ON i.id = a.item_id WHERE i.key = ?1",
-            [key.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if has > 0 {
+    if attachment_count(&db, &key).unwrap_or(0) > 0 {
         eprintln!("saveAttachment: {key} は既に添付あり skip");
         return zjson(StatusCode::CREATED, json!({}));
     }
@@ -518,7 +501,7 @@ async fn save_attachment(
     }
 }
 
-/// session の connector item id → openref key を引く
+/// session の connector item id → openref key を引く。item id が無ければ、その session の唯一の item（単数保存の一般ケース）
 fn key_for(st: &St, session: &str, item_id: Option<&str>) -> Option<String> {
     let sessions = st.sessions();
     let map = sessions.get(session)?;
@@ -527,6 +510,18 @@ fn key_for(st: &St, session: &str, item_id: Option<&str>) -> Option<String> {
         None if map.len() == 1 => map.values().next().cloned(),
         _ => None,
     }
+}
+
+/// サーバ側の連鎖（PMC → Unpaywall → Crossref → 着地ページ。数十秒〜数分）で PDF を取得して添付する。blocking（spawn_blocking の中で呼ぶ）。
+/// ① DB 読取 → ② ロック外でネットワーク → ③ 再ロックして添付（連鎖の間 /capture/status 等を止めない）
+fn fetch_pdf_unlocked(st: &St, key: &str) -> openref_core::Result<pdffetch::Fetched> {
+    let plan = {
+        let db = st.db();
+        pdffetch::fetch_pdf_prepare(&db, key)?
+    };
+    let dl = pdffetch::fetch_pdf_download(&plan)?;
+    let db = st.db();
+    pdffetch::fetch_pdf_attach(&db, &plan, dl)
 }
 
 /// 誌面 PDF が取れなかった時に connector が問い合わせてくる: OA 経路の当てがあるか
@@ -558,17 +553,7 @@ async fn save_attachment_from_resolver(
         return zjson(StatusCode::INTERNAL_SERVER_ERROR, json!("item を解決できません"));
     };
     let st2 = st.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        // ① DB 読取 → ② ロック外でネットワーク → ③ 再ロックして添付（連鎖の間 /capture/status 等を止めない）
-        let plan = {
-            let db = st2.db();
-            pdffetch::fetch_pdf_prepare(&db, &key)?
-        };
-        let dl = pdffetch::fetch_pdf_download(&plan)?;
-        let db = st2.db();
-        pdffetch::fetch_pdf_attach(&db, &plan, dl).map(|f| f.filename)
-    })
-    .await;
+    let res = tokio::task::spawn_blocking(move || fetch_pdf_unlocked(&st2, &key).map(|f| f.filename)).await;
     match res {
         Ok(Ok(filename)) => {
             eprintln!("resolver: OA から添付 {filename}");
@@ -588,11 +573,7 @@ async fn save_standalone_attachment(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let meta: Value = headers
-        .get("X-Metadata")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
+    let meta = x_metadata(&headers);
     if !body.starts_with(b"%PDF") {
         return zjson(StatusCode::CREATED, json!({}));
     }
@@ -689,9 +670,7 @@ async fn update_session(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResp
             .unwrap_or_default();
         let db = st.db();
         for k in keys {
-            if let Err(e) = edit::add_to_collection(&db, &k, target) {
-                eprintln!("connector: {} をフォルダ(id {})へ追加できず: {}", k, target, e);
-            }
+            add_to_folder(&db, &k, target, "connector");
         }
         eprintln!("updateSession: session={session} → C{target}");
     }
@@ -703,12 +682,7 @@ async fn update_session(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResp
 // 書誌の正確さは resolver（PubMed 第一・doi.org 補完）が担う = translator 不要。
 
 async fn capture_status(State(st): State<Arc<St>>) -> impl IntoResponse {
-    let n: i64 = {
-        let db = st.db();
-        db.conn
-            .query_row("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0))
-            .unwrap_or(0)
-    };
+    let n = live_item_count(&st.db());
     zjson(
         StatusCode::OK,
         json!({ "ok": true, "app": "openref", "version": env!("CARGO_PKG_VERSION"), "items": n }),
@@ -718,20 +692,8 @@ async fn capture_status(State(st): State<Arc<St>>) -> impl IntoResponse {
 async fn capture_collections(State(st): State<Arc<St>>) -> impl IntoResponse {
     let db = st.db();
     let rows = search::collections(&db).unwrap_or_default();
-    let path_of = |id: i64| -> String {
-        let mut parts = Vec::new();
-        let mut cur = Some(id);
-        while let Some(c) = cur {
-            if let Some(r) = rows.iter().find(|r| r.id == c) {
-                parts.push(r.name.clone());
-                cur = r.parent_id;
-            } else {
-                break;
-            }
-        }
-        parts.reverse();
-        parts.join("/")
-    };
+    let paths = search::collection_paths(&rows);
+    let path_of = |id: i64| -> String { paths[&id].clone() };
     let out: Vec<Value> = rows
         .iter()
         .map(|r| json!({ "id": r.id, "path": path_of(r.id), "n_items": r.n_items }))
@@ -788,57 +750,44 @@ async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRespon
     let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         let mut db = st2.db();
         // dedup 先行（登録済みなら resolver を呼ばない）
-        if let Ok(Some((_id, key))) = search::find_by_ids(&db, pmid.as_deref(), doi.as_deref()) {
-            if let Some(cid) = collection_id {
-                if let Err(e) = edit::add_to_collection(&db, &key, cid) {
-                    eprintln!("capture: {} をフォルダ(id {})へ追加できず: {}", key, cid, e);
-                }
-            }
-            return summarize_item(&db, &key, "existing", &None);
-        }
-
-        let input = pmid
-            .clone()
-            .map(resolver::AddInput::Pmid)
-            .or_else(|| doi.clone().map(resolver::AddInput::Doi));
-        let resolved = match input {
-            Some(i) => resolver::resolve(&i).map_err(|e| e.to_string())?,
-            None => {
-                // 識別子ゼロ: 捏造せず、ページ情報だけで document を作る
-                let t = title.ok_or("DOI / PMID もタイトルも見つかりません")?;
-                resolver::Resolved {
-                    csl: json!({
-                        "type": "document",
-                        "title": t,
-                        "URL": url,
-                        "custom": { "source": "capture" }
-                    }),
-                    retracted: None,
-                    source: "capture",
+        let (key, status, retraction) = match search::find_by_ids(&db, pmid.as_deref(), doi.as_deref()) {
+            Ok(Some((_id, key))) => (key, "existing", None),
+            _ => {
+                let input = pmid
+                    .clone()
+                    .map(resolver::AddInput::Pmid)
+                    .or_else(|| doi.clone().map(resolver::AddInput::Doi));
+                let resolved = match input {
+                    Some(i) => resolver::resolve(&i).map_err(|e| e.to_string())?,
+                    None => {
+                        // 識別子ゼロ: 捏造せず、ページ情報だけで document を作る
+                        let t = title.ok_or("DOI / PMID もタイトルも見つかりません")?;
+                        resolver::Resolved {
+                            csl: json!({
+                                "type": "document",
+                                "title": t,
+                                "URL": url,
+                                "custom": { "source": "capture" }
+                            }),
+                            retracted: None,
+                            source: "capture",
+                        }
+                    }
+                };
+                match ingest::add_item(&mut db, &resolved) {
+                    Ok(added) => (added.key, "created", resolved.retracted),
+                    Err(openref_core::CoreError::Duplicate { existing_key, .. }) => (existing_key, "existing", None),
+                    Err(e) => return Err(e.to_string()),
                 }
             }
         };
-        let retraction = resolved.retracted.clone();
-        match ingest::add_item(&mut db, &resolved) {
-            Ok(added) => {
-                if let Some(cid) = collection_id {
-                    if let Err(e) = edit::add_to_collection(&db, &added.key, cid) {
-                        eprintln!("capture: {} をフォルダ(id {})へ追加できず: {}", added.key, cid, e);
-                    }
-                }
-                eprintln!("capture: 新規 {}", added.key);
-                summarize_item(&db, &added.key, "created", &retraction)
-            }
-            Err(openref_core::CoreError::Duplicate { existing_key, .. }) => {
-                if let Some(cid) = collection_id {
-                    if let Err(e) = edit::add_to_collection(&db, &existing_key, cid) {
-                        eprintln!("capture: {} をフォルダ(id {})へ追加できず: {}", existing_key, cid, e);
-                    }
-                }
-                summarize_item(&db, &existing_key, "existing", &None)
-            }
-            Err(e) => Err(e.to_string()),
+        if let Some(cid) = collection_id {
+            add_to_folder(&db, &key, cid, "capture");
         }
+        if status == "created" {
+            eprintln!("capture: 新規 {key}");
+        }
+        summarize_item(&db, &key, status, &retraction)
     })
     .await;
     match res {
@@ -865,10 +814,7 @@ async fn capture_attachment(
         return zjson(StatusCode::BAD_REQUEST, json!({ "error": "key 必須" }));
     };
     if !body.starts_with(b"%PDF") {
-        return zjson(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({ "error": format!("PDF ではありません（{} bytes）", body.len()) }),
-        );
+        return zjson(StatusCode::UNPROCESSABLE_ENTITY, not_pdf(&body));
     }
     let source = q.get("source").cloned().unwrap_or_default();
     let via = q.get("via").cloned().unwrap_or_else(|| "page".into());
@@ -877,6 +823,10 @@ async fn capture_attachment(
     let res = tokio::task::spawn_blocking(move || -> Result<(StatusCode, Value), String> {
         // md5 はここで 1 度だけ取り、③ の重複判定にもそのまま渡す（照合印は添付行 id で書く）
         let md5 = pdffetch::md5_hex(&body);
+        let skipped = || {
+            eprintln!("capture: {key} は同一 PDF（md5 一致）が添付済み → スキップ");
+            (StatusCode::OK, json!({ "status": "skipped", "reason": "同一ファイルが添付済み（md5 一致）" }))
+        };
         // ① DB 読取（短く）: item の CSL と、同一ファイル（md5）が既に付いているか
         let (csl, filename) = {
             let db = st2.db();
@@ -892,11 +842,7 @@ async fn capture_attachment(
                 )
                 .unwrap_or(0);
             if dup > 0 {
-                eprintln!("capture: {key} は同一 PDF（md5 一致）が添付済み → スキップ");
-                return Ok((
-                    StatusCode::OK,
-                    json!({ "status": "skipped", "reason": "同一ファイルが添付済み（md5 一致）" }),
-                ));
+                return Ok(skipped());
             }
             let f = pdffetch::suggest_filename(&it.csl);
             (it.csl, f)
@@ -932,7 +878,7 @@ async fn capture_attachment(
                 doi_check
             }
         };
-        // ③ 再ロックして添付。md5 の意味論は GUI 一括取込の attach_or_skip と同じ:
+        // ③ 再ロックして添付。md5 の意味論は GUI 一括取込(ingest_pdf_report → attach_or_skip_with_md5)と同じ:
         // 未添付なら添付 / 同一ファイル（md5 一致）ならスキップ / 別ファイルなら 2 本目として添付
         let db = st2.db();
         match pdfingest::attach_or_skip_with_md5(&db, &key, &filename, &body, &md5) {
@@ -941,13 +887,7 @@ async fn capture_attachment(
                     eprintln!("capture: ⚠ {reason}");
                 }
                 let status = match outcome {
-                    pdfingest::PdfIngestOutcome::DuplicateFile { .. } => {
-                        eprintln!("capture: {key} は同一 PDF（md5 一致）が添付済み → スキップ");
-                        return Ok((
-                            StatusCode::OK,
-                            json!({ "status": "skipped", "reason": "同一ファイルが添付済み（md5 一致）" }),
-                        ));
-                    }
+                    pdfingest::PdfIngestOutcome::DuplicateFile { .. } => return Ok(skipped()),
                     pdfingest::PdfIngestOutcome::AttachedAdditional { .. } => "attached_additional",
                     _ => "attached",
                 };
@@ -975,6 +915,11 @@ async fn capture_attachment(
     }
 }
 
+/// `/capture/attachment`・`/capture/pdf` で body が PDF でないときの 422 の本文
+fn not_pdf(body: &[u8]) -> Value {
+    json!({ "error": format!("PDF ではありません（{} bytes）", body.len()) })
+}
+
 /// body = PDF バイト列、query = collection_id / title / url（ヒント）。**PDF タブからの取込の本命経路**。
 /// 冒頭テキストの DOI/PMID → resolver → 新規登録 or 既存 item へ添付（GUI の一括取込と同じ
 /// `pdfingest::ingest_pdf_report`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
@@ -988,10 +933,7 @@ async fn capture_pdf(
     body: Bytes,
 ) -> impl IntoResponse {
     if !body.starts_with(b"%PDF") {
-        return zjson(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({ "error": format!("PDF ではありません（{} bytes）", body.len()) }),
-        );
+        return zjson(StatusCode::UNPROCESSABLE_ENTITY, not_pdf(&body));
     }
     let collection_id = q.get("collection_id").and_then(|s| s.trim().parse::<i64>().ok());
     let clean = |k: &str| q.get(k).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
@@ -1068,9 +1010,7 @@ fn capture_pdf_ingest(
     let retraction = match (&live, collection_id) {
         (Some(it), cid) => {
             if let Some(cid) = cid {
-                if let Err(e) = edit::add_to_collection(&db, &key, cid) {
-                    eprintln!("capture: {} をフォルダ(id {})へ追加できず: {}", key, cid, e);
-                }
+                add_to_folder(&db, &key, cid, "capture");
             }
             search::retraction_of(&db, it.id).unwrap_or(None)
         }
@@ -1174,17 +1114,7 @@ async fn capture_fetch_oa(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRe
     };
     let st2 = st.clone();
     let key2 = key.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        // ① DB 読取 → ② ロック外でネットワーク（PMC → Unpaywall → Crossref → 着地ページ。数十秒〜数分）→ ③ 再ロックして添付
-        let plan = {
-            let db = st2.db();
-            pdffetch::fetch_pdf_prepare(&db, &key2)?
-        };
-        let dl = pdffetch::fetch_pdf_download(&plan)?;
-        let db = st2.db();
-        pdffetch::fetch_pdf_attach(&db, &plan, dl).map(|f| (f.filename, f.source))
-    })
-    .await;
+    let res = tokio::task::spawn_blocking(move || fetch_pdf_unlocked(&st2, &key2).map(|f| (f.filename, f.source))).await;
     match res {
         Ok(Ok((filename, source))) => {
             eprintln!("capture: fetch-oa {key} ✓ {source} {filename}");

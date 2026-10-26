@@ -46,10 +46,6 @@ Private Sub Check(ByVal name As String, ByVal ok As Boolean, Optional ByVal deta
     Flush
 End Sub
 
-Private Function Esc(ByVal s As String) As String
-    Esc = ORIpc.JStr(s)
-End Function
-
 Private Function Payload(ParamArray keys() As Variant) As String
     Dim i As Long, s As String
     For i = LBound(keys) To UBound(keys)
@@ -95,6 +91,13 @@ Private Function CountTag(ByVal doc As Document, ByVal tag As String) As Long
     Dim cc As ContentControl
     For Each cc In doc.ContentControls
         If cc.Tag = tag Then CountTag = CountTag + 1
+    Next
+End Function
+
+Private Function CountPrefix(ByVal doc As Document, ByVal prefix As String) As Long
+    Dim cc As ContentControl
+    For Each cc In doc.ContentControls
+        If Left$(cc.Tag, Len(prefix)) = prefix Then CountPrefix = CountPrefix + 1
     Next
 End Function
 
@@ -234,7 +237,7 @@ Private Sub TAddEdit()
     If c.Count = 3 Then
         t = c(2).Tag
         CursorInside c(2)
-        ORCmd.OR_TestQueue "R" & vbTab & "ok" & vbTab & LineEsc(Payload(K1, K2))
+        QueueOk Payload(K1, K2)
         ORCmd.OpenRefAddEdit
         lg = TestLog()
         Set c = Cites(d)
@@ -275,7 +278,7 @@ Private Sub TAddEdit()
     CursorEnd d
     Queue "R" & vbTab & "cancel"
     ORCmd.OpenRefAddEdit
-    Check "cancel: no placeholder left", CountPending(d) = 0, CStr(CountPending(d))
+    Check "cancel: no placeholder left", CountPrefix(d, "refract-pending-") = 0, CStr(CountPrefix(d, "refract-pending-"))
     Check "cancel: text unchanged", d.Range.Text = t, d.Range.Text
 Done:
     CloseDoc d
@@ -285,16 +288,9 @@ EH:
     CloseDoc d
 End Sub
 
-Private Function CountPending(ByVal doc As Document) As Long
-    Dim cc As ContentControl
-    For Each cc In doc.ContentControls
-        If Left$(cc.Tag, 16) = "refract-pending-" Then CountPending = CountPending + 1
-    Next
-End Function
-
 ' ---------- 設定・移動・Update・入れ子・削除 ----------
 Private Sub TSettingsMoveRemove()
-    Dim d As Document, c As Collection, lg As String, bib As ContentControl, head As ContentControl, v As Variable, n As Long, inner As ContentControl
+    Dim d As Document, c As Collection, lg As String, head As ContentControl, v As Variable, n As Long, inner As ContentControl
     On Error GoTo EH
     Set d = NewDoc("First paragraph. ")
     d.Range.InsertParagraphAfter
@@ -350,7 +346,7 @@ Private Sub TSettingsMoveRemove()
     ORCmd.OpenRefRemoveCitationCodes
     lg = TestLog()
     Check "remove: confirm asked", InStr(lg, """notice"":""confirm""") > 0, lg
-    Check "remove: no OpenRef content controls", CountOpenRef(d) = 0, CStr(CountOpenRef(d))
+    Check "remove: no OpenRef content controls", CountPrefix(d, "refract-") = 0, CStr(CountPrefix(d, "refract-"))
     For Each v In d.Variables
         If Left$(v.Name, 8) = "refract-" Then n = n + 1
     Next
@@ -362,13 +358,6 @@ EH:
     Check "settings/move/remove (error)", False, Err.Number & " " & Err.Description & " log=" & TestLog()
     CloseDoc d
 End Sub
-
-Private Function CountOpenRef(ByVal doc As Document) As Long
-    Dim cc As ContentControl
-    For Each cc In doc.ContentControls
-        If Left$(cc.Tag, 8) = "refract-" Then CountOpenRef = CountOpenRef + 1
-    Next
-End Function
 
 ' ---------- 旧文書の文献リスト（見出し CC が無い・素の "References" 段落がある） ----------
 Private Sub TOldBibliography()
@@ -562,7 +551,7 @@ Private Sub TTrackChanges()
     Check "track: protected document refuses update", InStr(lg, JFrag("保護されている")) > 0, lg
     ORCmd.OpenRefAddEdit
     lg = TestLog()
-    Check "track: protected document refuses add before the dialog", InStr(lg, JFrag("保護されている")) > 0 And InStr(lg, """kind"":""cite""") = 0 And CountPending(d) = 0, "pending=" & CountPending(d) & " log=" & lg
+    Check "track: protected document refuses add before the dialog", InStr(lg, JFrag("保護されている")) > 0 And InStr(lg, """kind"":""cite""") = 0 And CountPrefix(d, "refract-pending-") = 0, "pending=" & CountPrefix(d, "refract-pending-") & " log=" & lg
     Set c = Cites(d)
     If c.Count > 0 Then
         CursorInside c(1)

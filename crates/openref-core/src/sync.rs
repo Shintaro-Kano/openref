@@ -20,6 +20,9 @@ pub struct SyncReport {
 pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
     // mount 側: 全 PDF（NFC 正規化した絶対パス → 表示用相対パス）
     let mut mount_files: Vec<(String, String)> = Vec::new();
+    let file_entry = |p: &Path| -> (String, String) {
+        (p.to_string_lossy().nfc().collect(), p.strip_prefix(mount).unwrap_or(p).to_string_lossy().to_string())
+    };
     for entry in walkdir::WalkDir::new(mount).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry
@@ -27,14 +30,7 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
                 .extension()
                 .map_or(false, |e| e.eq_ignore_ascii_case("pdf"))
         {
-            let abs_nfc: String = entry.path().to_string_lossy().nfc().collect();
-            let rel = entry
-                .path()
-                .strip_prefix(mount)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .to_string();
-            mount_files.push((abs_nfc, rel));
+            mount_files.push(file_entry(entry.path()));
         }
     }
 
@@ -48,14 +44,7 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
         {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    let p = Path::new(line);
-                    let abs_nfc: String = line.nfc().collect();
-                    let rel = p
-                        .strip_prefix(mount)
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .to_string();
-                    mount_files.push((abs_nfc, rel));
+                    mount_files.push(file_entry(Path::new(line)));
                 }
                 if !mount_files.is_empty() {
                     eprintln!("(note) ディレクトリ列挙が空だったため find(1) fallback を使用");
@@ -80,7 +69,6 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
         .map(|(_, rel)| rel.clone())
         .collect();
     new_files.sort();
-    let new_files = new_files;
 
     let orphans: Vec<String> = linked
         .iter()

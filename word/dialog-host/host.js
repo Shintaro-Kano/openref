@@ -7,7 +7,6 @@
 // 前提: 素の osascript の窓は macOS 14+ で前面化されない（LaunchServices で起動したアプレットなら
 // キー窓になり入力欄にフォーカスまで入る）・NSPanel は hidesOnDeactivate で消える・setActivationPolicy は呼ばない・
 // JS の null を NSURL の代わりに渡すと NSNull に化けて落ちる・stringWithContentsOfURL ではヘッダを足せない（NSMutableURLRequest）。
-// テスト用: `--close-after <ms>` で × と同じ performClose: を指定 ms 後に起こす。
 ObjC.import("Cocoa");
 ObjC.import("WebKit");
 
@@ -78,7 +77,7 @@ function installMenu(app) {
 /** 1 セッションの窓を開き、閉じるまで回す。戻り値 "done"（ページが結果を送った）/ "closed"（× など）。
     開いて 0.8 秒後に前面化できたか（active / key）を connectd のログへ 1 行（macOS は前面のアプリ以外からの起動を
     前面化しないことがある = そのときは窓をクリックすれば入力できる） */
-function show(app, s, closeAfter, base) {
+function show(app, s, base) {
   var w = s.width || 600;
   var h = s.height || 460;
   try {
@@ -124,10 +123,6 @@ function show(app, s, closeAfter, base) {
     if (notes.length && Date.now() - t0 > notes[0]) {
       report(base, "info", "shown " + s.sid + " +" + notes.shift() + "ms active=" + app.isActive + " key=" + win.isKeyWindow);
     }
-    if (closeAfter && Date.now() - t0 > closeAfter) {
-      closeAfter = 0;
-      win.performClose(null);
-    }
   }
   win.orderOut(null);
   return how;
@@ -136,10 +131,8 @@ function show(app, s, closeAfter, base) {
 function run() {
   var a = args();
   var base = DEFAULT_BASE;
-  var closeAfter = 0;
   for (var i = 1; i < a.length; i++) {
     if (/^https?:\/\//.test(a[i])) base = a[i].replace(/\/+$/, "");
-    else if (a[i] === "--close-after" && i + 1 < a.length) closeAfter = parseInt(a[++i], 10) || 0;
   }
   var app = $.NSApplication.sharedApplication;
   installMenu(app);
@@ -158,7 +151,7 @@ function run() {
       break;
     }
     try {
-      show(app, s, closeAfter, base);
+      show(app, s, base);
     } catch (e) {
       report(base, "error", "窓を開けません（" + s.sid + "）: " + e.message);
     }

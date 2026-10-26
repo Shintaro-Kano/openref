@@ -416,22 +416,12 @@ fn ensure_collection_path(
         }
         // 兄弟の照合は大小無視（edit::ensure_collection_path・collections::create_collection と同じ基準）。
         // GUI で "Liver" → "liver" と改名した後に再 import しても同じ親の下に "Liver" をもう 1 つ作らない
-        let found: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND parent_id IS ?2 AND deleted_at IS NULL",
-                rusqlite::params![seg, parent],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let id = match found {
+        let id = match crate::collections::child_id(conn, parent, seg)? {
             Some(id) => id,
             None => {
-                conn.execute(
-                    "INSERT INTO collections (key, name, parent_id) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![keys::new_key(), seg, parent],
-                )?;
+                let id = crate::collections::insert_child(conn, parent, seg)?;
                 *created += 1;
-                conn.last_insert_rowid()
+                id
             }
         };
         cache.insert(acc.clone(), id);

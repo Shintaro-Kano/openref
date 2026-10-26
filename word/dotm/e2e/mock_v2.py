@@ -19,7 +19,6 @@ def esc(s):
                 out.append('%%u%04X' % int.from_bytes(b[k:k+2], 'little'))
     return ''.join(out)
 
-LOG = []
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, body, ctype='text/plain'):
@@ -38,7 +37,6 @@ class H(BaseHTTPRequestHandler):
             req = json.loads(raw.decode('ascii'))
         except Exception as e:
             return self.send('ERR\t' + esc('bad json: %s %r' % (e, raw[:200])))
-        LOG.append((self.path, req))
         if self.path == '/word/v2/render':
             order, lines = [], []
             for p in req['cites']:

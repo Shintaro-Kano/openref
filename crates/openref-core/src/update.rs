@@ -108,10 +108,14 @@ pub fn fetch_latest(url: &str, current: &str) -> Result<String> {
     Ok(v.to_string())
 }
 
+/// settings の 2 鍵を 1 文で書く（まとめて入るか入らないか）
+const UPSERT_TWO: &str =
+    "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
 /// 取れた結果を settings に書く（1 文 = まとめて入るか入らないか。前回の失敗の理由は消す）
 pub fn record(db: &Db, now: i64, latest: &str) -> Result<()> {
     db.conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        UPSERT_TWO,
         rusqlite::params![KEY_CHECKED_AT, now.to_string(), KEY_LATEST, latest],
     )?;
     db.conn.execute("DELETE FROM settings WHERE key = ?1", [KEY_ERROR])?;
@@ -121,7 +125,7 @@ pub fn record(db: &Db, now: i64, latest: &str) -> Result<()> {
 /// 取れなかったことを settings に書く（確認した日時は進める = 起動のたびに GET しない。前回の版番号はそのまま）
 pub fn record_failure(db: &Db, now: i64, why: &str) -> Result<()> {
     db.conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        UPSERT_TWO,
         rusqlite::params![KEY_CHECKED_AT, now.to_string(), KEY_ERROR, format!("{now}: {why}")],
     )?;
     Ok(())

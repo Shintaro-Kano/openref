@@ -55,13 +55,19 @@ fn first_pdf_attachment(db: &Db, item_key: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
-pub fn add_annotation(db: &Db, item_key: &str, na: &NewAnnotation) -> Result<String> {
-    if !["highlight", "note", "underline", "strikethrough"].contains(&na.kind.as_str()) {
-        return Err(CoreError::BadInput(format!(
-            "kind は highlight / note / underline / strikethrough のいずれか: {}",
-            na.kind
-        )));
+/// 注釈の kind の許可表（DB の CHECK と同じ）
+const KINDS: [&str; 4] = ["highlight", "note", "underline", "strikethrough"];
+
+fn check_kind(kind: &str) -> Result<()> {
+    if KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(CoreError::BadInput(format!("kind は highlight / note / underline / strikethrough のいずれか: {kind}")))
     }
+}
+
+pub fn add_annotation(db: &Db, item_key: &str, na: &NewAnnotation) -> Result<String> {
+    check_kind(&na.kind)?;
     if na.author.trim().is_empty() {
         return Err(CoreError::BadInput("author 必須".into()));
     }
@@ -137,37 +143,29 @@ pub struct AnnotationPatch {
 
 pub fn update_annotation(db: &Db, key: &str, patch: &AnnotationPatch) -> Result<()> {
     if let Some(k) = &patch.kind {
-        if !["highlight", "note", "underline", "strikethrough"].contains(&k.as_str()) {
-            return Err(CoreError::BadInput(format!(
-                "kind は highlight / note / underline / strikethrough のいずれか: {k}"
-            )));
-        }
+        check_kind(k)?;
     }
     if patch.comment.is_none() && patch.color.is_none() && patch.kind.is_none() {
         return Err(CoreError::BadInput(
             "update_annotation: comment / color / kind のいずれかを指定してください".into(),
         ));
     }
-
-    let mut sets: Vec<String> = vec!["date_modified = datetime('now')".to_string()];
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(comment) = &patch.comment {
-        sets.push("comment = ?".to_string());
-        params.push(Box::new(comment.clone()));
-    }
-    if let Some(color) = &patch.color {
-        sets.push("color = ?".to_string());
-        params.push(Box::new(color.clone()));
-    }
-    if let Some(kind) = &patch.kind {
-        sets.push("kind = ?".to_string());
-        params.push(Box::new(kind.clone()));
-    }
-    params.push(Box::new(key.to_string()));
-
-    let sql = format!("UPDATE annotations SET {} WHERE key = ?", sets.join(", "));
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let n = db.conn.execute(&sql, param_refs.as_slice())?;
+    // 指定の無い列は自分の値のまま（?1 / ?3 = 指定ありか。NULL への消去と区別する）
+    let n = db.conn.execute(
+        "UPDATE annotations SET date_modified = datetime('now'),
+           comment = CASE WHEN ?1 THEN ?2 ELSE comment END,
+           color = CASE WHEN ?3 THEN ?4 ELSE color END,
+           kind = COALESCE(?5, kind)
+         WHERE key = ?6",
+        rusqlite::params![
+            patch.comment.is_some(),
+            patch.comment.as_ref().and_then(|c| c.as_deref()),
+            patch.color.is_some(),
+            patch.color.as_ref().and_then(|c| c.as_deref()),
+            patch.kind,
+            key,
+        ],
+    )?;
     if n == 0 {
         return Err(CoreError::NotFound(format!("annotation {key}")));
     }
@@ -190,24 +188,11 @@ pub fn delete_note(db: &Db, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// viewer 側で解決した座標をキャッシュする（次回表示を速くする・任意）
-pub fn set_rects(db: &Db, key: &str, rects_json: &str) -> Result<()> {
-    db.conn.execute(
-        "UPDATE annotations SET rects = ?1, date_modified = datetime('now') WHERE key = ?2",
-        rusqlite::params![rects_json, key],
-    )?;
-    Ok(())
-}
-
 pub fn add_note(db: &Db, item_key: &str, author: &str, content_md: &str) -> Result<String> {
     if content_md.trim().is_empty() {
         return Err(CoreError::BadInput("content_md が空です".into()));
     }
-    let item_id: i64 = db
-        .conn
-        .query_row("SELECT id FROM items WHERE key = ?1", [item_key], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| CoreError::NotFound(format!("item {item_key}")))?;
+    let item_id = crate::edit::item_id(db, item_key)?;
     let key = keys::new_key();
     db.conn.execute(
         "INSERT INTO notes (key, item_id, author, content_md) VALUES (?1, ?2, ?3, ?4)",

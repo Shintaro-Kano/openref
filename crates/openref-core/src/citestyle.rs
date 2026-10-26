@@ -319,7 +319,7 @@ pub fn install(dir: &Path, id: &str) -> Result<Value> {
         (None, Some(p)) => parse_meta(&raw_style(dir, p)?).ok().and_then(|m| m.format),
         _ => None,
     };
-    let entry = json!({
+    let mut entry = json!({
         "id": id,
         "title": if meta.title.is_empty() { id.to_string() } else { meta.title.clone() },
         "short": meta.title_short,
@@ -327,7 +327,6 @@ pub fn install(dir: &Path, id: &str) -> Result<Value> {
         "parent": meta.parent,
     });
     let mut list = read_manifest(dir);
-    let mut entry = entry;
     if let Some(pos) = list.iter().position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id)) {
         // 再導入（既定に設定した時など）でも「自作」の印は保つ。導入順も保つ
         if list[pos].get("custom") == Some(&json!(true)) {

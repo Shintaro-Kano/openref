@@ -2,21 +2,15 @@
 //! Crossref / DataCite 両 agency をこの 1 経路でカバーする（PubMed 非収載 DOI の fallback）。
 
 use super::Resolved;
-use crate::{CoreError, Result};
+use crate::Result;
 use serde_json::{json, Value};
 
 pub fn fetch_by_doi(doi: &str) -> Result<Resolved> {
     let url = format!("https://doi.org/{doi}");
-    let req = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("openref/0.1 (personal reference manager)")
-        .build()
+    let req = super::pubmed::agent()
         .get(&url)
         .set("Accept", "application/vnd.citationstyles.csl+json");
-    let resp = super::pubmed::call_with_retry(req, &format!("doi.org negotiation ({doi})"))?;
-    let body = resp
-        .into_string()
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+    let body = super::pubmed::call_with_retry(req, &format!("doi.org negotiation ({doi})"))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(Resolved {
         csl: normalize(v),
@@ -38,16 +32,12 @@ pub struct Candidate {
 
 /// Crossref `works?query.bibliographic=` でタイトル推定文字列から候補を引く（識別子なし PDF 用）。
 pub fn search_bibliographic(q: &str, rows: usize) -> Result<Vec<Candidate>> {
-    let req = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("openref/0.1 (personal reference manager)")
-        .build()
+    let req = super::pubmed::agent()
         .get("https://api.crossref.org/works")
         .query("query.bibliographic", q)
         .query("rows", &rows.to_string())
         .query("select", "DOI,title,author,issued,container-title,type");
-    let resp = super::pubmed::call_with_retry(req, "crossref search")?;
-    let body = resp.into_string().map_err(|e| CoreError::Http(e.to_string()))?;
+    let body = super::pubmed::call_with_retry(req, "crossref search")?;
     let v: Value = serde_json::from_str(&body)?;
     let items = v
         .pointer("/message/items")

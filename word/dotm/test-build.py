@@ -52,19 +52,18 @@ check("ovba compress roundtrip", all(B.ovba_decompress(B.ovba_compress(s)) == s 
 # ---- 本番ビルド: 読み戻し・決定論・中身 ----
 with tempfile.TemporaryDirectory() as tmp:
     a, b = os.path.join(tmp, "a.dotm"), os.path.join(tmp, "b.dotm")
-    modules, macros = B.build(a)
+    modules, _ = B.build(a)
     B.build(b)
     check("deterministic bytes", open(a, "rb").read() == open(b, "rb").read())
     srcs = B.check(a, modules)
     joined = "".join(srcs.values())
     check("compiled sources are ASCII without \\ and ~", all(32 <= ord(c) < 127 or c in "\r\n\t" for c in joined) and "\\" not in joined and "~" not in joined)
     check("project name differs from file name", B.PROJECT != "OpenRef", B.PROJECT)
-    check("AutoExec is registered in vbaData", B.PROJECT + ".ORRibbon.AutoExec" in macros, macros)
     with zipfile.ZipFile(a) as z:
         vbadata = z.read("word/vbaData.xml").decode()
         ui = z.read("customUI/customUI14.xml").decode()
         dirs = B.ovba_decompress(B.cfb_read(z.read("word/vbaProject.bin"))["VBA/dir"])
-    check("vbaData lists AutoExec", "ORRIBBON.AUTOEXEC" in vbadata)
+    check("vbaData lists AutoExec", ('wne:macroName="%s"' % (B.PROJECT + ".ORRibbon.AutoExec").upper()) in vbadata, vbadata)
     check("ribbon tab after References", 'insertAfterMso="TabReferences"' in ui)
     check("production build has no E2E constant", b"OPENREF_E2E" not in dirs)
     # ORStr の生成式が元の文字列に戻る
@@ -85,7 +84,6 @@ with tempfile.TemporaryDirectory() as tmp:
             cases[cur] += eval_vba_str(m.group(2))
     check("ORStr expressions decode to the source strings", [cases.get(i + 1) for i in range(len(strings.items))] == strings.items,
           [(i + 1, strings.items[i], cases.get(i + 1)) for i in range(len(strings.items)) if cases.get(i + 1) != strings.items[i]][:3])
-    check("ORStr dispatch has no integer division", "\\" not in gen)
     # E2E ビルドは定数と E2E モジュールを持つ
     e = os.path.join(tmp, "e.dotm")
     emods, _ = B.build(e, e2e=True)

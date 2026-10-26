@@ -12,17 +12,6 @@ pub enum FieldKind {
     Date,
 }
 
-impl FieldKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FieldKind::Text => "text",
-            FieldKind::Multiline => "multiline",
-            FieldKind::Names => "names",
-            FieldKind::Date => "date",
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FieldDef {
     pub key: &'static str,

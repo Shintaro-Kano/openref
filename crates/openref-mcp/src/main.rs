@@ -442,7 +442,8 @@ fn schema_text(db: &Db) -> String {
     out.push_str("`call(name, args)`。item は key・フォルダは key かパス・ラベルは名前。書込のコマンドはこのプロセスで最初の 1 回の前に DB のスナップショットを取る。\n\n");
     out.push_str(&commands::markdown());
     out.push_str("\n## 4. 環境\n\n");
-    let q = |sql: &str| -> String { db.conn.query_row(sql, [], |r| r.get::<_, rusqlite::types::Value>(0)).map(|v| fmt_value(&v)).unwrap_or_else(|e| format!("?（{e}）")) };
+    // どれも整数を返す問い合わせ（user_version・件数）
+    let q = |sql: &str| -> String { db.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).map(|n| n.to_string()).unwrap_or_else(|e| format!("?（{e}）")) };
     let path = db.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(in-memory)".into());
     let app_dir = db.app_dir().map(|p| p.display().to_string()).unwrap_or_else(|| "(なし)".into());
     let bdir = backup::backup_dir(db).map(|p| p.display().to_string()).unwrap_or_else(|| "(なし)".into());
@@ -466,17 +467,6 @@ fn schema_text(db: &Db) -> String {
     ));
     out.push_str(RESTORE_TEXT);
     out
-}
-
-fn fmt_value(v: &rusqlite::types::Value) -> String {
-    use rusqlite::types::Value as V;
-    match v {
-        V::Null => "NULL".into(),
-        V::Integer(i) => i.to_string(),
-        V::Real(f) => f.to_string(),
-        V::Text(s) => s.clone(),
-        V::Blob(b) => format!("<{} bytes>", b.len()),
-    }
 }
 
 // ---------------- tests ----------------

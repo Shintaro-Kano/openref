@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use openref_core::{annotate, citestyle, collections, datadir, edit, ingest, model, pdfingest, resolver, search, tags, types, update, Db};
-use serde::Serialize;
+use openref_core::{annotate, citestyle, collections, datadir, edit, ingest, pdfingest, resolver, search, tags, types, update, Db};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
@@ -12,7 +11,7 @@ struct AppState {
 
 // ---------- 定型 ----------
 // 戻り値は core の行型をそのまま返す（core 側の `#[derive(Serialize)]`・camelCase。TS の型は app/src/lib/api.ts が 1:1 で持つ）。
-// GUI だけの整形は search::ItemSummary（一覧の行）と下の BibtexEntry（引用メニュー用の合成）だけ
+// GUI だけの整形は search::ItemSummary（一覧の行）だけ
 
 /// core / rusqlite / lock / JoinError のエラーを Tauri command の Err(String) に落とす
 fn err(e: impl std::fmt::Display) -> String {
@@ -24,6 +23,11 @@ fn lock(m: &Mutex<Db>) -> Result<MutexGuard<'_, Db>, String> {
     m.lock().map_err(err)
 }
 
+/// main thread から外して待つ（同期 command は main thread で走る）。JoinError も Err(String) に落とす
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f).await.map_err(err)?
+}
+
 // ---------- commands ----------
 
 #[tauri::command]
@@ -31,12 +35,11 @@ async fn list_items(state: tauri::State<'_, AppState>, filter: search::ListFilte
     // 本文検索（fulltext_fts + 抜粋）は一般語で数百 ms かかり得るので main thread から外す（UI を止めない）。
     // 応答順は保証されないため、フロント（state.svelte.ts refreshList）が古い応答を捨てる
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let db = lock(&db)?;
         Ok(search::list_items(&db, &filter).map_err(err)?.iter().map(search::ListedItem::summary).collect())
     })
     .await
-    .map_err(err)?
 }
 
 /// 詳細（ゴミ箱の item も引ける。deleted / notes 込み = core の ItemDetail そのまま）
@@ -78,9 +81,7 @@ fn styles_dir_of(state: &tauri::State<'_, AppState>) -> Result<PathBuf, String> 
 #[tauri::command]
 async fn cite_catalog(state: tauri::State<'_, AppState>, refresh: bool) -> Result<Vec<serde_json::Value>, String> {
     let dir = styles_dir_of(&state)?;
-    tauri::async_runtime::spawn_blocking(move || citestyle::catalog(&dir, refresh).map_err(err))
-        .await
-        .map_err(err)?
+    blocking(move || citestyle::catalog(&dir, refresh).map_err(err)).await
 }
 
 /// 同梱 4 種 + 導入済み
@@ -93,17 +94,13 @@ fn cite_installed(state: tauri::State<'_, AppState>) -> Result<Vec<serde_json::V
 #[tauri::command]
 async fn cite_style_xml(state: tauri::State<'_, AppState>, id: String) -> Result<String, String> {
     let dir = styles_dir_of(&state)?;
-    tauri::async_runtime::spawn_blocking(move || citestyle::style_xml(&dir, &id).map_err(err))
-        .await
-        .map_err(err)?
+    blocking(move || citestyle::style_xml(&dir, &id).map_err(err)).await
 }
 
 #[tauri::command]
 async fn cite_locale_xml(state: tauri::State<'_, AppState>, lang: String) -> Result<String, String> {
     let dir = styles_dir_of(&state)?;
-    tauri::async_runtime::spawn_blocking(move || citestyle::locale_xml(&dir, &lang).map_err(err))
-        .await
-        .map_err(err)?
+    blocking(move || citestyle::locale_xml(&dir, &lang).map_err(err)).await
 }
 
 /// `{style, locale, doi_always}`（MCP の cite_prefs と同じ JSON。snake_case のまま = api.ts の CitePrefs 参照）
@@ -126,9 +123,7 @@ async fn cite_set_prefs(
     // （今のフロントは 3 項目すべて渡すので入らない経路）
     if let Some(st) = style.clone() {
         let dir = styles_dir_of(&state)?;
-        tauri::async_runtime::spawn_blocking(move || citestyle::install(&dir, &st).map_err(err))
-            .await
-            .map_err(err)??;
+        blocking(move || citestyle::install(&dir, &st).map_err(err)).await?;
     }
     citestyle::set_prefs_partial(&*lock(&state.db)?, style.as_deref(), locale.as_deref(), doi_always).map_err(err)
 }
@@ -137,50 +132,31 @@ async fn cite_set_prefs(
 #[tauri::command]
 async fn cite_install_file(state: tauri::State<'_, AppState>, path: String) -> Result<serde_json::Value, String> {
     let dir = styles_dir_of(&state)?;
-    tauri::async_runtime::spawn_blocking(move || citestyle::install_file(&dir, Path::new(&path)).map_err(err))
-        .await
-        .map_err(err)?
-}
-
-/// 引用メニューの 1 件（GUI だけの合成: bibtex / citekey は core の関数の戻り値を束ねたもの）
-#[derive(Serialize)]
-struct BibtexEntry {
-    key: String,
-    citekey: String,
-    bibtex: String,
-    doi: Option<String>,
+    blocking(move || citestyle::install_file(&dir, Path::new(&path)).map_err(err)).await
 }
 
 /// 引用メニューの BibTeX / 引用キー / LaTeX / DOI 用（keys の順で返す・見つからない key は飛ばす）
 #[tauri::command]
-fn bibtex_entries(state: tauri::State<AppState>, keys: Vec<String>) -> Result<Vec<BibtexEntry>, String> {
-    let db = lock(&state.db)?;
-    let mut out = Vec::new();
-    for k in keys {
-        if let Some(item) = search::get_by_key(&db, &k).map_err(err)? {
-            out.push(BibtexEntry {
-                citekey: openref_core::bibtex::citekey(&item.csl, &k),
-                bibtex: openref_core::bibtex::item_to_bibtex(&item.csl, &k),
-                doi: model::s(&item.csl, "DOI").map(str::to_string),
-                key: k,
-            });
-        }
-    }
-    Ok(out)
+fn bibtex_entries(state: tauri::State<AppState>, keys: Vec<String>) -> Result<Vec<openref_core::bibtex::Entry>, String> {
+    openref_core::bibtex::entries(&*lock(&state.db)?, &keys).map_err(err)
 }
 
 /// DOI/PMID/URL から書誌を引く（編集画面の Auto update）。DB には触れない。
 #[tauri::command]
 async fn lookup(input: String) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let parsed = resolver::parse_input(&input).map_err(err)?;
         Ok(resolver::resolve(&parsed).map_err(err)?.csl)
     })
     .await
-    .map_err(err)?
 }
 
 // ---------- PDF viewer・注釈 ----------
+
+/// 添付の実体のパス（attachments.path）
+fn attachment_path(db: &Db, id: i64) -> Result<String, String> {
+    db.conn.query_row("SELECT path FROM attachments WHERE id = ?1", [id], |r| r.get(0)).map_err(err)
+}
 
 /// PDF 実体を生バイトで返す（pdf.js に渡す）。`tauri::ipc::Response` = IPC の応答が ArrayBuffer になり、
 /// base64 → JSON → atob の 3 段のコピーが消える（最大 30.9MB の PDF で WebView 側のピーク約 140MB → 約 60MB）。
@@ -188,13 +164,8 @@ async fn lookup(input: String) -> Result<serde_json::Value, String> {
 /// 読込は spawn_blocking（同期 command は main thread で走る）
 #[tauri::command]
 async fn attachment_data(state: tauri::State<'_, AppState>, id: i64) -> Result<tauri::ipc::Response, String> {
-    let path: String = lock(&state.db)?
-        .conn
-        .query_row("SELECT path FROM attachments WHERE id = ?1", [id], |r| r.get(0))
-        .map_err(err)?;
-    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&path).map_err(|e| format!("{path}: {e}")))
-        .await
-        .map_err(err)??;
+    let path = attachment_path(&*lock(&state.db)?, id)?;
+    let bytes = blocking(move || std::fs::read(&path).map_err(|e| format!("{path}: {e}"))).await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -414,11 +385,10 @@ fn set_ui_pref(state: tauri::State<AppState>, key: String, value: String) -> Res
 #[tauri::command]
 async fn data_version(state: tauri::State<'_, AppState>) -> Result<i64, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         lock(&db)?.conn.query_row("PRAGMA data_version", [], |r| r.get(0)).map_err(err)
     })
     .await
-    .map_err(err)?
 }
 
 /// 新版の確認（起動時に App が 1 回呼ぶ）= core update::check: settings の update_check / update_checked_at / update_latest /
@@ -430,7 +400,7 @@ async fn data_version(state: tauri::State<'_, AppState>) -> Result<i64, String> 
 async fn check_update(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<Option<String>, String> {
     let db = state.db.clone();
     let current = app.package_info().version.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let url = openref_core::env_os("UPDATE_URL")
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_else(|| update::CHECK_URL.to_string());
@@ -445,7 +415,6 @@ async fn check_update(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
         Ok(out.newer)
     })
     .await
-    .map_err(err)?
 }
 
 #[tauri::command]
@@ -456,39 +425,28 @@ fn view_counts(state: tauri::State<AppState>) -> Result<search::ViewCounts, Stri
 #[tauri::command]
 async fn quick_add(state: tauri::State<'_, AppState>, input: String) -> Result<search::ItemSummary, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let parsed = resolver::parse_input(&input).map_err(err)?;
         let resolved = resolver::resolve(&parsed).map_err(err)?;
         let mut db = lock(&db)?;
         let added = ingest::add_item(&mut db, &resolved).map_err(err)?;
         let d = search::item_detail(&db, &added.key).map_err(err)?.ok_or("登録直後の item が見つかりません")?;
-        Ok(search::ListedItem {
-            has_pdf: !d.attachments.is_empty(),
-            retracted: d.retraction.is_some(),
-            has_note: !d.notes.is_empty(),
-            fulltext_snippet: None,
-            tags: d.tags,
-            item: d.item,
-        }
-        .summary())
+        Ok(search::ListedItem::from(d).summary())
     })
     .await
-    .map_err(err)?
 }
 
 /// PDF 取込 1 件（取込モーダルの行に対応）。結果の区分と文言は core（MCP の import_pdf と同じ要約）。理由・降格の警告も message に入る
 #[tauri::command]
 async fn import_pdf(state: tauri::State<'_, AppState>, path: String) -> Result<pdfingest::ImportSummary, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || Ok(pdfingest::import_summary(&mut *lock(&db)?, Path::new(&path))))
-        .await
-        .map_err(err)?
+    blocking(move || Ok(pdfingest::import_summary(&mut *lock(&db)?, Path::new(&path)))).await
 }
 
 #[tauri::command]
 async fn fetch_pdf(state: tauri::State<'_, AppState>, key: String) -> Result<String, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         // ① DB 読取 → ② ロック外でネットワーク → ③ 再ロックして添付（一覧・検索を止めない）
         let plan = openref_core::pdffetch::fetch_pdf_prepare(&*lock(&db)?, &key).map_err(err)?;
         let dl = openref_core::pdffetch::fetch_pdf_download(&plan).map_err(err)?;
@@ -496,18 +454,16 @@ async fn fetch_pdf(state: tauri::State<'_, AppState>, key: String) -> Result<Str
         Ok(format!("✓ PDF 取得（{}・{} KB）", f.source, f.bytes_len / 1024))
     })
     .await
-    .map_err(err)?
 }
 
 #[tauri::command]
 async fn attach_pdf(state: tauri::State<'_, AppState>, key: String, path: String) -> Result<(), String> {
     // 添付直後に本文抽出（大きい PDF で 1 秒前後）が走るので main thread から外す
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         edit::attach_auto(&*lock(&db)?, &key, Path::new(&path)).map(|_| ()).map_err(err)
     })
     .await
-    .map_err(err)?
 }
 
 #[tauri::command]
@@ -543,10 +499,7 @@ fn remove_from_collection(state: tauri::State<AppState>, key: String, collection
 
 #[tauri::command]
 fn open_attachment(state: tauri::State<AppState>, id: i64) -> Result<(), String> {
-    let path: String = lock(&state.db)?
-        .conn
-        .query_row("SELECT path FROM attachments WHERE id = ?1", [id], |r| r.get(0))
-        .map_err(err)?;
+    let path = attachment_path(&*lock(&state.db)?, id)?;
     std::process::Command::new("/usr/bin/open").arg(&path).spawn().map_err(err)?;
     Ok(())
 }
@@ -560,12 +513,6 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 窓を出す前の致命的エラー（データ移行の中止など）。stderr と警告ダイアログ（osascript）に出して終了する
-/// メインメニュー = tauri 2.11.5 の `Menu::default` から **Close Window(⌘W)を外したもの**。
-/// 既定メニューは File と Window の両方に `PredefinedMenuItem::close_window` を置き、WKWebView がページへ渡す前に
-/// NSApp のキー等価(⌘W)として窓を閉じてしまう(PDF タブ 1 枚で ⌘W → 窓が閉じる)。
-/// ⌘W はアプリ(タブを閉じる)が奪うので、メニューには置かない。File は macOS では Close Window しか無いので省く。
-/// Edit の項目は WebView の ⌘C / ⌘V / ⌘A の経路なので残す。Window / Help の id は tauri が NSApp の windows / help メニューとして扱うため既定と同じ。
 /// Settings › 起動時に前回のタブを開く（CheckMenuItem の id）。チェック = ui_tabs を復元（既定）・外す = 次回は「すべて」1 枚
 const RESTORE_TABS_ID: &str = "restore_tabs";
 /// Settings › Language › 日本語 / English（CheckMenuItem 2 つ・排他）。DB の ui_lang（"ja" 既定 / "en"）に書き、
@@ -599,6 +546,11 @@ fn update_check_text(en: bool) -> &'static str {
     }
 }
 
+/// メインメニュー = tauri 2.11.5 の `Menu::default` から **Close Window(⌘W)を外したもの**。
+/// 既定メニューは File と Window の両方に `PredefinedMenuItem::close_window` を置き、WKWebView がページへ渡す前に
+/// NSApp のキー等価(⌘W)として窓を閉じてしまう(PDF タブ 1 枚で ⌘W → 窓が閉じる)。
+/// ⌘W はアプリ(タブを閉じる)が奪うので、メニューには置かない。File は macOS では Close Window しか無いので省く。
+/// Edit の項目は WebView の ⌘C / ⌘V / ⌘A の経路なので残す。Window / Help の id は tauri が NSApp の windows / help メニューとして扱うため既定と同じ。
 fn app_menu(app: &tauri::AppHandle, restore_tabs: bool, update_check: bool, en: bool) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{AboutMetadata, CheckMenuItem, Menu, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
     let pkg = app.package_info();
@@ -734,6 +686,7 @@ fn save_setting(app: &tauri::AppHandle, key: &str, value: &str) -> bool {
     }
 }
 
+/// 窓を出す前の致命的エラー（データ移行の中止など）。stderr と警告ダイアログ（osascript）に出して終了する
 fn fatal(msg: &str) -> ! {
     eprintln!("openref-app: {msg}");
     let _ = std::process::Command::new("/usr/bin/osascript")

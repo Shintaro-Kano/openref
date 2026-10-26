@@ -6,7 +6,7 @@
      扱わない。DB に残る旧 underline / strikethrough もハイライトとして表示・描画する）。
      Claude 注釈（author が claude 系）は色を purple 固定のまま変更不可（予約色の意味を守る）。 */
   import type { AnnotationRow } from "../api";
-  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation } from "./util";
+  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, isClaudeAuthor } from "./util";
 
   let {
     a,
@@ -36,7 +36,7 @@
     onDraftComment: (v: string) => void;
   } = $props();
 
-  const isClaude = $derived(a.author.startsWith("claude"));
+  const isClaude = $derived(isClaudeAuthor(a.author));
 
   /** text を検索語との一致 / 非一致の断片に分ける（大小無視）。長さの変わる lowercase（例 'İ'）があれば強調しない */
   function parts(text: string, q: string): { t: string; m: boolean }[] {

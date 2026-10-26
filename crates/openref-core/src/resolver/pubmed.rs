@@ -8,20 +8,21 @@ use serde_json::{json, Map, Value};
 
 const EUTILS: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 
-fn agent() -> ureq::Agent {
+/// resolver 共通の HTTP agent（timeout 30s・UA 固定。crossref.rs も使う）
+pub(super) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("openref/0.1 (personal reference manager)")
         .build()
 }
 
-/// 429（E-utilities は 3 req/s 超・Crossref も混雑時）なら 1s, 2s 待って最大 2 回再試行。
+/// 429（E-utilities は 3 req/s 超・Crossref も混雑時）なら 1s, 2s 待って最大 2 回再試行。成功したら本文を文字列で返す。
 /// PDF 一括取込では 1 件あたり esearch+efetch の 2 連打になり、素のままでは実測で 429 が出た。
-pub(super) fn call_with_retry(req: ureq::Request, what: &str) -> Result<ureq::Response> {
+pub(super) fn call_with_retry(req: ureq::Request, what: &str) -> Result<String> {
     let mut attempt: u64 = 0;
     loop {
         match req.clone().call() {
-            Ok(r) => return Ok(r),
+            Ok(r) => return r.into_string().map_err(|e| CoreError::Http(e.to_string())),
             Err(ureq::Error::Status(429, _)) if attempt < 2 => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(1000 * attempt));
@@ -38,10 +39,7 @@ pub fn find_pmid_by_doi(doi: &str) -> Result<Option<String>> {
         .query("term", &format!("\"{doi}\"[DOI]"))
         .query("retmode", "json")
         .query("tool", "openref");
-    let resp = call_with_retry(req, "esearch")?;
-    let body = resp
-        .into_string()
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+    let body = call_with_retry(req, "esearch")?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(v.pointer("/esearchresult/idlist")
         .and_then(|x| x.as_array())
@@ -57,10 +55,7 @@ pub fn fetch_by_pmid(pmid: &str) -> Result<Resolved> {
         .query("id", pmid)
         .query("retmode", "xml")
         .query("tool", "openref");
-    let resp = call_with_retry(req, "efetch")?;
-    let xml = resp
-        .into_string()
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+    let xml = call_with_retry(req, "efetch")?;
     parse_pubmed_xml(&xml)
 }
 
@@ -220,11 +215,7 @@ pub fn parse_pubmed_xml(xml: &str) -> Result<Resolved> {
 
     // 撤回検出（Zotero retractedItems の思想を ingest 時に前倒し）
     let mut retracted = None;
-    if art
-        .descendants()
-        .filter(|n| n.has_tag_name("PublicationType"))
-        .any(|n| deep_text(&n) == "Retracted Publication")
-    {
+    if pubtypes.iter().any(|t| t == "Retracted Publication") {
         retracted = Some("PubMed PublicationType: Retracted Publication".to_string());
     }
     for cc in citation
@@ -382,5 +373,22 @@ mod tests {
         assert_eq!(c["ISSN"], "0016-5085");
         assert!(r.retracted.is_none());
         assert_eq!(r.source, "pubmed");
+    }
+
+    #[test]
+    fn retraction_detected() {
+        let typed = FIXTURE.replace(
+            r#"<PublicationType UI="D016428">Journal Article</PublicationType>"#,
+            r#"<PublicationType UI="D016428">Journal Article</PublicationType><PublicationType UI="D016441">Retracted Publication</PublicationType>"#,
+        );
+        let r = parse_pubmed_xml(&typed).unwrap();
+        assert_eq!(r.retracted.as_deref(), Some("PubMed PublicationType: Retracted Publication"));
+        assert_eq!(r.csl["custom"]["publication-types"][1], "Retracted Publication");
+        // RetractionIn があればそちらの出典で上書きする
+        let both = typed.replace(
+            "<MeshHeadingList>",
+            r#"<CommentsCorrectionsList><CommentsCorrections RefType="RetractionIn"><RefSource>Gastroenterology. 2024;166:1.</RefSource></CommentsCorrections></CommentsCorrectionsList><MeshHeadingList>"#,
+        );
+        assert_eq!(parse_pubmed_xml(&both).unwrap().retracted.as_deref(), Some("RetractionIn: Gastroenterology. 2024;166:1."));
     }
 }

@@ -56,7 +56,7 @@ impl Default for IngestOpts {
 
 /// `ingest_pdf_report` の戻り値: 結果区分 + 要確認になった理由 + 呼び手がログ/UI に出すべき警告
 /// （warnings = Drive → managed 降格の理由。reason = 識別子なし / 題名ガード不採用 / テキスト層なし）。
-/// GUI モーダル・CLI・connectd の応答 `reason` はすべてこれを出す（`ingest_pdf_with` は outcome だけの互換 API）
+/// GUI モーダル・CLI・connectd の応答 `reason` はすべてこれを出す
 #[derive(Debug)]
 pub struct IngestReport {
     pub outcome: PdfIngestOutcome,
@@ -73,14 +73,6 @@ pub struct IngestReport {
 /// 「要確認」ラベル名（stub 登録時に付与・色は橙）
 pub const REVIEW_TAG: &str = "要確認";
 pub const REVIEW_TAG_COLOR: &str = "peach"; // 橙（tags::LABEL_COLORS）
-
-pub fn ingest_pdf(db: &mut Db, pdf: &Path) -> Result<PdfIngestOutcome> {
-    ingest_pdf_with(db, pdf, &IngestOpts::default())
-}
-
-pub fn ingest_pdf_with(db: &mut Db, pdf: &Path, opts: &IngestOpts) -> Result<PdfIngestOutcome> {
-    ingest_pdf_report(db, pdf, opts).map(|r| r.outcome)
-}
 
 pub fn ingest_pdf_report(db: &mut Db, pdf: &Path, opts: &IngestOpts) -> Result<IngestReport> {
     if !pdf.exists() {
@@ -120,7 +112,7 @@ pub fn ingest_pdf_bytes_report(
             let r = resolver::resolve(&input)?;
             let title = model::s(&r.csl, "title").unwrap_or("");
             match guard_first_candidate(title, &text, lenient) {
-                Guard::Accept | Guard::AcceptLenient => (Some(r), None),
+                Guard::Accept => (Some(r), None),
                 Guard::Reject => {
                     let label = match &input {
                         resolver::AddInput::Doi(d) => format!("DOI {d}"),
@@ -181,15 +173,15 @@ pub fn ingest_pdf_bytes_report(
 #[derive(Debug, PartialEq, Eq)]
 pub enum Guard {
     Accept,
-    AcceptLenient,
     Reject,
 }
 
 pub fn guard_first_candidate(title: &str, text: &str, lenient: bool) -> Guard {
     if lenient {
-        return Guard::AcceptLenient;
+        return Guard::Accept;
     }
-    if title_in_text(&model::strip_markup(title), &normalized_text(text)) {
+    // 本文は冒頭 2 頁すべてを正規化して照合する（頁 1 の見出し部に絞ると長い前付けの PDF で誤拒否する）
+    if title_in_text(&model::strip_markup(title), &normalize(text)) {
         Guard::Accept
     } else {
         Guard::Reject
@@ -342,11 +334,6 @@ fn note_placement(p: edit::Placement, warnings: &mut Vec<String>) {
     }
 }
 
-/// 題名ガード用の正規化本文（冒頭 2 頁すべて。頁 1 の見出し部に絞ると長い前付けの PDF で誤拒否する）
-pub fn normalized_text(text: &str) -> String {
-    normalize(text)
-}
-
 /// resolver の題名が本文にあるか（正規化して包含、空白を全部落としても包含 = マークアップ由来の空白ずれ
 /// "18 F-PSMA" vs "18F-PSMA" やハイフン改行 "embed- ding" に耐える、または 4 語以上で語彙 90% 以上）。
 /// 20 字未満の題名は判定できないので通す
@@ -391,20 +378,11 @@ pub fn attach_or_skip(db: &Db, key: &str, pdf: &Path) -> Result<PdfIngestOutcome
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "file.pdf".into());
-    attach_or_skip_bytes(db, key, &filename, &bytes).map(|(o, _)| o)
+    attach_or_skip_with_md5(db, key, &filename, &bytes, &crate::pdffetch::md5_hex(&bytes)).map(|(o, _)| o)
 }
 
 /// `attach_or_skip` のバイト列版。添付したときは行 id・md5・置き場所（Drive / managed 降格）も返す。
-pub fn attach_or_skip_bytes(
-    db: &Db,
-    key: &str,
-    filename: &str,
-    bytes: &[u8],
-) -> Result<(PdfIngestOutcome, Option<edit::Attached>)> {
-    attach_or_skip_with_md5(db, key, filename, bytes, &crate::pdffetch::md5_hex(bytes))
-}
-
-/// md5 を計算済みの呼び手用（connectd の `/capture/attachment` は届いた PDF をファイルに落とさず、
+/// md5 は計算済みのものを受ける（connectd の `/capture/attachment` は届いた PDF をファイルに落とさず、
 /// 先に取った md5 で重複判定 → 同一性照合 → ここ、と同じ md5 を使い回す）。`new_md5` = `bytes` の 16 進 md5
 pub fn attach_or_skip_with_md5(
     db: &Db,
@@ -458,11 +436,16 @@ pub fn find_ids_in_text(text: &str) -> Option<resolver::AddInput> {
     find_pmid_in_text(text).map(resolver::AddInput::Pmid)
 }
 
+/// 本文中の DOI の候補（取込の識別子抽出と、取得物の同一性照合 `pdffetch` が同じ規則を使う）
+pub(crate) fn doi_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)").unwrap())
+}
+
 /// 本文中の DOI を出現順に（大小無視で重複を除き・最大 5 件）
 pub fn find_dois_in_text(text: &str) -> Vec<String> {
-    let doi_re = regex::Regex::new(r"(?i)\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)").unwrap();
     let mut out: Vec<String> = Vec::new();
-    for c in doi_re.captures_iter(text) {
+    for c in doi_re().captures_iter(text) {
         let doi = c[1].trim_end_matches(['.', ',', ';', ')', ']']).to_string();
         if !out.iter().any(|d| d.eq_ignore_ascii_case(&doi)) {
             out.push(doi);
@@ -708,7 +691,8 @@ mod tests {
         assert_eq!(guard_first_candidate("Structure of the cited protein complex at atomic resolution", text, false), Guard::Reject);
         assert_eq!(guard_first_candidate("Short title", text, false), Guard::Accept, "20 字未満は判定不能として通す");
         // lenient（和文主体 / 文字化け）は照合せず通す（main と同じ）
-        assert_eq!(guard_first_candidate("Anything at all that is long enough", text, true), Guard::AcceptLenient);
+        assert_eq!(guard_first_candidate("Anything at all that is long enough", text, true), Guard::Accept);
+        assert_eq!(guard_first_candidate("Anything at all that is long enough", text, false), Guard::Reject, "lenient でなければ照合して不採用");
         // Crossref の題名マークアップ（実例 10.1101/2021.10.26.21265520 = "Protocol for\n <sup>18</sup>\n F-PSMA …"）
         let pre = "medRxiv preprint doi: https://doi.org/10.1101/2021.10.26.21265520\nProtocol for 18F-PSMA PET imaging in staging and management of prostate cancer - a retrospective cohort study\nAuthor One";
         assert_eq!(

@@ -25,8 +25,9 @@ const HTML: &str = "text/html; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 
-/// word_port = 待受ポート（Startup テンプレート版のダイアログの URL・アプレットの起点に使う）
-pub fn router(st: Arc<St>, word_port: u16) -> Router {
+/// word_port = 待受ポート（Startup テンプレート版のダイアログの URL・アプレットの起点に使う）。
+/// app_dir = DB の置き場（ダイアログの器 `word/OpenRef Dialog.app` の既定の場所）
+pub fn router(st: Arc<St>, word_port: u16, app_dir: &std::path::Path) -> Router {
     Router::new()
         // 挿入 > アドイン から開いたときの入口（使い方と診断のみ）
         .route("/word/taskpane.html", get(|| async { asset(word_asset!("taskpane.html"), HTML) }))
@@ -43,8 +44,8 @@ pub fn router(st: Arc<St>, word_port: u16) -> Router {
         .route("/word/notice.js", get(|| async { asset(word_asset!("notice.js"), JS) }))
         .route("/word/dialog-common.js", get(|| async { asset(word_asset!("dialog-common.js"), JS) }))
         .route("/word/dialog.css", get(|| async { asset(word_asset!("dialog.css"), CSS) }))
-        .route("/word/cite-core.js", get(|| async { asset(word_asset!("cite-core.js"), JS) }))
-        .route("/word/citeproc.js", get(|| async { asset(word_asset!("vendor/citeproc.js"), JS) }))
+        .route("/word/cite-core.js", get(|| async { asset(crate::word_v2::CITE_CORE_JS.as_bytes(), JS) }))
+        .route("/word/citeproc.js", get(|| async { asset(crate::word_v2::CITEPROC_JS.as_bytes(), JS) }))
         .route("/word/locales/:file", get(locale))
         .route("/word/manifest.xml", get(|| async { asset(word_asset!("manifest.xml"), "application/xml") }))
         .route("/word/styles/:id", get(style))
@@ -55,7 +56,7 @@ pub fn router(st: Arc<St>, word_port: u16) -> Router {
         .route("/api/items", post(api_items))
         .with_state(st.clone())
         // Startup テンプレート版（OpenRef.dotm・VBA）の API
-        .merge(crate::word_v2::router(st, word_port))
+        .merge(crate::word_v2::router(st, word_port, app_dir))
 }
 
 /// Word の WebView は taskpane を強くキャッシュするため no-store を明示する
@@ -131,10 +132,7 @@ async fn icon(AxPath(name): AxPath<String>) -> impl IntoResponse {
 async fn api_status(State(st): State<Arc<St>>) -> impl IntoResponse {
     let (items, db_version) = {
         let db = st.db();
-        let n: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0))
-            .unwrap_or(0);
+        let n = crate::live_item_count(&db);
         let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         (n, v)
     };

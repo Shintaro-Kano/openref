@@ -325,7 +325,7 @@ export interface CitePrefs {
   doi_always: boolean;
 }
 
-/** = app/src-tauri の BibtexEntry（GUI だけの合成: core の bibtex::citekey / item_to_bibtex を束ねたもの） */
+/** = core の bibtex::Entry（bibtex::citekey / item_to_bibtex と DOI を束ねたもの。MCP の bibtex_entries と同じ中身） */
 export interface BibtexEntry {
   key: string;
   citekey: string;

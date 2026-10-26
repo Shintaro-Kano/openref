@@ -35,11 +35,6 @@ pub fn extract_pages(pdf: &Path, from: usize, to: usize) -> Result<Extracted> {
     extract(&bytes, Some(pdf), Some((from, to)))
 }
 
-pub fn extract_all(pdf: &Path) -> Result<Extracted> {
-    let bytes = read_file(pdf)?;
-    extract(&bytes, Some(pdf), None)
-}
-
 /// バイト列版（取込・添付・照合の経路: 手元のバイト列を解析し、ファイルは読み直さない）。
 /// `file` = 同じ内容が置いてあるパス（pdftotext fallback に渡す）。None なら fallback が要るときだけ一時ファイルに落とす
 pub fn extract_pages_bytes(bytes: &[u8], file: Option<&Path>, from: usize, to: usize) -> Result<Extracted> {
@@ -64,22 +59,17 @@ fn extract(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> 
             return Ok(Extracted { pages: builtin.unwrap(), backend: "builtin", info_title });
         }
     }
-    let builtin_backend = |pages: &[String]| if looks_garbled(pages) { "builtin-garbled" } else { "builtin" };
-    // 内蔵で取れない（エラー / 実質空 / 文字化け）→ poppler があれば頼る
-    if find_pdftotext().is_some() {
-        match pdftotext_pages(bytes, file, range) {
+    // 内蔵で取れない（エラー / 実質空 / 文字化け）→ poppler があれば頼る。pdftotext も失敗したら内蔵の結果
+    // （内蔵もエラーなら pdftotext のエラー）
+    if let Some(bin) = find_pdftotext() {
+        match pdftotext_pages(&bin, bytes, file, range) {
             Ok(pages) => return Ok(Extracted { pages, backend: "pdftotext", info_title }),
-            Err(e) => {
-                if let Ok(pages) = builtin {
-                    let backend = builtin_backend(&pages);
-                    return Ok(Extracted { pages, backend, info_title });
-                }
-                return Err(e);
-            }
+            Err(e) if builtin.is_err() => return Err(e),
+            Err(_) => {}
         }
     }
     builtin.map(|pages| {
-        let backend = builtin_backend(&pages);
+        let backend = if looks_garbled(&pages) { "builtin-garbled" } else { "builtin" };
         Extracted { pages, backend, info_title }
     })
 }
@@ -155,9 +145,10 @@ fn builtin_pages(bytes: &[u8], range: Option<(usize, usize)>) -> (Result<Vec<Str
     }
 }
 
-/// pdftotext に渡すファイル: `file` があればそれ、無ければバイト列を一時ファイルに落とす（Drop で消える）
-fn pdftotext_pages(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> Result<Vec<String>> {
-    let mut cmd = pdftotext_cmd()?;
+/// `bin` = `find_pdftotext` で見つけた pdftotext。渡すファイル: `file` があればそれ、無ければバイト列を一時ファイルに
+/// 落とす（Drop で消える）
+fn pdftotext_pages(bin: &Path, bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> Result<Vec<String>> {
+    let mut cmd = Command::new(bin);
     if let Some((f, t)) = range {
         cmd.args(["-f", &f.to_string(), "-l", &t.to_string()]);
     }
@@ -193,9 +184,18 @@ fn pdftotext_pages(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usiz
     Ok(text.split('\u{c}').map(|s| s.to_string()).collect())
 }
 
+/// 一時 PDF（Drop で必ず消す。`fs::write` の途中失敗・panic でも残さない）。手元のバイト列を pdftotext（poppler）に
+/// 渡すときだけ使う（内蔵解析はバイト列から行うので通常は作らない）。
+struct TempPdf(PathBuf);
+impl Drop for TempPdf {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// バイト列を pdftotext 用の一時ファイルに落とす（Drop で消える）
-fn temp_pdf(bytes: &[u8]) -> Result<crate::pdffetch::TempPdf> {
-    let tmp = crate::pdffetch::TempPdf(std::env::temp_dir().join(format!(
+fn temp_pdf(bytes: &[u8]) -> Result<TempPdf> {
+    let tmp = TempPdf(std::env::temp_dir().join(format!(
         "openref-pdftotext-{}-{}.pdf",
         std::process::id(),
         fastrand::u64(..)
@@ -207,11 +207,6 @@ fn temp_pdf(bytes: &[u8]) -> Result<crate::pdffetch::TempPdf> {
 /// PDF Info 辞書の /Title（出版社 PDF は論文題名が入っていることが多い）。
 /// UTF-16BE（BOM 付き）/ PDFDocEncoding（ASCII 域）を復号。無ければ None。
 /// 取込経路は `Extracted::info_title`（同じ解析から取る）を使い、これは単独で題名だけ要るとき（1 回の解析）
-pub fn info_title(pdf: &Path) -> Option<String> {
-    let bytes = std::fs::read(pdf).ok()?;
-    info_title_bytes(&bytes)
-}
-
 pub fn info_title_bytes(bytes: &[u8]) -> Option<String> {
     use pdf_extract::Document;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -288,16 +283,6 @@ fn find_in(env_override: Option<PathBuf>, path_var: Option<OsString>, candidates
         }
     }
     candidates.iter().find(|p| p.is_file()).cloned()
-}
-
-/// pdftotext の Command。見つからなければ導入案内つきのエラー。
-pub fn pdftotext_cmd() -> Result<Command> {
-    let p = find_pdftotext().ok_or_else(|| {
-        CoreError::NotFound(
-            "pdftotext が見つかりません（Homebrew: brew install poppler。別の場所にあるなら環境変数 OPENREF_PDFTOTEXT で指定）".into(),
-        )
-    })?;
-    Ok(Command::new(p))
 }
 
 /// 最小の 1 頁 PDF（Helvetica・/Info /Title 付き）を正しい xref 付きで組み立てる（テスト用。integration テストからも使う）
@@ -405,7 +390,6 @@ mod tests {
         assert_eq!(ex.pages.len(), 1, "総頁数で丸める");
         assert!(ex.pages[0].contains("10.1148/rg.240011"), "{:?}", ex.pages);
         assert_eq!(ex.info_title.as_deref(), Some("A Test Title"), "同じ解析から /Title も取る");
-        assert_eq!(info_title(&p).as_deref(), Some("A Test Title"));
         // バイト列版はファイルを読まない（ファイル無しでも同じ結果）
         let bytes = std::fs::read(&p).unwrap();
         let exb = extract_pages_bytes(&bytes, None, 1, 2).unwrap();

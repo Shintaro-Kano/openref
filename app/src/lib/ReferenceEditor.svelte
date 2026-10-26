@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { t } from "./i18n.svelte";
   import { api, type TypeDef } from "./api";
   import { formatBibliography } from "./cite";
@@ -17,7 +18,6 @@
   let busy = $state(false);
   let err = $state("");
   let lookupInput = $state("");
-  let loaded = false;
 
   const def = $derived(types.find((t) => t.id === typeId));
   const shown = $derived(
@@ -163,15 +163,11 @@
     }
   }
 
-  $effect(() => {
-    if (loaded) return;
-    loaded = true;
-    (async () => {
-      types = await api.itemTypes();
-      subs = await api.subtypes();
-      if (app.editorCsl) loadCsl(app.editorCsl);
-      await updatePreview();
-    })();
+  onMount(async () => {
+    types = await api.itemTypes();
+    subs = await api.subtypes();
+    if (app.editorCsl) loadCsl(app.editorCsl);
+    await updatePreview();
   });
 </script>
 

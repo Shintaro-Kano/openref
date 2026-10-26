@@ -197,6 +197,23 @@ pub struct RenameOutcome {
 /// 別ラベルの置換後）と同名になるものは conflict で飛ばす（勝手に統合しない。統合は Merge で明示的に）。
 /// dry_run = true は何も書かずに予定だけ返す（プレビュー用）
 pub fn find_replace_tags(db: &Db, find: &str, replace: &str, dry_run: bool) -> Result<Vec<RenameOutcome>> {
+    find_replace(db, "tags", find, replace, dry_run, false, || {
+        Ok(list_tags(db, TagSort::Alphabetical)?.into_iter().map(|t| (t.id, t.name, ())).collect())
+    })
+}
+
+/// 名前の検索置換の本体（ラベル・フォルダ共通）。`rows` = 対象の (id, 名前, 同名を数える範囲) を名前順で返す
+/// （ラベル = 全体で 1 つの範囲・フォルダ = 同じ親）。`slash_invalid` = 置換後が `/` を含むものを "invalid" にする。
+/// 判定の順 = empty → invalid → conflict → renamed。renamed は同じ一括の後続の同名判定に入る。`table` = 書き込む表
+pub(crate) fn find_replace<S: Copy + Eq + std::hash::Hash>(
+    db: &Db,
+    table: &'static str,
+    find: &str,
+    replace: &str,
+    dry_run: bool,
+    slash_invalid: bool,
+    rows: impl FnOnce() -> Result<Vec<(i64, String, S)>>,
+) -> Result<Vec<RenameOutcome>> {
     if find.is_empty() {
         return Err(CoreError::BadInput("検索する文字列が空です".into()));
     }
@@ -204,52 +221,44 @@ pub fn find_replace_tags(db: &Db, find: &str, replace: &str, dry_run: bool) -> R
         .case_insensitive(true)
         .build()
         .map_err(|e| CoreError::BadInput(e.to_string()))?;
-    let all = list_tags(db, TagSort::Alphabetical)?;
-    // 同名判定は DB の UNIQUE（COLLATE NOCASE = ASCII だけ大小無視）と同じ畳み方にする。
+    let all = rows()?;
+    // 同名判定は DB の COLLATE NOCASE（ASCII だけ大小無視。ラベル = UNIQUE・フォルダ = 兄弟の照合）と同じ畳み方にする。
     // Unicode の小文字化だと "Äab" と "äab"（DB では別名）が 1 つに潰れ、予定と実行が食い違う
-    let lower = |s: &str| s.to_ascii_lowercase();
-    let mut taken: std::collections::HashMap<String, i64> =
-        all.iter().map(|t| (lower(&t.name), t.id)).collect();
+    let key = |scope: S, s: &str| (scope, s.to_ascii_lowercase());
+    let mut taken: std::collections::HashMap<(S, String), i64> =
+        all.iter().map(|(id, name, scope)| (key(*scope, name), *id)).collect();
     let mut out = Vec::new();
-    for t in all.iter().filter(|t| re.is_match(&t.name)) {
-        let new = re.replace_all(&t.name, regex::NoExpand(replace)).trim().to_string();
+    for (id, name, scope) in all.iter().filter(|(_, name, _)| re.is_match(name)) {
+        let new = re.replace_all(name, regex::NoExpand(replace)).trim().to_string();
         let status = if new.is_empty() {
             "empty"
-        } else if taken.get(&lower(&new)).is_some_and(|&other| other != t.id) {
+        } else if slash_invalid && new.contains('/') {
+            "invalid"
+        } else if taken.get(&key(*scope, &new)).is_some_and(|other| other != id) {
             "conflict"
         } else {
             "renamed"
         };
         if status == "renamed" {
-            taken.remove(&lower(&t.name));
-            taken.insert(lower(&new), t.id);
+            taken.remove(&key(*scope, name));
+            taken.insert(key(*scope, &new), *id);
         }
-        out.push(RenameOutcome { id: t.id, old: t.name.clone(), new, status });
+        out.push(RenameOutcome { id: *id, old: name.clone(), new, status });
     }
     if !dry_run {
+        let sql = format!("UPDATE {table} SET name = ?1 WHERE id = ?2");
         let tx = db.conn.unchecked_transaction()?;
         for o in out.iter().filter(|o| o.status == "renamed" && o.old != o.new) {
-            tx.execute("UPDATE tags SET name = ?1 WHERE id = ?2", rusqlite::params![o.new, o.id])?;
+            tx.execute(&sql, rusqlite::params![o.new, o.id])?;
         }
         tx.commit()?;
     }
     Ok(out)
 }
 
-/// D&D 並べ替え: id 配列の順序で sort_order を振り直す
-pub fn reorder_tags(db: &Db, ordered_ids: &[i64]) -> Result<()> {
-    let mut stmt = db
-        .conn
-        .prepare("UPDATE tags SET sort_order = ?1 WHERE id = ?2")?;
-    for (i, id) in ordered_ids.iter().enumerate() {
-        stmt.execute(rusqlite::params![i as i64, id])?;
-    }
-    Ok(())
-}
-
 /// タグ id を item に付与（key 経由。存在しない組合せのみ挿入）
 pub fn attach_tag(db: &Db, item_key: &str, tag_id: i64) -> Result<()> {
-    let item_id = item_id_by_key(db, item_key)?;
+    let item_id = crate::edit::item_id(db, item_key)?;
     db.conn.execute(
         "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
         rusqlite::params![item_id, tag_id],
@@ -258,7 +267,7 @@ pub fn attach_tag(db: &Db, item_key: &str, tag_id: i64) -> Result<()> {
 }
 
 pub fn detach_tag(db: &Db, item_key: &str, tag_id: i64) -> Result<()> {
-    let item_id = item_id_by_key(db, item_key)?;
+    let item_id = crate::edit::item_id(db, item_key)?;
     db.conn.execute(
         "DELETE FROM item_tags WHERE item_id = ?1 AND tag_id = ?2",
         rusqlite::params![item_id, tag_id],
@@ -275,13 +284,6 @@ fn tag_id_by_name(db: &Db, name: &str) -> Result<Option<i64>> {
             |r| r.get(0),
         )
         .optional()?)
-}
-
-fn item_id_by_key(db: &Db, key: &str) -> Result<i64> {
-    db.conn
-        .query_row("SELECT id FROM items WHERE key = ?1", [key], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| CoreError::NotFound(format!("item {key}")))
 }
 
 #[cfg(test)]
@@ -322,13 +324,6 @@ mod tests {
         // rename 衝突
         assert!(rename_tag(&db, red, "MRI").is_err());
         rename_tag(&db, red, "pancreatic").unwrap();
-
-        // 並べ替え用の sort_order は名前順に影響しない
-        let ids: Vec<i64> = list_tags(&db, TagSort::Alphabetical).unwrap().iter().map(|t| t.id).collect();
-        let reversed: Vec<i64> = ids.iter().rev().cloned().collect();
-        reorder_tags(&db, &reversed).unwrap();
-        let after: Vec<i64> = list_tags(&db, TagSort::Alphabetical).unwrap().iter().map(|t| t.id).collect();
-        assert_eq!(after, ids);
 
         // 色はパレット id か #rrggbb のみ
         assert!(create_tag(&db, "bad", Some("pink-ish")).is_err());

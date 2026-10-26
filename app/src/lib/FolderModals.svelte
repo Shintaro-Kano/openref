@@ -124,9 +124,12 @@
     close();
   }
 
+  /** ＋ New folder 欄の名前の誤り（"" = 空・null = 作れる） */
+  const inlineErr = $derived(folderNameError(m.newName, null));
+
   async function createInline() {
     m.flushRename();
-    if (m.busy || folderNameError(m.newName, null) !== null) return;
+    if (m.busy || inlineErr !== null) return;
     const id = await m.run(() => createFolder(m.newName, null));
     if (id !== null) {
       m.newName = "";
@@ -276,9 +279,9 @@
                 use:focusMe
                 bind:value={m.newName}
                 onkeydown={(e) => onEnter(e, createInline)} />
-              <button class="ml-btn primary" disabled={m.busy || folderNameError(m.newName, null) !== null} onclick={createInline}>Create folder</button>
+              <button class="ml-btn primary" disabled={m.busy || inlineErr !== null} onclick={createInline}>Create folder</button>
             </div>
-            {#if folderNameError(m.newName, null)}<div class="nf-err">{folderNameError(m.newName, null)}</div>{/if}
+            {#if inlineErr}<div class="nf-err">{inlineErr}</div>{/if}
           {:else if m.panel === "find"}
             <FindReplacePanel {m} {why}>
               {#snippet prefix(p)}

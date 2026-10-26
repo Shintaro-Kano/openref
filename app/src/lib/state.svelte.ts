@@ -9,6 +9,7 @@ import {
   type TagRow,
   type ViewCounts,
 } from "./api";
+import { formatBibliographyMany } from "./cite";
 
 export type ImportFileStatus = "pending" | "running" | "canceled" | ImportStatus;
 export interface ImportFile {
@@ -147,12 +148,9 @@ export const app = $state({
     installed: [] as StyleEntry[],
   },
   // pointer ベースの内部 D&D（Tauri dragDropEnabled と HTML5 dnd が競合するため自作）
-  // keys: チェック済みの行を掴んだときはチェック全件を一緒に運ぶ
   // kind: rows = 行 → サイドバーのフォルダ/ラベル / label = サイドバーのラベル → 行（Paperpile の「ラベルを論文へドラッグ」）
   drag: null as null | {
     kind: "rows" | "label";
-    keys: string[];
-    tagId?: number;
     label: string;
     x: number;
     y: number;
@@ -284,13 +282,7 @@ async function revealNow(key: string) {
   const tab = app.tab;
   const listed = () => app.items.some((i) => i.key === key);
   if (!listed()) {
-    let d: ItemDetail | null = null;
-    try {
-      d = await api.getItem(key);
-    } catch (e) {
-      toast(`✗ ${t("一覧に表示できませんでした")}: ${String(e).slice(0, 200)}`);
-      return;
-    }
+    const d = await api.getItem(key);
     if (app.tab !== tab) return;
     if (!d) {
       toast(t("✗ 一覧に表示できませんでした（item が見つかりません）"));
@@ -339,10 +331,14 @@ export async function setView(v: View) {
   // 開こうとしたフォルダ / ラベルがその間に消えた（削除と行き違い）なら何もしない
   if (app.tab !== tab || (live && !viewLive(v))) return;
   app.view = v;
-  // 詳細の item のチェックだけは残す（新しい一覧に無ければ refreshList がチェックからも詳細からも外す）
+  keepOnlyDetailChecked();
+  await refreshList();
+}
+
+/** ビューを設定するとき（setView・patchViews）: 詳細の item のチェックだけは残す（新しい一覧に無ければ refreshList がチェックからも詳細からも外す） */
+function keepOnlyDetailChecked() {
   for (const k of [...app.checked]) if (k !== app.selected) app.checked.delete(k);
   app.checkAnchor = app.selected;
-  await refreshList();
 }
 
 // ---------- タブ（ブラウザ型・ヘッダーの上に 1 段） ----------
@@ -512,6 +508,23 @@ export function activateTabAt(n: number) {
   if (t) void activateTab(t.id);
 }
 
+/** id のタブを to 番目へ動かす（TabStrip のドラッグ並べ替え）。配列の順そのものを変える = ⌘1〜9・巡回・⌘W の行き先・
+    ui_tabs の保存（App の effect が見張る）はこの順に従う。前面の中身は app.* に居て配列の位置に依らないので切替は要らない。
+    to は端に丸める。無い id・同じ位置なら何もしない。処理中（busy）でも受け付ける（並びは一覧の状態に触れない）。
+    動く範囲 [lo, hi] を 1 回の splice で書き換える（抜いて挿す 2 回だと length が n → n-1 → n と揺れ、length を見る effect
+    = TabStrip の前面タブの scrollIntoView が走って溢れた列が飛ぶ） */
+export function moveTab(id: number, to: number) {
+  const from = app.tabs.findIndex((t) => t.id === id);
+  if (from < 0) return;
+  to = Math.max(0, Math.min(app.tabs.length - 1, to));
+  if (to === from) return;
+  const lo = Math.min(from, to);
+  const seg = app.tabs.slice(lo, Math.max(from, to) + 1);
+  const [t] = seg.splice(from - lo, 1);
+  seg.splice(to - lo, 0, t);
+  app.tabs.splice(lo, seg.length, ...seg);
+}
+
 const sameTarget = (a: View, b: View) =>
   a.kind === b.kind && (a.kind === "collection" || a.kind === "tag" ? a.id === (b as { id: number }).id : true);
 
@@ -537,10 +550,7 @@ export async function patchViews(f: (v: View) => View | null): Promise<boolean> 
   const nv = f(cur) ?? { kind: "all" };
   if (nv === cur) return false;
   const moved = !sameTarget(nv, cur);
-  if (moved) {
-    for (const k of [...app.checked]) if (k !== app.selected) app.checked.delete(k);
-    app.checkAnchor = app.selected;
-  }
+  if (moved) keepOnlyDetailChecked();
   app.view = nv;
   if (moved) await refreshList();
   return moved;
@@ -623,7 +633,7 @@ export function tabsPref(): string {
     tabs: app.tabs.map((t) => {
       const front = t.id === app.tab;
       return {
-        view: viewPref(front ? app.view : t.view),
+        view: viewPref(tabView(t)),
         search: front ? app.search : t.search,
         filters: front ? app.filters : t.filters,
         // PDF タブ = item key + 添付 id（照合用）+ 題名（ビューアの見出し・タブの題名）
@@ -755,8 +765,6 @@ export async function restoreTabs() {
       const id = `${v.itemKey}\u0000${v.attachmentId}`;
       if (seen.has(id)) return;
       seen.add(id);
-    }
-    if (v) {
       f.tab.viewer = v;
       f.tab.checked = [v.itemKey];
       f.tab.checkAnchor = v.itemKey;
@@ -851,8 +859,8 @@ function bulkToast(verb: string, r: { ok: number; fail: number }) {
   toast(r.fail ? `${verb}: ${r.ok} ${t("件成功・")}${r.fail} ${t("件失敗")}` : `✓ ${tn(r.ok, "件を")}${verb}`);
 }
 
-/** 詳細パネルの item がチェックに含まれていたら詳細も更新 */
-async function reloadDetailIfChecked(keys: string[]) {
+/** 詳細パネルの item が keys（操作した item）に含まれていたら詳細も更新 */
+async function reloadDetailIfAmong(keys: string[]) {
   if (app.selected && keys.includes(app.selected)) await reloadDetail();
 }
 
@@ -861,7 +869,7 @@ export async function bulkAddToCollection(collectionId: number, keys: string[] =
   const name = app.collections.find((c) => c.id === collectionId)?.name ?? t("フォルダ::fallback");
   const r = await forKeys(keys, (k) => api.addToCollection(k, collectionId));
   bulkToast(`${t("「::added-to")}${name}${t("」へ追加")}`, r);
-  await Promise.all([refreshSidebar(), reloadDetailIfChecked(r.keys)]);
+  await Promise.all([refreshSidebar(), reloadDetailIfAmong(r.keys)]);
   if (app.view.kind === "collection") await refreshList();
 }
 
@@ -869,7 +877,7 @@ export async function bulkRemoveFromCollection(collectionId: number) {
   const name = app.collections.find((c) => c.id === collectionId)?.name ?? t("フォルダ::fallback");
   const r = await forChecked((k) => api.removeFromCollection(k, collectionId));
   bulkToast(`${t("「::removed-from")}${name}${t("」から外す")}`, r);
-  await Promise.all([refreshSidebar(), reloadDetailIfChecked(r.keys)]);
+  await Promise.all([refreshSidebar(), reloadDetailIfAmong(r.keys)]);
   if (app.view.kind === "collection") await refreshList();
 }
 
@@ -905,7 +913,7 @@ export async function applyLabelChanges(add: number[], remove: number[]) {
   } finally {
     busyEnd();
   }
-  await Promise.all([refreshSidebar(), refreshList(), reloadDetailIfChecked(keys)]);
+  await Promise.all([refreshSidebar(), refreshList(), reloadDetailIfAmong(keys)]);
 }
 
 export async function bulkTrash() {
@@ -972,8 +980,7 @@ export async function confirmPurge() {
       ? `${t("完全削除")}: ${r.ok} ${t("件成功・")}${r.fail} ${t("件失敗")}${suffix}`
       : `✓ ${tn(r.ok, "件を完全に削除しました")}${suffix}`
   );
-  if (app.selected && keys.includes(app.selected)) closeDetail();
-  clearChecks();
+  clearChecks(); // 詳細も閉じる（チェックが空になるので closeDetailIfUnchecked が閉じる）
   await refreshAll();
 }
 
@@ -1068,7 +1075,7 @@ async function saveNoteNow(close: boolean) {
     busyEnd();
   }
   if (close && app.noteEditor === n) app.noteEditor = null; // 保存の間に開き直した別のメモ欄は閉じない
-  await Promise.all([refreshList(), app.selected === n.key ? reloadDetail() : Promise.resolve()]);
+  await Promise.all([refreshList(), reloadDetailIfAmong([n.key])]);
 }
 
 /** 別の行をクリック / ビュー切替のとき: 未保存なら保存して閉じ、未編集ならただ閉じる（自動保存） */
@@ -1088,14 +1095,16 @@ export function closeNoteEditor(force = false) {
 export async function bulkStar(starred: boolean) {
   const r = await forChecked((k) => api.setStar(k, starred));
   bulkToast(starred ? t("★ Star") : t("★ 解除"), r);
-  await Promise.all([refreshList(), refreshSidebar(), reloadDetailIfChecked(r.keys)]);
+  await Promise.all([refreshList(), refreshSidebar(), reloadDetailIfAmong(r.keys)]);
 }
 
 /** 引用メニューのコピー種別（Paperpile の Cite ▾: Citation / BibTeX / Citation key / LaTeX citation / DOI） */
 export type CopyKind = "citation" | "bibtex" | "citekey" | "latex" | "doi";
 
-/** keys（一覧順）を kind の形式でクリップボードへ。citation は既定スタイル・言語（番号付きスタイルは keys の順で採番） */
-export async function copyAs(keys: string[], kind: CopyKind) {
+/** チェック全件（一覧順）を kind の形式でクリップボードへ（一覧ツールバーの 引用 ▾）。citation は既定スタイル・言語
+    （番号付きスタイルは一覧の順で採番） */
+export async function bulkCopy(kind: CopyKind) {
+  const keys = checkedKeys();
   if (keys.length === 0) return;
   busyBegin();
   try {
@@ -1108,7 +1117,6 @@ export async function copyAs(keys: string[], kind: CopyKind) {
         const d = await api.getItem(k);
         if (d) items.push({ key: k, csl: d.csl });
       }
-      const { formatBibliographyMany } = await import("./cite");
       text = await formatBibliographyMany(items, app.cite.style, app.cite.locale, app.cite.doiAlways);
       note = styleTitle(app.cite.style);
       n = items.length;
@@ -1137,11 +1145,6 @@ export async function copyAs(keys: string[], kind: CopyKind) {
   } finally {
     busyEnd();
   }
-}
-
-/** チェック全件をコピー（一覧ツールバーの 引用 ▾） */
-export function bulkCopy(kind: CopyKind) {
-  return copyAs(checkedKeys(), kind);
 }
 
 export async function doSearch(q: string) {
@@ -1792,68 +1795,90 @@ export async function filterByLabel(id: number) {
   await setView({ kind: "tag", id, name: t.name });
 }
 
-// ---------- pointer ベース D&D（行 → サイドバーのラベル/フォルダ） ----------
+// ---------- pointer ベース D&D（行 → サイドバーのラベル/フォルダ・ラベル → 行） ----------
 
-let dragListeners: { move: (e: PointerEvent) => void; up: (e: PointerEvent) => void } | null = null;
+/** 追っている最中のドラッグを落とさずに終える（次の pointerdown で前のが残っていたら先に解く） */
+let endDrag: (() => void) | null = null;
 let dragConsumed = false;
 
-/** ItemList の行 pointerdown から呼ぶ。6px 動いたらドラッグ開始 */
-export function beginRowDrag(e: PointerEvent, key: string, label: string) {
-  if (e.button !== 0) return;
-  // チェック済みの行を掴んだらチェック全件をまとめて運ぶ（Paperpile と同じ）
-  const keys = app.checked.has(key) && app.checked.size > 1 ? checkedKeys() : [key];
-  const ghost = keys.length > 1 ? tn(keys.length, "件") : label;
+/** 行・ラベルの pointerdown の後を window で追う。6px 動いたらドラッグを開始し（それまではクリック扱い）、move ごとに幽霊
+    （app.drag = ghost + ポインタの位置 + 直下の落とし先のうち kinds の種類のもの）を書く。左ボタンを離したら幽霊を消し、
+    ドラッグになっていれば直後の click（選択）を抑止して、落とし先があれば drop(落とし先) を呼ぶ。
+    pointerup が来ない経路は落とさずに終える: pointercancel・window の blur（⌘Tab で他のアプリへ）・contextmenu（掴んだまま右クリック
+    = OS のメニューが mouseup を飲む）・左ボタンが離れている move（ev.buttons = pointerup の取りこぼし。これが無いと離した後も hover で
+    幽霊が付いて回り、次にどこかで離すと最後に重なった落とし先へ落ちる）。前の追跡が残っていれば先に落とさずに終えて解く */
+function trackDrag(e: PointerEvent, ghost: { kind: "rows" | "label"; label: string }, kinds: string[], drop: (over: string) => Promise<void>) {
+  if (e.button !== 0 || !e.isPrimary) return;
+  endDrag?.();
   const sx = e.clientX;
   const sy = e.clientY;
   let started = false;
   dragConsumed = false;
   const move = (ev: PointerEvent) => {
+    if (!(ev.buttons & 1)) return cancel();
     if (!started && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) return;
     if (!started) {
       started = true;
       document.body.classList.add("dragging");
     }
-    app.drag = { kind: "rows", keys, label: ghost, x: ev.clientX, y: ev.clientY, over: dropTarget(ev, ["col", "tag"]) };
+    app.drag = { ...ghost, x: ev.clientX, y: ev.clientY, over: dropTarget(ev, kinds) };
   };
-  const up = async (ev: PointerEvent) => {
-    cleanup();
-    if (!started) return;
-    dragConsumed = true; // 直後の click（選択）を抑止
-    const drag = app.drag;
+  /** リスナーを外して幽霊を消す。ドラッグになっていなければ undefined・なっていれば落とし先（null = 落とし先の外） */
+  const stop = (): string | null | undefined => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    window.removeEventListener("pointercancel", cancel);
+    window.removeEventListener("blur", cancel);
+    window.removeEventListener("contextmenu", cancel, true);
+    if (endDrag === cancel) endDrag = null;
+    if (!started) return undefined;
+    const over = app.drag?.over ?? null;
     app.drag = null;
     document.body.classList.remove("dragging");
-    if (!drag?.over) return;
-    const [type, idStr] = drag.over.split(":");
+    return over;
+  };
+  const up = () => {
+    const over = stop();
+    if (over === undefined) return;
+    dragConsumed = true; // 直後の click（選択）を抑止
+    if (over) void drop(over);
+  };
+  /** cancel の経路では click が続かないので抑止しない */
+  const cancel = () => void stop();
+  endDrag = cancel;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+  window.addEventListener("pointercancel", cancel);
+  window.addEventListener("blur", cancel);
+  window.addEventListener("contextmenu", cancel, true); // capture = フォルダ行の oncontextmenu が stopPropagation しても届く
+}
+
+/** ItemList の行 pointerdown から呼ぶ。6px 動いたらドラッグ開始 */
+export function beginRowDrag(e: PointerEvent, key: string, label: string) {
+  // チェック済みの行を掴んだらチェック全件をまとめて運ぶ（Paperpile と同じ）
+  const keys = app.checked.has(key) && app.checked.size > 1 ? checkedKeys() : [key];
+  const ghost = keys.length > 1 ? tn(keys.length, "件") : label;
+  trackDrag(e, { kind: "rows", label: ghost }, ["col", "tag"], async (over) => {
+    const [type, idStr] = over.split(":");
     const id = Number(idStr);
     try {
-      const n = drag.keys.length;
+      const n = keys.length;
       const pfx = n > 1 ? tn(n, "件に") : "";
       if (type === "tag") {
-        for (const k of drag.keys) await api.attachTag(k, id);
+        for (const k of keys) await api.attachTag(k, id);
         const tag = app.tags.find((x) => x.id === id);
         toast(`✓ ${pfx}${t("「::labeled")}${tag?.name ?? t("ラベル::fallback")}${t("」を付与")}`);
       } else if (type === "col") {
-        for (const k of drag.keys) await api.addToCollection(k, id);
+        for (const k of keys) await api.addToCollection(k, id);
         const c = app.collections.find((c) => c.id === id);
         toast(`✓ ${pfx}${t("「::added-to")}${c?.name ?? t("フォルダ::fallback")}${t("」へ追加")}`);
       }
       await Promise.all([refreshSidebar(), refreshList()]); // 行のラベルバッジも更新
-      if (app.selected && drag.keys.includes(app.selected)) await reloadDetail();
+      await reloadDetailIfAmong(keys);
     } catch (err) {
       toast(`✗ ${String(err).slice(0, 200)}`);
     }
-    void ev;
-  };
-  const cleanup = () => {
-    if (dragListeners) {
-      window.removeEventListener("pointermove", dragListeners.move);
-      window.removeEventListener("pointerup", dragListeners.up);
-      dragListeners = null;
-    }
-  };
-  dragListeners = { move, up };
-  window.addEventListener("pointermove", move);
-  window.addEventListener("pointerup", up);
+  });
 }
 
 /** ポインタ直下の [data-drop]（"col:1" / "tag:2" / "row:KEY"）のうち kinds に含まれる種類だけ */
@@ -1866,48 +1891,18 @@ function dropTarget(ev: PointerEvent, kinds: string[]): string | null {
 /** サイドバーのラベル → 一覧の行へドラッグして付与（Paperpile: "drag it onto one or more references"）。
     チェック済みの行へ落とせばチェック全件に、それ以外はその行だけに付ける。6px 動くまではクリック扱い */
 export function beginLabelDrag(e: PointerEvent, tagId: number, name: string) {
-  if (e.button !== 0) return;
-  const sx = e.clientX;
-  const sy = e.clientY;
-  let started = false;
-  dragConsumed = false;
-  const move = (ev: PointerEvent) => {
-    if (!started && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) return;
-    if (!started) {
-      started = true;
-      document.body.classList.add("dragging");
-    }
-    app.drag = { kind: "label", keys: [], tagId, label: name, x: ev.clientX, y: ev.clientY, over: dropTarget(ev, ["row"]) };
-  };
-  const up = async () => {
-    cleanup();
-    if (!started) return;
-    dragConsumed = true;
-    const drag = app.drag;
-    app.drag = null;
-    document.body.classList.remove("dragging");
-    if (!drag?.over) return;
-    const key = drag.over.slice("row:".length);
+  trackDrag(e, { kind: "label", label: name }, ["row"], async (over) => {
+    const key = over.slice("row:".length);
     const keys = app.checked.has(key) && app.checked.size > 1 ? checkedKeys() : [key];
     try {
       for (const k of keys) await api.attachTag(k, tagId);
       toast(`✓ ${keys.length > 1 ? tn(keys.length, "件に") : ""}${t("「::labeled")}${name}${t("」を付与")}`);
       await Promise.all([refreshSidebar(), refreshList()]);
-      if (app.selected && keys.includes(app.selected)) await reloadDetail();
+      await reloadDetailIfAmong(keys);
     } catch (err) {
       toast(`✗ ${String(err).slice(0, 200)}`);
     }
-  };
-  const cleanup = () => {
-    if (dragListeners) {
-      window.removeEventListener("pointermove", dragListeners.move);
-      window.removeEventListener("pointerup", dragListeners.up);
-      dragListeners = null;
-    }
-  };
-  dragListeners = { move, up };
-  window.addEventListener("pointermove", move);
-  window.addEventListener("pointerup", up);
+  });
 }
 
 /** ドラッグ直後の click を 1 回だけ握りつぶす（行選択の誤発火防止） */

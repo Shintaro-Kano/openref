@@ -78,7 +78,7 @@
     previewErr = "";
     queueMicrotask(() => {
       inputEl?.focus();
-      listEl?.querySelector(".sm-row.cur")?.scrollIntoView({ block: "nearest" });
+      scrollToCursor();
     });
     // プレビュー対象: チェック先頭 → 見本（入口は 引用 ▾ = チェック 1 件以上。見本は読めなかったときの代わり）
     sample = { csl: SAMPLE, label: () => t("見本（架空の書誌）") };
@@ -141,6 +141,11 @@
     return rows.findIndex((s) => s.id === chosen);
   }
 
+  /** カーソルの行を一覧の見える位置へ（行の描画の後 = microtask で呼ぶ） */
+  function scrollToCursor() {
+    listEl?.querySelector(".sm-row.cur")?.scrollIntoView({ block: "nearest" });
+  }
+
   function onQueryKey(e: KeyboardEvent) {
     if (composing(e)) return;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -148,7 +153,7 @@
       if (!rows.length) return;
       cursor = Math.max(0, Math.min(rows.length - 1, cursor + (e.key === "ArrowDown" ? 1 : -1)));
       chosen = rows[cursor].id;
-      queueMicrotask(() => listEl?.querySelector(".sm-row.cur")?.scrollIntoView({ block: "nearest" }));
+      queueMicrotask(scrollToCursor);
     } else if (e.key === "Enter") {
       e.preventDefault();
       // 該当なし・取得失敗・候補未選択（索引の読込前に打った等）では保存しない（保存ボタンの disabled と同じ条件）
@@ -238,7 +243,7 @@
       chosen = e.id;
       // 検索欄が元から空だと query の $effect が走らないので、カーソルもここで読み込んだ行に合わせる
       cursor = cursorOfChosen();
-      queueMicrotask(() => listEl?.querySelector(".sm-row.cur")?.scrollIntoView({ block: "nearest" }));
+      queueMicrotask(scrollToCursor);
       toast(t("✓ 読み込みました: ") + e.title);
     } catch (e) {
       toast(t("✗ CSL を読み込めません: ") + String(e).slice(0, 200));

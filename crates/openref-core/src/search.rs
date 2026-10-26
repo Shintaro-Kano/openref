@@ -1,4 +1,5 @@
 use crate::{annotate::NoteRow, model::ItemRow, CoreError, Db, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -11,18 +12,22 @@ pub fn list(db: &Db, limit: usize) -> Result<Vec<ItemRow>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// FTS5 検索。ユーザー入力はトークンごとに引用符で包む（FTS 構文エラー防止・AND 意味論）。
+/// FTS5 の問い合わせ語。ユーザー入力はトークンごとに引用符で包む（FTS 構文エラー防止・AND 意味論）。
 /// CJK を含むトークンは index 側と同じ per-char 分かち書きに変換して phrase 化する
 /// （cjk 列にヒット。"胆道" → "\"胆 道\"" が「胆 道 疾 患…」に部分一致）。
-pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<ItemRow>> {
-    let fts_q = query
-        .split_whitespace()
+fn fts_query(q: &str) -> String {
+    q.split_whitespace()
         .map(|t| {
             let t = t.replace('"', "");
             format!("\"{}\"", crate::model::cjk_spaced(&t))
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// FTS5 検索。入力はトークンごとに引用符で包み（AND 意味論）、CJK を含むトークンは per-char の phrase にする（`fts_query`）
+pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<ItemRow>> {
+    let fts_q = fts_query(query);
     if fts_q.is_empty() {
         return Ok(vec![]);
     }
@@ -38,7 +43,6 @@ pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<ItemRow>> {
 
 /// PMID → DOI の順で既存 item を探す（connector 側 dedup 用）
 pub fn find_by_ids(db: &Db, pmid: Option<&str>, doi: Option<&str>) -> Result<Option<(i64, String)>> {
-    use rusqlite::OptionalExtension;
     for (val, sql) in [
         (pmid, "SELECT id, key FROM items WHERE deleted_at IS NULL AND pmid = ?1"),
         (doi, "SELECT id, key FROM items WHERE deleted_at IS NULL AND doi = ?1"),
@@ -57,7 +61,6 @@ pub fn find_by_ids(db: &Db, pmid: Option<&str>, doi: Option<&str>) -> Result<Opt
 }
 
 pub fn get_by_key(db: &Db, key: &str) -> Result<Option<ItemRow>> {
-    use rusqlite::OptionalExtension;
     Ok(db
         .conn
         .query_row(
@@ -70,7 +73,6 @@ pub fn get_by_key(db: &Db, key: &str) -> Result<Option<ItemRow>> {
 }
 
 pub fn retraction_of(db: &Db, item_id: i64) -> Result<Option<String>> {
-    use rusqlite::OptionalExtension;
     Ok(db
         .conn
         .query_row(
@@ -133,6 +135,20 @@ pub struct ListedItem {
     pub fulltext_snippet: Option<String>,
     /// 付いているラベル（行のバッジ用・名前順）
     pub tags: Vec<TagRef>,
+}
+
+/// 詳細から一覧の 1 行を作る（登録直後の行を返すとき。本文の抜粋は無し）
+impl From<ItemDetail> for ListedItem {
+    fn from(d: ItemDetail) -> Self {
+        ListedItem {
+            has_pdf: !d.attachments.is_empty(),
+            retracted: d.retraction.is_some(),
+            has_note: !d.notes.is_empty(),
+            fulltext_snippet: None,
+            tags: d.tags,
+            item: d.item,
+        }
+    }
 }
 
 /// GUI の一覧の行（表示に要る項目だけ・CSL は持たない）。MCP の list_items の要約（commands.rs の item_summary = 誌名 journal・
@@ -209,14 +225,7 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
              SELECT jk.item_id FROM journal_keys jk WHERE jk.key IN (SELECT k FROM jc)))";
     let (sql, fts_q) = match &f.search {
         Some(q) if !q.trim().is_empty() => {
-            let fts_q = q
-                .split_whitespace()
-                .map(|t| {
-                    let t = t.replace('"', "");
-                    format!("\"{}\"", crate::model::cjk_spaced(&t))
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let fts_q = fts_query(q);
             // meta = items_fts の hit、ft = fulltext_fts の hit を添付 → item に畳む（item ごとに rank 最良の 1 添付 = att）。
             // 抜粋（snippet）は全文の走査で高価なので、ここでは作らず LIMIT 後の結果行だけ後段で引く（?10 = 本文検索 off）
             (
@@ -292,7 +301,6 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
         )?;
         for (li, att) in out.iter_mut() {
             if let Some(att) = *att {
-                use rusqlite::OptionalExtension;
                 let raw: Option<String> = snip_stmt
                     .query_row(rusqlite::params![q, att], |r| r.get(0))
                     .optional()?;
@@ -357,7 +365,6 @@ pub struct ItemDetail {
 }
 
 pub fn item_detail(db: &Db, key: &str) -> Result<Option<ItemDetail>> {
-    use rusqlite::OptionalExtension;
     let row = db
         .conn
         .query_row(
@@ -459,6 +466,26 @@ pub fn collections(db: &Db) -> Result<Vec<CollectionRow>> {
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// `collections` の行の id → パス（'親/子'）。親が行に無ければそこまで・257 段を超える鎖（万一の循環を含む）は 257 段で打ち切る
+pub fn collection_paths(rows: &[CollectionRow]) -> std::collections::HashMap<i64, String> {
+    let by_id: std::collections::HashMap<i64, &CollectionRow> = rows.iter().map(|r| (r.id, r)).collect();
+    rows.iter()
+        .map(|r| {
+            let mut parts = Vec::new();
+            let mut cur = Some(r.id);
+            while let Some(c) = cur.and_then(|c| by_id.get(&c)) {
+                parts.push(c.name.clone());
+                cur = c.parent_id;
+                if parts.len() > 256 {
+                    break;
+                }
+            }
+            parts.reverse();
+            (r.id, parts.join("/"))
+        })
+        .collect()
 }
 
 /// 複数 item の所属集計（一括操作ツールバーの三状態表示: 全部 / 一部 / なし）。
