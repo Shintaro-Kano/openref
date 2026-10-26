@@ -353,88 +353,48 @@ fn cmd_style(db: &Db, action: StyleAction) -> anyhow::Result<()> {
 }
 
 fn cmd_cutover(db: &Db, action: CutoverAction) -> anyhow::Result<()> {
-    use openref_core::{drive_layout, mount};
-    let count_mode = |m: &str| -> i64 {
-        db.conn
-            .query_row("SELECT COUNT(*) FROM attachments WHERE mode = ?1", [m], |r| r.get(0))
-            .unwrap_or(0)
-    };
+    use openref_core::mount;
     match action {
         CutoverAction::Status => {
             println!("pdf_write_mode: {}", db.pdf_write_mode());
-            println!("attachments: linked {} / managed {}", count_mode("linked"), count_mode("managed"));
+            println!(
+                "attachments: linked {} / managed {}",
+                mount::count_attachments_by_mode(db, "linked"),
+                mount::count_attachments_by_mode(db, "managed")
+            );
             match mount::detect() {
                 Some(m) => println!("mount: {}", m.display()),
                 None => println!("mount: (未検出)"),
             }
         }
         CutoverAction::Enable => {
-            // preflight 1: mount
-            let m = mount::detect().ok_or_else(|| {
-                anyhow::anyhow!("Drive mount が見つかりません（Drive for Desktop 稼働と Paperpile フォルダを確認。OPENREF_MOUNT で明示も可）")
-            })?;
-            // preflight 2: All Papers 実在（Paperpile レイアウトの存在確認）
-            let all_papers = m.join("All Papers");
-            if !all_papers.is_dir() {
-                bail!("{} がありません — Paperpile レイアウトが確認できず中止", all_papers.display());
-            }
-            // preflight 3: 書込プローブ（File Provider は readdir 拒否でも write は通る想定を実測で確認）
-            let probe = all_papers.join(".openref-write-probe");
-            std::fs::write(&probe, b"probe")
-                .with_context(|| format!("書込プローブ失敗: {}", probe.display()))?;
-            std::fs::remove_file(&probe).ok();
-            db.set_setting("pdf_write_mode", "drive")?;
+            let enabled = mount::enable_drive_mode(db)?;
             println!("✓ cutover 有効化: 以後の新規 PDF 添付は Drive 互換レイアウトへ書きます");
-            println!("  mount: {}", m.display());
-            let managed = count_mode("managed");
-            if managed > 0 {
-                println!("  ※ managed 添付が {managed} 件あります。`openref cutover migrate-managed` で Drive へ移行できます");
+            println!("  mount: {}", enabled.mount.display());
+            if enabled.managed_remaining > 0 {
+                println!(
+                    "  ※ managed 添付が {} 件あります。`openref cutover migrate-managed` で Drive へ移行できます",
+                    enabled.managed_remaining
+                );
             }
         }
         CutoverAction::Disable => {
-            db.set_setting("pdf_write_mode", "managed")?;
+            mount::disable_drive_mode(db)?;
             println!("✓ managed モードへ戻しました（既存の linked 添付には影響しません）");
         }
         CutoverAction::MigrateManaged { dry_run } => {
-            let m = mount::detect()
-                .ok_or_else(|| anyhow::anyhow!("Drive mount が見つかりません"))?;
-            let rows: Vec<(i64, String, String, String)> = {
-                let mut stmt = db.conn.prepare(
-                    "SELECT a.id, a.path, i.key, i.csl FROM attachments a
-                     JOIN items i ON i.id = a.item_id WHERE a.mode = 'managed' ORDER BY a.id",
-                )?;
-                let r = stmt
-                    .query_map([], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                r
-            };
-            if rows.is_empty() {
+            let migrated = mount::migrate_managed_to_drive(db, dry_run)?;
+            if migrated.is_empty() {
                 println!("managed 添付はありません（移行済み）");
                 return Ok(());
             }
-            for (att_id, src_path, item_key, csl_s) in rows {
-                let csl: serde_json::Value = serde_json::from_str(&csl_s)?;
-                let (initial, filename) = drive_layout::relative_target(&csl);
+            for m in migrated {
                 if dry_run {
-                    println!("[dry-run] {item_key}: {src_path}\n  → All Papers/{initial}/{filename}");
-                    continue;
+                    println!("[dry-run] {}: {}\n  → {}", m.item_key, m.src_path, m.dest_path.display());
+                } else {
+                    println!("✓ {}: → {}", m.item_key, m.dest_path.display());
+                    println!("  (storage 原本は保険で残置: {})", m.src_path);
                 }
-                let bytes = std::fs::read(&src_path)
-                    .with_context(|| format!("storage 原本を読めません: {src_path}"))?;
-                let dest = drive_layout::place_bytes(&m, &csl, &bytes)?;
-                // 読み戻し照合（サイズ + 内容。Drive 書込の完全性を確認してから DB を書き換える）
-                let back = std::fs::read(&dest)?;
-                if back != bytes {
-                    bail!("照合不一致: {} — DB は変更していません", dest.display());
-                }
-                db.conn.execute(
-                    "UPDATE attachments SET mode = 'linked', path = ?1 WHERE id = ?2",
-                    (dest.to_string_lossy().to_string(), att_id),
-                )?;
-                println!("✓ {item_key}: → {}", dest.display());
-                println!("  (storage 原本は保険で残置: {src_path})");
             }
         }
     }

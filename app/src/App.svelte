@@ -205,6 +205,11 @@
     // Settings › 起動時に新版を確認 を外した → 出ている帯をその場で消す（Rust が DB に書けてから emit する）
     let unlistenUpdateOff: (() => void) | undefined;
     listen("update-check-off", () => (app.updateLatest = null)).then((fn) => (unlistenUpdateOff = fn));
+    let unlistenMenuToast: (() => void) | undefined;
+    listen<string>("menu-toast", (e) => {
+      toast(e.payload);
+      void reloadDetail();
+    }).then((fn) => (unlistenMenuToast = fn));
     let unlisten: (() => void) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -225,6 +230,7 @@
       unlisten?.();
       unlistenLang?.();
       unlistenUpdateOff?.();
+      unlistenMenuToast?.();
     };
   });
 </script>

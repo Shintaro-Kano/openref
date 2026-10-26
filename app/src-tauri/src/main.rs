@@ -521,15 +521,24 @@ const LANG_JA_ID: &str = "lang_ja";
 const LANG_EN_ID: &str = "lang_en";
 /// Settings › 起動時に新版を確認（settings の update_check・"0" で止める = core update.rs。確認は App 起動時の check_update）
 const UPDATE_CHECK_ID: &str = "update_check";
-/// on_menu_event から項目のチェック状態を読み書きするために持つ（Menu::get の再帰に頼らない）
+/// Settings › PDF の保存先 › ローカル (Mac 内) / Google Drive / ローカル保存済みの PDF を Drive へ移行
+const PDF_STORAGE_MANAGED_ID: &str = "pdf_storage_managed";
+const PDF_STORAGE_DRIVE_ID: &str = "pdf_storage_drive";
+const PDF_MIGRATE_DRIVE_ID: &str = "pdf_migrate_drive";
+
+/// on_menu_event から項目のチェック状態やラベルを読み書きするために持つ（Menu::get の再帰に頼らない）
 struct SettingsItems {
     restore: tauri::menu::CheckMenuItem<tauri::Wry>,
     update_check: tauri::menu::CheckMenuItem<tauri::Wry>,
     lang_ja: tauri::menu::CheckMenuItem<tauri::Wry>,
     lang_en: tauri::menu::CheckMenuItem<tauri::Wry>,
+    pdf_storage: tauri::menu::Submenu<tauri::Wry>,
+    pdf_managed: tauri::menu::CheckMenuItem<tauri::Wry>,
+    pdf_drive: tauri::menu::CheckMenuItem<tauri::Wry>,
+    pdf_migrate: tauri::menu::MenuItem<tauri::Wry>,
 }
 
-/// 言語で変わる項目名（メニューのタイトルと「日本語」「English」はどちらの言語でも同じ）
+/// 言語で変わる項目名（メニューのタイトルと「日本語」「English」「Google Drive」はどちらの言語でも同じ）
 fn restore_tabs_text(en: bool) -> &'static str {
     if en {
         "Restore tabs on launch"
@@ -546,13 +555,43 @@ fn update_check_text(en: bool) -> &'static str {
     }
 }
 
+fn pdf_storage_text(en: bool) -> &'static str {
+    if en {
+        "PDF storage"
+    } else {
+        "PDF の保存先"
+    }
+}
+
+fn pdf_managed_text(en: bool) -> &'static str {
+    if en {
+        "Local (on this Mac)"
+    } else {
+        "ローカル (Mac 内)"
+    }
+}
+
+fn pdf_migrate_text(en: bool) -> &'static str {
+    if en {
+        "Move local PDFs to Google Drive"
+    } else {
+        "ローカル保存済みの PDF を Drive へ移行"
+    }
+}
+
 /// メインメニュー = tauri 2.11.5 の `Menu::default` から **Close Window(⌘W)を外したもの**。
 /// 既定メニューは File と Window の両方に `PredefinedMenuItem::close_window` を置き、WKWebView がページへ渡す前に
 /// NSApp のキー等価(⌘W)として窓を閉じてしまう(PDF タブ 1 枚で ⌘W → 窓が閉じる)。
 /// ⌘W はアプリ(タブを閉じる)が奪うので、メニューには置かない。File は macOS では Close Window しか無いので省く。
 /// Edit の項目は WebView の ⌘C / ⌘V / ⌘A の経路なので残す。Window / Help の id は tauri が NSApp の windows / help メニューとして扱うため既定と同じ。
-fn app_menu(app: &tauri::AppHandle, restore_tabs: bool, update_check: bool, en: bool) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{AboutMetadata, CheckMenuItem, Menu, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
+fn app_menu(
+    app: &tauri::AppHandle,
+    restore_tabs: bool,
+    update_check: bool,
+    en: bool,
+    pdf_drive_mode: bool,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{AboutMetadata, CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
     let pkg = app.package_info();
     let config = app.config();
     let about = AboutMetadata {
@@ -601,11 +640,34 @@ fn app_menu(app: &tauri::AppHandle, restore_tabs: bool, update_check: bool, en: 
     // Settings: 設定が増えたらここに並べる（ダイアログは作らない）。Help（空）と Services は置かない
     let restore = CheckMenuItem::with_id(app, RESTORE_TABS_ID, restore_tabs_text(en), true, restore_tabs, None::<&str>)?;
     let update_check = CheckMenuItem::with_id(app, UPDATE_CHECK_ID, update_check_text(en), true, update_check, None::<&str>)?;
+    let pdf_managed = CheckMenuItem::with_id(app, PDF_STORAGE_MANAGED_ID, pdf_managed_text(en), true, !pdf_drive_mode, None::<&str>)?;
+    let pdf_drive = CheckMenuItem::with_id(app, PDF_STORAGE_DRIVE_ID, "Google Drive", true, pdf_drive_mode, None::<&str>)?;
+    let pdf_migrate = MenuItem::with_id(app, PDF_MIGRATE_DRIVE_ID, pdf_migrate_text(en), true, None::<&str>)?;
+    let pdf_storage = Submenu::with_items(
+        app,
+        pdf_storage_text(en),
+        true,
+        &[
+            &pdf_managed,
+            &pdf_drive,
+            &PredefinedMenuItem::separator(app)?,
+            &pdf_migrate,
+        ],
+    )?;
     let lang_ja = CheckMenuItem::with_id(app, LANG_JA_ID, "日本語", true, !en, None::<&str>)?;
     let lang_en = CheckMenuItem::with_id(app, LANG_EN_ID, "English", true, en, None::<&str>)?;
     let language = Submenu::with_items(app, "Language", true, &[&lang_ja, &lang_en])?;
-    app.manage(SettingsItems { restore: restore.clone(), update_check: update_check.clone(), lang_ja: lang_ja.clone(), lang_en: lang_en.clone() });
-    let settings = Submenu::with_items(app, "Settings", true, &[&restore, &update_check, &language])?;
+    app.manage(SettingsItems {
+        restore: restore.clone(),
+        update_check: update_check.clone(),
+        lang_ja: lang_ja.clone(),
+        lang_en: lang_en.clone(),
+        pdf_storage: pdf_storage.clone(),
+        pdf_managed: pdf_managed.clone(),
+        pdf_drive: pdf_drive.clone(),
+        pdf_migrate: pdf_migrate.clone(),
+    });
+    let settings = Submenu::with_items(app, "Settings", true, &[&restore, &update_check, &pdf_storage, &language])?;
     Menu::with_items(app, &[&app_menu, &edit, &view, &settings, &window])
 }
 
@@ -653,7 +715,15 @@ fn on_menu_event(app: &tauri::AppHandle, ev: tauri::menu::MenuEvent) {
             let saved = switched && save_setting(app, "ui_lang", if en { "en" } else { "ja" });
             // 押し直し・書けた = 選んだ言語 / 書けなかった = 前の言語のまま
             let now_en = if switched && !saved { !en } else { en };
-            let menu = items.lang_ja.set_checked(!now_en).and(items.lang_en.set_checked(now_en)).and(items.restore.set_text(restore_tabs_text(now_en))).and(items.update_check.set_text(update_check_text(now_en)));
+            let menu = items
+                .lang_ja
+                .set_checked(!now_en)
+                .and(items.lang_en.set_checked(now_en))
+                .and(items.restore.set_text(restore_tabs_text(now_en)))
+                .and(items.update_check.set_text(update_check_text(now_en)))
+                .and(items.pdf_storage.set_text(pdf_storage_text(now_en)))
+                .and(items.pdf_managed.set_text(pdf_managed_text(now_en)))
+                .and(items.pdf_migrate.set_text(pdf_migrate_text(now_en)));
             if let Err(e) = menu {
                 eprintln!("openref-app: メニューを更新できません: {e}");
             }
@@ -662,6 +732,95 @@ fn on_menu_event(app: &tauri::AppHandle, ev: tauri::menu::MenuEvent) {
                     eprintln!("openref-app: ui-lang を webview へ送れません: {e}");
                 }
             }
+        }
+        id @ (PDF_STORAGE_MANAGED_ID | PDF_STORAGE_DRIVE_ID) => {
+            let want_drive = id == PDF_STORAGE_DRIVE_ID;
+            let picked = if want_drive { &items.pdf_drive } else { &items.pdf_managed };
+            let switched = picked.is_checked().unwrap_or(true);
+            let en = items.lang_en.is_checked().unwrap_or(false);
+            if !switched {
+                // 既に選ばれている方を押し直した → チェックを戻すだけ
+                let _ = items.pdf_managed.set_checked(!want_drive).and(items.pdf_drive.set_checked(want_drive));
+                return;
+            }
+            let st = app.state::<AppState>();
+            let res = match st.db.lock() {
+                Ok(db) => {
+                    if want_drive {
+                        openref_core::mount::enable_drive_mode(&db).map(|info| {
+                            if en {
+                                if info.managed_remaining > 0 {
+                                    format!(
+                                        "✓ PDF storage set to Google Drive ({} local PDFs can be moved from Settings › PDF storage)",
+                                        info.managed_remaining
+                                    )
+                                } else {
+                                    "✓ PDF storage set to Google Drive".to_string()
+                                }
+                            } else if info.managed_remaining > 0 {
+                                format!(
+                                    "✓ PDF の保存先を Google Drive に切り替えました（ローカル保存済みの {} 件は Settings › PDF の保存先 から移行できます）",
+                                    info.managed_remaining
+                                )
+                            } else {
+                                "✓ PDF の保存先を Google Drive に切り替えました".to_string()
+                            }
+                        })
+                    } else {
+                        openref_core::mount::disable_drive_mode(&db).map(|()| {
+                            if en {
+                                "✓ PDF storage set to Local (on this Mac)".to_string()
+                            } else {
+                                "✓ PDF の保存先をローカル (Mac 内) に切り替えました".to_string()
+                            }
+                        })
+                    }
+                }
+                Err(e) => Err(openref_core::CoreError::BadInput(format!("DB lock failed: {e}"))),
+            };
+            match res {
+                Ok(msg) => {
+                    let _ = items.pdf_managed.set_checked(!want_drive).and(items.pdf_drive.set_checked(want_drive));
+                    let _ = app.emit("menu-toast", msg);
+                }
+                Err(e) => {
+                    let _ = items.pdf_managed.set_checked(want_drive).and(items.pdf_drive.set_checked(!want_drive));
+                    let prefix = if en { "✗ Could not switch PDF storage: " } else { "✗ PDF 保存先の切替に失敗: " };
+                    let _ = app.emit("menu-toast", format!("{prefix}{e}"));
+                }
+            }
+        }
+        PDF_MIGRATE_DRIVE_ID => {
+            let en = items.lang_en.is_checked().unwrap_or(false);
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let st = app.state::<AppState>();
+                let res = match st.db.lock() {
+                    Ok(db) => openref_core::mount::migrate_managed_to_drive(&db, false),
+                    Err(e) => Err(openref_core::CoreError::BadInput(format!("DB lock failed: {e}"))),
+                };
+                let msg = match res {
+                    Ok(list) if list.is_empty() => {
+                        if en {
+                            "No local PDFs to move (all PDFs are already on Google Drive)".to_string()
+                        } else {
+                            "移行対象のローカル PDF はありません（移行済み）".to_string()
+                        }
+                    }
+                    Ok(list) => {
+                        if en {
+                            format!("✓ Moved {} local PDF(s) to Google Drive", list.len())
+                        } else {
+                            format!("✓ ローカル保存済みの PDF {} 件を Google Drive へ移行しました", list.len())
+                        }
+                    }
+                    Err(e) => {
+                        let prefix = if en { "✗ Failed to move PDFs to Google Drive: " } else { "✗ Google Drive への PDF 移行に失敗: " };
+                        format!("{prefix}{e}")
+                    }
+                };
+                let _ = app.emit("menu-toast", msg);
+            });
         }
         _ => {}
     }
@@ -702,13 +861,14 @@ fn main() {
         Err(e) => fatal(&e.to_string()),
     };
     // Settings › 起動時に前回のタブを開く（既定 = 開く。"0" のときだけ外す）・起動時に新版を確認（既定 = 確認。"0" のときだけ外す）
-    // ・Language（既定 = 日本語。"en" のときだけ English）
+    // ・Language（既定 = 日本語。"en" のときだけ English）・PDF の保存先
     let restore_tabs = db.setting("ui_restore_tabs").as_deref() != Some("0");
     let update_check = update::cached(&db).enabled;
     let lang_en = db.setting("ui_lang").as_deref() == Some("en");
+    let pdf_drive_mode = db.pdf_write_mode() == "drive";
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .menu(move |app| app_menu(app, restore_tabs, update_check, lang_en))
+        .menu(move |app| app_menu(app, restore_tabs, update_check, lang_en, pdf_drive_mode))
         .on_menu_event(on_menu_event)
         .manage(AppState {
             db: Arc::new(Mutex::new(db)),
