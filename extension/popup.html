@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    :root {
+      --bg: #f6f7f8; --panel: #fff; --border: #dfe3e6; --text: #1c2733;
+      --dim: #6b7a89; --accent: #1a73e8; --accent-soft: #e8f0fe; --danger: #c0392b; --ok: #1e8e3e;
+      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; font-size: 13px;
+    }
+    * { box-sizing: border-box; margin: 0; }
+    body { width: 340px; background: var(--bg); color: var(--text); padding: 10px; }
+    .head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .head img { width: 20px; height: 20px; border-radius: 5px; }
+    .head b { font-size: 14px; }
+    .head .conn { margin-left: auto; font-size: 11px; color: var(--dim); }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; }
+    .title { line-height: 1.4; font-weight: 600; }
+    .meta { color: var(--dim); font-size: 11.5px; margin-top: 4px; word-break: break-all; }
+    .badge { display: inline-block; border: 1px solid currentColor; border-radius: 4px; font-size: 10px; padding: 0 4px; margin-right: 4px; }
+    .badge.ok { color: var(--ok); }
+    .badge.no { color: var(--dim); }
+    select, button.primary {
+      width: 100%; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border);
+      font: inherit; background: var(--panel); color: var(--text);
+    }
+    select { margin-bottom: 8px; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+    button.primary:disabled { opacity: 0.5; cursor: default; }
+    #status { margin-top: 8px; font-size: 12px; color: var(--dim); white-space: pre-wrap; line-height: 1.5; min-height: 18px; }
+    #status.err { color: var(--danger); }
+    #status.done { color: var(--ok); }
+    .warn { color: var(--danger); font-size: 11.5px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <img src="icons/icon-32.png" alt="" />
+    <b>OpenRef Capture</b>
+    <span class="conn" id="conn">接続確認中…</span>
+  </div>
+  <div class="card">
+    <div class="title" id="title">ページを解析中…</div>
+    <div class="meta" id="ids"></div>
+  </div>
+  <select id="collection"><option value="">フォルダなし</option></select>
+  <button class="primary" id="save" disabled>OpenRef に保存</button>
+  <div id="status"></div>
+  <div class="warn" id="keepopen" style="display:none">保存中はこのポップアップを閉じないでください（PDF 転送中）</div>
+  <script src="popup.js"></script>
+</body>
+</html>

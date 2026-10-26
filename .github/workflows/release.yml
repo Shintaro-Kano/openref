@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish macOS arm64 Release
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify version consistency across manifests and git tag
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(python3 -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          PKG_VER="$(python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("app/package.json").read_text())["version"])')"
+          TAURI_VER="$(python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("app/src-tauri/tauri.conf.json").read_text())["version"])')"
+          echo "tag=$TAG_VER cargo=$CARGO_VER pkg=$PKG_VER tauri=$TAURI_VER"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$PKG_VER" ] || [ "$TAG_VER" != "$TAURI_VER" ]; then
+            echo "::error::Version mismatch: tag($TAG_VER) != Cargo.toml($CARGO_VER) / package.json($PKG_VER) / tauri.conf.json($TAURI_VER)"
+            exit 1
+          fi
+          # X.Y.Z only: the app's launch-time update check (core update.rs) cannot parse pre-release / build metadata
+          if ! [[ "$TAG_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be X.Y.Z (no pre-release / build metadata): $TAG_VER"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run test suite before packaging
+        run: |
+          cargo test --workspace --locked
+          node app/src/lib/viewer/util.test.mjs
+          node app/src/lib/i18n.test.mjs
+          node word/test-cite.cjs && node word/test-types.cjs && node word/test-styles.cjs && node word/test-commands.cjs
+          node word/test-dotm-render.cjs && node word/test-dialog-dotm.cjs
+          python3 word/dotm/test-build.py
+          xmllint --noout --schema word/xsd/OfficeAppManifestV1_1.xsd word/manifest.xml
+          python3 scripts/check-licenses.py
+
+      - name: Build CLI, MCP, connectd, and OpenRef.app
+        run: |
+          cargo build --release --locked -p openref-cli -p openref-mcp -p openref-connectd
+          (cd app && npm run tauri build -- --bundles app)
+
+      - name: Assemble signed release tarball
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          STAGE="target/release-dist"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/bundle/bin" "$STAGE/bundle/word" "$STAGE/dl"
+          printf '%s\n' "$TAG_VER" > "$STAGE/bundle/VERSION"
+          cp -R target/release/bundle/macos/OpenRef.app "$STAGE/bundle/OpenRef.app"
+          PLIST_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGE/bundle/OpenRef.app/Contents/Info.plist")"
+          if [ "$PLIST_VER" != "$TAG_VER" ]; then
+            echo "::error::Info.plist CFBundleShortVersionString ($PLIST_VER) != tag ($TAG_VER)"
+            exit 1
+          fi
+          for bin in openref openref-mcp openref-connectd; do
+            cp "target/release/$bin" "$STAGE/bundle/bin/$bin"
+            codesign --force -s - "$STAGE/bundle/bin/$bin"
+            codesign -v "$STAGE/bundle/bin/$bin"
+          done
+          rsync -a --exclude ".DS_Store" extension/ "$STAGE/bundle/extension/"
+          scripts/bundle-word.sh "$STAGE/bundle/word"  # OpenRef.dotm + OpenRef Dialog.app
+          codesign --force --deep -s - "$STAGE/bundle/OpenRef.app"
+          codesign -v "$STAGE/bundle/OpenRef.app"
+          tar -czf "$STAGE/dl/openref-macos-arm64.tar.gz" -C "$STAGE/bundle" VERSION OpenRef.app bin extension word
+          (cd "$STAGE/dl" && shasum -a 256 openref-macos-arm64.tar.gz > openref-macos-arm64.tar.gz.sha256)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            target/release-dist/dl/openref-macos-arm64.tar.gz \
+            target/release-dist/dl/openref-macos-arm64.tar.gz.sha256 \
+            site/install.sh \
+            site/uninstall.sh \
+            --title "OpenRef $GITHUB_REF_NAME" \
+            --generate-notes

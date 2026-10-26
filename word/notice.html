@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenRef</title>
+  <script>
+    // Startup テンプレート版（?host=dotm = OpenRef Dialog.app の WKWebView）は office.js を読まない。Office では従来どおり同期読込
+    if (!/[?&]host=dotm(&|$)/.test(location.search)) document.write('<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"><\/script>');
+  </script>
+  <link rel="stylesheet" href="/word/dialog.css" />
+</head>
+<body class="rd-body">
+  <div class="rd-page">
+    <div class="rd-notice">
+      <div class="rd-logo">
+        <img src="/word/assets/icon-80.png" alt="OpenRef" />
+        <span id="rd-warn" class="rd-warn" hidden>⚠</span>
+      </div>
+      <div class="rd-ntext">
+        <div id="rd-title" class="rd-nh"></div>
+        <p id="rd-msg" class="rd-nmsg"></p>
+        <p id="rd-detail" class="rd-ndetail" hidden></p>
+      </div>
+    </div>
+    <div class="rd-actions">
+      <span class="rd-left">
+        <button id="rd-copy" class="rd-btn" type="button" hidden>コピー</button>
+        <span id="rd-copied" class="rd-copied"></span>
+      </span>
+      <button id="rd-cancel" class="rd-btn" type="button" hidden>キャンセル</button>
+      <button id="rd-ok" class="rd-btn rd-primary" type="button">閉じる</button>
+    </div>
+  </div>
+  <script src="/word/dialog-common.js"></script>
+  <script src="/word/notice.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+/target
+/incoming
+/app/node_modules
+/app/dist
+/app/src-tauri/gen
+/app/harness/fixtures
+*.sqlite
+*.sqlite-*
+.DS_Store
+
+# 画面収録など（バグ報告用の一時置き場）
+/*.mp4
+/*.mov
+
+# Python のキャッシュ(word/dotm/test-build.py が scripts/build-word-dotm.py を import する)
+__pycache__/

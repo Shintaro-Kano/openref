@@ -1,0 +1,453 @@
+<!-- 出典: MS-OWEMXML 5.2 (http://schemas.microsoft.com/office/appforoffice/1.1 Schema)。https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-owemxml/ の Appendix A から 2026-10-20 取得。
+     改変は 1 点だけ: libxml2（xmllint）が解釈できない pattern の "{0,3}?" を "{0,3}" に置換（一致する集合は同じ）。
+     用途: word/manifest.xml の検証（Word は不正な manifest を黙って無視する）。 -->
+<xs:schema id="OfficeAppManifest" elementFormDefault="qualified" version="1.1" targetNamespace="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:mailor="http://schemas.microsoft.com/office/mailappversionoverrides" xmlns:taskpanor="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xmlns:contentor="http://schemas.microsoft.com/office/contentappversionoverrides" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+   <xs:import schemaLocation="ContentAppVersionOverridesV1_0.xsd" namespace="http://schemas.microsoft.com/office/contentappversionoverrides"/>
+   <xs:import schemaLocation="MailAppVersionOverridesV1_0.xsd" namespace="http://schemas.microsoft.com/office/mailappversionoverrides"/>
+   <xs:import schemaLocation="OfficeAppBasicTypesV1_0.xsd" namespace="http://schemas.microsoft.com/office/officeappbasictypes/1.0"/>
+   <xs:import schemaLocation="TaskPaneAppVersionOverridesV1_0.xsd" namespace="http://schemas.microsoft.com/office/taskpaneappversionoverrides"/>
+   <xs:simpleType name="NonEmptyString">
+     <xs:restriction base="xs:string">
+       <xs:minLength value="1"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="ShortString">
+     <xs:restriction base="xs:string">
+       <xs:minLength value="1"/>
+       <xs:maxLength value="125"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="LongString">
+     <xs:restriction base="xs:string">
+       <xs:minLength value="1"/>
+       <xs:maxLength value="250"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="URL">
+     <xs:restriction base="xs:anyURI">
+       <xs:minLength value="1"/>
+       <xs:maxLength value="2048"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="LocaleOverride">
+     <xs:attribute name="Locale" type="CultureName" use="required"/>
+     <xs:attribute name="Value" type="NonEmptyString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="ShortLocaleOverride">
+     <xs:attribute name="Locale" type="CultureName" use="required"/>
+     <xs:attribute name="Value" type="ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="LongLocaleOverride">
+     <xs:attribute name="Locale" type="CultureName" use="required"/>
+     <xs:attribute name="Value" type="LongString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="URLLocaleOverride">
+     <xs:attribute name="Locale" type="CultureName" use="required"/>
+     <xs:attribute name="Value" type="URL" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="LocaleAwareSetting">
+     <xs:sequence>
+       <xs:element name="Override" type="LocaleOverride" minOccurs="0" maxOccurs="unbounded"/>
+     </xs:sequence>
+     <xs:attribute name="DefaultValue" type="NonEmptyString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="ShortLocaleAwareSetting">
+     <xs:sequence>
+       <xs:element name="Override" type="ShortLocaleOverride" minOccurs="0" maxOccurs="unbounded"/>
+     </xs:sequence>
+     <xs:attribute name="DefaultValue" type="ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="LongLocaleAwareSetting">
+     <xs:sequence>
+       <xs:element name="Override" type="LongLocaleOverride" minOccurs="0" maxOccurs="unbounded"/>
+     </xs:sequence>
+     <xs:attribute name="DefaultValue" type="LongString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="URLLocaleAwareSetting">
+     <xs:sequence>
+       <xs:element name="Override" type="URLLocaleOverride" minOccurs="0" maxOccurs="unbounded"/>
+     </xs:sequence>
+     <xs:attribute name="DefaultValue" type="URL" use="required"/>
+   </xs:complexType>
+   <xs:simpleType name="UUID">
+     <xs:restriction base="xs:string">
+       <xs:pattern value="(urn:uuid:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="AlternateId">
+     <xs:restriction base="xs:string">
+       <xs:pattern value=".{5,12}\\WA[0-9]{9}"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="CultureName">
+     <xs:restriction base="xs:string">
+       <xs:pattern value="[a-zA-Z]{2,3}-[a-zA-Z0-9]{3,8}(-[a-zA-Z]{2,3})?|[a-zA-Z]{2,3}(-[a-zA-Z]{2,3}(_tradnl|\.pseudo|-[a-zA-Z]{4,8})?)?"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="Version">
+     <xs:restriction base="xs:string">
+       <xs:pattern value="([0-9]{1,5})(\.[0-9]{1,5}){0,3}"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="ShortVersion">
+     <xs:restriction base="xs:string">
+       <xs:pattern value="([0-9]{1,5})\.([0-9]{1,5})"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="ST_RequestedWidth">
+     <xs:restriction base="xs:integer">
+       <xs:minInclusive value="32"/>
+       <xs:maxInclusive value="1000"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="ST_RequestedHeight">
+     <xs:restriction base="xs:integer">
+       <xs:minInclusive value="32"/>
+       <xs:maxInclusive value="1000"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ContentAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="RequestedWidth" minOccurs="0" maxOccurs="1" type="ST_RequestedWidth"/>
+       <xs:element name="RequestedHeight" minOccurs="0" maxOccurs="1" type="ST_RequestedHeight"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="TaskPaneAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:simpleType name="ST_RequestedHeight1">
+     <xs:restriction base="xs:integer">
+       <xs:minInclusive value="32"/>
+       <xs:maxInclusive value="450"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ItemReadDesktopMailAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="RequestedHeight" minOccurs="1" maxOccurs="1" type="ST_RequestedHeight1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:simpleType name="ST_RequestedHeight2">
+     <xs:restriction base="xs:integer">
+       <xs:minInclusive value="32"/>
+       <xs:maxInclusive value="450"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ItemReadTabletMailAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="RequestedHeight" minOccurs="1" maxOccurs="1" type="ST_RequestedHeight2"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="ItemReadPhoneMailAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="ItemEditMailAppSettings">
+     <xs:sequence>
+       <xs:element name="SourceLocation" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="FormType" abstract="true"/>
+   <xs:complexType name="ItemRead">
+     <xs:complexContent>
+       <xs:extension base="FormType">
+         <xs:sequence>
+           <xs:element name="DesktopSettings" type="ItemReadDesktopMailAppSettings" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="TabletSettings" type="ItemReadTabletMailAppSettings" minOccurs="0" maxOccurs="1"/>
+           <xs:element name="PhoneSettings" type="ItemReadPhoneMailAppSettings" minOccurs="0" maxOccurs="1"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="ItemEdit">
+     <xs:complexContent>
+       <xs:extension base="FormType">
+         <xs:sequence>
+           <xs:element name="DesktopSettings" type="ItemEditMailAppSettings" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="TabletSettings" type="ItemEditMailAppSettings" minOccurs="0" maxOccurs="1"/>
+           <xs:element name="PhoneSettings" type="ItemEditMailAppSettings" minOccurs="0" maxOccurs="1"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="FormSettings">
+     <xs:sequence>
+       <xs:element name="Form" type="FormType" minOccurs="1" maxOccurs="2"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Rule" abstract="true"/>
+   <xs:simpleType name="ItemFormType">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Read"/>
+       <xs:enumeration value="Edit"/>
+       <xs:enumeration value="ReadOrEdit"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ItemIs">
+     <xs:complexContent>
+       <xs:extension base="Rule">
+         <xs:attribute name="ItemType" type="ItemType" use="required"/>
+         <xs:attribute name="FormType" type="ItemFormType" use="required"/>
+         <xs:attribute name="ItemClass" type="NonEmptyString" use="optional"/>
+         <xs:attribute name="IncludeSubClasses" type="xs:boolean" use="optional"/>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:simpleType name="ItemType">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Message"/>
+       <xs:enumeration value="Appointment"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:simpleType name="KnownEntityType">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="MeetingSuggestion"/>
+       <xs:enumeration value="TaskSuggestion"/>
+       <xs:enumeration value="Address"/>
+       <xs:enumeration value="Url"/>
+       <xs:enumeration value="PhoneNumber"/>
+       <xs:enumeration value="EmailAddress"/>
+       <xs:enumeration value="Contact"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ItemHasKnownEntity">
+     <xs:complexContent>
+       <xs:extension base="Rule">
+         <xs:attribute name="EntityType" type="KnownEntityType" use="required"/>
+         <xs:attribute name="RegExFilter" type="NonEmptyString" use="optional"/>
+         <xs:attribute name="FilterName" type="NonEmptyString" use="optional"/>
+         <xs:attribute name="IgnoreCase" type="xs:boolean" use="optional"/>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:simpleType name="PropertyName">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Subject"/>
+       <xs:enumeration value="BodyAsPlaintext"/>
+       <xs:enumeration value="BodyAsHTML"/>
+       <xs:enumeration value="SenderSMTPAddress"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ItemHasRegularExpressionMatch">
+     <xs:complexContent>
+       <xs:extension base="Rule">
+         <xs:attribute name="RegExName" type="NonEmptyString" use="required"/>
+         <xs:attribute name="RegExValue" type="NonEmptyString" use="required"/>
+         <xs:attribute name="PropertyName" type="PropertyName" use="required"/>
+         <xs:attribute name="IgnoreCase" type="xs:boolean" use="optional"/>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="ItemHasAttachment">
+     <xs:complexContent>
+       <xs:extension base="Rule"/>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:simpleType name="LogicalOperator">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="And"/>
+       <xs:enumeration value="Or"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="RuleCollection">
+     <xs:complexContent>
+       <xs:extension base="Rule">
+         <xs:sequence>
+           <xs:element name="Rule" type="Rule" minOccurs="1" maxOccurs="unbounded"/>
+         </xs:sequence>
+         <xs:attribute name="Mode" type="LogicalOperator" use="required"/>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="AppDomains">
+     <xs:sequence minOccurs="1" maxOccurs="unbounded">
+       <xs:element name="AppDomain" type="LongString"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="OfficeApp" abstract="true">
+     <xs:sequence>
+       <xs:element name="Id" type="UUID" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="AlternateId" type="AlternateId" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="Version" type="Version" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="ProviderName" type="ShortString" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="DefaultLocale" type="CultureName" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="DisplayName" type="ShortLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="Description" type="LongLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="IconUrl" type="URLLocaleAwareSetting" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="HighResolutionIconUrl" type="URLLocaleAwareSetting" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="SupportUrl" type="URLLocaleAwareSetting" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="AppDomains" type="AppDomains" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="Hosts" type="Hosts" minOccurs="0" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Host">
+     <xs:attribute name="Name" type="ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="Hosts">
+     <xs:sequence minOccurs="1" maxOccurs="unbounded">
+       <xs:element name="Host" type="Host"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Requirements">
+     <xs:sequence>
+       <xs:element name="Sets" type="Sets" minOccurs="0" maxOccurs="1"/>
+       <xs:element name="Methods" type="Methods" minOccurs="0" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Sets">
+     <xs:sequence minOccurs="1" maxOccurs="unbounded">
+       <xs:element name="Set" type="VersionedRequirement"/>
+     </xs:sequence>
+     <xs:attribute name="DefaultMinVersion" type="ShortVersion" default="1.1"/>
+   </xs:complexType>
+   <xs:complexType name="VersionedRequirement">
+     <xs:attribute name="MinVersion" type="ShortVersion" use="optional"/>
+     <xs:attribute name="Name" type="ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="Methods">
+     <xs:sequence minOccurs="1" maxOccurs="unbounded">
+       <xs:element name="Method" type="Requirement"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Requirement">
+     <xs:attribute name="Name" type="LongString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="MailAppRequirements">
+     <xs:sequence>
+       <xs:element name="Sets" type="Sets" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:simpleType name="ST_Permissions">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Restricted"/>
+       <xs:enumeration value="ReadDocument"/>
+       <xs:enumeration value="WriteDocument"/>
+       <xs:enumeration value="ReadWriteDocument"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="ContentApp">
+     <xs:complexContent>
+       <xs:extension base="OfficeApp">
+         <xs:sequence>
+           <xs:element name="Requirements" type="Requirements" minOccurs="0" maxOccurs="1"/>
+           <xs:element name="DefaultSettings" type="ContentAppSettings" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="Permissions" minOccurs="1" maxOccurs="1" type="ST_Permissions"/>
+           <xs:element name="AllowSnapshot" type="xs:boolean" minOccurs="0" maxOccurs="1"/>
+           <xs:element ref="contentor:VersionOverrides" minOccurs="0" maxOccurs="1"/>
+           <xs:any id="ContentAppSignature" minOccurs="0" maxOccurs="1" namespace="http://www.w3.org/2000/09/xmldsig#" processContents="lax"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="Dictionary">
+     <xs:sequence>
+       <xs:element name="TargetDialects" type="TargetDialects" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="QueryUri" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="CitationText" type="ShortLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="DictionaryName" type="ShortLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+       <xs:element name="DictionaryHomePage" type="URLLocaleAwareSetting" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="TargetDialects">
+     <xs:sequence minOccurs="1" maxOccurs="unbounded">
+       <xs:element name="TargetDialect" type="CultureName"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="Token" abstract="true">
+     <xs:attribute name="Name" type="bt:ShortString" use="required"/>
+     <xs:attribute name="DefaultValue" type="bt:ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="RequirementsTokenOverride">
+     <xs:sequence>
+       <xs:element name="Requirements" type="Requirements" minOccurs="1" maxOccurs="1"/>
+     </xs:sequence>
+     <xs:attribute name="Value" type="bt:ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="RequirementsToken">
+     <xs:complexContent>
+       <xs:extension base="Token">
+         <xs:sequence>
+           <xs:element name="Override" type="RequirementsTokenOverride" minOccurs="0" maxOccurs="unbounded"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="LocaleTokenOverride">
+     <xs:attribute name="Locale" type="bt:ShortString" use="required"/>
+     <xs:attribute name="Value" type="bt:ShortString" use="required"/>
+   </xs:complexType>
+   <xs:complexType name="LocaleToken">
+     <xs:complexContent>
+       <xs:extension base="Token">
+         <xs:sequence>
+           <xs:element name="Override" type="LocaleTokenOverride" minOccurs="0" maxOccurs="unbounded"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:complexType name="Tokens">
+     <xs:sequence>
+       <xs:element name="Token" type="Token" minOccurs="0" maxOccurs="unbounded"/>
+     </xs:sequence>
+   </xs:complexType>
+   <xs:complexType name="ExtendedOverrides">
+     <xs:sequence>
+       <xs:element name="Tokens" type="Tokens" minOccurs="0" maxOccurs="1"/>
+     </xs:sequence>
+     <xs:attribute name="Url" type="URL" use="required"/>
+     <xs:attribute name="ResourcesUrl" type="URL" use="optional"/>
+   </xs:complexType>
+   <xs:simpleType name="ST_Permissions1">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Restricted"/>
+       <xs:enumeration value="ReadDocument"/>
+       <xs:enumeration value="ReadAllDocument"/>
+       <xs:enumeration value="WriteDocument"/>
+       <xs:enumeration value="ReadWriteDocument"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="TaskPaneApp">
+     <xs:complexContent>
+       <xs:extension base="OfficeApp">
+         <xs:sequence>
+           <xs:element name="Requirements" type="Requirements" minOccurs="0" maxOccurs="1"/>
+           <xs:element name="DefaultSettings" type="TaskPaneAppSettings" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="Permissions" minOccurs="1" maxOccurs="1" type="ST_Permissions1"/>
+           <xs:element name="Dictionary" type="Dictionary" minOccurs="0" maxOccurs="1"/>
+           <xs:element ref="taskpanor:VersionOverrides" minOccurs="0" maxOccurs="1"/>
+           <xs:element name="ExtendedOverrides" type="ExtendedOverrides" minOccurs="0" maxOccurs="1"/>
+           <xs:any id="TaskPaneAppSignature" minOccurs="0" maxOccurs="1" namespace="http://www.w3.org/2000/09/xmldsig#" processContents="lax"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:simpleType name="ST_Permissions2">
+     <xs:restriction base="xs:string">
+       <xs:enumeration value="Restricted"/>
+       <xs:enumeration value="ReadItem"/>
+       <xs:enumeration value="ReadWriteItem"/>
+       <xs:enumeration value="ReadWriteMailbox"/>
+     </xs:restriction>
+   </xs:simpleType>
+   <xs:complexType name="MailApp">
+     <xs:complexContent>
+       <xs:extension base="OfficeApp">
+         <xs:sequence>
+           <xs:element name="Requirements" type="MailAppRequirements" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="FormSettings" type="FormSettings" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="Permissions" minOccurs="0" maxOccurs="1" type="ST_Permissions2"/>
+           <xs:element name="Rule" type="Rule" minOccurs="1" maxOccurs="1"/>
+           <xs:element name="DisableEntityHighlighting" type="xs:boolean" minOccurs="0" maxOccurs="1"/>
+           <xs:element ref="mailor:VersionOverrides" minOccurs="0" maxOccurs="1"/>
+           <xs:any id="MailAppSignature" minOccurs="0" maxOccurs="1" namespace="http://www.w3.org/2000/09/xmldsig#" processContents="lax"/>
+         </xs:sequence>
+       </xs:extension>
+     </xs:complexContent>
+   </xs:complexType>
+   <xs:element name="OfficeApp" type="OfficeApp"/>
+ </xs:schema>

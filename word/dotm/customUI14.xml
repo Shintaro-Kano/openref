@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- OpenRef for Word のリボン（Startup テンプレート OpenRef.dotm）。参照設定タブの直後に出る。
+     コールバックは word/dotm/ORRibbon.bas。image は scripts/build-word-dotm.py の IMAGES（word/assets/*-80.png） -->
+<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui" onLoad="OR_RibbonLoad">
+  <ribbon>
+    <tabs>
+      <tab id="OpenRefTab" label="OpenRef" insertAfterMso="TabReferences">
+        <group id="OpenRefGroup" label="OpenRef">
+          <button id="OpenRefAddEdit" size="large" image="add-edit" label="Add/Edit Citation" onAction="OR_AddEdit"
+            screentip="Add/Edit Citation" supertip="蔵書を検索してカーソル位置に引用を挿入。引用の中にカーソルを置いて押すとその引用を編集" />
+          <button id="OpenRefUpdate" size="large" image="update" label="Update Citations and Bibliography" onAction="OR_Update"
+            screentip="Update Citations and Bibliography" supertip="文書内の引用番号と文献リスト（References）を最新の書誌・スタイルで再生成" />
+          <menu id="OpenRefTools" size="large" image="settings" label="Settings and Tools"
+            screentip="Settings and Tools" supertip="引用スタイル・文書の設定・文献リストの移動・引用コードの削除">
+            <button id="OpenRefStyle" label="Citation Style..." onAction="OR_Style"
+              screentip="Citation Style..." supertip="この文書の引用スタイルを変更（導入済みスタイルから選択）" />
+            <button id="OpenRefDocSettings" label="Document Settings..." onAction="OR_DocSettings"
+              screentip="Document Settings..." supertip="DOI / URL を常に含める・引用と文献リストのフォント" />
+            <menuSeparator id="OpenRefSep1" />
+            <button id="OpenRefMoveBib" label="Move bibliography here" onAction="OR_MoveBib"
+              screentip="Move bibliography here" supertip="文献リスト（References）をカーソル位置へ移動" />
+            <button id="OpenRefRemoveCodes" label="Remove Citation Codes" onAction="OR_RemoveCodes"
+              screentip="Remove Citation Codes" supertip="引用と文献リストを通常のテキストに変換（投稿用・元に戻せません）" />
+            <menuSeparator id="OpenRefSep2" />
+            <button id="OpenRefDiagnostics" label="Show Diagnostics..." onAction="OR_Diagnostics"
+              screentip="Show Diagnostics..." supertip="接続状態・スタイル・引用数などの診断情報を表示" />
+          </menu>
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenRef — 引用</title>
+  <script>
+    // Startup テンプレート版（?host=dotm = OpenRef Dialog.app の WKWebView）は office.js を読まない。Office では従来どおり同期読込
+    if (!/[?&]host=dotm(&|$)/.test(location.search)) document.write('<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"><\/script>');
+  </script>
+  <link rel="stylesheet" href="/word/dialog.css" />
+</head>
+<body class="rd-body">
+  <div class="rd-page">
+    <div class="rd-searchbar">
+      <div class="rd-search" id="rd-search">
+        <!-- 選択済みのチップは cite-dialog.js が検索欄の前に差し込む -->
+        <input id="rd-q" class="rd-q" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+          placeholder="蔵書を検索（著者・タイトル・誌名・年）" aria-label="蔵書を検索" />
+        <button id="rd-clear" class="rd-clear" type="button" title="入力をクリア" aria-label="入力をクリア" hidden>×</button>
+      </div>
+    </div>
+    <div id="rd-note" class="rd-note" hidden></div>
+    <div id="rd-results" class="rd-results" role="listbox" aria-label="検索結果"></div>
+    <div class="rd-actions">
+      <button id="rd-cancel" class="rd-btn" type="button">キャンセル</button>
+      <button id="rd-ok" class="rd-btn rd-primary" type="button" disabled>挿入</button>
+    </div>
+    <div class="rd-footer">
+      <span id="rd-style"></span>
+      <span>↑↓ 選択 · Enter 追加 · ⌘Enter 確定 · Esc キャンセル</span>
+    </div>
+  </div>
+  <script src="/word/dialog-common.js"></script>
+  <script src="/word/cite-dialog.js"></script>
+</body>
+</html>

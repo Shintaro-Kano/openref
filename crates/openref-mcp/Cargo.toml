@@ -1,0 +1,14 @@
+[package]
+name = "openref-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
+openref-core = { path = "../openref-core" }
+
+[[bin]]
+name = "openref-mcp"
+path = "src/main.rs"

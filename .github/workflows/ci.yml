@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test & Validate (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Cargo tests (workspace)
+        run: cargo test --workspace --locked
+
+      - name: Frontend build & Svelte check
+        working-directory: app
+        run: npm run build
+
+      - name: Viewer & i18n unit tests
+        run: |
+          node app/src/lib/viewer/util.test.mjs
+          node app/src/lib/i18n.test.mjs
+
+      - name: Word add-in tests & XSD validation
+        run: |
+          node word/test-cite.cjs
+          node word/test-types.cjs
+          node word/test-styles.cjs
+          node word/test-commands.cjs
+          node word/test-dotm-render.cjs
+          node word/test-dialog-dotm.cjs
+          xmllint --noout --schema word/xsd/OfficeAppManifestV1_1.xsd word/manifest.xml
+          python3 word/dotm/test-build.py
+
+      - name: Shell script syntax & License audit
+        run: |
+          bash -n site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh
+          python3 scripts/check-licenses.py

@@ -1,0 +1,21 @@
+[package]
+name = "openref-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+roxmltree.workspace = true
+fastrand.workspace = true
+walkdir.workspace = true
+unicode-normalization.workspace = true
+time.workspace = true
+regex.workspace = true
+pdf-extract = "0.12"
+md5 = "0.7"

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>OpenRef</title>
+  <!-- 挿入 > アドイン から開いたときの入口（manifest の DefaultSettings）。操作はリボンの OpenRef タブで行う。
+       ここは使い方と診断の表示だけ（Office 層は doc.js を共用） -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="/word/doc.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --tp-text: #1f2328; --tp-dim: #5f6b7a; --tp-line: #e3e7eb; --tp-accent: #1a73e8; --tp-danger: #c5221f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 14px; background: #ffffff; color: var(--tp-text);
+      font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Segoe UI", sans-serif;
+    }
+    .tp-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .tp-head img { width: 32px; height: 32px; }
+    .tp-head h1 { font-size: 16px; margin: 0; }
+    h2 { font-size: 12px; color: var(--tp-dim); letter-spacing: .4px; margin: 18px 0 6px; }
+    ul { margin: 0; padding-left: 18px; }
+    li { margin: 4px 0; }
+    .tp-hint { color: var(--tp-dim); font-size: 12px; }
+    .tp-diag { white-space: pre-wrap; background: #f6f8fa; border: 1px solid var(--tp-line); border-radius: 6px; padding: 8px 10px; font-size: 12px; }
+    .tp-err { color: var(--tp-danger); }
+  </style>
+</head>
+<body>
+  <div class="tp-head">
+    <img src="/word/assets/icon-80.png" alt="" />
+    <h1>OpenRef</h1>
+  </div>
+  <p>引用の挿入・更新はリボンの <b>OpenRef</b> タブから行います（このパネルは使い方と診断の表示だけです）。</p>
+  <ul>
+    <li><b>Add/Edit Citation</b> — カーソル位置に […] を仮置き → 蔵書を検索して挿入。引用の中にカーソルを置いて押すとその引用を編集</li>
+    <li><b>Update Citations and Bibliography</b> — 引用番号と文献リスト（References）を再生成</li>
+    <li><b>Settings and Tools ▾</b> — 引用スタイル / 文書の設定（DOI・フォント）/ 文献リストをここへ移動 / 引用コードの削除 / 診断</li>
+  </ul>
+  <p class="tp-hint">OpenRef タブが見えない時は Word を ⌘Q で終了して再起動してください。</p>
+
+  <h2>診断</h2>
+  <div id="tp-diag" class="tp-diag">確認中…</div>
+
+  <script>
+    (function () {
+      "use strict";
+      var box = document.getElementById("tp-diag");
+      function show(lines, err) {
+        box.textContent = lines.join("\n");
+        box.classList.toggle("tp-err", !!err);
+      }
+      function conn(c) {
+        return c && c.ok
+          ? "connectd: 接続 OK（v" + c.version + "・蔵書 " + c.items + " 件・DB v" + c.db_version + "）"
+          : "connectd: 接続できません（" + ((c && c.error) || "不明") + "）";
+      }
+      function run(info) {
+        var head = "OpenRef Word アドイン " + OpenRefDoc.VERSION;
+        if (!info || info.host !== Office.HostType.Word) {
+          // Office の外（ブラウザで直接開いた）: 接続だけ見る
+          OpenRefDoc.fetchJson("/api/status").then(
+            function (c) { show([head, conn(c), "文書: Word の外で開いています"]); },
+            function (e) { show([head, conn({ ok: false, error: e.message })], true); }
+          );
+          return;
+        }
+        OpenRefDoc.diagnostics().then(function (g) {
+          var d = g.doc || {};
+          show([
+            head,
+            conn(g.connectd),
+            d.error
+              ? "文書: 読み取れません（" + d.error + "）"
+              : "文書: 引用 " + d.cites + " 箇所 · 文献 " + d.items + " 本 · 文献リスト " + (d.bib ? "あり" : "なし") +
+                " · スタイル " + d.styleTitle,
+          ]);
+        }, function (e) { show([head, "診断に失敗: " + e.message], true); });
+      }
+      if (typeof Office === "undefined") {
+        show(["office.js を読み込めません（ネットワークを確認してください）"], true);
+      } else {
+        Office.onReady(run);
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+  <Id>1f6b8a3e-4c7d-4d2a-9b8e-5a0c2e7d9f11</Id>
+  <Version>1.2.0.0</Version>
+  <ProviderName>OpenRef</ProviderName>
+  <DefaultLocale>ja-JP</DefaultLocale>
+  <DisplayName DefaultValue="OpenRef for Word" />
+  <Description DefaultValue="OpenRef for Word — ローカル文献管理の引用ツール（Add/Edit Citation・Update Citations and Bibliography・Settings and Tools）" />
+  <IconUrl DefaultValue="https://localhost:23120/word/assets/icon-32.png?v=1.2.0" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:23120/word/assets/icon-80.png?v=1.2.0" />
+  <SupportUrl DefaultValue="https://localhost:23120/word/taskpane.html" />
+  <AppDomains>
+    <AppDomain>https://localhost:23120</AppDomain>
+  </AppDomains>
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+  <Requirements>
+    <Sets DefaultMinVersion="1.3">
+      <Set Name="WordApi" MinVersion="1.3" />
+    </Sets>
+  </Requirements>
+  <DefaultSettings>
+    <!-- TaskPaneApp の必須要素。挿入 > アドイン から開いたときの入口（使い方と診断のみ。操作はリボンの OpenRef タブ） -->
+    <SourceLocation DefaultValue="https://localhost:23120/word/taskpane.html" />
+  </DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <!-- 関数コマンドの置き場（画面なし）。ボタンはすべて ExecuteFunction = Paperpile と同じくサイドパネルを使わない -->
+          <FunctionFile resid="OpenRef.Url.Commands" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <!-- 独自タブ（Word では InsertAfter / InsertBefore は使えない = タブは右端に出る） -->
+            <CustomTab id="OpenRef.Tab">
+              <Group id="OpenRef.Group">
+                <Label resid="OpenRef.Group.Label" />
+                <Icon>
+                  <bt:Image size="16" resid="OpenRef.Icon16" />
+                  <bt:Image size="32" resid="OpenRef.Icon32" />
+                  <bt:Image size="80" resid="OpenRef.Icon80" />
+                </Icon>
+                <Control xsi:type="Button" id="OpenRef.AddEdit">
+                  <Label resid="OpenRef.AddEdit.Label" />
+                  <Supertip>
+                    <Title resid="OpenRef.AddEdit.Label" />
+                    <Description resid="OpenRef.AddEdit.Tip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="OpenRef.AddEdit16" />
+                    <bt:Image size="32" resid="OpenRef.AddEdit32" />
+                    <bt:Image size="80" resid="OpenRef.AddEdit80" />
+                  </Icon>
+                  <Action xsi:type="ExecuteFunction">
+                    <FunctionName>addEditCitation</FunctionName>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="OpenRef.Update">
+                  <Label resid="OpenRef.Update.Label" />
+                  <Supertip>
+                    <Title resid="OpenRef.Update.Label" />
+                    <Description resid="OpenRef.Update.Tip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="OpenRef.Update16" />
+                    <bt:Image size="32" resid="OpenRef.Update32" />
+                    <bt:Image size="80" resid="OpenRef.Update80" />
+                  </Icon>
+                  <Action xsi:type="ExecuteFunction">
+                    <FunctionName>updateCitations</FunctionName>
+                  </Action>
+                </Control>
+                <Control xsi:type="Menu" id="OpenRef.Tools">
+                  <Label resid="OpenRef.Tools.Label" />
+                  <Supertip>
+                    <Title resid="OpenRef.Tools.Label" />
+                    <Description resid="OpenRef.Tools.Tip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="OpenRef.Settings16" />
+                    <bt:Image size="32" resid="OpenRef.Settings32" />
+                    <bt:Image size="80" resid="OpenRef.Settings80" />
+                  </Icon>
+                  <Items>
+                    <Item id="OpenRef.Tools.Style">
+                      <Label resid="OpenRef.Style.Label" />
+                      <Supertip>
+                        <Title resid="OpenRef.Style.Label" />
+                        <Description resid="OpenRef.Style.Tip" />
+                      </Supertip>
+                      <Icon>
+                        <bt:Image size="16" resid="OpenRef.Icon16" />
+                        <bt:Image size="32" resid="OpenRef.Icon32" />
+                        <bt:Image size="80" resid="OpenRef.Icon80" />
+                      </Icon>
+                      <Action xsi:type="ExecuteFunction">
+                        <FunctionName>citationStyle</FunctionName>
+                      </Action>
+                    </Item>
+                    <Item id="OpenRef.Tools.DocSettings">
+                      <Label resid="OpenRef.DocSet.Label" />
+                      <Supertip>
+                        <Title resid="OpenRef.DocSet.Label" />
+                        <Description resid="OpenRef.DocSet.Tip" />
+                      </Supertip>
+                      <Icon>
+                        <bt:Image size="16" resid="OpenRef.Icon16" />
+                        <bt:Image size="32" resid="OpenRef.Icon32" />
+                        <bt:Image size="80" resid="OpenRef.Icon80" />
+                      </Icon>
+                      <Action xsi:type="ExecuteFunction">
+                        <FunctionName>documentSettings</FunctionName>
+                      </Action>
+                    </Item>
+                    <Item id="OpenRef.Tools.MoveBib">
+                      <Label resid="OpenRef.Move.Label" />
+                      <Supertip>
+                        <Title resid="OpenRef.Move.Label" />
+                        <Description resid="OpenRef.Move.Tip" />
+                      </Supertip>
+                      <Icon>
+                        <bt:Image size="16" resid="OpenRef.Icon16" />
+                        <bt:Image size="32" resid="OpenRef.Icon32" />
+                        <bt:Image size="80" resid="OpenRef.Icon80" />
+                      </Icon>
+                      <Action xsi:type="ExecuteFunction">
+                        <FunctionName>moveBibliography</FunctionName>
+                      </Action>
+                    </Item>
+                    <Item id="OpenRef.Tools.RemoveCodes">
+                      <Label resid="OpenRef.Remove.Label" />
+                      <Supertip>
+                        <Title resid="OpenRef.Remove.Label" />
+                        <Description resid="OpenRef.Remove.Tip" />
+                      </Supertip>
+                      <Icon>
+                        <bt:Image size="16" resid="OpenRef.Icon16" />
+                        <bt:Image size="32" resid="OpenRef.Icon32" />
+                        <bt:Image size="80" resid="OpenRef.Icon80" />
+                      </Icon>
+                      <Action xsi:type="ExecuteFunction">
+                        <FunctionName>removeCitationCodes</FunctionName>
+                      </Action>
+                    </Item>
+                    <Item id="OpenRef.Tools.Diagnostics">
+                      <Label resid="OpenRef.Diag.Label" />
+                      <Supertip>
+                        <Title resid="OpenRef.Diag.Label" />
+                        <Description resid="OpenRef.Diag.Tip" />
+                      </Supertip>
+                      <Icon>
+                        <bt:Image size="16" resid="OpenRef.Icon16" />
+                        <bt:Image size="32" resid="OpenRef.Icon32" />
+                        <bt:Image size="80" resid="OpenRef.Icon80" />
+                      </Icon>
+                      <Action xsi:type="ExecuteFunction">
+                        <FunctionName>showDiagnostics</FunctionName>
+                      </Action>
+                    </Item>
+                  </Items>
+                </Control>
+              </Group>
+              <Label resid="OpenRef.Tab.Label" />
+            </CustomTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="OpenRef.Icon16" DefaultValue="https://localhost:23120/word/assets/icon-16.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Icon32" DefaultValue="https://localhost:23120/word/assets/icon-32.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Icon80" DefaultValue="https://localhost:23120/word/assets/icon-80.png?v=1.2.0" />
+        <bt:Image id="OpenRef.AddEdit16" DefaultValue="https://localhost:23120/word/assets/add-edit-16.png?v=1.2.0" />
+        <bt:Image id="OpenRef.AddEdit32" DefaultValue="https://localhost:23120/word/assets/add-edit-32.png?v=1.2.0" />
+        <bt:Image id="OpenRef.AddEdit80" DefaultValue="https://localhost:23120/word/assets/add-edit-80.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Update16" DefaultValue="https://localhost:23120/word/assets/update-16.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Update32" DefaultValue="https://localhost:23120/word/assets/update-32.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Update80" DefaultValue="https://localhost:23120/word/assets/update-80.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Settings16" DefaultValue="https://localhost:23120/word/assets/settings-16.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Settings32" DefaultValue="https://localhost:23120/word/assets/settings-32.png?v=1.2.0" />
+        <bt:Image id="OpenRef.Settings80" DefaultValue="https://localhost:23120/word/assets/settings-80.png?v=1.2.0" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="OpenRef.Url.Commands" DefaultValue="https://localhost:23120/word/commands.html" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="OpenRef.Tab.Label" DefaultValue="OpenRef" />
+        <bt:String id="OpenRef.Group.Label" DefaultValue="OpenRef" />
+        <bt:String id="OpenRef.AddEdit.Label" DefaultValue="Add/Edit Citation" />
+        <bt:String id="OpenRef.Update.Label" DefaultValue="Update Citations and Bibliography" />
+        <bt:String id="OpenRef.Tools.Label" DefaultValue="Settings and Tools" />
+        <bt:String id="OpenRef.Style.Label" DefaultValue="Citation Style..." />
+        <bt:String id="OpenRef.DocSet.Label" DefaultValue="Document Settings..." />
+        <bt:String id="OpenRef.Move.Label" DefaultValue="Move bibliography here" />
+        <bt:String id="OpenRef.Remove.Label" DefaultValue="Remove Citation Codes" />
+        <bt:String id="OpenRef.Diag.Label" DefaultValue="Show Diagnostics..." />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="OpenRef.AddEdit.Tip" DefaultValue="蔵書を検索してカーソル位置に引用を挿入。引用の中にカーソルを置いて押すとその引用を編集" />
+        <bt:String id="OpenRef.Update.Tip" DefaultValue="文書内の引用番号と文献リスト（References）を最新の書誌・スタイルで再生成" />
+        <bt:String id="OpenRef.Tools.Tip" DefaultValue="引用スタイル・文書の設定・文献リストの移動・引用コードの削除" />
+        <bt:String id="OpenRef.Style.Tip" DefaultValue="この文書の引用スタイルを変更（導入済みスタイルから選択）" />
+        <bt:String id="OpenRef.DocSet.Tip" DefaultValue="DOI / URL を常に含める・引用と文献リストのフォント" />
+        <bt:String id="OpenRef.Move.Tip" DefaultValue="文献リスト（References）をカーソル位置へ移動" />
+        <bt:String id="OpenRef.Remove.Tip" DefaultValue="引用と文献リストを通常のテキストに変換（投稿用・元に戻せません）" />
+        <bt:String id="OpenRef.Diag.Tip" DefaultValue="接続状態・スタイル・引用数などの診断情報を表示" />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
