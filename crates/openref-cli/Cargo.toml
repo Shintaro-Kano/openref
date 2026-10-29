@@ -13,3 +13,6 @@ openref-core = { path = "../openref-core" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

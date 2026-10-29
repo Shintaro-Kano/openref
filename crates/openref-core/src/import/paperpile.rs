@@ -7,7 +7,245 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use unicode_normalization::UnicodeNormalization;
+
+/// Normalize without opening a database or contacting any network service.
+/// Current array/attachment shape verified with a 2026-10-27 Paperpile export.
+/// A second observed export includes labels/labelsNamed. Folder hierarchy and
+/// notes remain unverified rather than guessed from the old importer.
+pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super::ImportInput> {
+    use std::collections::BTreeMap;
+    if source.format != "paperpile" {
+        return Err(CoreError::BadInput(
+            "Paperpile adapter の移行元形式が一致しません".into(),
+        ));
+    }
+    let bytes = std::fs::read(json_path)?;
+    let data: Value = serde_json::from_slice(&bytes)?;
+    let records = data
+        .as_array()
+        .ok_or_else(|| CoreError::Parse("Paperpile JSON: 配列ではありません".into()))?;
+    let mut folders = BTreeMap::new();
+    let mut items = Vec::with_capacity(records.len());
+    for (position, rec) in records.iter().enumerate() {
+        if !rec.is_object() {
+            return Err(CoreError::Parse(format!(
+                "Paperpile JSON: レコード {} がオブジェクトではありません",
+                position + 1
+            )));
+        }
+        let mut warnings = Vec::new();
+        let (csl, folder_paths) = match record_to_csl(rec) {
+            Some((csl, extras)) => (csl, extras.folders),
+            None => {
+                warnings.push(
+                    "題名のない元レコードを document として保持します。書誌は補っていません".into(),
+                );
+                (json!({"type":"document"}), Vec::new())
+            }
+        };
+        let mut folder_ids = Vec::new();
+        // Only the explicitly named legacy path field is split. Current opaque
+        // folder IDs and Zotero collection names must never be split on '/'.
+        for path in folder_paths {
+            let mut parent_id = None;
+            let mut current = String::new();
+            for name in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(name);
+                let id = format!("legacy-path:{current}");
+                folders
+                    .entry(id.clone())
+                    .or_insert_with(|| super::ImportFolder {
+                        id: id.clone(),
+                        stable_id: false,
+                        name: name.into(),
+                        parent_id: parent_id.clone(),
+                        raw: json!({"foldersNamed": path}),
+                    });
+                parent_id = Some(id);
+            }
+            if let Some(id) = parent_id {
+                folder_ids.push(id);
+            }
+        }
+        for field in ["folders", "notes"] {
+            if rec.get(field).is_some_and(|v| {
+                !v.is_null() && v != &json!([]) && v != &json!({}) && v != &json!("")
+            }) {
+                warnings.push(format!(
+                    "{field}: 実出力の形式が未検証のため未変換です。元レコードに保持しています"
+                ));
+            }
+        }
+        let mut tags = Vec::new();
+        let label_names = rec.get("labelsNamed").and_then(Value::as_array);
+        let label_ids = rec.get("labels").and_then(Value::as_array);
+        if matches!((label_names,label_ids),(Some(names),Some(ids)) if names.len()!=ids.len()) {
+            warnings.push("labels と labelsNamed の件数が異なるため、名前でタグを保持し、ID 対応は原情報に残します".into());
+        }
+        if let Some(names) = label_names {
+            for (n, name) in names.iter().enumerate() {
+                let Some(name) = name.as_str().filter(|s| !s.trim().is_empty()) else {
+                    warnings.push("空または未対応の labelsNamed を元レコードに保持しました".into());
+                    continue;
+                };
+                let original_id = label_ids
+                    .filter(|ids| ids.len() == names.len())
+                    .and_then(|ids| ids[n].as_str());
+                tags.push(super::ImportTag {
+                    id: original_id.map(str::to_string).unwrap_or_else(|| {
+                        format!("label-name:{}", super::files::digest(name.as_bytes()))
+                    }),
+                    stable_id: false,
+                    name: name.into(),
+                    color: None,
+                    raw: json!({"id":original_id,"name":name}),
+                });
+            }
+        }
+        if label_ids.is_some_and(|ids| !ids.is_empty()) && tags.is_empty() {
+            warnings.push(
+                "labels: 名前を取得できないため未変換です。元レコードに保持しています".into(),
+            );
+        }
+        let handled = [
+            "_id",
+            "title",
+            "abstract",
+            "author",
+            "journalfull",
+            "journal",
+            "issn",
+            "volume",
+            "issue",
+            "pages",
+            "publisher",
+            "language",
+            "pmid",
+            "pmc",
+            "keywords",
+            "doi",
+            "url",
+            "published",
+            "accessed",
+            "foldersNamed",
+            "folders",
+            "notes",
+            "labels",
+            "labelsNamed",
+            "attachments",
+            "created",
+            "citekey",
+            "sha1",
+            "kind",
+            "pubtype",
+        ];
+        let internal = ["owner", "dup_sha1", "incomplete", "pdf_restricted"];
+        let unmapped: Vec<_> = rec
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, value)| {
+                !handled.contains(&key.as_str())
+                    && !internal.contains(&key.as_str())
+                    && !value.is_null()
+                    && **value != json!("")
+                    && **value != json!([])
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if !unmapped.is_empty() {
+            warnings.push(format!(
+                "UI/引用に未反映のフィールドを元レコードに保持: {}",
+                unmapped.join(", ")
+            ));
+        }
+        if rec
+            .get("url")
+            .and_then(Value::as_array)
+            .is_some_and(|urls| urls.len() > 1)
+        {
+            warnings.push("URL は先頭を引用用に採用し、残りを元レコードに保持します".into());
+        }
+        if !matches!(
+            rec.get("pubtype").and_then(Value::as_str),
+            None | Some("PP_ARTICLE")
+        ) {
+            warnings.push("論文以外の Paperpile 種別は実標本が未取得です。未反映の書誌項目は元レコードに保持しています".into());
+        }
+        let mut attachments = Vec::new();
+        if let Some(atts) = rec.get("attachments") {
+            let atts = atts.as_array().ok_or_else(|| {
+                CoreError::Parse(format!(
+                    "レコード {} の attachments が配列ではありません",
+                    position + 1
+                ))
+            })?;
+            for (n, att) in atts.iter().enumerate() {
+                let filename = att.get("filename").and_then(Value::as_str).unwrap_or("");
+                // Verified relationship in the sample: JSON All Papers/K/...,
+                // ZIP Paperpile files/K/.... Keep the complete relative suffix.
+                let alternative_paths = zip_layout_paths(filename);
+                attachments.push(super::ImportAttachment {
+                    stable_id: false,
+                    id: att
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("attachment:{n}")),
+                    path: filename.into(),
+                    alternative_paths,
+                    media_type: att
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    raw: att.clone(),
+                });
+            }
+        }
+        items.push(super::ImportItem {
+            id: rec
+                .get("_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("record:{position}")),
+            // A single export proves presence, not stability across re-exports.
+            stable_id: false,
+            csl,
+            date_added: rec
+                .get("created")
+                .and_then(Value::as_f64)
+                .and_then(unix_to_sqlite),
+            raw: rec.clone(),
+            folder_ids,
+            tags,
+            notes: Vec::new(),
+            attachments,
+            warnings,
+        });
+    }
+    let has_tags = items.iter().any(|item| !item.tags.is_empty());
+    let mut input=super::ImportInput {
+        source, adopt_legacy_paperpile_ids:false, input_sha256: super::files::digest(&bytes), adapter_version: "paperpile-array-v1".into(),
+        items, folders: folders.into_values().collect(),
+        warnings: vec![
+            "Paperpile の現行配列形式と labelsNamed のタグ名を確認済み。フォルダ階層・ノート・空フォルダ・独立添付は未検証です".into(),
+            "元レコードと内部 CSL は別々に保持します。この事前確認では DB への保存は行いません".into(),
+            "内容変更後の再書出しにおける元 ID の安定性は未検証です。同一入力ダイジェスト内だけで照合します".into(),
+        ],
+    };
+    if has_tags {
+        input.warnings.push(
+            "元のタグ色は JSON に含まれないため、OpenRef 側の既定色または既存の色を使用します"
+                .into(),
+        );
+    }
+    Ok(input)
+}
 
 #[derive(Debug)]
 pub struct ImportReport {
@@ -345,17 +583,26 @@ fn unix_to_sqlite(ts: f64) -> Option<String> {
     odt.format(&fmt).ok()
 }
 
-/// Drive mount 内の相対パス解決。NFC/NFD の揺れに両対応（日本語ファイル名対策）。
+/// Verified from the supplied JSON + ZIP pair; never a basename search.
+fn zip_layout_paths(filename: &str) -> Vec<String> {
+    filename
+        .strip_prefix("All Papers/")
+        .map(|suffix| vec![format!("Paperpile files/{suffix}"), suffix.to_string()])
+        .unwrap_or_default()
+}
+
+/// Legacy CLI still links PDFs, but uses the same explicit-root safety checks
+/// and the observed ZIP layout. Ambiguous/unsafe paths remain unresolved.
 fn resolve_in_mount(mount: &Path, rel: &str) -> Option<PathBuf> {
-    let nfc: String = rel.nfc().collect();
-    let nfd: String = rel.nfd().collect();
-    for cand in [rel, nfc.as_str(), nfd.as_str()] {
-        let p = mount.join(cand);
-        if p.exists() {
-            return Some(p);
-        }
+    let roots = super::files::AttachmentRoots::new(&[mount.to_path_buf()]).ok()?;
+    let alternatives = zip_layout_paths(rel);
+    let paths: Vec<_> = std::iter::once(rel)
+        .chain(alternatives.iter().map(String::as_str))
+        .collect();
+    match roots.resolve_candidates(&paths).ok()? {
+        super::files::ResolvedPath::Found { path } => Some(path),
+        _ => None,
     }
-    None
 }
 
 /// dedup 三段キー: PMID → DOI → Paperpile _id（DOI・PMID を持たない和文誌等の再 import 重複防止）

@@ -4,6 +4,7 @@ use openref_core::{annotate, citestyle, collections, datadir, edit, ingest, pdfi
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
+mod migration;
 
 struct AppState {
     db: Arc<Mutex<Db>>,
@@ -21,6 +22,77 @@ fn err(e: impl std::fmt::Display) -> String {
 /// DB のロック（poisoned なら Err）。`lock(&state.db)` / spawn_blocking に持ち込んだ Arc には `lock(&db)`
 fn lock(m: &Mutex<Db>) -> Result<MutexGuard<'_, Db>, String> {
     m.lock().map_err(err)
+}
+
+fn migration_db(state: &AppState) -> Result<PathBuf, String> {
+    lock(&state.db)?
+        .conn
+        .path()
+        .map(PathBuf::from)
+        .ok_or_else(|| "移行先 DB のパスがありません".into())
+}
+#[tauri::command]
+fn migration_preview(
+    state: tauri::State<AppState>,
+    jobs: tauri::State<migration::Jobs>,
+    config: migration::Config,
+) -> Result<String, String> {
+    jobs.preview(migration_db(&state)?, config)
+}
+#[tauri::command]
+fn migration_status(
+    jobs: tauri::State<migration::Jobs>,
+) -> Result<Option<migration::Status>, String> {
+    jobs.status()
+}
+#[tauri::command]
+fn migration_start(jobs: tauri::State<migration::Jobs>, id: String) -> Result<(), String> {
+    jobs.start(&id)
+}
+#[tauri::command]
+fn migration_cancel(jobs: tauri::State<migration::Jobs>, id: String) -> Result<(), String> {
+    jobs.cancel(&id)
+}
+#[tauri::command]
+fn migration_index(jobs: tauri::State<migration::Jobs>, id: String) -> Result<(), String> {
+    jobs.index(&id)
+}
+#[tauri::command]
+async fn migration_select_report(
+    state: tauri::State<'_, AppState>,
+    jobs: tauri::State<'_, migration::Jobs>,
+    run: String,
+) -> Result<(), String> {
+    let db = migration_db(&state)?;
+    let jobs = jobs.inner().clone();
+    blocking(move || jobs.select_report(db, &run)).await
+}
+#[tauri::command]
+async fn migration_save_report(
+    jobs: tauri::State<'_, migration::Jobs>,
+    id: String,
+    path: PathBuf,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    blocking(move || jobs.save_report(&id, path)).await
+}
+#[tauri::command]
+async fn migration_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let path = migration_db(&state)?;
+    blocking(move || {
+        let history = openref_core::import::apply::history(&path).map_err(err)?;
+        Ok(history
+            .into_iter()
+            .take(50)
+            .map(|mut entry| {
+                entry.as_object_mut().unwrap().remove("report");
+                entry
+            })
+            .collect())
+    })
+    .await
 }
 
 /// main thread から外して待つ（同期 command は main thread で走る）。JoinError も Err(String) に落とす
@@ -164,7 +236,12 @@ fn attachment_path(db: &Db, id: i64) -> Result<String, String> {
 /// 読込は spawn_blocking（同期 command は main thread で走る）
 #[tauri::command]
 async fn attachment_data(state: tauri::State<'_, AppState>, id: i64) -> Result<tauri::ipc::Response, String> {
-    let path = attachment_path(&*lock(&state.db)?, id)?;
+    let path = {
+        let db = lock(&state.db)?;
+        let path = attachment_path(&db, id)?;
+        openref_core::db::reject_connection_file(&db.conn, std::path::Path::new(&path)).map_err(err)?;
+        path
+    };
     let bytes = blocking(move || std::fs::read(&path).map_err(|e| format!("{path}: {e}"))).await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
@@ -873,6 +950,7 @@ fn main() {
         .manage(AppState {
             db: Arc::new(Mutex::new(db)),
         })
+        .manage(migration::Jobs::default())
         .invoke_handler(tauri::generate_handler![
             list_items,
             get_item,
@@ -880,6 +958,14 @@ fn main() {
             view_counts,
             quick_add,
             import_pdf,
+            migration_preview,
+            migration_status,
+            migration_start,
+            migration_cancel,
+            migration_index,
+            migration_select_report,
+            migration_history,
+            migration_save_report,
             attach_pdf,
             fetch_pdf,
             set_star,
@@ -941,6 +1027,14 @@ fn main() {
 mod parity {
     /// GUI 専用の command と理由。理由が弱くなったら登録表へ移す（入れる方が安全）
     const GUI_ONLY: &[(&str, &str)] = &[
+        ("migration_preview", "GUI のバックグラウンド移行ジョブ。CLI import も同じ core の事前確認を使う"),
+        ("migration_status", "GUI の移行ジョブの進捗。永続結果は CLI import history/report で取得可能"),
+        ("migration_start", "利用者が GUI で確認した入力だけを背景で適用。CLI import が同じ core を使う"),
+        ("migration_cancel", "GUI が保持する移行ジョブの中止フラグ"),
+        ("migration_index", "GUI の移行済み PDF の背景索引。CLI fulltext index でも可能"),
+        ("migration_select_report", "GUI で過去の移行結果を選択。CLI import report と同じ永続結果"),
+        ("migration_history", "GUI の移行元選択用。CLI import history で取得可能"),
+        ("migration_save_report", "ネイティブ保存ダイアログで選んだ結果 JSON の保存先"),
         ("open_attachment", "デスクトップのアプリで開く = ホストの open（パスは get_item の attachments[].path）"),
         ("open_external", "ブラウザで開く = ホストの open"),
         ("attachment_data", "ビューア用の生バイト（IPC の ArrayBuffer）。エージェントは get_item の添付パスでファイルを直接読む"),

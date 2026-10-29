@@ -2,6 +2,53 @@ use crate::Result;
 use rusqlite::Connection;
 use std::path::Path;
 
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Reject DB/sidecar aliases before opening a non-SQLite descriptor. Closing
+/// even a read-only alias can release this process's POSIX SQLite locks.
+/// This stat check does not protect against a concurrent path replacement.
+pub fn reject_database_file(path: &Path, db: &Path) -> Result<()> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        let other = match std::fs::metadata(Path::new(&name)) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            meta.dev() == other.dev() && meta.ino() == other.ino()
+        };
+        #[cfg(not(unix))]
+        let same = { let _ = (&meta, &other); path.canonicalize()? == Path::new(&name).canonicalize()? };
+        if same {
+            return Err(crate::CoreError::BadInput(
+                "DB・WAL・SHM は添付や結果保存先に指定できません".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn reject_connection_file(conn: &Connection, path: &Path) -> Result<()> {
+    // Includes attached databases, if a caller uses them.
+    let mut stmt = conn.prepare("PRAGMA database_list")?;
+    for db in stmt.query_map([], |r| r.get::<_, String>(2))? {
+        let db = db?;
+        if !db.is_empty() {
+            reject_database_file(path, Path::new(&db))?;
+        }
+    }
+    Ok(())
+}
+
 pub struct Db {
     pub conn: Connection,
     /// DB ファイルパス（in-memory は None）。managed storage の位置決めに使う。
@@ -55,6 +102,19 @@ impl Db {
     }
 
     fn init(conn: Connection, path: Option<std::path::PathBuf>) -> Result<Self> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current > SCHEMA_VERSION {
+            return Err(crate::CoreError::BadInput(
+                "この DB は新しい OpenRef で作成されています。対応する版を使ってください".into(),
+            ));
+        }
+        let db = Db { conn, path };
+        // Preserve the old schema before any journal-mode or schema changes.
+        if current > 0 && current < MIGRATIONS.len() as i64 {
+            crate::backup::snapshot(&db, "pre-schema-", 5)?;
+        }
+        let Db { conn, path } = db;
         // journal_mode は行を返すので query で実行する（pragma_update は不可）
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -79,6 +139,9 @@ impl Db {
                 }
                 if v == 7 {
                     backfill_fulltext_fts_v7(&tx)?;
+                }
+                if v == 10 {
+                    crate::import::plan::create_identity_indexes(&tx)?;
                 }
                 tx.pragma_update(None, "user_version", v)?;
                 tx.commit()?;
@@ -118,7 +181,63 @@ fn backfill_journal_keys_v6(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9];
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9, SCHEMA_V10,
+];
+
+/// Import provenance stays outside CSL/FTS. Target keys deliberately have no FK:
+/// a purged target leaves a tombstone, preventing accidental resurrection.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE tags ADD COLUMN import_key TEXT;
+CREATE UNIQUE INDEX idx_tags_import_key ON tags(import_key) WHERE import_key IS NOT NULL;
+CREATE TABLE import_sources (
+  id TEXT PRIMARY KEY,
+  format TEXT NOT NULL,
+  date_added TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE import_runs (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES import_sources(id),
+  input_sha256 TEXT NOT NULL,
+  adapter_version TEXT NOT NULL,
+  attachment_mode TEXT NOT NULL CHECK (attachment_mode IN ('copy','link')),
+  state TEXT NOT NULL CHECK (state IN ('running','finished','cancelled','interrupted','failed')),
+  input_json TEXT NOT NULL CHECK (json_valid(input_json)),
+  report_json TEXT,
+  backup_path TEXT,
+  date_added TEXT NOT NULL DEFAULT (datetime('now')),
+  date_finished TEXT
+);
+CREATE TABLE import_objects (
+  source_id TEXT NOT NULL REFERENCES import_sources(id),
+  kind TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  raw_json TEXT NOT NULL CHECK (json_valid(raw_json)),
+  content_sha256 TEXT NOT NULL,
+  PRIMARY KEY (source_id,kind,scope,object_id)
+);
+CREATE INDEX idx_import_objects_target ON import_objects(kind,target_key);
+CREATE TABLE import_results (
+  run_id TEXT NOT NULL REFERENCES import_runs(id),
+  ordinal INTEGER NOT NULL,
+  result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+  PRIMARY KEY (run_id,ordinal)
+);
+CREATE TABLE import_files (
+  run_id TEXT NOT NULL REFERENCES import_runs(id),
+  key TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  staging_path TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  owns_staging INTEGER NOT NULL DEFAULT 0,
+  file_device TEXT,
+  file_inode TEXT,
+  state TEXT NOT NULL CHECK (state IN ('planned','ready','attached','cleaned'))
+);
+"#;
 
 /// v9: `attachments.doi_check` — 自動取得（pdffetch の DOI 起点連鎖）した PDF の同一性照合の結果を添付行に永続化する。
 /// 'match' = 冒頭 2 頁に目的 DOI があった / 'unknown' = DOI で照合を試みたが本文に目的 DOI も別 DOI も無く、未確認のまま添付
@@ -412,7 +531,7 @@ mod tests {
         assert!(!cols(&conn).iter().any(|c| c == "doi_check"), "v8 には無い列");
         let db = Db::init(conn, None).unwrap();
         let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 9);
+        assert_eq!(v, 10);
         let c = cols(&db.conn);
         assert!(c.iter().any(|x| x == "doi_check"));
         for keep in ["id", "key", "item_id", "kind", "mode", "path", "md5", "page_count", "edition", "date_added"] {

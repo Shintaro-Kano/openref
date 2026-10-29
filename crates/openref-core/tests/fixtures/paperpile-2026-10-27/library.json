@@ -1,0 +1,311 @@
+[
+  {
+    "_id": "fixture-record-0",
+    "abstract": "fixture-abstract",
+    "accessed": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "attachments": [
+      {
+        "_id": "fixture-attachment-0-0",
+        "article_pdf": 1,
+        "created": 1750000000.0,
+        "filename": "All Papers/F/Fixture0 - Article.pdf",
+        "filesize": 100,
+        "gdrive_id": "fixture-gdrive_id",
+        "mimeType": "application/pdf",
+        "owner": "fixture-owner",
+        "pub_id": "fixture-pub_id",
+        "source_filename": "Fixture0.pdf",
+        "xor_hash": [
+          "fixture-xor_hash"
+        ]
+      }
+    ],
+    "author": [
+      {
+        "first": "Author0",
+        "last": "Fixture0",
+        "initials": "A",
+        "orcid": "0000-0000-0000-0000",
+        "formatted": "Fixture0, Author0"
+      },
+      {
+        "first": "Author1",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author1"
+      },
+      {
+        "first": "Author2",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author2"
+      },
+      {
+        "first": "Author3",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author3"
+      },
+      {
+        "first": "Author4",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author4"
+      },
+      {
+        "first": "Author5",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author5"
+      },
+      {
+        "first": "Author6",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author6"
+      },
+      {
+        "first": "Author7",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author7"
+      },
+      {
+        "first": "Author8",
+        "last": "Fixture0",
+        "initials": "A",
+        "orcid": "0000-0000-0000-0000",
+        "formatted": "Fixture0, Author8"
+      },
+      {
+        "first": "Author9",
+        "last": "Fixture0",
+        "initials": "A",
+        "formatted": "Fixture0, Author9"
+      }
+    ],
+    "citedByLink": "fixture-citedByLink",
+    "citekey": "Fixture2026-0",
+    "copyright": "fixture-copyright",
+    "created": 1750000000.0,
+    "doi": "10.5555/fixture-0",
+    "dup_sha1": "fixture-dup_sha1",
+    "folders": [],
+    "id_list": [
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list"
+    ],
+    "incomplete": 1,
+    "issn": "fixture-issn",
+    "issn_alt": "fixture-issn_alt",
+    "journal": "fixture-journal",
+    "journalfull": "fixture-journalfull",
+    "keywords": "fixture-keywords",
+    "kind": "fixture-kind",
+    "labels": [],
+    "language": "fixture-language",
+    "owner": "fixture-owner",
+    "pdf_restricted": 1,
+    "pmid": "90000000",
+    "published": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "publisher": "fixture-publisher",
+    "pubtype": "PP_ARTICLE",
+    "sha1": "fixture-sha1",
+    "title": "Fixture article 0",
+    "url": [
+      "fixture-url",
+      "fixture-url",
+      "fixture-url",
+      "fixture-url"
+    ]
+  },
+  {
+    "_id": "fixture-record-1",
+    "abstract": "fixture-abstract",
+    "accessed": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "attachments": [
+      {
+        "_id": "fixture-attachment-1-0",
+        "article_pdf": 1,
+        "created": 1750000000.0,
+        "filename": "All Papers/F/Fixture1 - Article.pdf",
+        "filesize": 100,
+        "gdrive_id": "fixture-gdrive_id",
+        "mimeType": "application/pdf",
+        "owner": "fixture-owner",
+        "pub_id": "fixture-pub_id",
+        "source_filename": "Fixture1.pdf",
+        "xor_hash": [
+          "fixture-xor_hash"
+        ]
+      }
+    ],
+    "author": [
+      {
+        "last": "Fixture1",
+        "first": "Author0",
+        "initials": "A",
+        "formatted": "Fixture1, Author0"
+      },
+      {
+        "last": "Fixture1",
+        "first": "Author1",
+        "initials": "A",
+        "formatted": "Fixture1, Author1"
+      },
+      {
+        "last": "Fixture1",
+        "first": "Author2",
+        "initials": "A",
+        "formatted": "Fixture1, Author2"
+      },
+      {
+        "last": "Fixture1",
+        "first": "Author3",
+        "initials": "A",
+        "formatted": "Fixture1, Author3"
+      },
+      {
+        "last": "Fixture1",
+        "first": "Author4",
+        "initials": "A",
+        "formatted": "Fixture1, Author4"
+      }
+    ],
+    "citedByLink": "fixture-citedByLink",
+    "citekey": "Fixture2026-1",
+    "created": 1750000000.0,
+    "doi": "10.5555/fixture-1",
+    "dup_sha1": "fixture-dup_sha1",
+    "folders": [],
+    "id_list": [
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list"
+    ],
+    "incomplete": 1,
+    "issn": "fixture-issn",
+    "issue": "fixture-issue",
+    "journal": "fixture-journal",
+    "journalfull": "fixture-journalfull",
+    "labels": [],
+    "language": "fixture-language",
+    "owner": "fixture-owner",
+    "pdf_restricted": 1,
+    "pmid": "90000001",
+    "published": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "publisher": "fixture-publisher",
+    "pubtype": "PP_ARTICLE",
+    "sha1": "fixture-sha1",
+    "title": "Fixture article 1",
+    "url": [
+      "fixture-url",
+      "fixture-url",
+      "fixture-url",
+      "fixture-url"
+    ],
+    "volume": "fixture-volume"
+  },
+  {
+    "_id": "fixture-record-2",
+    "abstract": "fixture-abstract",
+    "accessed": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "author": [
+      {
+        "last": "Fixture2",
+        "first": "Author0",
+        "orcid": "0000-0000-0000-0000",
+        "initials": "A",
+        "formatted": "Fixture2, Author0"
+      },
+      {
+        "last": "Fixture2",
+        "first": "Author1",
+        "initials": "A",
+        "formatted": "Fixture2, Author1"
+      },
+      {
+        "last": "Fixture2",
+        "first": "Author2",
+        "orcid": "0000-0000-0000-0000",
+        "initials": "A",
+        "formatted": "Fixture2, Author2"
+      }
+    ],
+    "citedByLink": "fixture-citedByLink",
+    "citekey": "Fixture2026-2",
+    "copyright": "fixture-copyright",
+    "created": 1750000000.0,
+    "doi": "10.5555/fixture-2",
+    "dup_sha1": "fixture-dup_sha1",
+    "folders": [],
+    "id_list": [
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list",
+      "fixture-id_list"
+    ],
+    "incomplete": 1,
+    "issn": "fixture-issn",
+    "issue": "fixture-issue",
+    "journal": "fixture-journal",
+    "journalfull": "fixture-journalfull",
+    "labels": [],
+    "language": "fixture-language",
+    "owner": "fixture-owner",
+    "pages": "fixture-pages",
+    "pdf_restricted": 1,
+    "pmid": "90000002",
+    "published": {
+      "year": "2026",
+      "month": "10",
+      "day": "27"
+    },
+    "publisher": "fixture-publisher",
+    "pubtype": "PP_ARTICLE",
+    "sha1": "fixture-sha1",
+    "title": "Fixture article 2",
+    "url": [
+      "fixture-url",
+      "fixture-url",
+      "fixture-url",
+      "fixture-url"
+    ],
+    "volume": "fixture-volume"
+  }
+]

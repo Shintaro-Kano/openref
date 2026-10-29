@@ -78,6 +78,7 @@ pub fn ingest_pdf_report(db: &mut Db, pdf: &Path, opts: &IngestOpts) -> Result<I
     if !pdf.exists() {
         return Err(CoreError::NotFound(format!("file {}", pdf.display())));
     }
+    crate::db::reject_connection_file(&db.conn, pdf)?;
     let bytes = std::fs::read(pdf)?;
     let src_name = pdf
         .file_name()
@@ -373,6 +374,7 @@ fn find_item_by_md5(db: &Db, md5: &str) -> Result<Option<String>> {
 /// 既存 item への添付判断: 未添付なら添付、同一ファイル（md5）があればスキップ、別ファイルなら 2 本目。
 /// md5 列が空の既存添付は実体から計算して埋める（過去データの遅延バックフィル）。
 pub fn attach_or_skip(db: &Db, key: &str, pdf: &Path) -> Result<PdfIngestOutcome> {
+    crate::db::reject_connection_file(&db.conn, pdf)?;
     let bytes = std::fs::read(pdf)?;
     let filename = pdf
         .file_name()
@@ -410,6 +412,7 @@ pub fn attach_or_skip_with_md5(
                 if !p.exists() {
                     continue;
                 }
+                crate::db::reject_connection_file(&db.conn, p)?;
                 let h = crate::pdffetch::md5_hex(&std::fs::read(p)?);
                 db.conn
                     .execute("UPDATE attachments SET md5 = ?1 WHERE id = ?2", rusqlite::params![h, id])?;

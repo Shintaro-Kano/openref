@@ -118,14 +118,15 @@ export const app = $state({
     | "newFolder"
     | "renameFolder"
     | "deleteFolder"
-    | "manageFolders",
+    | "manageFolders"
+    | "migration",
   /** フォルダのモーダルの対象（Rename / Delete = id、New folder = parentId（null = root）） */
   folderTarget: { id: null as number | null, parentId: null as number | null },
   /** フォルダ行の「…」/ 右クリックのメニュー（fixed で出す位置）。Esc の優先順位制御のため state に置く */
   folderMenu: null as null | { id: number; top: number; left: number },
   /** 完全削除の確認対象（modal === "purge" の間だけ意味を持つ。一覧順の key） */
   purgeKeys: [] as string[],
-  /** 行下のインラインメモ編集（Paperpile の note。1 item = 1 メモ。saved = 保存済み本文・text = 編集中） */
+  /** 行下のインラインメモ編集。複数メモは noteKey で選択。saved = 保存済み本文・text = 編集中 */
   noteEditor: null as null | { key: string; noteKey: string | null; text: string; saved: string },
   /** 「＋ 新規 ▾」メニューの開閉 */
   newMenu: false,
@@ -993,21 +994,24 @@ export function cancelPurge() {
 
 /** 指定 item のメモ編集を開く。user 著のメモがあれば前置きして編集、無ければ新規（空）。
     MCP 経由で Claude が残したメモ（author≠user）は編集対象にしない（詳細パネルに著者付きで表示するだけ） */
-export async function openNoteEditor(key: string) {
+let noteEditorRequest = 0;
+export async function openNoteEditor(key: string, noteKey?: string | null) {
+  const request = ++noteEditorRequest;
   app.listMenu = null;
-  if (app.noteEditor?.key === key) return;
+  if (app.noteEditor?.key === key && (noteKey === undefined || app.noteEditor.noteKey === noteKey)) return;
   const tab = app.tab;
   // 別の item のメモ欄が開いていたら、先に自動保存して閉じる（行のクリック・ビューの変更・タブの切替と同じ。行のメモバッジと
   // 詳細の「メモを編集…」は行のクリックを通らないので、ここで保存しないと未保存の追記を黙って捨てる）。保存に失敗して開いたままなら開かない
   if (app.noteEditor) {
     await autoSaveAndCloseNote();
-    if (app.noteEditor || app.tab !== tab) return;
+    if (app.noteEditor || app.tab !== tab || request !== noteEditorRequest) return;
   }
   try {
     const notes = await api.listNotes(key);
     // 読む間に別のタブへ切り替わった（前のタブの item のメモ欄を切替先で開かない）・別のメモ欄が開いて書き始めていたら置き換えない
-    if (app.tab !== tab || noteDirty()) return;
-    const mine = notes.find((n) => n.author === "user") ?? null;
+    if (app.tab !== tab || noteDirty() || request !== noteEditorRequest) return;
+    const mine = noteKey === null ? null : notes.find((n) => n.author === "user" && (noteKey === undefined || n.key === noteKey)) ?? null;
+    if (noteKey && !mine) throw new Error(t("指定したメモが見つかりません"));
     app.noteEditor = { key, noteKey: mine?.key ?? null, text: mine?.contentMd ?? "", saved: mine?.contentMd ?? "" };
   } catch (e) {
     toast(`✗ ${t("メモの読込に失敗")}: ${String(e).slice(0, 200)}`);

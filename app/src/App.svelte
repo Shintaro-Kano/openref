@@ -12,6 +12,7 @@
   import TagModals from "./lib/TagModals.svelte";
   import FolderModals from "./lib/FolderModals.svelte";
   import ImportModal from "./lib/ImportModal.svelte";
+  import MigrationModal from "./lib/MigrationModal.svelte";
   import PurgeModal from "./lib/PurgeModal.svelte";
   import StyleModal from "./lib/StyleModal.svelte";
   import LabelBadge from "./lib/LabelBadge.svelte";
@@ -292,6 +293,9 @@
             <button onclick={() => { app.newMenu = false; void openImportDialog(); }}>
               <span>{t("PDF を取り込む…")}</span>
             </button>
+            <button onclick={() => { app.newMenu = false; app.modal = "migration"; }}>
+              <span>{t("他の文献管理ソフトから移行…")}</span>
+            </button>
           </div>
         {/if}
       </div>
@@ -335,6 +339,7 @@
   <TagModals />
   <FolderModals />
   <ImportModal />
+  <MigrationModal />
   <PurgeModal />
   <StyleModal />
   {#if app.editorOpen}<ReferenceEditor />{/if}

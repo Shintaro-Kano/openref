@@ -330,6 +330,7 @@ pub fn attach_auto(db: &Db, key: &str, src: &Path) -> Result<Attached> {
         .ok_or_else(|| CoreError::BadInput(format!("ファイル名が取れません: {}", src.display())))?
         .to_string_lossy()
         .to_string();
+    crate::db::reject_connection_file(&db.conn, src)?;
     let bytes = std::fs::read(src)?;
     attach_auto_bytes(db, key, &fname, &bytes)
 }

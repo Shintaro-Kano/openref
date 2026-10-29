@@ -1,5 +1,5 @@
 use anyhow::{bail, Context};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use openref_core::{datadir, fulltext, ingest, model, pdffetch, resolver, search, sync, CoreError, Db};
 use std::path::PathBuf;
 
@@ -137,21 +137,71 @@ enum CutoverAction {
 
 #[derive(Subcommand)]
 enum ImportSrc {
+    /// Zotero RDF + files（既定は PDF を OpenRef 保存領域へコピー）
+    Zotero {
+        rdf: PathBuf,
+        #[arg(long)]
+        files: Vec<PathBuf>,
+        #[arg(long, value_enum)]
+        attachments: Option<ImportAttachmentMode>,
+        #[arg(long)]
+        source_id: Option<String>,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        report_json: bool,
+        /// 入力ダイジェストに結び付いた候補選択JSON（事前確認後に指定）
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+    },
     /// Paperpile JSON export（初回 seed。folders/添付リンク込み）
     Paperpile {
         json: PathBuf,
-        /// Paperpile の Drive mount（省略時は自動検出）
+        /// 旧 CLI の Paperpile ID が同じライブラリに属することを確認して照合する
+        #[arg(long)]
+        adopt_legacy_ids: bool,
+        /// Paperpile の PDF フォルダ（省略時は書誌のみ）
         #[arg(long)]
         mount: Option<PathBuf>,
         /// 書き込まずに結果だけ報告
         #[arg(long)]
         dry_run: bool,
+        /// 明示した添付フォルダ（繰り返し指定可能）
+        #[arg(long)]
+        files: Vec<PathBuf>,
+        /// 共通移行処理を使い、PDF をコピーまたはリンクする
+        #[arg(long, value_enum)]
+        attachments: Option<ImportAttachmentMode>,
+        /// 再エクスポートを以前の移行元に追加するときの ID
+        #[arg(long)]
+        source_id: Option<String>,
+        /// 完了分を再利用し、同一入力の未完了分を再処理する実行 ID
+        #[arg(long)]
+        resume: Option<String>,
+        /// 事前確認または結果を JSON で標準出力に書く
+        #[arg(long)]
+        report_json: bool,
+        /// 入力ダイジェストに結び付いた候補選択JSON（事前確認後に指定）
+        #[arg(long)]
+        decisions: Option<PathBuf>,
     },
     /// 手元の PDF を一括登録（冒頭 2 頁の DOI/PMID → 書誌確定 → 登録＋添付。識別子なしは登録しない）
     Pdf {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// ライブラリ移行の履歴（読取のみ・JSON）
+    History,
+    /// 指定した移行実行の結果（読取のみ・JSON）
+    Report { run: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportAttachmentMode {
+    Copy,
+    Link,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -160,6 +210,81 @@ fn main() -> anyhow::Result<()> {
         Some(p) => p,
         None => datadir::db_path()?,
     };
+    // These routes must run before Db::open: even a read-only SQLite open can
+    // create WAL/SHM on the original. The core reads a verified private copy.
+    if let Cmd::Import { source } = &cli.cmd {
+        match source {
+            ImportSrc::Zotero {
+                rdf,
+                files,
+                attachments,
+                source_id,
+                resume,
+                dry_run,
+                report_json,
+                decisions,
+            } => {
+                return cmd_library_import(
+                    &path,
+                    "zotero",
+                    false,
+                    rdf,
+                    &None,
+                    files,
+                    *attachments,
+                    source_id.as_deref(),
+                    resume.as_deref(),
+                    *dry_run,
+                    *report_json,
+                    decisions.as_deref(),
+                );
+            }
+            ImportSrc::History => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&openref_core::import::apply::history(&path)?)?
+                );
+                return Ok(());
+            }
+            ImportSrc::Report { run } => {
+                let history = openref_core::import::apply::history(&path)?;
+                let report = history
+                    .iter()
+                    .find(|r| r["id"].as_str() == Some(run))
+                    .context("移行実行が見つかりません")?;
+                println!("{}", serde_json::to_string_pretty(report)?);
+                return Ok(());
+            }
+            ImportSrc::Paperpile {
+                json,
+                adopt_legacy_ids,
+                mount,
+                dry_run,
+                files,
+                attachments,
+                source_id,
+                resume,
+                report_json,
+                decisions,
+            } => {
+                return cmd_library_import(
+                    &path,
+                    "paperpile",
+                    *adopt_legacy_ids,
+                    json,
+                    mount,
+                    files,
+                    *attachments,
+                    source_id.as_deref(),
+                    resume.as_deref(),
+                    *dry_run,
+                    *report_json,
+                    decisions.as_deref(),
+                );
+            }
+            _ => {}
+        }
+    }
     let mut db =
         Db::open(&path).with_context(|| format!("DB open 失敗: {}", path.display()))?;
     match cli.cmd {
@@ -224,42 +349,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Show { key, json } => cmd_show(&db, &key, json)?,
         Cmd::Import { source } => match source {
             ImportSrc::Pdf { paths } => cmd_import_pdf(&mut db, &paths)?,
-            ImportSrc::Paperpile {
-                json,
-                mount,
-                dry_run,
-            } => {
-                let m = mount.or_else(openref_core::mount::detect);
-                match &m {
-                    Some(p) => eprintln!("mount: {}", p.display()),
-                    None => eprintln!("mount: (未検出 — PDF リンクはスキップされます)"),
-                }
-                let rep = openref_core::import::paperpile::import(&mut db, &json, m, dry_run)?;
-                println!(
-                    "=== Paperpile import{} ===",
-                    if rep.dry_run { "（dry-run・未書込）" } else { "" }
-                );
-                println!(
-                    "records {} / 新規 {} / merge {} / 不採用 {}",
-                    rep.total, rep.inserted, rep.merged, rep.skipped_bad
-                );
-                println!(
-                    "collections 作成 {} / PDF リンク {} / PDF 不明 {} / DOI・PMID なし {}",
-                    rep.collections_created,
-                    rep.pdf_linked,
-                    rep.pdf_missing.len(),
-                    rep.without_ids
-                );
-                for f in &rep.pdf_missing {
-                    println!("  PDF 不明: {f}");
-                }
-                if !rep.dry_run {
-                    println!(
-                        "本文索引 {} / 未索引 {}（未索引は openref fulltext index で再試行）",
-                        rep.fulltext_indexed, rep.fulltext_unindexed
-                    );
-                }
-            }
+            ImportSrc::Paperpile { .. }
+            | ImportSrc::History
+            | ImportSrc::Report { .. }
+            | ImportSrc::Zotero { .. } => unreachable!("handled before opening DB"),
         },
         Cmd::Fulltext { action } => cmd_fulltext(&db, action)?,
         Cmd::Collections => cmd_collections(&db)?,
@@ -723,6 +816,250 @@ fn print_row(r: &model::ItemRow) {
 
 /// 連続して NCBI（E-utilities・3 req/s）を引くときの間隔
 const NCBI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// ライブラリ移行の安全な中止フラグ。
+static IMPORT_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn cancel_library_import(_: libc::c_int) {
+    IMPORT_CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+struct ImportSignalGuard(libc::sighandler_t);
+#[cfg(unix)]
+impl ImportSignalGuard {
+    fn install() -> std::io::Result<Self> {
+        IMPORT_CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: handler only stores to a lock-free AtomicBool; no allocation,
+        // IO, SQLite calls, or non-signal-safe operations run in the handler.
+        let previous = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                cancel_library_import as *const () as libc::sighandler_t,
+            )
+        };
+        if previous == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(previous))
+    }
+}
+#[cfg(unix)]
+impl Drop for ImportSignalGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore the handler returned by the preceding signal call.
+        unsafe {
+            libc::signal(libc::SIGINT, self.0);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_library_import(
+    db_path: &std::path::Path,
+    format: &str,
+    adopt_legacy_ids: bool,
+    json_path: &std::path::Path,
+    mount: &Option<PathBuf>,
+    files: &[PathBuf],
+    mode: Option<ImportAttachmentMode>,
+    source_id: Option<&str>,
+    resume: Option<&str>,
+    dry_run: bool,
+    report_json: bool,
+    decisions: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use openref_core::import::{self, apply, files::AttachmentRoots, AttachmentMode, ImportSource};
+    let source = ImportSource {
+        id: "pending".into(),
+        format: format.into(),
+    };
+    apply::reject_database_file(json_path, db_path)?;
+    let mut input = if format == "zotero" {
+        import::zotero_rdf::read_input(json_path, source)?
+    } else {
+        import::paperpile::read_input(json_path, source)?
+    };
+    input.adopt_legacy_paperpile_ids = adopt_legacy_ids;
+    let mut resumed_mode = None;
+    let prior = if let Some(run) = resume {
+        let history = apply::history(db_path)?;
+        let prior = history
+            .into_iter()
+            .find(|r| r["id"].as_str() == Some(run))
+            .context("再開する移行実行が見つかりません")?;
+        if prior["input_sha256"].as_str() != Some(input.input_sha256.as_str()) {
+            bail!(
+                "再開には同一の入力ファイルが必要です。別の書出しは --source-id で追加してください"
+            );
+        }
+        resumed_mode = Some(if prior["attachment_mode"].as_str() == Some("copy") {
+            ImportAttachmentMode::Copy
+        } else {
+            ImportAttachmentMode::Link
+        });
+        Some(
+            prior["source_id"]
+                .as_str()
+                .context("履歴の移行元 ID がありません")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    if let (Some(source), Some(prior)) = (source_id, prior.as_deref()) {
+        if source != prior {
+            bail!("--source-id と再開する実行の移行元が一致しません");
+        }
+    }
+    input.source.id = source_id
+        .map(str::to_string)
+        .or(prior)
+        .map(Ok)
+        .unwrap_or_else(|| apply::default_source(db_path, format))?;
+    let mut paths: Vec<_> = files.iter().cloned().chain(mount.iter().cloned()).collect();
+    if format == "zotero" {
+        paths.push(
+            std::fs::canonicalize(json_path)?
+                .parent()
+                .context("RDF の親フォルダがありません")?
+                .into(),
+        );
+    }
+    let roots = AttachmentRoots::new(&paths)?;
+    let mode = match mode.or(resumed_mode).unwrap_or(if format == "zotero" {
+        ImportAttachmentMode::Copy
+    } else {
+        ImportAttachmentMode::Link
+    }) {
+        ImportAttachmentMode::Copy => AttachmentMode::Copy,
+        ImportAttachmentMode::Link => AttachmentMode::Link,
+    };
+    #[cfg(unix)]
+    let _signals = ImportSignalGuard::install()?;
+    let mut plan =
+        apply::prepare_controlled(db_path, &input, &roots, mode, &IMPORT_CANCELLED, |_| {})?;
+    if let Some(path) = decisions {
+        let choices = serde_json::from_slice(&std::fs::read(path)?)?;
+        import::decisions::resolve(
+            db_path,
+            &input,
+            &roots,
+            &mut plan,
+            &choices,
+            &IMPORT_CANCELLED,
+        )?;
+    }
+    if dry_run {
+        if report_json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            println!("移行元: {}", input.source.id);
+            println!(
+                "文献 {} / 新規 {} / 既存 {} / 確認候補 {} / 保留 {}",
+                input.items.len(),
+                plan.counts.new_items,
+                plan.counts.existing_items,
+                plan.counts.review,
+                plan.counts.blocked
+            );
+            println!(
+                "PDF {} / 不足 {} / 曖昧 {} / 対象外 {} / 失敗 {}",
+                plan.counts.available_pdfs,
+                plan.counts.missing_pdfs,
+                plan.counts.ambiguous_pdfs,
+                plan.counts.unsupported_attachments,
+                plan.counts.failed_pdfs
+            );
+            println!(
+                "フォルダ {} / タグ所属 {} / ノート {}",
+                plan.counts.folders, plan.counts.tags, plan.counts.notes
+            );
+            if mode == AttachmentMode::Copy {
+                println!(
+                    "コピー先: {} / 最大 {} bytes",
+                    plan.managed_storage.as_ref().unwrap().display(),
+                    plan.counts.copy_bytes_upper_bound
+                );
+            }
+            for warning in &plan.warnings {
+                println!("注意: {warning}");
+            }
+        }
+        return Ok(());
+    }
+    eprintln!("移行元: {}（Ctrl+C で安全に中止）", input.source.id);
+    let report = apply::execute(
+        db_path,
+        json_path,
+        &input,
+        &plan,
+        &roots,
+        &IMPORT_CANCELLED,
+        |p| {
+            if p.phase == "committed" && (p.completed % 100 == 0 || p.completed == p.total) {
+                eprintln!("移行: {}/{}", p.completed, p.total);
+            }
+        },
+    )?;
+    if report_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "実行 {} / 状態 {} / 文献 {}/{}",
+            report.run_id,
+            report.state,
+            report.results.len(),
+            report.total
+        );
+        for result in &report.results {
+            println!("{}: {}", result.object_id, result.status);
+            for warning in &result.warnings {
+                println!("  注意: {warning}");
+            }
+            for att in &result.attachments {
+                println!("  添付 {}: {}", att.id, att.status);
+                if let Some(detail) = &att.detail {
+                    println!("    {detail}");
+                }
+            }
+        }
+        for warning in &report.warnings {
+            println!("注意: {warning}");
+        }
+        if report.fulltext_pending > 0 {
+            println!(
+                "全文索引は {} 本が未処理です。この DB に対して fulltext index で再試行できます",
+                report.fulltext_pending
+            );
+        }
+        println!("結果 JSON: openref import report {}", report.run_id);
+    }
+    if report.state == "failed" {
+        bail!(
+            "移行が途中で失敗しました。結果を確認し --resume {} で再試行してください",
+            report.run_id
+        );
+    }
+    if report.state == "cancelled" {
+        bail!(
+            "移行を中止しました。完了分は保存済みです。--resume {} で再開できます",
+            report.run_id
+        );
+    }
+    if report
+        .results
+        .iter()
+        .any(|r| r.status == "failed" || r.attachments.iter().any(|a| a.status == "failed"))
+    {
+        bail!(
+            "一部の処理が失敗しました。結果を確認し --resume {} で再試行してください",
+            report.run_id
+        );
+    }
+    Ok(())
+}
 
 /// PDF 一括登録。1 件ごとに結果を出し、最後に内訳を集計（GUI の取込モーダルと同じ分類）。
 fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {

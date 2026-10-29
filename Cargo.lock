@@ -2547,7 +2547,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openref-app"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "openref-core",
  "regex",
@@ -2560,17 +2560,18 @@ dependencies = [
 
 [[package]]
 name = "openref-cli"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "openref-core",
  "serde_json",
 ]
 
 [[package]]
 name = "openref-connectd"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2583,16 +2584,20 @@ dependencies = [
 
 [[package]]
 name = "openref-core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "fastrand",
+ "html5ever",
+ "libc",
  "md5",
  "pdf-extract",
+ "percent-encoding",
  "regex",
  "roxmltree",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
  "time",
  "unicode-normalization",
@@ -2603,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "openref-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "openref-core",
  "rusqlite",

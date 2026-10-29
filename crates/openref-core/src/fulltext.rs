@@ -73,6 +73,7 @@ pub fn index_attachment_opts(
     if !fetch_dataless && is_dataless(&meta) {
         return Ok(IndexOutcome::Skipped(format!("未ダウンロード（CloudStorage の dataless）: {path}")));
     }
+    crate::db::reject_connection_file(conn, p)?;
     let bytes = match std::fs::read(p) {
         Ok(b) => b,
         Err(e) => return Ok(IndexOutcome::Skipped(format!("読めない（{e}）: {path}"))),

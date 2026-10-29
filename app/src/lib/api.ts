@@ -1,5 +1,47 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface MigrationConfig {
+  format: "paperpile" | "zotero";
+  path: string;
+  roots: string[];
+  mode: "copy" | "link";
+  source_id: string | null;
+  adopt_legacy_ids: boolean;
+  decisions?: MigrationDecisions;
+}
+export interface MigrationDecisions {
+  source_id:string; input_sha256:string;
+  items:{object_id:string;item_key:string;csl_sha256?:string|null}[];
+  files:{object_id:string;attachment_id:string;path:string}[];
+}
+export interface MigrationPlan {
+  input_sha256:string;
+  source_id: string;
+  managed_storage: string | null;
+  counts: Record<"new_items" | "existing_items" | "review" | "blocked" | "folders" | "notes" | "tags" | "available_pdfs" | "existing_pdfs" | "missing_pdfs" | "ambiguous_pdfs" | "unsupported_attachments" | "failed_pdfs" | "copy_bytes_upper_bound", number>;
+  warnings: string[];
+  items: {object_id:string; title:string; allow_new:boolean; candidate_details:{key:string;csl_sha256:string;title:string;doi:string|null;pmid:string|null}[]; file_options:{object_id:string;attachment_id:string;path:string}[]; selection:{item_key:string}|null; selected_files:string[]; action:{action:string; item_key?:string; candidates?:string[]; reason?:string}; warnings:string[]; attachments:{id:string; status:string; path?:string; candidates?:string[]; reason?:string}[]}[];
+}
+export interface MigrationReport {
+  run_id:string; source_id:string; state:string; total:number; complete:boolean; fulltext_pending:number; backup_path:string|null; warnings:string[];
+  results:{object_id:string; status:string; item_key:string|null; warnings:string[]; attachments:{id:string;status:string;detail:string|null}[]}[];
+}
+export interface MigrationStatus {
+  id:string; phase:string; progress:{phase:string;completed:number;total:number;bytes:number}|null;
+  config:MigrationConfig|null; plan:MigrationPlan|null; report:MigrationReport|null; error:string|null;
+}
+export interface MigrationHistory {id:string;format:string;source_id:string;state:string;attachment_mode:string;date_added:string;total:number}
+export const migrationApi = {
+  preview:(config:MigrationConfig)=>invoke<string>("migration_preview",{config}),
+  status:()=>invoke<MigrationStatus|null>("migration_status"),
+  start:(id:string)=>invoke<void>("migration_start",{id}),
+  cancel:(id:string)=>invoke<void>("migration_cancel",{id}),
+  index:(id:string)=>invoke<void>("migration_index",{id}),
+  selectReport:(run:string)=>invoke<void>("migration_select_report",{run}),
+  history:()=>invoke<MigrationHistory[]>("migration_history"),
+  save:(id:string,path:string)=>invoke<void>("migration_save_report",{id,path}),
+};
+
 // ---- 型: core（crates/openref-core）の行型と 1:1（Rust 側の `#[derive(Serialize)]`・camelCase を手で写す。自動生成はしない）。
 //      鍵の並びは Rust の定義順。core に足した列はここにも足す（使わなくても）
 

@@ -392,6 +392,7 @@ const SCHEMA_NOTES: &str = "\
 - 注釈 = `annotations`（attachment_id 経由で item へ。quote・prefix・suffix・page が位置の手がかり・rects と sort_key は未使用 = 常に NULL）。ノート = `notes`（item 単位の markdown）。author は user が書いたものが 'user'、エージェントは 'claude:<model>'（例 'claude:opus-5.5'）を付ける。
 - 「前回以降」は `items.date_added` / `date_modified`・`notes.date_modified`・`annotations.date_added` で引ける（UTC の 'YYYY-MM-DD HH:MM:SS'）。
 - `retraction_flags` = 撤回の印。`journal_keys` = 誌名の同一性のキー。`settings` の主なキー: `pdf_write_mode`（drive = 添付を Drive の Paperpile フォルダへ書く / managed = storage/）・`cite_style` `cite_locale` `cite_doi_always`（引用の既定）・`ui_*`（app の表示状態）。
+- `import_sources` / `import_runs` / `import_objects` / `import_results` / `import_files` はライブラリ移行の由来・履歴・対応表・結果・コピー台帳。元レコードは引用用 CSL や全文索引とは別のローカル資料。削除済み対象の対応も残すので、履歴を削除して再作成・復元する操作はしない。
 - `PRAGMA data_version` は他の接続の書込で増える（app はこれを 2 秒ごとに見て一覧を読み直す = call の書込はすぐ画面に出る）。
 - sql の PRAGMA は値なしの読み（`PRAGMA user_version` 等）と表の情報（table_info・table_xinfo・table_list・index_list・index_info・index_xinfo・foreign_key_list・integrity_check・quick_check）だけ。表の情報は `SELECT * FROM pragma_table_info('items')` の形でも読める（JOIN・WHERE に使える）。
 ";
@@ -545,7 +546,7 @@ mod tests {
         assert!(!s.contains("CREATE TABLE 'items_fts_data'") && !s.contains("CREATE TABLE \"items_fts_data\""));
         assert!(s.contains(SCHEMA_NOTES) && s.contains(RESTORE_TEXT));
         assert!(s.contains("`search_library`") && s.contains("`create_collection_in`"));
-        assert!(s.contains("user_version` 9") && s.contains("pre-agent-"));
+        assert!(s.contains("user_version` 10") && s.contains("pre-agent-"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -603,7 +604,7 @@ mod tests {
         let q = |s: &Server, q: &str| -> i64 { s.db.conn.query_row(q, [], |r| r.get(0)).unwrap() };
         assert_eq!(q(&srv, "SELECT count(*) FROM items"), 1);
         assert_eq!(q(&srv, "SELECT count(*) FROM tags"), 0);
-        assert_eq!(q(&srv, "PRAGMA user_version"), 9);
+        assert_eq!(q(&srv, "PRAGMA user_version"), 10);
         assert_eq!(q(&srv, "SELECT starred FROM items"), 0);
         // 書込のコマンドでないので スナップショットも作らない
         assert!(!dir.join("backup").exists());

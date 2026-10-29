@@ -35,10 +35,12 @@ pub struct Added {
 /// item 登録の一気通貫: dedup 照合 → items + creators_index + FTS + 撤回フラグ（単一 tx）。
 pub fn add_item(db: &mut Db, resolved: &Resolved) -> Result<Added> {
     let csl = &resolved.csl;
-    let pmid = model::s(csl, "PMID").map(str::to_string);
-    let doi = model::s(csl, "DOI").map(|x| x.to_lowercase());
 
-    if let Some((existing_key, field)) = find_duplicate(db, pmid.as_deref(), doi.as_deref())? {
+    // Match and insert under the same writer reservation as library migration.
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some((existing_key, field)) = find_duplicate(&tx, csl)? {
         return Err(CoreError::Duplicate {
             existing_key,
             field,
@@ -46,7 +48,6 @@ pub fn add_item(db: &mut Db, resolved: &Resolved) -> Result<Added> {
     }
 
     let key = keys::new_key();
-    let tx = db.conn.transaction()?;
 
     tx.execute(
         "INSERT INTO items (key, csl) VALUES (?1, ?2)",
@@ -112,6 +113,7 @@ pub(crate) fn index_fts(
     id: i64,
     csl: &serde_json::Value,
 ) -> rusqlite::Result<()> {
+    crate::import::plan::index_descriptive(conn, id, csl)?;
     let creators_txt = model::authors(csl).join("; ");
     let mut kw: Vec<String> = Vec::new();
     if let Some(k) = model::s(csl, "keyword") {
@@ -319,27 +321,27 @@ pub fn merge_enrichment(db: &mut Db, id: i64, richer: &serde_json::Value) -> Res
 }
 
 fn find_duplicate(
-    db: &Db,
-    pmid: Option<&str>,
-    doi: Option<&str>,
+    conn: &rusqlite::Connection,
+    csl: &serde_json::Value,
 ) -> Result<Option<(String, &'static str)>> {
-    if let Some(p) = pmid {
-        if let Some(k) = one_key(db, "SELECT key FROM items WHERE deleted_at IS NULL AND pmid = ?1", p)? {
-            return Ok(Some((k, "PMID")));
-        }
-    }
-    if let Some(d) = doi {
-        if let Some(k) = one_key(db, "SELECT key FROM items WHERE deleted_at IS NULL AND doi = ?1", d)? {
-            return Ok(Some((k, "DOI")));
+    let candidates = crate::import::plan::identifier_candidates(conn, csl, None)?;
+    let pmid = crate::import::plan::pmid(csl);
+    let doi = crate::import::plan::doi(csl);
+    for (field, value) in [("PMID", pmid), ("DOI", doi)] {
+        if let Some(value) = value {
+            if let Some((key, _, _)) = candidates.iter().find(|(_, csl, deleted)| {
+                !*deleted
+                    && (if field == "PMID" {
+                        crate::import::plan::pmid(csl)
+                    } else {
+                        crate::import::plan::doi(csl)
+                    })
+                    .as_deref()
+                        == Some(&value)
+            }) {
+                return Ok(Some((key.clone(), field)));
+            }
         }
     }
     Ok(None)
-}
-
-fn one_key(db: &Db, sql: &str, arg: &str) -> Result<Option<String>> {
-    use rusqlite::OptionalExtension;
-    Ok(db
-        .conn
-        .query_row(sql, [arg], |r| r.get::<_, String>(0))
-        .optional()?)
 }

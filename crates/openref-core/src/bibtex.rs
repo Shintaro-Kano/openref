@@ -31,9 +31,7 @@ pub fn entries(db: &Db, keys: &[String]) -> Result<Vec<Entry>> {
 
 /// 引用キー（BibTeX の citekey・LaTeX の \cite{} に使う）
 pub fn citekey(csl: &Value, item_key: &str) -> String {
-    csl
-        .pointer("/custom/paperpile/citekey")
-        .and_then(|v| v.as_str())
+    explicit_citekey(csl)
         .map(str::to_string)
         .unwrap_or_else(|| {
             let fam: String = model::first_author_family(csl)
@@ -51,6 +49,17 @@ pub fn citekey(csl: &Value, item_key: &str) -> String {
                 .rev()
                 .collect();
             format!("{fam}{year}-{}", tail.to_lowercase())
+        })
+}
+
+pub(crate) fn explicit_citekey(csl: &Value) -> Option<&str> {
+    csl.pointer("/custom/paperpile/citekey")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            csl.get("citation-key")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
         })
 }
 
@@ -162,5 +171,7 @@ mod tests {
             "author": [{"family": "Kano"}], "issued": {"date-parts": [[2026]]}});
         let b2 = item_to_bibtex(&csl2, "WXYZ6789");
         assert!(b2.starts_with("@article{Kano2026-6789,"), "{b2}");
+        let explicit = json!({"citation-key":"Exported2026","custom":{"paperpile":{"citekey":""}}});
+        assert_eq!(citekey(&explicit, "ABCD2345"), "Exported2026");
     }
 }

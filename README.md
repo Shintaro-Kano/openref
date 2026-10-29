@@ -88,11 +88,61 @@ openref collections                                      # フォルダツリー
 openref fetch-pdf --missing                              # OA 論文の PDF を自動取得（PMC AWS Open Data 等）
 openref info
 
-# Paperpile JSON エクスポートからの一括インポート（冪等・再実行で既存とマージ）
+# Paperpile JSON エクスポートからの一括インポート（同じ入力から再実行可能）
 openref import paperpile "/path/to/Paperpile-Export.json" [--dry-run]
 ```
 
 DB の既定パス: `~/Library/Application Support/OpenRef/openref.sqlite`（`--db` または環境変数 `OPENREF_DB` で上書き可）。
+
+## ライブラリ移行（開発版・受入検証中）
+
+以下は次版向けの実装です。配布版 1.0.1 には新しい移行画面は含まれません。
+
+「＋ 新規 ▾ → 他の文献管理ソフトから移行…」で Paperpile または Zotero を選び、書誌ファイルと添付フォルダを指定します。
+事前確認で新規・既存への追加・保留・PDF 不足・対象外・コピー容量を確認してから開始します。
+移行中も画面を閉じてライブラリを閲覧でき、中止後は同じ入力で再確認すると保存済みの文献を再利用します。
+過去の結果と JSON 保存、全文索引の再試行も同じ画面から行えます。
+
+- **Paperpile**: ライブラリ全体の JSON を別途書き出し、PDF は「Download files as ZIP」で注釈を含めて取得します。ZIP を Finder で展開し、JSON と展開フォルダを選択します。JSON だけでも書誌を取り込めます。[公式手順](https://paperpile.com/h/bulk-download-PDFs/)
+- **Zotero**: 「Export Library…」で Zotero RDF を選び、ノート・ファイル・PDF 注釈を含めます。RDF を選ぶと、その隣の files フォルダも参照します。元の登録・更新日時は引き継げません。[公式手順](https://www.zotero.org/support/kb/exporting)
+- PDF は **OpenRef の Mac ローカル保存領域へコピー**が GUI の既定です。Drive の保存先設定には追従しません。リンクを選ぶ場合は、ZIP の展開フォルダを含め元ファイルの場所を保持してください。
+- 同形式の移行元が1つなら GUI・CLI とも既定で再利用し、複数なら選択が必要です。同じライブラリの補完では「以前の移行に追加」を選びます。別ライブラリを同じ移行元にしないでください。新しい移行元を明示すると別の由来として扱うため、既存対象との対応を警告で確認してください。旧 Paperpile 取込の ID 照合には、同じライブラリであることの明示が必要です。
+- 同じ移行元の別エクスポートに過去の取込との対応候補があれば、まず文献を保留します。IDだけで対応を確定しません。候補から同じ文献を選び、再確認すると書誌の不足分とPDFを追加できます。この場合、過去のノート・タグ・所属との対応は自動確定せず保留します。
+- 既存の空でない編集値と、過去に適用後に削除・空にした書誌フィールドは保持し、未適用の不足情報だけを追加します。識別子の矛盾、同じ移行元の由来で確認できる削除済み文献、題名だけの候補、曖昧な添付は保留として報告します。確認候補の既存文献と曖昧なPDFは選択後に「選択内容で再確認」で確定します。入力内だけの重複候補は「新規として登録」（CLI decisions の item_key は `@new`）を選べます。適用時に識別子を再照合し、同一文献なら合流、矛盾なら保留します。未選択、削除済み対象、識別子の矛盾は保留します。
+- 複数ノートを個別編集でき、PDF 内のハイライトやコメントは読み取り専用で閲覧できます。元 PDF のバイト列は変更しません。独自注釈への変換、既存 Word 文書の引用変換、双方向同期は含みません。
+
+検証済み: Paperpile の小標本で文献・PDF・名前付きタグの適用と再実行。Zotero は公式公開 RDF とテスト用 graph でコレクション・著者順・ノート・全 PDF を検証。
+Paperpile の現行 `folders` / `notes` は形式未確定のため、原情報と警告を保存するだけで階層・ノートへ変換しません。旧 `foldersNamed` と名前付きタグは対応済みです。現行 Zotero アプリの実書出し、両ソフト由来の注釈付き PDF は引き続き検証対象です。
+画像・PDF 以外の添付、未対応フィールドは元情報をローカルに保存し、未対応の理由を結果に表示します。注意事項や不足があれば完全移行とは表示しません。
+
+CLI は従来の Paperpile 引数を含め、事前退避・照合・履歴を備える共通処理を使います。Paperpile の既定はリンクです。PDF の場所は `--files` または `--mount` で明示してください。Drive の自動探索は行わず、指定がなければ書誌だけを取り込みます。
+
+```sh
+openref import paperpile /path/library.json --files /path/extracted --attachments copy --dry-run
+openref import paperpile /path/library.json --files /path/extracted --attachments copy
+openref import zotero /path/export.rdf --dry-run
+openref import zotero /path/export.rdf
+openref import history
+openref import report RUN_ID
+# 同じ入力から再開。別の書出しを追加する場合は --source-id SOURCE_ID
+openref import paperpile /path/library.json --files /path/extracted --resume RUN_ID --report-json
+```
+
+
+既存文献の選択には `candidate_details` の `csl_sha256` も保存します。候補の書誌が変わった場合は選び直してください。`@new` にはこの値は不要です。
+
+CLI の候補確定は `--decisions /path/choices.json` を使います。まず `--dry-run --report-json` の `source_id` / `input_sha256`、文献の `object_id` / `candidate_details`、添付の `id` / `file_options` を確認して、次の形のJSONを用意します。値は実際のプレビューに置き換え、同じ `--source-id` と添付ルートで再確認してから適用してください。
+
+```json
+{
+  "source_id": "SOURCE_ID",
+  "input_sha256": "INPUT_SHA256",
+  "items": [{"object_id": "INPUT_OBJECT_ID", "item_key": "EXISTING_KEY", "csl_sha256": "CANDIDATE_CSL_SHA256"}],
+  "files": [{"object_id": "INPUT_OBJECT_ID", "attachment_id": "ATTACHMENT_ID", "path": "/exact/candidate.pdf"}]
+}
+```
+
+指定しない文献・添付は通常の判定を維持します。候補外のパスや別入力の選択は拒否します。既存文献の編集・削除、識別子の競合、PDFの変更は適用前にも検査し、選択で安全確認を解除しません。元ファイルへのリンクも同じ選択処理を使います。
 
 ---
 

@@ -30,6 +30,7 @@
   import { tick, untrack } from "svelte";
   import * as pdfjs from "pdfjs-dist";
   import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+  import noteIconUrl from "pdfjs-dist/web/images/annotation-note.svg?url";
   import "pdfjs-dist/web/pdf_viewer.css"; // v6: textLayer は公式 CSS + --total-scale-factor が前提
   import { api, type AnnotationRow, type AnnotationPatch } from "./api";
   import { app, toast, type TabViewer } from "./state.svelte";
@@ -40,6 +41,7 @@
   import OutlineTab from "./viewer/OutlineTab.svelte";
   import ThumbnailsTab from "./viewer/ThumbnailsTab.svelte";
   import AnnotationCard from "./viewer/AnnotationCard.svelte";
+  import { embeddedComments, inertMarkup, type EmbeddedComment } from "./viewer/embedded";
   import {
     normText,
     absRotation,
@@ -90,6 +92,10 @@
   let loading = $state(true);
   let error = $state("");
   let anns = $state<AnnotationRow[]>([]);
+  let embedded = $state<EmbeddedComment[]>([]);
+  let embeddedLoading = $state(false);
+  let embeddedError = $state("");
+  const filteredEmbedded = $derived(embedded.filter(a=>normText(a.text+" "+a.author).includes(normText(annQuery).trim())));
   let selInfo = $state<{ text: string; page: number } | null>(null);
   let popPos = $state<PopoverPos | null>(null);
   let selColor = $state("yellow");
@@ -194,7 +200,7 @@
       anns = a;
       const buf = await api.attachmentData(attachmentId); // ArrayBuffer（base64 / atob を経由しない）
       if (disposed) return; // 読込中にタブを閉じた（unmount 済み）
-      loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf) }); // pdf.js は data を worker へ transfer する（この後は使わない）
+      loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf), enableXfa:false }); // pdf.js は data を worker へ transfer する（この後は使わない）
       const d = await loadingTask.promise;
       if (disposed) return; // 開く間に閉じた（unmount の後始末が loadingTask を destroy 済み）
       doc = d;
@@ -215,10 +221,45 @@
       buildPlaceholders();
       recomputeFit(true); // 初期 scale（自動）を確定しプレースホルダ寸法を更新
       prefetchPromise = prefetchTexts().then(buildRunningTable); // 背景でテキスト全ページ prefetch → 柱・ノンブル表
+      void readEmbeddedComments();
     } catch (e) {
       error = String(e);
       loading = false;
     }
+  }
+
+  async function readEmbeddedComments() {
+    embeddedLoading=true;
+    const comments:EmbeddedComment[]=[];
+    try {
+      for(let n=1;n<=pageCount;n++) {
+        if(disposed)return;
+        const page=await doc.getPage(n);
+        const annotations=await page.getAnnotations({intent:"display"});
+        if(disposed)return;
+        comments.push(...embeddedComments(annotations,n));
+        // Batch state updates; yield so a long PDF remains responsive.
+        if(n%10===0 || n===pageCount){embedded=[...comments];await new Promise(resolve=>setTimeout(resolve,0));}
+      }
+    } catch(e) {if(!disposed)embeddedError=String(e);}
+    finally {if(!disposed)embeddedLoading=false;}
+  }
+
+  async function renderEmbeddedLayer(page:any,wrap:HTMLElement,viewport:any,gen:number,n:number) {
+    try {
+      const annotations=inertMarkup(await page.getAnnotations({intent:"display"}));
+      if(disposed || gen!==renderGen || !rendered.has(n) || !annotations.length)return;
+      const div=document.createElement("div");div.className="annotationLayer embedded-annotation-layer";
+      div.setAttribute("aria-hidden","true");div.inert=true;
+      const layer=new pdfjs.AnnotationLayer({div,page,viewport:viewport.clone({dontFlip:true}),accessibilityManager:null,annotationCanvasMap:null,annotationEditorUIManager:null,structTreeLayer:null,commentManager:null,linkService:null,annotationStorage:null});
+      await layer.render({div,page,viewport:viewport.clone({dontFlip:true}),annotations,linkService:null as any,renderForms:false,enableScripting:false,hasJSActions:false});
+      // Bundle a local icon rather than resolving PDF-controlled icon names.
+      for(const img of div.querySelectorAll("img"))img.src=noteIconUrl;
+      if(disposed || gen!==renderGen || !rendered.has(n)){layer.destroy();return;}
+      // Canvas paints PDF appearances once. This inert layer supplies markup
+      // geometry only; comment text is rendered as plain text in the sidebar.
+      wrap.appendChild(div);
+    } catch(e){if(!disposed && gen===renderGen)embeddedError=String(e);}
   }
 
   // 描画帯（active）と保持帯（keep）を別マージンで二段化＝解放ヒステリシス。
@@ -432,6 +473,8 @@
       if (gen !== renderGen || !rendered.has(n)) return;
 
       await renderTextLayer(n, page, textLayer, viewport);
+      if (gen !== renderGen || !rendered.has(n)) return;
+      await renderEmbeddedLayer(page,wrap,viewport,gen,n);
       if (gen !== renderGen || !rendered.has(n)) return;
 
       // ハイライト幾何は現在の viewport（scale + rotation）から確定させる。
@@ -1813,7 +1856,7 @@
             {t("検索")}{#if searchHits.length} <span class="dim">{searchHits.length}</span>{/if}
           </button>
           <button class:active={sideTab === "annotations"} onclick={() => (sideTab = "annotations")}>
-            {t("注釈")} <span class="dim">{anns.length}</span>
+            {t("注釈")} <span class="dim">{anns.length+embedded.length}</span>
           </button>
           <button class:active={sideTab === "outline"} onclick={() => (sideTab = "outline")}>
             {t("目次")}
@@ -1852,11 +1895,13 @@
               }}
             />
           </div>
-          {#if annQuery.trim()}<div class="an-count">{tn(filteredAnns.length, "件::annotations")}</div>{/if}
+          {#if annQuery.trim()}<div class="an-count">{tn(filteredAnns.length+filteredEmbedded.length, "件::annotations")}</div>{/if}
           <div class="side-scroll">
-            {#if !anns.length}
+            {#if embeddedLoading}<p class="dim hint">{t("PDF 内注釈を読み込み中…")}</p>{/if}
+            {#if embeddedError}<p class="dim hint">{t("PDF 内注釈の読込に失敗")}: {embeddedError}</p>{/if}
+            {#if !anns.length && !embedded.length}
               <p class="dim hint">{t("本文を選択するとハイライト（コメント付き）を作成できます。")}</p>
-            {:else if !filteredAnns.length}
+            {:else if !filteredAnns.length && !filteredEmbedded.length}
               <p class="dim hint">{t("一致する注釈はありません。")}</p>
             {/if}
             {#each filteredAnns as a (a.key)}
@@ -1874,6 +1919,14 @@
                 onDraftColor={(c) => (editColor = c)}
                 onDraftComment={(v) => (editComment = v)}
               />
+            {/each}
+            {#if filteredEmbedded.length}<p class="dim hint">{t("PDF 内注釈（読み取り専用）")}</p>{/if}
+            {#each filteredEmbedded as a (`${a.page}:${a.id}`)}
+              <article class="embedded-card">
+                <button class="link" onclick={()=>gotoPage(a.page)}>p. {a.page} · {a.kind}</button>
+                {#if a.author}<p class="dim">{a.author}</p>{/if}
+                {#if a.text}<p class="embedded-comment">{a.text}</p>{/if}
+              </article>
             {/each}
           </div>
         {:else if sideTab === "outline"}

@@ -19,3 +19,9 @@ time.workspace = true
 regex.workspace = true
 pdf-extract = "0.12"
 md5 = "0.7"
+sha2 = "0.10"
+percent-encoding = "2"
+html5ever = "0.38"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -133,10 +133,11 @@
         <div class="note-card" class:other={nt.author !== "user"}>
           {#if nt.author !== "user"}<span class="note-author">{nt.author}</span>{/if}
           <p class="note-body">{nt.contentMd}</p>
+          {#if nt.author === "user"}<button class="link" onclick={() => openNoteEditor(d.key, nt.key)}>{t("メモを編集…")}</button>{/if}
         </div>
       {/each}
-      <button class="link" onclick={() => openNoteEditor(d.key)}>
-        {d.notes.some((nt) => nt.author === "user") ? t("メモを編集…") : t("＋ メモを書く…")}
+      <button class="link" onclick={() => openNoteEditor(d.key, null)}>
+        {t("＋ メモを書く…")}
       </button>
     </div>
 
@@ -163,6 +164,7 @@
         <p class="att" class:missing={!a.exists}>
           <span class="mode">{a.mode}</span>
           <span class="path" title={a.path}>{a.path.split("/").pop()}</span>
+          {#if a.exists}<button class="link" onclick={() => void openViewer(d.key, a.id, `${c.title ?? ""} — ${a.path.split("/").pop()}`)}>{t("この添付を読む")}</button>{/if}
           {#if !a.exists}<span class="warn">{t("（実体なし）")}</span>{/if}
           {#if a.doiCheck === "unknown"}<span class="warn" title={t("自動取得した PDF の冒頭 2 頁に、この文献の DOI が見つからなかった（別論文の可能性。中身を確認してください）")}>{t("（DOI 未確認）")}</span>{/if}
         </p>

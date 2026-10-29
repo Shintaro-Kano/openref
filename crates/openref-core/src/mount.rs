@@ -146,11 +146,13 @@ pub fn migrate_managed_to_drive(db: &Db, dry_run: bool) -> Result<Vec<MigratedAt
             });
             continue;
         }
+        crate::db::reject_connection_file(&db.conn, std::path::Path::new(&src_path))?;
         let bytes = std::fs::read(&src_path).map_err(|e| {
             CoreError::BadInput(format!("ローカルの原本を読めません ({src_path}): {e}"))
         })?;
         let dest = drive_layout::place_bytes(&m, &csl, &bytes)?;
         // 読み戻し照合（サイズ + 内容。Drive 書込の完全性を確認してから DB を書き換える）
+        crate::db::reject_connection_file(&db.conn, &dest)?;
         let back = std::fs::read(&dest)?;
         if back != bytes {
             return Err(CoreError::BadInput(format!(
