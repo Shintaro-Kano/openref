@@ -94,9 +94,9 @@ openref import paperpile "/path/to/Paperpile-Export.json" [--dry-run]
 
 DB の既定パス: `~/Library/Application Support/OpenRef/openref.sqlite`（`--db` または環境変数 `OPENREF_DB` で上書き可）。
 
-## ライブラリ移行（開発版・受入検証中）
+## ライブラリ移行（Paperpile / Zotero）
 
-以下は次版向けの実装です。配布版 1.0.1 には新しい移行画面は含まれません。
+配布版 1.1.0 以降で利用できます。
 
 「＋ 新規 ▾ → 他の文献管理ソフトから移行…」で Paperpile または Zotero を選び、書誌ファイルと添付フォルダを指定します。
 事前確認で新規・既存への追加・保留・PDF 不足・対象外・コピー容量を確認してから開始します。
