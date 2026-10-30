@@ -354,7 +354,7 @@ fn n1_legacy_mount_reexport_reuses_source_and_tree_after_rename() {
             .query_row("SELECT count(*) FROM collections", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        3
+        2
     );
     assert_eq!(db.conn.query_row("SELECT count(*) FROM collection_items ci JOIN collections c ON c.id=ci.collection_id WHERE c.name='Renamed'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
 }

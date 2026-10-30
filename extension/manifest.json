@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenRef Capture",
-  "version": "0.2.0",
+  "version": "0.2.5",
   "description": "論文ページから 1 クリックで OpenRef へ取込。識別子（DOI/PMID）→ PubMed/Crossref で書誌確定、PDF はページ内 fetch（認証済み session）で取得。取れないときは DOI ページを背景タブで開いて取得（初回に全サイト許可を求める・任意・実験的）。",
   "permissions": ["activeTab", "scripting", "storage", "alarms"],
   "host_permissions": ["http://127.0.0.1/*"],

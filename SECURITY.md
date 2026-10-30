@@ -15,16 +15,16 @@ OpenRef は「文献データをユーザーの Mac ローカルに保持し、A
 
 ## 2. ローカル待受デーモン (`openref-connectd`) の境界
 
-ブラウザ拡張（OpenRef Capture / Zotero Connector）および Microsoft Word アドインとの連携用デーモン `openref-connectd` は、**ループバックアドレス（`127.0.0.1`）のみ**にバインドします。
+ブラウザ拡張（OpenRef Capture / Zotero Connector）および OpenRef for Word（Word の Startup テンプレート `OpenRef.dotm` と `OpenRef Dialog.app`）との連携用デーモン `openref-connectd` は、**ループバックアドレス（`127.0.0.1`）のみ**にバインドします。
 
 | ポート | プロトコル | 用途 | バインド先 |
 |---|---|---|---|
 | `23119` | HTTP | Chrome 拡張（OpenRef Capture / Zotero Connector 互換）からの書誌・PDF 受領 | `127.0.0.1:23119` |
-| `23120` | HTTPS | Word アドイン（OpenRef for Word）への UI 配信・引用整形 API | `127.0.0.1:23120` |
+| `23120` | HTTPS | OpenRef for Word（`OpenRef.dotm` / `OpenRef Dialog.app`）の引用整形・参考文献一覧・検索ダイアログの API（`/word/v2/*`） | `127.0.0.1:23120` |
 
 - LAN や外部ネットワークからは到達不能です。
-- Word アドイン用の HTTPS 通信には、初回起動時にローカル（`~/Library/Application Support/OpenRef/certs/`）で生成した `localhost` 専用の自己署名証明書を使用します（秘密鍵は端末外に出ません）。
-- PDF 自動取得（`fetch_pdf`）が DOI 着地ページ等を辿る際は、ループバック・プライベート IP（`127.0.0.0/8`, `10.0.0.0/8`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `localhost`, 数値表記 IP 等）へのリクエストを各リダイレクトホップで拒否する SSRF ガードを備えています。
+- Word 連携用の HTTPS 通信には、初回起動時にローカル（`~/Library/Application Support/OpenRef/certs/`）で生成した `localhost` 専用の自己署名証明書を使用します（秘密鍵は端末外に出ません）。
+- PDF 自動取得（`fetch_pdf`）が DOI 着地ページ等を辿る際は、ループバック・プライベート IP（`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `localhost`, 数値表記 IP 等）へのリクエストを各リダイレクトホップで拒否する SSRF ガードを備えています。
 
 ---
 
@@ -36,7 +36,9 @@ OpenRef がインターネットへ HTTP(S) リクエストを送るのは、ユ
 |---|---|---|
 | **NCBI PubMed E-utilities** (`eutils.ncbi.nlm.nih.gov`) | PMID / DOI からの書誌確定・撤回情報確認時 | PMID または DOI |
 | **Crossref / doi.org** (`api.crossref.org`, `doi.org`) | DOI からの書誌確定・PDF 所在確認時 | DOI またはタイトル断片（PDF 取込時） |
+| **医書.jp** (`webview.isho.jp`) | 医書.jp の DOI（`10.18885/CI.` で始まるもの）がまだ doi.org で解決できないときの書誌確定 | DOI |
 | **PMC AWS Open Data** (`pmc-oa-opendata.s3.amazonaws.com`) | OA 論文の PDF 自動取得時 | PMCID |
+| **出版社のサイト**（DOI の着地ページ・Crossref が示す PDF の URL・ページが宣言する `citation_pdf_url` のホスト） | PDF 自動取得時 | 通常の GET のみ（URL に含まれる DOI 等。Cookie・識別子は送りません。各ホップで §2 の SSRF ガード） |
 | **Unpaywall API** (`api.unpaywall.org`) | 環境変数 `OPENREF_EMAIL` をユーザーが設定している場合のみ（opt-in） | DOI + `OPENREF_EMAIL` |
 | **CSL Styles Repository** (GitHub `citation-style-language`) | 同梱 4 種以外の引用スタイル・言語ファイルを新規導入したとき | スタイル ID / ロケール名（取得後はローカルにキャッシュ） |
 | **配布サイト** (`openref.unitedradiology.jp`) | アプリ起動時・前回から 24 時間以上経っていたときだけ（Settings › 起動時に新版を確認 で無効化可） | 動いている版番号のみ（`dl/VERSION` の GET 1 回。User-Agent `openref/X.Y.Z`） |
@@ -59,7 +61,7 @@ curl -fsSL https://openref.unitedradiology.jp/install.sh | less
 5. `openref`（CLI）・`openref-mcp`（MCP サーバ）・`openref-connectd`（取込サービス）を `~/Library/Application Support/OpenRef/bin/` へ設置
 6. `~/Library/LaunchAgents/dev.openref.connectd.plist` を作成し、`launchctl bootstrap` で `openref-connectd` を常駐開始
 7. Chrome 拡張フォルダを `~/Applications/OpenRef Capture/` へ展開
-8. Microsoft Word が導入されている場合、`~/Library/Containers/com.microsoft.Word/Data/Documents/wef/openref-manifest.xml` を配置し、`security add-trusted-cert` でローカル自己署名証明書（`openref-localhost.pem`）をログインキーチェーンに信頼登録（このとき macOS のパスワード確認ダイアログが 1 回表示されます）
+8. Microsoft Word が導入されている場合、Word の Startup フォルダ（`~/Library/Group Containers/UBF8T346G9.Office/User Content/Startup/Word/`。環境により `User Content.localized/Startup.localized/Word/`）に `OpenRef.dotm` を、`~/Library/Application Support/OpenRef/word/` に `OpenRef Dialog.app` を設置し、旧方式の Office アドイン manifest（`~/Library/Containers/com.microsoft.Word/Data/Documents/wef/openref-manifest.xml`）があれば削除したうえで、`security add-trusted-cert` でローカル自己署名証明書（`openref-localhost.pem`）をログインキーチェーンに信頼登録（このとき macOS のパスワード確認ダイアログが 1 回表示されます）
 
 ### `install.sh` が行わないこと
 - システム領域（`/usr`, `/Library` 等）への書き込みや `sudo` によるルート権限昇格（キーチェーンへの証明書登録時のみ macOS 標準の確認が出ます）

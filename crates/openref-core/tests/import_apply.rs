@@ -167,7 +167,7 @@ fn copy_ignores_drive_setting_repeats_without_duplicates_and_preserves_dates() {
         2
     );
     assert_eq!(f.count("attachments"), 2);
-    assert_eq!(f.count("import_objects"), 9); // Includes memberships and bibliography key history.
+    assert_eq!(f.count("import_objects"), 6); // Includes memberships and bibliography key history.
     let two = f.run(&input, AttachmentMode::Copy);
     assert_eq!(
         two.results.iter().filter(|r| r.status == "merged").count(),
@@ -351,7 +351,7 @@ fn folders_notes_tags_retain_edits_and_tombstones_on_reexecution() {
         raw: json!({}),
     });
     f.run(&input, AttachmentMode::Copy);
-    assert_eq!(f.count("collections"), 3);
+    assert_eq!(f.count("collections"), 2);
     assert_eq!(f.count("notes"), 2);
     let db = Db::open(&f.db).unwrap();
     db.conn
@@ -376,7 +376,7 @@ fn folders_notes_tags_retain_edits_and_tombstones_on_reexecution() {
     input.items[0].notes[0].content_md = "Changed source note".into();
     let report = f.run(&input, AttachmentMode::Copy);
     assert_eq!(f.count("notes"), 2);
-    assert_eq!(f.count("collections"), 3);
+    assert_eq!(f.count("collections"), 2);
     assert_eq!(f.count("tags"), 1);
     assert!(report.results[0]
         .warnings
@@ -1135,7 +1135,7 @@ fn review_reexport_preserves_deleted_objects_and_holds_purged_items() {
     assert_eq!(report.results[0].status, "review");
     assert_eq!(f.count("notes"), 0);
     assert_eq!(f.count("tags"), 0);
-    assert_eq!(f.count("collections"), 1);
+    assert_eq!(f.count("collections"), 0);
     let db = Db::open(&f.db).unwrap();
     db.conn.execute("DELETE FROM items", []).unwrap();
     drop(db);
@@ -1905,8 +1905,8 @@ fn n4_reexport_new_item_joins_existing_renamed_folders_and_tags() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!((folders, tags), (3, 2));
-    assert_eq!(f.count("collections"), 3);
+    assert_eq!((folders, tags), (2, 2));
+    assert_eq!(f.count("collections"), 2);
 }
 
 #[test]
@@ -1923,7 +1923,7 @@ fn n5_second_record_in_run_adds_its_own_memberships() {
     let r = f.run(&input, AttachmentMode::Copy);
     assert!(r.results.iter().all(|r| r.status == "merged"));
     assert_eq!(f.count("item_tags"), 2);
-    assert_eq!(f.count("collection_items"), 4);
+    assert_eq!(f.count("collection_items"), 2);
     f.run(&input, AttachmentMode::Copy);
     assert_eq!(f.count("item_tags"), 2);
 }
@@ -2147,4 +2147,173 @@ fn recovery_rejects_database_alias_even_with_matching_ledger_identity() {
     let next = f.run(&f.input(), AttachmentMode::Copy);
     assert!(part.exists());
     assert!(next.warnings.iter().any(|w| w.contains("DB・WAL・SHM")), "{:?}", next.warnings);
+}
+
+#[test]
+fn folders_go_to_top_level_and_join_same_named_existing_folder() {
+    let f = Fixture::new(json!([
+        {"_id":"a","title":"Alpha","doi":"10.1234/top-a","foldersNamed":["Neuro/CT","Chest"]},
+        {"_id":"b","title":"Beta","doi":"10.1234/top-b"}
+    ]));
+    let db = Db::open(&f.db).unwrap();
+    db.conn
+        .execute("INSERT INTO collections(key,name) VALUES('MINE','neuro')", [])
+        .unwrap();
+    drop(db);
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    assert!(report.results.iter().all(|r| r.status == "inserted"));
+    assert!(!report
+        .warnings
+        .iter()
+        .chain(report.results.iter().flat_map(|r| r.warnings.iter()))
+        .any(|w| w.contains("表示名を変更") || w.contains("所属先")));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w == "同名の既存フォルダへ追加: Neuro → neuro"));
+    assert!(!report.warnings.iter().any(|w| w.contains("以前の移行で作った")));
+    let db = Db::open(&f.db).unwrap();
+    let tree: Vec<(String, Option<String>)> = db
+        .conn
+        .prepare("SELECT c.name,p.name FROM collections c LEFT JOIN collections p ON p.id=c.parent_id ORDER BY c.name COLLATE NOCASE")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        tree,
+        vec![
+            ("Chest".into(), None),
+            ("CT".into(), Some("neuro".into())),
+            ("neuro".into(), None)
+        ]
+    );
+    let memberships: Vec<(String, String)> = db
+        .conn
+        .prepare("SELECT i.title,c.name FROM collection_items ci JOIN items i ON i.id=ci.item_id JOIN collections c ON c.id=ci.collection_id ORDER BY c.name COLLATE NOCASE")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        memberships,
+        vec![("Alpha".into(), "Chest".into()), ("Alpha".into(), "CT".into())]
+    );
+    drop(db);
+    f.run(&f.input(), AttachmentMode::Copy);
+    assert_eq!(f.count("collections"), 3);
+    assert_eq!(f.count("collection_items"), 2);
+}
+
+#[test]
+fn same_named_folders_within_one_input_stay_separate() {
+    let f = Fixture::new(json!([
+        {"_id":"a","title":"Alpha","doi":"10.1234/dup-a","foldersNamed":["Neuro/CT"]},
+        {"_id":"b","title":"Beta","doi":"10.1234/dup-b","foldersNamed":["neuro/MR"]}
+    ]));
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    let db = Db::open(&f.db).unwrap();
+    let top: Vec<String> = db
+        .conn
+        .prepare("SELECT name FROM collections WHERE parent_id IS NULL ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(top.len(), 2, "{top:?}");
+    assert!(top.iter().any(|n| n.contains(" (")), "{top:?}");
+    assert!(report.warnings.iter().any(|w| w.contains("表示名を変更")));
+    assert!(!report.warnings.iter().any(|w| w.contains("同名の既存フォルダへ追加")));
+    assert_eq!(f.count("collections"), 4);
+}
+
+#[test]
+fn source_root_left_by_earlier_version_is_kept_and_reported() {
+    let first = json!({"_id":"a","title":"Alpha","doi":"10.1234/legacy-root","foldersNamed":["Neuro"]});
+    let f = Fixture::new(json!([first.clone()]));
+    f.run(&f.input(), AttachmentMode::Copy);
+    // 1.1.0 の移行が残した状態: 移行元名の親フォルダ（その下に元フォルダ）と kind = source_root の対応
+    let db = Db::open(&f.db).unwrap();
+    db.conn
+        .execute("INSERT INTO collections(key,name) VALUES('OLDROOT','Paperpile')", [])
+        .unwrap();
+    db.conn
+        .execute("UPDATE collections SET parent_id=(SELECT id FROM collections WHERE key='OLDROOT') WHERE name='Neuro'", [])
+        .unwrap();
+    db.conn.execute("INSERT INTO import_objects(source_id,kind,scope,object_id,target_key,raw_json,content_sha256) VALUES('test-library','source_root','','root','OLDROOT','{\"generated_source_root\":true}','')",[]).unwrap();
+    drop(db);
+    let same = f.run(&f.input(), AttachmentMode::Copy);
+    assert!(!same.warnings.iter().any(|w| w.contains("以前の移行で作った")));
+    assert_eq!(f.count("collections"), 2);
+    // 再書出しで最上位のフォルダが増えると知らせる。元フォルダ「Paperpile」は旧親フォルダへ合流させない
+    std::fs::write(
+        &f.json,
+        json!([first,{"_id":"b","title":"Beta","doi":"10.1234/legacy-root-b","foldersNamed":["Chest","Paperpile"]}]).to_string(),
+    )
+    .unwrap();
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("親フォルダ「Paperpile」はそのまま残します")));
+    assert!(!report.warnings.iter().any(|w| w.contains("同名の既存フォルダへ追加")));
+    let db = Db::open(&f.db).unwrap();
+    let in_root: i64 = db
+        .conn
+        .query_row("SELECT count(*) FROM collection_items ci JOIN collections c ON c.id=ci.collection_id WHERE c.key='OLDROOT'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(in_root, 0);
+    assert_eq!(f.count("collections"), 4);
+}
+
+#[test]
+fn reexport_case_variant_folder_does_not_join_the_mapped_one_regardless_of_order() {
+    let first = json!({"_id":"a","title":"Alpha","doi":"10.1234/order-a","foldersNamed":["Neuro"]});
+    let f = Fixture::new(json!([first.clone()]));
+    f.run(&f.input(), AttachmentMode::Copy);
+    // BTreeMap 順で "NEURO" が "Neuro" より先に処理される
+    std::fs::write(
+        &f.json,
+        json!([first,{"_id":"b","title":"Beta","doi":"10.1234/order-b","foldersNamed":["NEURO"]}]).to_string(),
+    )
+    .unwrap();
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    assert!(!report.warnings.iter().any(|w| w.contains("同名の既存フォルダへ追加")));
+    let db = Db::open(&f.db).unwrap();
+    let names: Vec<String> = db
+        .conn
+        .prepare("SELECT name FROM collections ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names[0], "Neuro");
+    assert!(names[1].starts_with("NEURO ("), "{names:?}");
+}
+
+#[test]
+fn removed_membership_of_joined_user_folder_is_not_restored() {
+    let f = Fixture::new(json!([{"_id":"a","title":"Alpha","doi":"10.1234/join-r7","foldersNamed":["Neuro"]}]));
+    let db = Db::open(&f.db).unwrap();
+    db.conn
+        .execute("INSERT INTO collections(key,name) VALUES('MINE','Neuro')", [])
+        .unwrap();
+    drop(db);
+    f.run(&f.input(), AttachmentMode::Copy);
+    assert_eq!(f.count("collection_items"), 1);
+    let db = Db::open(&f.db).unwrap();
+    db.conn.execute("DELETE FROM collection_items", []).unwrap();
+    drop(db);
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    assert_eq!(f.count("collection_items"), 0);
+    assert_eq!(f.count("collections"), 1);
+    assert!(report.results[0]
+        .warnings
+        .iter()
+        .any(|w| w.contains("解除済み")));
 }

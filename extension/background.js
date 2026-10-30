@@ -154,7 +154,9 @@ async function fetchPdf(url, follow, hopped) {
       const next = nextPdfUrlFromHtml(html, r.url || url);
       if (next && next !== url) return fetchPdf(next, true, true);
     }
-    throw new Error("PDF ではない応答（" + buf.byteLength + " bytes" + (hopped ? "・中継先も HTML" : "") + "）");
+    const err = new Error("PDF ではない応答（" + buf.byteLength + " bytes" + (hopped ? "・中継先も HTML" : "") + "）");
+    err.html = true; // popup が「PDF タブで開いて取り直す」経路に回す目印（content.js と同じ）
+    throw err;
   }
   return bufToB64(buf);
 }
@@ -174,7 +176,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "openref-bg-fetch-pdf") {
     fetchPdf(msg.url, !!msg.follow, false)
       .then((b64) => sendResponse({ ok: true, b64 }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      .catch((e) => sendResponse({ ok: false, error: String(e), html: !!e.html }));
     return true; // async
   }
   return false;

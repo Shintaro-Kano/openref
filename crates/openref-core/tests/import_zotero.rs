@@ -168,7 +168,7 @@ fn zotero_copy_apply_and_repeat_preserve_all_counts_and_bytes() {
         ("attachments", 3),
         ("notes", 3),
         ("tags", 2),
-        ("collections", 4),
+        ("collections", 3),
     ] {
         let actual: i64 = db
             .conn

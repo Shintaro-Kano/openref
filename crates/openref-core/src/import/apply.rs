@@ -1721,15 +1721,15 @@ fn report_complete(report: &ImportReport) -> bool {
         })
 }
 
-struct FolderMap {
-    root: Option<String>,
-    nodes: HashMap<String, Option<String>>,
-}
+/// 元フォルダ id → 対応先フォルダ key（None = 保留・削除済み）
+type FolderMap = HashMap<String, Option<String>>;
 
+/// 元フォルダを OpenRef のフォルダへ対応させる。parent = None は最上位（移行元名の親フォルダは作らない）。
+/// 同じ親の下に大小無視の同名があればそれへ追加する（OpenRef の兄弟名は大小無視で一意・タグも名前で合流する）。
+/// ただし今回の入力の別の元フォルダの対応先には合流させない（入力内の別々の同名は従来どおり表示名を変えて分ける）
 fn mapped_folder(
     conn: &Connection,
     input: &ImportInput,
-    kind: &str,
     id: &str,
     stable: bool,
     name: &str,
@@ -1737,6 +1737,7 @@ fn mapped_folder(
     raw: &Value,
     warnings: &mut Vec<String>,
 ) -> Result<Option<String>> {
+    let kind = "folder";
     let scope = scope(input, stable);
     if let Some((key, _)) = object(conn, input, kind, scope, id)? {
         let existing: Option<i64> = conn
@@ -1774,11 +1775,25 @@ fn mapped_folder(
     } else {
         base
     };
+    let same:Option<(String,String)>=conn.query_row("SELECT key,name FROM collections WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE AND deleted_at IS NULL ORDER BY id LIMIT 1",params![parent,base],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((key, existing)) = same {
+        // 1.1.0 までの移行が作った移行元名の親フォルダ（source_root）にも合流させない
+        let taken:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM import_objects WHERE target_key=?4 AND ((source_id=?1 AND kind=?2 AND scope=?3 AND object_id!=?5) OR kind='source_root'))",params![input.source.id,kind,scope,key,id],|r|r.get(0))?;
+        if !taken {
+            warnings.push(if existing == name {
+                format!("同名の既存フォルダへ追加: {name}")
+            } else {
+                format!("同名の既存フォルダへ追加: {name} → {existing}")
+            });
+            remember(conn, input, kind, scope, id, &key, raw, "")?;
+            return Ok(Some(key));
+        }
+    }
     let mut display = base.clone();
     let suffix = &digest(json!([input.source.id, scope, id]).to_string().as_bytes())[..8];
     let mut n = 0;
     loop {
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM collections WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE)",params![parent,display],|r|r.get(0))?;
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM collections WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE AND deleted_at IS NULL)",params![parent,display],|r|r.get(0))?;
         if !exists {
             break;
         }
@@ -1808,31 +1823,48 @@ fn prepare_folders(
     cancel: &AtomicBool,
     warnings: &mut Vec<String>,
 ) -> Result<FolderMap> {
-    let root = {
-        let tx = db
+    // 1.1.0 までの移行は移行元名の親フォルダ（kind = source_root）を作っていた。残っていれば触らず、
+    // 今回の移行が最上位にフォルダを作ったときだけ知らせる（木が親フォルダの内と外に分かれるため）
+    let legacy_root: Option<String> = match object(&db.conn, input, "source_root", "", "root")? {
+        Some((key, _)) => db
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let root = mapped_folder(
-            &tx,
-            input,
-            "source_root",
-            "root",
-            true,
-            if input.source.format == "paperpile" {
-                "Paperpile"
-            } else {
-                "Zotero"
-            },
-            None,
-            &json!({"generated_source_root":true}),
-            warnings,
-        )?;
-        tx.commit()?;
-        root
+            .query_row(
+                "SELECT name FROM collections WHERE key=?1 AND deleted_at IS NULL",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?,
+        None => None,
     };
+    let top_level = |conn: &Connection| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM collections WHERE parent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    };
+    let top_before = top_level(&db.conn)?;
+    // 別の書出しの対応は親に依存しないので先に全部記録する（同名合流の判定が入力の並び順に左右されないように）
+    for node in &input.folders {
+        let node_scope = scope(input, node.stable_id);
+        if object(&db.conn, input, "folder", node_scope, &node.id)?.is_none() {
+            if let Some(key) = prior.target("folder", &node.id, &node.name) {
+                remember(
+                    &db.conn,
+                    input,
+                    "folder",
+                    node_scope,
+                    &node.id,
+                    key,
+                    &node.raw,
+                    &digest(node.name.as_bytes()),
+                )?;
+            }
+        }
+    }
     let nodes: HashMap<_, _> = input.folders.iter().map(|f| (f.id.as_str(), f)).collect();
     let mut folders = HashMap::new();
-    for folder in &input.folders {
+    'all: for folder in &input.folders {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -1847,38 +1879,13 @@ fn prepare_folders(
         }
         for node in chain.into_iter().rev() {
             if cancel.load(Ordering::Relaxed) {
-                return Ok(FolderMap {
-                    root,
-                    nodes: folders,
-                });
+                break 'all;
             }
+            // 親の対応先（最上位 = None）。Some(None) = 親が保留・削除済みなので子も作らない
             let parent = node
                 .parent_id
                 .as_ref()
-                .and_then(|p| folders.get(p).cloned())
-                .unwrap_or_else(|| root.clone());
-            if object(
-                &db.conn,
-                input,
-                "folder",
-                scope(input, node.stable_id),
-                &node.id,
-            )?
-            .is_none()
-            {
-                if let Some(key) = prior.target("folder", &node.id, &node.name) {
-                    remember(
-                        &db.conn,
-                        input,
-                        "folder",
-                        scope(input, node.stable_id),
-                        &node.id,
-                        key,
-                        &node.raw,
-                        &digest(node.name.as_bytes()),
-                    )?;
-                }
-            }
+                .map(|p| folders.get(p).cloned().flatten());
             let pending = prior.folder_needs_review(node)
                 && object(
                     &db.conn,
@@ -1891,33 +1898,34 @@ fn prepare_folders(
             let target = if pending {
                 warnings.push(format!("別の書出しのフォルダ対応候補を保留: {}", node.name));
                 None
-            } else if let Some(parent) = parent {
+            } else if matches!(parent, Some(None)) {
+                None
+            } else {
                 let tx = db
                     .conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let target = mapped_folder(
                     &tx,
                     input,
-                    "folder",
                     &node.id,
                     node.stable_id,
                     &node.name,
-                    Some(&parent),
+                    parent.flatten().as_deref(),
                     &node.raw,
                     warnings,
                 )?;
                 tx.commit()?;
                 target
-            } else {
-                None
             };
             folders.insert(node.id.clone(), target);
         }
     }
-    Ok(FolderMap {
-        root,
-        nodes: folders,
-    })
+    if let Some(name) = legacy_root {
+        if top_level(&db.conn)? > top_before {
+            warnings.push(format!("以前の移行で作った親フォルダ「{name}」はそのまま残します（中のフォルダも移しません）。今回新しく作ったフォルダは最上位に置きました"));
+        }
+    }
+    Ok(folders)
 }
 
 fn apply_metadata(
@@ -1931,14 +1939,11 @@ fn apply_metadata(
     folders: &FolderMap,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    for (id, folder) in std::iter::once(("移行元の親フォルダ", folders.root.as_deref())).chain(
-        item.folder_ids.iter().map(|id| {
-            (
-                id.as_str(),
-                folders.nodes.get(id).and_then(|k| k.as_deref()),
-            )
-        }),
-    ) {
+    for (id, folder) in item
+        .folder_ids
+        .iter()
+        .map(|id| (id.as_str(), folders.get(id).and_then(|k| k.as_deref())))
+    {
         if let Some(folder) = folder {
             apply_membership(
                 conn,

@@ -1,4 +1,5 @@
 mod crossref;
+mod isho;
 mod pubmed;
 
 pub use crossref::{search_bibliographic, Candidate};
@@ -68,7 +69,12 @@ pub fn resolve(input: &AddInput) -> Result<Resolved> {
         AddInput::Pmid(p) => pubmed::fetch_by_pmid(p),
         AddInput::Doi(d) => match pubmed::find_pmid_by_doi(d) {
             Ok(Some(pmid)) => pubmed::fetch_by_pmid(&pmid),
-            _ => crossref::fetch_by_doi(d),
+            _ => match crossref::fetch_by_doi(d) {
+                Ok(resolved) => Ok(resolved),
+                Err(primary) if isho::canonical_doi(d).is_some() => isho::fetch(d)
+                    .map_err(|fallback| CoreError::Http(format!("{primary} / {fallback}"))),
+                Err(error) => Err(error),
+            },
         },
     }
 }

@@ -40,6 +40,11 @@
       );
       if (md) doi = cleanDoi(decodeURIComponent(md[1]));
     }
+    // 医書.jp: PDF 自体に DOI の印字がなくても出版社 URL に識別子がある。
+    if (!doi && location.hostname === "webview.isho.jp") {
+      var isho = location.pathname.match(/^\/journal\/detail\/(?:pdf|abs)\/(10\.\d{4,9}\/.+)$/);
+      if (isho) doi = cleanDoi(decodeURIComponent(isho[1]));
+    }
     // doi.org リンク
     if (!doi) {
       var a = document.querySelector('a[href*="doi.org/10."]');
@@ -73,6 +78,23 @@
         pdfSource = "atypon";
       }
     }
+    // ScienceDirect: この論文の pdfft だけを採用（参考文献・合本・補遺を除外）。
+    if (!pdfUrl && location.hostname === "www.sciencedirect.com") {
+      var article = location.pathname.match(/^\/science\/article\/pii\/([A-Za-z0-9]+)\/?$/);
+      if (article) {
+        var pdfLink = Array.from(document.querySelectorAll("a[href]")).find(function (a) {
+          try {
+            var u = new URL(a.href, location.href);
+            return u.origin === location.origin &&
+              u.pathname === "/science/article/pii/" + article[1] + "/pdfft";
+          } catch (e) { return false; }
+        });
+        if (pdfLink) {
+          pdfUrl = pdfLink.href;
+          pdfSource = "sciencedirect";
+        }
+      }
+    }
     // 明示的な PDF リンク（ページ上の先頭 1 件。検索結果ページでは無関係な論文になり得る）
     if (!pdfUrl) {
       var links = Array.prototype.slice.call(document.querySelectorAll("a[href]"));
@@ -85,6 +107,20 @@
       }
     }
 
+    // 参考文献欄の PMC リンクは使わず、当該 PMID の full-text links だけを使う。
+    var pmcUrl = null;
+    if (location.hostname === "pubmed.ncbi.nlm.nih.gov" && pmid &&
+        location.pathname === "/" + pmid + "/") {
+      var pmc = Array.from(document.querySelectorAll(".full-text-links-list a[href]")).find(function (a) {
+        try {
+          var u = new URL(a.href);
+          return u.protocol === "https:" && u.hostname === "pmc.ncbi.nlm.nih.gov" &&
+            u.pathname === "/articles/pmid/" + pmid + "/";
+        } catch (e) { return false; }
+      });
+      if (pmc) pmcUrl = pmc.href;
+    }
+
     var title =
       meta("citation_title") || meta("og:title") || (document.title || "").trim() || null;
 
@@ -93,6 +129,7 @@
       pmid: pmid,
       pdfUrl: pdfUrl,
       pdfSource: pdfSource,
+      pmcUrl: pmcUrl,
       title: title,
       url: location.href,
       // タブ自体が PDF（Chrome の PDF ビューアには注入できないので通常 false。pdf.js 系ビューア用）
@@ -160,10 +197,19 @@
 
   /* ページ内 fetch = ユーザーの認証済み session・正しい referrer が乗る。
      purchase/購読済みの paywall PDF はこの経路でのみ取れる。
-     `follow` が真のとき（背景タブ経路）だけ、HTML が返ったら nextPdfUrlFromHtml の先へ **1 回だけ** 追従する
-     （既存のアクティブタブ経路の挙動は変えない）。 */
+     `follow` が真のとき（popup の fetchPdfViaTabThenBg = 背景タブ経路と PDF タブ経由の取り直し）だけ、HTML が返ったら
+     nextPdfUrlFromHtml の先へ **1 回だけ** 追従する（論文ページでの最初の取得 = fetchPdfBytes は追従しない）。
+     PDF でない応答の Error には `html = true` を付ける（popup が「PDF タブで開いて取り直す」経路に回す目印）。 */
   async function fetchPdfBase64(url, follow, hopped) {
-    var r = await fetch(url, { credentials: "include" });
+    var r;
+    try {
+      r = await fetch(url, { credentials: "include" });
+    } catch (e) {
+      // 別オリジンの配信先が `Access-Control-Allow-Origin: *`（署名付き URL 等・Cookie 不要）だと
+      // include は CORS で拒否される（TypeError）→ Cookie なしで取り直す
+      if (new URL(url, location.href).origin === location.origin) throw e;
+      r = await fetch(url, { credentials: "omit" });
+    }
     if (!r.ok) throw new Error("HTTP " + r.status);
     var buf = await r.arrayBuffer();
     var b = new Uint8Array(buf);
@@ -173,9 +219,11 @@
         var next = nextPdfUrlFromHtml(html, r.url || url);
         if (next && next !== url) return fetchPdfBase64(next, true, true);
       }
-      throw new Error(
+      var err = new Error(
         "PDF ではない応答（" + buf.byteLength + " bytes・HTML の可能性" + (hopped ? "・中継先も HTML" : "") + "）"
       );
+      err.html = true;
+      throw err;
     }
     var CHUNK = 0x8000;
     var parts = [];
@@ -209,7 +257,7 @@
           sendResponse({ ok: true, b64: b64 });
         })
         .catch(function (e) {
-          sendResponse({ ok: false, error: String(e) });
+          sendResponse({ ok: false, error: String(e), html: !!e.html });
         });
       return true; // async
     }

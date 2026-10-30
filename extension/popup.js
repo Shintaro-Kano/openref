@@ -8,7 +8,10 @@
      DOI/PMID を抽出 → 書誌確定 → 既存 item に添付 or 新規登録（識別子が無ければ要確認 stub）
    ⑤識別子なし・PDF も無い（ページ上のリンク拾いは信用しない）: /capture/save（題名のみの document・捏造しない）
    ⑥層 2（実験的）: ③の OA 経路も失敗し DOI があれば **DOI ページを背景タブで開いて取得**（viaDoiTab）。全サイト許可が要るので
-     初回の保存クリック時に 1 度だけ求め、拒否は記録して以後は聞かない */
+     初回の保存クリック時に 1 度だけ求め、拒否は記録して以後は聞かない
+   識別子のある経路（論文ページ・PMC 本文・DOI ページ）では、宣言された PDF の URL が HTML（中継ページ）を返したら、
+   その URL を背景タブで開いてサイト自身の処理（PMC の proof-of-work・ScienceDirect の pdfft → 署名付き URL 等）を
+   走らせてから取り直す（fetchPdfViaNavigation） */
 "use strict";
 
 const BASE = "http://127.0.0.1:23119";
@@ -16,6 +19,10 @@ const ALL_SITES = { origins: ["https://*/*", "http://*/*"] };
 const DECLINED_KEY = "openref_allsites_declined";
 const DOI_TAB_TIMEOUT_MS = 20000;
 const STEP_TIMEOUT_MS = 10000; // executeScript / sendMessage 1 回あたり
+const NAV_QUIET_MS = 10000; // PDF タブが HTML のまま次へ移らなければ「中継ではない（ログイン・購入頁）」とみなす
+const RELAY_WAIT_MS = 8000; // 識別子の無い着地ページ（ブラウザ確認・JS の転送）が次へ移るのを待つ上限
+// ページが宣言した「この論文の PDF」の所在（content.js の pdfSource）。link = ページ上の .pdf リンク拾いは含めない
+const DECLARED = ["meta", "self", "atypon", "sciencedirect"];
 let allSites = false; // optional_host_permissions（全サイト）が付与済みか
 let allSitesDeclined = false; // 過去に拒否した記録（init で読む。クリック時に await を挟まないため）
 let savedDoi = null; // /capture/save が確定した DOI（応答に doi キーがあればそれ。無い旧 connectd だけページ抽出の DOI）。層 2 が使う
@@ -72,6 +79,18 @@ function urlOnlyAnalyze(url) {
     out.pdfSource = "self";
     out.isPdf = true;
   }
+  try {
+    const u = new URL(url);
+    const isho = u.pathname.match(/^\/journal\/detail\/(pdf|abs)\/(10\.\d{4,9}\/.+)$/);
+    if (u.hostname === "webview.isho.jp" && isho) {
+      out.doi = decodeURIComponent(isho[2]);
+      if (isho[1] === "pdf") {
+        out.pdfUrl = url;
+        out.pdfSource = "self";
+        out.isPdf = true;
+      }
+    }
+  } catch (e) { /* malformed URL */ }
   return out;
 }
 
@@ -99,6 +118,7 @@ function renderPage() {
   if (page.doi) bits.push("DOI " + page.doi);
   let badge;
   if (isPdfTab()) badge = '<span class="badge ok">PDF タブ</span>';
+  else if (page.pmcUrl) badge = '<span class="badge ok">PMC 本文あり</span>';
   else if (page.pdfUrl) badge = '<span class="badge ok">PDF あり</span>';
   else if (!contentScriptOk && !page.pmid && !page.doi) badge = '<span class="badge ok">PDF タブ？</span>';
   else badge = '<span class="badge no">PDF リンクなし</span>';
@@ -179,20 +199,22 @@ function b64ToBytes(b64) {
 }
 
 /* PDF バイト列の取得: ページ内 fetch（認証済み session・正しい referrer）→ 拡張（service worker）fetch。
-   戻り値 {bytes, how} か {bytes: null, error} */
+   戻り値 {bytes, how} か {bytes: null, error, html}（html = どれかが PDF の代わりに HTML を受けた） */
 async function fetchPdfBytes(url) {
   const errors = [];
+  let html = false;
   if (contentScriptOk) {
     setStatus("PDF を取得中…（ページ内 fetch）");
     const r1 = await sendToTab({ type: "openref-fetch-pdf", url });
     if (r1.ok) return { bytes: b64ToBytes(r1.b64), how: "ページ内" };
     errors.push("ページ内 fetch: " + r1.error);
+    html = html || !!r1.html;
   }
   setStatus("PDF を取得中…（拡張から fetch）");
   const r2 = await sendToBg({ type: "openref-bg-fetch-pdf", url });
   if (r2.ok) return { bytes: b64ToBytes(r2.b64), how: "拡張" };
   errors.push("拡張 fetch: " + r2.error);
-  return { bytes: null, error: errors.join(" / ") };
+  return { bytes: null, error: errors.join(" / "), html: html || !!r2.html };
 }
 
 /* OA 経路の失敗文から末尾の一般案内（core の定型文）を落とし、tried 連鎖だけ見せる */
@@ -208,7 +230,7 @@ const refused = (e) => e.status === 409 || (e.status === 422 && e.body && e.body
 
 /* PDF のバイト列を /capture/attachment へ（source = PDF URL の出どころ・via = 取った経路 page / doi-tab） */
 const postAttachment = (key, bytes, source, via) =>
-  api("/capture/attachment?key=" + encodeURIComponent(key) + "&source=" + encodeURIComponent(source || "") + "&via=" + via, {
+  api("/capture/attachment?key=" + encodeURIComponent(key) + "&source=" + encodeURIComponent(source === "sciencedirect" ? "link" : source || "") + "&via=" + via, {
     method: "POST",
     headers: { "Content-Type": "application/pdf" },
     body: bytes,
@@ -219,11 +241,22 @@ async function attachPdf(key) {
   $("keepopen").style.display = "block";
   let note;
   if (page.pdfUrl) {
-    const got = await fetchPdfBytes(page.pdfUrl);
+    let got = await fetchPdfBytes(page.pdfUrl);
+    let source = page.pdfSource;
+    // PDF タブで開き直すのは、ページが宣言した PDF だけ（ページ上のリンク拾い = link は user が押していないリンクなので開かない）
+    if (!got.bytes && got.html && allSites && DECLARED.includes(page.pdfSource)) {
+      try {
+        const nav = await fetchPdfViaNavigation(page.pdfUrl, tab.id, contentScriptOk);
+        got = { bytes: b64ToBytes(nav.b64), how: nav.how };
+        if (nav.moved) source = "link";
+      } catch (e) {
+        got.error += " / PDF タブ: " + String(e.message || e);
+      }
+    }
     if (got.bytes) {
       setStatus("PDF を OpenRef へ転送中…（" + kb(got.bytes.length) + "）");
       try {
-        const res = await postAttachment(key, got.bytes, page.pdfSource, "page");
+        const res = await postAttachment(key, got.bytes, source, "page");
         const mark = res.doi_check === "unknown" ? "・DOI 未確認" : "";
         if (res.status === "attached") return "PDF 添付 ✓（" + got.how + " fetch・" + kb(res.bytes) + mark + "）";
         if (res.status === "attached_additional") return "PDF を 2 本目として添付 ✓（既存添付と別ファイル・" + kb(res.bytes) + mark + "）";
@@ -242,6 +275,14 @@ async function attachPdf(key) {
   } else {
     // PubMed ページ等: PDF リンクが無いので即 OA 経路へ
     note = "ページに PDF リンクなし";
+  }
+  if (page.pmcUrl && page.pmid && allSites) {
+    try {
+      return await viaDoiTab(key, savedDoi, { url: page.pmcUrl, pmid: page.pmid });
+    } catch (e) {
+      if (refused(e)) return "書誌は保存済み。PDF は添付しませんでした — " + String(e.message || e);
+      note += " / PMC 本文経由: " + String(e.message || e);
+    }
   }
   setStatus(note + " → OpenRef 側で取得を試行…（PMC / Unpaywall / Crossref / DOI 着地ページ）");
   try {
@@ -404,54 +445,142 @@ function waitForTabLoad(tabId, timeoutMs) {
 }
 
 /* PDF バイト列（base64）をタブ内 fetch → 失敗なら service worker の fetch で取る。
-   content script の fetch はページオリジンの CORS を受ける（別オリジンの配信ホスト = AIC の storage.・
-   ScienceDirect の pdf.sciencedirectassets.com は `ACAO: *` でも credentials:include で拒否される）ので、
+   content script の fetch はページオリジンの CORS を受ける（別オリジンの配信ホスト = AIC の storage. 等。
+   `ACAO: *` の署名付き URL は content.js が Cookie なしで再試行する）ので、
    全サイト権限を持つ SW の fetch（CORS を受けない）へ必ず fallback する。「HTML なら 1 回だけ追従」は
    タブ内 = meta refresh か同一オリジンの .pdf パスがちょうど 1 つ / SW = meta refresh のみ（規則差は background.js に明記）。
-   注意: 追従先（meta refresh の飛び先 = 任意ホスト）へも user の cookie 付きで fetch する。 */
+   注意: 追従先（meta refresh の飛び先 = 任意ホスト）へも user の cookie 付きで fetch する。
+   失敗の Error は、どちらかが PDF の代わりに HTML を受けていれば `html = true`（fetchPdfViaNavigation へ回す目印）。 */
 async function fetchPdfViaTabThenBg(tabId, url, injected) {
   const errors = [];
+  let html = false;
   if (injected) {
     const f = await withTimeout(sendToTab({ type: "openref-fetch-pdf", url, follow: true }, tabId), 60000, "タブ内 fetch");
     if (f.ok) return { b64: f.b64, how: "タブ内" };
     errors.push("タブ内: " + f.error);
+    html = html || !!f.html;
   }
   const g = await withTimeout(sendToBg({ type: "openref-bg-fetch-pdf", url, follow: true }), 60000, "拡張 fetch");
   if (g.ok) return { b64: g.b64, how: "拡張" };
   errors.push("拡張: " + g.error);
-  throw new Error(errors.join(" / "));
+  const err = new Error(errors.join(" / "));
+  err.html = html || !!g.html;
+  throw err;
+}
+
+/* タブの読込の世代（onUpdated の loading / complete のたびに +1）。「次のページへ移ったか」を URL ではなく世代で見る
+   （同じ URL の reload = PMC の proof-of-work の後も拾う。解析の往復中に始まった遷移も取りこぼさない） */
+function watchTab(tabId) {
+  let gen = 0;
+  const onUpd = (id, info) => {
+    if (id === tabId && info.status) gen++;
+  };
+  chrome.tabs.onUpdated.addListener(onUpd);
+  return { gen: () => gen, stop: () => chrome.tabs.onUpdated.removeListener(onUpd) };
+}
+
+/* cond() が ms 以内に真になるか（250 ms ごとに見る） */
+async function waitUntil(cond, ms) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() >= end) return false;
+    await sleep(250);
+  }
+  return true;
+}
+
+/* 宣言された PDF の URL が HTML（中継ページ）を返すとき: user が PDF のリンクを押したのと同じく背景タブで開き、
+   サイト自身の JS を走らせてから取り直す。中継ページの例 = PMC の「Preparing to download …」（proof-of-work を計算して
+   cookie `cloudpmc-viewer-pow`（5 時間）を立て reload。cookie が無い間は fetch に HTML しか返らない）・
+   ScienceDirect の pdfft（JS で pdf.sciencedirectassets.com の署名付き URL へ転送）。出版社名では分岐しない。
+   取り直しはタブの**新しい読込が完了するたびに 1 回**、タブの今の URL を元の論文タブ（cookie・referrer。別オリジンの
+   署名 URL は content.js が Cookie なしで再試行）→ 拡張の順で fetch し、%PDF が返った時点で終える。
+   HTML のまま NAV_QUIET_MS 次へ移らなければ中継ではない（ログイン・購入頁）とみなして早めに諦める。HTTP エラー等はすぐ投げる。
+   中身が目的の論文かは /capture/attachment の DOI 照合が決める。PDF が宣言 URL と別オリジンに着いたら `moved` を返し、
+   呼び手は照合を厳格（source=link）にする（転送の連鎖だけを同一性の根拠にしない）。成否にかかわらずタブを閉じる。
+   制限: Content-Disposition: attachment の PDF は Chrome がダウンロードに回す（タブは空のまま）。 */
+async function fetchPdfViaNavigation(url, contextTabId, contextInjected) {
+  setStatus("PDF を背景タブで開いて、サイトの中継ページの処理を待っています…（" + hostOf(url) + "）");
+  const t = await chrome.tabs.create({ url, active: false });
+  const w = watchTab(t.id);
+  try {
+    await sendToBg({ type: "openref-hidden-tab", tabId: t.id, open: true });
+    const deadline = Date.now() + DOI_TAB_TIMEOUT_MS;
+    let tried = -1; // 最後に取り直した読込の世代
+    let quietSince = 0;
+    let lastError = "";
+    while (Date.now() < deadline) {
+      await sleep(500);
+      if (w.gen() === tried) {
+        if (Date.now() - quietSince >= NAV_QUIET_MS) break;
+        continue;
+      }
+      const current = await chrome.tabs.get(t.id);
+      // 読込中は待つ（中継ページの complete で取り直して HTML なら、次の読込を待つだけ）
+      if (current.status !== "complete" || !/^https?:/.test(current.url || "")) continue;
+      tried = w.gen();
+      try {
+        const got = await fetchPdfViaTabThenBg(contextTabId, current.url, contextInjected);
+        return { b64: got.b64, how: "PDF タブ経由・" + got.how, moved: new URL(current.url).origin !== new URL(url).origin };
+      } catch (e) {
+        if (!e.html) throw e;
+        lastError = String(e.message || e);
+        quietSince = Date.now();
+      }
+    }
+    throw new Error(
+      "PDF タブが PDF へ届きませんでした（中継ページのまま・ログイン / アクセス確認が要る場合はブラウザで PDF を開いてください）" +
+        (lastError ? " — " + lastError : "")
+    );
+  } finally {
+    w.stop();
+    try { await chrome.tabs.remove(t.id); } catch (e) { /* already closed */ }
+    await sendToBg({ type: "openref-hidden-tab", tabId: t.id, open: false });
+  }
 }
 
 /* DOI ページを背景タブで開き、着地ページで PDF リンクを探して取得。
-   失敗でも必ずタブを閉じる（popup が途中で閉じても SW が storage.session / alarms で閉じる）。
-   再試行ループは作らない（中継ページの meta refresh を最大 4 回待つだけ）。
-   制限: 着地が Content-Disposition: attachment の PDF だと Chrome がダウンロードに回し、タブは空のまま → 20 秒で時間切れになる。 */
-async function viaDoiTab(key, doi) {
-  setStatus("DOI ページを背景タブで開いて PDF を探しています…（doi.org/" + doi + "）");
+   成否にかかわらずタブを閉じる。中継ページ（meta refresh・識別子も PDF の宣言も無いページ = ブラウザ確認や JS の転送）は
+   サイト自身の遷移を待って最大 4 回やり直す。宣言された PDF が HTML を返したら fetchPdfViaNavigation で取り直す。 */
+async function viaDoiTab(key, doi, pmc = null) {
+  const route = pmc ? "PMC 本文経由" : "DOI ページ経由";
+  if (pmc && pmc.url !== "https://pmc.ncbi.nlm.nih.gov/articles/pmid/" + pmc.pmid + "/") {
+    throw new Error("対象 PMID の PMC リンクではありません");
+  }
+  setStatus(route + "：背景タブで PDF を探しています…");
   const t = await chrome.tabs.create({
-    url: "https://doi.org/" + encodeURIComponent(doi).replace(/%2F/gi, "/"),
+    url: pmc ? pmc.url : "https://doi.org/" + encodeURIComponent(doi).replace(/%2F/gi, "/"),
     active: false,
   });
-  await sendToBg({ type: "openref-hidden-tab", tabId: t.id, open: true });
+  const w = watchTab(t.id);
   const started = Date.now();
   try {
+    await sendToBg({ type: "openref-hidden-tab", tabId: t.id, open: true });
     let pdfUrl = null;
-    let pdfSource = null; // meta | self | atypon（宣言された所在だけを受ける。link = ページ上の .pdf リンク拾いは本体とは限らない）
+    // meta | self | atypon | sciencedirect（宣言された所在 = この論文の PDF だけを受ける。link = ページ上の .pdf リンク拾いは本体とは限らない）
+    let pdfSource = null;
     let host = "";
     let refresh = null;
     let injected = false;
     let heuristicOnly = false;
+    let relay = false; // 最後に見たページが中継ページのまま
     for (let i = 0; i < 4; i++) {
       const remain = DOI_TAB_TIMEOUT_MS - (Date.now() - started);
       if (remain <= 0) throw new Error("DOI ページの読込が " + Math.round(DOI_TAB_TIMEOUT_MS / 1000) + " 秒以内に終わりません");
       const url = await waitForTabLoad(t.id, remain);
+      const seen = w.gen(); // この読込の世代。以後に増えたら次のページへ移り始めた
       host = hostOf(url || "");
       try {
         await withTimeout(chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["content.js"] }), STEP_TIMEOUT_MS, "content script の注入");
         injected = true;
       } catch (e) {
-        // 注入不可（Chrome の PDF ビューア・エラーページ・chrome:// 等）。URL が PDF なら拡張 fetch で取る
         injected = false;
+        if (w.gen() > seen) { // 注入の間に次のページへ移った（中継ページの転送）→ やり直す
+          relay = true;
+          continue;
+        }
+        // 注入不可（Chrome の PDF ビューア・エラーページ・chrome:// 等）。URL が PDF なら拡張 fetch で取る
+        if (pmc) throw new Error("PMC 本文の識別子を確認できません: " + String(e.message || e));
         if (url && /\.pdf(\?|#|$)/i.test(url)) {
           pdfUrl = url;
           pdfSource = "self";
@@ -460,31 +589,65 @@ async function viaDoiTab(key, doi) {
         throw new Error("着地ページ（" + host + "）に content script を注入できません（PDF ビューア / エラーページの可能性: " + String(e.message || e) + "）");
       }
       const a = await withTimeout(sendToTab({ type: "openref-analyze" }, t.id), STEP_TIMEOUT_MS, "着地ページの解析");
-      if (!a.ok) throw new Error("着地ページ（" + host + "）の解析に失敗: " + a.error);
-      if (a.data.pdfUrl && ["meta", "self", "atypon"].includes(a.data.pdfSource)) {
-        pdfUrl = a.data.pdfUrl;
-        pdfSource = a.data.pdfSource;
-        break;
+      if (!a.ok) {
+        if (w.gen() > seen) { // 解析の往復中に次のページへ移った（message port closed）→ やり直す
+          relay = true;
+          continue;
+        }
+        throw new Error("着地ページ（" + host + "）の解析に失敗: " + a.error);
       }
-      if (a.data.pdfUrl) heuristicOnly = true; // link 由来 = 宣言なし。使わない
+      const d = a.data;
+      relay = !d.pmid && !d.doi && !d.pdfUrl;
+      if (!relay) {
+        if (pmc && (host !== "pmc.ncbi.nlm.nih.gov" || d.pmid !== pmc.pmid ||
+            (doi && d.doi && d.doi.toLowerCase() !== doi.toLowerCase()))) {
+          throw new Error("PMC の本文識別子が保存対象と一致しません");
+        }
+        if (d.pdfUrl && DECLARED.includes(d.pdfSource)) {
+          pdfUrl = d.pdfUrl;
+          pdfSource = d.pdfSource;
+          break;
+        }
+        if (d.pdfUrl) heuristicOnly = true; // link 由来 = 宣言なし。使わない
+      }
       const r = await withTimeout(sendToTab({ type: "openref-refresh-url" }, t.id), STEP_TIMEOUT_MS, "中継判定");
       refresh = r.ok ? r.url : null;
-      if (!refresh) break;
-      // 中継ページ（meta refresh）: 飛び先の読込を待ってやり直す
-      setStatus("中継ページ（" + host + "）→ 着地を待っています…");
-      await sleep(700); // linkinghub.elsevier.com は "2; url=…" = 2 秒後に飛ぶ
+      if (refresh) {
+        // 中継ページ（meta refresh）: 飛び先の読込を待ってやり直す
+        setStatus("中継ページ（" + host + "）→ 着地を待っています…");
+        await sleep(700); // linkinghub.elsevier.com は "2; url=…" = 2 秒後に飛ぶ
+        continue;
+      }
+      // 識別子も PDF の宣言も無いページ = ブラウザ確認（PMC の reCAPTCHA の確認ページ等）や JS の転送の途中。
+      // サイト自身の遷移を待ってやり直す（確認を解く操作はしない。動かなければ下の誠実なエラーで終える）
+      const left = DOI_TAB_TIMEOUT_MS - (Date.now() - started);
+      if (!relay || i === 3 || left <= 0) break;
+      setStatus("中継ページ（" + host + "）→ 転送を待っています…");
+      if (!(await waitUntil(() => w.gen() > seen, Math.min(left, RELAY_WAIT_MS)))) break;
+    }
+    if (pmc && relay) {
+      throw new Error("PMC 本文の識別子を確認できません（" + host + " が確認ページ / 中継ページのまま。PMC のページを一度ブラウザで開いてから取り込み直してください）");
     }
     if (!pdfUrl) {
       throw new Error(
         "着地ページ（" + host + "）に PDF の宣言（citation_pdf_url 等）がありません" +
           (heuristicOnly ? "（ページ上の .pdf リンクは本体とは限らないため使いません）" : "") +
-          (refresh ? "（中継ページのまま）" : "")
+          (refresh || relay ? "（中継ページのまま）" : "")
       );
     }
     setStatus("PDF を取得中…（" + host + "・認証済み session）");
-    const got = await fetchPdfViaTabThenBg(t.id, pdfUrl, injected);
-    return await postPdf(key, got.b64, "DOI ページ経由・" + got.how + " fetch・" + host, pdfSource);
+    let got;
+    try {
+      got = await fetchPdfViaTabThenBg(t.id, pdfUrl, injected);
+    } catch (e) {
+      if (!e.html) throw e;
+      // 宣言された PDF の URL が中継ページを返した（PMC の proof-of-work・ScienceDirect の pdfft 等）
+      got = await fetchPdfViaNavigation(pdfUrl, t.id, injected);
+      if (got.moved) pdfSource = "link"; // 別オリジンに着いた PDF は DOI の一致を必須にする
+    }
+    return await postPdf(key, got.b64, route + "・" + got.how + " fetch・" + host, pdfSource);
   } finally {
+    w.stop();
     try {
       await chrome.tabs.remove(t.id);
     } catch (e) { /* 既に閉じている */ }

@@ -88,6 +88,19 @@ fn normalize(mut v: Value) -> Value {
         if let Some(d) = o.get("DOI").and_then(|d| d.as_str()).map(|d| d.to_lowercase()) {
             o.insert("DOI".into(), json!(d));
         }
+        // 医書.jp の DOI negotiation は type を省略し、号を number で返す。
+        // CSL の issue に写し、誌名・巻・頁がある同社の DOI だけ雑誌論文と補完する。
+        if !o.contains_key("issue") {
+            if let Some(number) = o.get("number").cloned() {
+                o.insert("issue".into(), number);
+            }
+        }
+        if !o.contains_key("type")
+            && o.get("DOI").and_then(Value::as_str).is_some_and(|d| d.starts_with("10.18885/"))
+            && ["container-title", "volume", "page"].iter().all(|k| o.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
+        {
+            o.insert("type".into(), json!("article-journal"));
+        }
         o.remove("id"); // citeproc 用の一時 id は保持しない
         match o.get_mut("custom").and_then(|c| c.as_object_mut()) {
             Some(c) => {
@@ -130,6 +143,27 @@ mod markup_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_isho_metadata() {
+        let v = json!({"DOI":"10.18885/CI.0000000612", "title":"頭蓋底の正常変異と側頭骨領域の先天奇形",
+            "author":[{"family":"安藤","given":"知広"},{"family":"加藤","given":"博基"},{"family":"松尾","given":"政之"}],
+            "container-title":"臨床画像", "issued":{"date-parts":[[2021,4,1]]},
+            "volume":"37", "number":"13", "page":"28-41"});
+        let n = normalize(v.clone());
+        assert_eq!(n["type"], "article-journal");
+        assert_eq!(n["issue"], "13");
+        assert_eq!(n["author"], v["author"]);
+        assert_eq!(n["issued"], v["issued"]);
+        assert_eq!(n["DOI"], "10.18885/ci.0000000612");
+        let mut existing = v.clone();
+        existing["type"] = json!("book-chapter");
+        existing["issue"] = json!("special");
+        let n = normalize(existing);
+        assert_eq!(n["type"], "book-chapter");
+        assert_eq!(n["issue"], "special");
+        assert!(normalize(json!({"DOI":"10.18885/other"})).get("type").is_none());
+    }
 
     #[test]
     fn normalize_crossref_quirks() {
