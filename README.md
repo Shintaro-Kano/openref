@@ -20,7 +20,7 @@
 
 ## インストール（macOS Apple Silicon）
 
-ターミナルで以下の 1 行を実行すると、`OpenRef.app`・常駐取込サービス (`openref-connectd`)・CLI (`openref`)・MCP サーバ (`openref-mcp`)・Chrome 拡張・Word アドインが一括で設置されます（更新も同じコマンドを再実行するだけです）:
+ターミナルで以下の 1 行を実行すると、`OpenRef.app`・常駐取込サービス (`openref-connectd`)・CLI (`openref`)・MCP サーバ (`openref-mcp`)・Chrome 拡張・Word アドインが一括で設置され、Claude Desktop が入っていればその設定にも MCP が登録されます（更新も同じコマンドを再実行するだけです）:
 
 ```bash
 curl -fsSL https://openref.unitedradiology.jp/install.sh | bash
@@ -46,7 +46,7 @@ curl -fsSL https://openref.unitedradiology.jp/uninstall.sh | bash
      ```bash
      claude mcp add -s user openref "$HOME/Library/Application Support/OpenRef/bin/openref-mcp"
      ```
-   - **Claude Desktop**: Claude Desktop を完全終了（⌘Q）した状態で `~/Library/Application Support/Claude/claude_desktop_config.json` の `mcpServers` に以下を追加して起動:
+   - **Claude Desktop**: インストーラが登録します（Claude Desktop を導入して一度は起動していること、そして**実行時に Claude Desktop が起動していない**こと。起動中だった場合は Claude Desktop を ⌘Q してからインストーラをもう一度実行）。手で登録する場合は、Claude Desktop を完全終了（⌘Q）した状態で `~/Library/Application Support/Claude/claude_desktop_config.json` の `mcpServers` に以下を追加して起動:
      ```json
      {
        "mcpServers": {

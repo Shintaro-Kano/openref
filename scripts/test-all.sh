@@ -43,8 +43,11 @@ run "word dialog-pages" node word/test-dialog-pages.cjs
 run "dotm build" python3 word/dotm/test-build.py
 # Chrome 拡張(OpenRef Capture)
 run "capture extension" node --test extension/tests/capture.test.cjs
-# 配布物のシェルの構文・依存のライセンス
-run "shell syntax" bash -n site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh scripts/test-all.sh
+# 配布物のシェルの構文(bash -n は最初のファイルしか見ないので 1 本ずつ)・インストーラの Claude Desktop 登録(偽 HOME・偽 ps)・依存のライセンス
+for f in site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh scripts/test-all.sh scripts/test-install-desktop-mcp.sh; do
+  run "shell syntax $f" bash -n "$f"
+done
+run "install desktop-mcp" /bin/bash scripts/test-install-desktop-mcp.sh   # /bin/bash 3.2 = curl | bash の利用者が使う bash
 run "licenses" python3 scripts/check-licenses.py
 
 echo

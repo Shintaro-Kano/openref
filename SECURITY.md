@@ -62,6 +62,7 @@ curl -fsSL https://openref.unitedradiology.jp/install.sh | less
 6. `~/Library/LaunchAgents/dev.openref.connectd.plist` を作成し、`launchctl bootstrap` で `openref-connectd` を常駐開始
 7. Chrome 拡張フォルダを `~/Applications/OpenRef Capture/` へ展開
 8. Microsoft Word が導入されている場合、Word の Startup フォルダ（`~/Library/Group Containers/UBF8T346G9.Office/User Content/Startup/Word/`。環境により `User Content.localized/Startup.localized/Word/`）に `OpenRef.dotm` を、`~/Library/Application Support/OpenRef/word/` に `OpenRef Dialog.app` を設置し、旧方式の Office アドイン manifest（`~/Library/Containers/com.microsoft.Word/Data/Documents/wef/openref-manifest.xml`）があれば削除したうえで、`security add-trusted-cert` でローカル自己署名証明書（`openref-localhost.pem`）をログインキーチェーンに信頼登録（このとき macOS のパスワード確認ダイアログが 1 回表示されます）
+9. Claude Desktop が導入されている場合（`~/Library/Application Support/Claude/` が存在）、その設定ファイル `claude_desktop_config.json` の `mcpServers` に `openref`（`~/Library/Application Support/OpenRef/bin/openref-mcp` を起動する 1 エントリ）を追加（既存の `openref` エントリがあれば `env` 等の他のキーは保って `command` だけを向け直す。`args` が配列でなければ `[]` にする）。他の登録・他の設定・キーの順序は保持する（ファイルは JSON として読み直して整形し直す）。書き換える前に同じフォルダへ `claude_desktop_config.json.bak-openref` として退避し（退避できなければ書かない）、所有者のみ読み書きできる権限（0600）で書く。設定ファイルが壊れた JSON・UTF-8 でない・NUL を含む・シンボリックリンク・読み書きできないときは触らずに理由を表示。Claude Desktop が起動中のときは書かずに案内だけ表示（Desktop は終了時に設定ファイルをメモリの内容で書き戻すため、起動中に足した項目は消える）。`uninstall.sh` は同じ条件で `openref` のエントリだけを外す。Claude Code への登録（`claude mcp add`）は行わない（README の 1 行を手動で実行）
 
 ### `install.sh` が行わないこと
 - システム領域（`/usr`, `/Library` 等）への書き込みや `sudo` によるルート権限昇格（キーチェーンへの証明書登録時のみ macOS 標準の確認が出ます）
