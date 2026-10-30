@@ -19,6 +19,7 @@ fn fake_resolved() -> Resolved {
         }),
         retracted: None,
         source: "test",
+        warnings: vec![],
     }
 }
 
@@ -557,7 +558,7 @@ fn retraction_flag_persisted() {
 
 /// resolver の応答に見立てる（撤回なし・PubMed 由来）
 fn enriched(csl: serde_json::Value) -> Resolved {
-    Resolved { csl, retracted: None, source: "pubmed" }
+    Resolved { csl, retracted: None, source: "pubmed", warnings: vec![] }
 }
 
 /// refresh / enrich（merge_enrichment）が resolver の撤回情報を印に写す（以前は取込時の add_item しか書かず、
@@ -1250,7 +1251,7 @@ fn folders_live() {
         assert_ne!(canon(&path), canon(&prod), "本番 DB では走らせない（scratch コピーを使う）");
     }
     let db = Db::open(&path).unwrap();
-    assert_ne!(db.pdf_write_mode(), "drive", "scratch コピーは直後に pdf_write_mode=managed にしてから使う");
+    assert_ne!(db.pdf_write_mode().unwrap(), "drive", "scratch コピーは直後に pdf_write_mode=managed にしてから使う");
     let q = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     // items の指紋（行数 + key・csl・削除状態の連結の長さと合計）。一度も変わらないこと
     let items_sig = || -> (i64, String) {
@@ -1338,6 +1339,7 @@ fn enrich_replaces_scraped_type_with_registry_type() {
         }),
         retracted: None,
         source: "connector",
+        warnings: vec![],
     };
     let added = ingest::add_item(&mut db, &scraped).unwrap();
     let richer = json!({
@@ -1384,6 +1386,7 @@ fn enrich_reindexes_creators() {
         }),
         retracted: None,
         source: "connector",
+        warnings: vec![],
     };
     let added = ingest::add_item(&mut db, &scraped).unwrap();
     let creators = |db: &Db| -> Vec<(i64, Option<String>, Option<String>)> {
@@ -1426,7 +1429,7 @@ fn enrich_reindexes_creators() {
 }
 
 /// 移行（apply）で取り込んだ書誌も和文 FTS（cjk per-char phrase）と英語の複語で引ける。
-/// 旧 Paperpile importer のテスト（tests/import_paperpile.rs・2-1 で削除）が守っていた検査を、現行の取込経路で守る。
+/// 旧 Paperpile importer のテスト（tests/import_paperpile.rs・削除済み）が守っていた検査を、現行の取込経路で守る。
 #[test]
 fn migrated_records_are_searchable_in_japanese_and_english() {
     use openref_core::import::{self, apply, files::AttachmentRoots, ImportSource};
@@ -1481,4 +1484,59 @@ fn migrated_records_are_searchable_in_japanese_and_english() {
     assert_eq!(search::search(&db, "importing references", 5).unwrap().len(), 1); // 英語の複語
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 読めない（表が無い・行の型が違う）SQL を既定値 / 空 / false に畳まない: settings を消した DB で設定の読み手が Err を返し、
+/// 保存先を判定できない添付は storage/ にも書かずに Err。linked の行が読めない sync・要確認 stub の判定も Err
+#[test]
+fn unreadable_sql_is_an_error_not_a_default() {
+    use openref_core::{citestyle, edit, pdfingest, sync, update};
+    let tmp = std::env::temp_dir().join(format!("openref-sqlerr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut db = Db::open(&tmp.join("t.sqlite")).unwrap();
+    let added = ingest::add_item(&mut db, &fake_resolved()).unwrap();
+    let item_id: i64 = db.conn.query_row("SELECT id FROM items WHERE key = ?1", [&added.key], |r| r.get(0)).unwrap();
+
+    // 普段の経路: 読めれば今までどおり（未設定 = 既定・stub でない = false）
+    assert_eq!(db.setting("pdf_write_mode").unwrap(), None);
+    assert_eq!(db.pdf_write_mode().unwrap(), "managed");
+    assert_eq!(citestyle::prefs(&db).unwrap()["style"], citestyle::DEFAULT_STYLE);
+    assert!(update::cached(&db).unwrap().enabled);
+    assert!(!pdfingest::is_review_stub(&db, &added.key).unwrap());
+    let mount = tmp.join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    assert_eq!(sync::scan(&db, &mount).unwrap().linked, 0);
+
+    // linked の path が TEXT でない行 = 読めない行（今までは黙って数から落ち、孤立の報告からも漏れた）
+    db.conn
+        .execute("INSERT INTO attachments (key, item_id, mode, path) VALUES ('ATTBLOB', ?1, 'linked', x'00ff')", [item_id])
+        .unwrap();
+    assert!(sync::scan(&db, &mount).is_err(), "読めない linked 行は Err");
+    db.conn.execute("DELETE FROM attachments WHERE key = 'ATTBLOB'", []).unwrap();
+
+    db.conn.execute_batch("DROP TABLE settings").unwrap();
+    assert!(db.setting("pdf_write_mode").is_err());
+    assert!(db.pdf_write_mode().is_err(), "保存先が読めないのに managed と答えない");
+    assert!(update::cached(&db).is_err(), "読めないまま「前回なし = 取りに行く番」にしない");
+    assert!(citestyle::prefs(&db).is_err());
+    assert!(
+        citestyle::set_prefs_partial(&db, None, None, Some(true)).is_err(),
+        "部分更新は読めなかった項目を既定で書き戻さない"
+    );
+    assert!(edit::attach_auto_bytes(&db, &added.key, "raw.pdf", b"%PDF-1.4 fake").is_err());
+    let stored = walk_files(&tmp.join("storage"));
+    assert!(stored.is_empty(), "保存先を判定できない添付は managed にも書かない: {stored:?}");
+
+    db.conn.execute_batch("DROP TABLE item_tags").unwrap();
+    assert!(pdfingest::is_review_stub(&db, &added.key).is_err(), "数えられないのを「stub でない」にしない");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    rd.flatten()
+        .flat_map(|e| if e.path().is_dir() { walk_files(&e.path()) } else { vec![e.path()] })
+        .collect()
 }

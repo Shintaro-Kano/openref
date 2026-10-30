@@ -1,4 +1,6 @@
 import { DEFAULT_LABEL_COLOR } from "./labels";
+import { byName, cmpFor } from "./sort";
+import { folderNameProblem, labelTaken, sameName } from "./folders";
 import {
   api,
   type CollectionRow,
@@ -101,7 +103,9 @@ export const app = $state({
   folderSort: "alpha" as "alpha" | "count",
   /** 折り畳んだフォルダの key（ui_folders_collapsed に永続。id は削除後に再利用されうるので key で持つ） */
   foldersCollapsed: new SvelteSet<string>(),
+  /** サイドバーの LABELS。tagSort の順に並べて持つ（refreshSidebar / setTagSort がフロントで並べる） */
   tags: [] as TagRow[],
+  /** ラベルの並び（Sort labels）。ui_tag_sort に永続 */
   tagSort: "alpha" as "alpha" | "count",
   counts: { all: 0, starred: 0, trash: 0 } as ViewCounts,
   toast: "",
@@ -172,22 +176,23 @@ function busyEnd() {
 }
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-export function toast(msg: string) {
+/** `ms` = 表示時間（既定 5 秒。長い警告を添えるときだけ延ばす） */
+export function toast(msg: string, ms = 5000) {
   // 英語は断片を日本語の語順で並べるので、文頭（✓ ✗ ⚠ の後）が小文字の訳になりうる → 大文字に
   app.toast = i18n.lang === "en" ? msg.replace(/^([✓✗⚠]?\s*)([a-z])/, (_, p, c) => p + c.toUpperCase()) : msg;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (app.toast = ""), 5000);
+  toastTimer = setTimeout(() => (app.toast = ""), ms);
 }
 
 export async function refreshSidebar() {
   const [collections, counts, tags] = await Promise.all([
     api.collectionsTree(),
     api.viewCounts(),
-    api.listTags(app.tagSort === "count"),
+    api.listTags(false),
   ]);
   app.collections = collections;
   app.counts = counts;
-  app.tags = tags;
+  app.tags = tags.sort(cmpFor(app.tagSort));
 }
 
 /** list_items は非同期（本文検索が重いことがある）。連打で古い応答が後から届いても新しい一覧を上書きしない */
@@ -666,8 +671,7 @@ function parseView(v: any): View | null {
       return c ? { kind: "collection", id: c.id, name: c.name } : null;
     }
     case "tag": {
-      const name = typeof v.name === "string" ? v.name.toLowerCase() : null;
-      const t = app.tags.find((t) => t.id === v.id && t.name.toLowerCase() === name);
+      const t = typeof v.name === "string" ? app.tags.find((t) => t.id === v.id && sameName(t.name, v.name)) : undefined;
       return t ? { kind: "tag", id: t.id, name: t.name } : null;
     }
   }
@@ -882,13 +886,13 @@ export async function bulkRemoveFromCollection(collectionId: number) {
   if (app.view.kind === "collection") await refreshList();
 }
 
-/** ツールバーの フォルダ ▾「＋「q」を作成して追加」。追加するのは押したときのチェック（作成を待つ間にタブが切り替わっても、
-    切替先のチェックを入れない） */
+/** ツールバーの フォルダ ▾「＋「q」を作成して追加」= root に作る（New folder と同じ規則 = folderNameError。`/` で入れ子を作らない）。
+    追加するのは押したときのチェック（作成を待つ間にタブが切り替わっても、切替先のチェックを入れない） */
 export async function createCollectionAndAdd(name: string) {
   if (!name.trim()) return;
   const keys = checkedKeys();
   try {
-    const id = await api.createCollection(name.trim());
+    const id = await api.createCollectionIn(name.trim(), null);
     await refreshSidebar();
     await bulkAddToCollection(id, keys);
   } catch (e) {
@@ -1196,7 +1200,8 @@ export async function quickAdd(input: string) {
   busyBegin();
   try {
     const item = await api.quickAdd(input.trim());
-    toast(`✓ ${t("登録")}: ${item.firstAuthor} (${item.year ?? "n.d."}) ${item.title.slice(0, 60)}`);
+    const warn = item.warnings.length ? ` — ⚠ ${item.warnings.join(" / ")}` : "";
+    toast(`${warn ? "⚠" : "✓"} ${t("登録")}: ${item.firstAuthor} (${item.year ?? "n.d."}) ${item.title.slice(0, 60)}${warn}`, warn ? 15000 : undefined);
     await refreshAll();
     await reveal(item.key);
   } catch (e) {
@@ -1408,14 +1413,6 @@ export function openStyleModal() {
 
 // ---------- フォルダ（Paperpile の folders。MY LIBRARY） ----------
 
-/** core の COLLATE NOCASE と同じ畳み方（ASCII だけ大小無視）。兄弟の同名判定と名前順に使う */
-const nocase = (s: string) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
-function byFolderName(a: CollectionRow, b: CollectionRow): number {
-  const x = nocase(a.name);
-  const y = nocase(b.name);
-  return x < y ? -1 : x > y ? 1 : a.id - b.id;
-}
-
 export interface FolderRow {
   c: CollectionRow;
   depth: number;
@@ -1437,7 +1434,7 @@ export function flatFolders(
     else kids.set(p, [c]);
   }
   const cmp = (a: CollectionRow, b: CollectionRow) => {
-    const r = sort === "count" ? b.nItems - a.nItems || byFolderName(a, b) : byFolderName(a, b);
+    const r = sort === "count" ? b.nItems - a.nItems || byName(a, b) : byName(a, b);
     return opts.reverse ? -r : r;
   };
   const out: FolderRow[] = [];
@@ -1490,15 +1487,19 @@ export function folderPath(id: number): string {
     .join(" › ");
 }
 
-/** フォルダ名を確定できない理由（確定できるなら null・空なら "" = 理由は出さずにボタンだけ無効）。
-    core と同じ規則: `/` は不可・同じ親の下で大小無視一意（別の親の下の同名は可）。except = 改名時の自分 */
+/** フォルダ名を確定できない理由の文（確定できるなら null・空なら "" = 理由は出さずにボタンだけ無効）。
+    規則は folders.ts の folderNameProblem（core と同じ）。except = 改名時の自分 */
 export function folderNameError(name: string, parentId: number | null, except?: number): string | null {
-  const n = name.trim();
-  if (!n) return "";
-  if (n.includes("/")) return t("「/」は使えません（フォルダの区切りに使うため）");
-  if (app.collections.some((c) => c.id !== except && c.parentId === parentId && nocase(c.name) === nocase(n)))
-    return `${t("同じ階層に「")}${n}${t("」が既にあります")}`;
-  return null;
+  switch (folderNameProblem(app.collections, name, parentId, except)) {
+    case "empty":
+      return "";
+    case "slash":
+      return t("「/」は使えません（フォルダの区切りに使うため）");
+    case "taken":
+      return `${t("同じ階層に「")}${name.trim()}${t("」が既にあります")}`;
+    default:
+      return null;
+  }
 }
 
 function saveUiPref(key: string, value: string) {
@@ -1509,17 +1510,25 @@ function saveCollapsed() {
   saveUiPref("ui_folders_collapsed", JSON.stringify([...app.foldersCollapsed]));
 }
 
-/** 起動時: フォルダの並び順と折畳を読む（App.svelte の onMount・loadCitePrefs と同じ場所） */
+/** 起動時: フォルダ・ラベルの並び順とフォルダの折畳を読む（App.svelte の onMount・loadCitePrefs と同じ場所） */
 export async function loadFolderPrefs() {
   try {
-    const [sort, collapsed] = await Promise.all([api.getUiPref("ui_folder_sort"), api.getUiPref("ui_folders_collapsed")]);
+    const [sort, tagSort, collapsed] = await Promise.all([
+      api.getUiPref("ui_folder_sort"),
+      api.getUiPref("ui_tag_sort"),
+      api.getUiPref("ui_folders_collapsed"),
+    ]);
     if (sort === "alpha" || sort === "count") app.folderSort = sort;
+    if (tagSort === "alpha" || tagSort === "count") {
+      app.tagSort = tagSort;
+      app.tags = app.tags.slice().sort(cmpFor(tagSort)); // refreshSidebar が先に終わっていた場合の並べ直し
+    }
     if (collapsed) {
       const keys: unknown = JSON.parse(collapsed);
       if (Array.isArray(keys)) for (const k of keys) if (typeof k === "string") app.foldersCollapsed.add(k);
     }
   } catch (e) {
-    toast(t("✗ フォルダの表示設定の読込に失敗: ") + String(e).slice(0, 160));
+    toast(t("✗ フォルダ・ラベルの表示設定の読込に失敗: ") + String(e).slice(0, 160));
   }
 }
 
@@ -1679,15 +1688,16 @@ export async function findReplaceFolders(find: string, replace: string) {
 
 // ---------- ラベル（Paperpile の LABELS） ----------
 
-/** ラベル名の重複（大小無視。DB の UNIQUE COLLATE NOCASE と同じ判定）。except = 改名時の自分 */
+/** ラベル名の重複（規則は folders.ts の labelTaken = DB の UNIQUE COLLATE NOCASE と同じ = ASCII だけ大小無視）。except = 改名時の自分 */
 export function labelNameTaken(name: string, except?: number): boolean {
-  const n = name.trim().toLowerCase();
-  return !!n && app.tags.some((t) => t.id !== except && t.name.toLowerCase() === n);
+  return labelTaken(app.tags, name, except);
 }
 
-export async function setTagSort(sort: "alpha" | "count") {
+/** ラベルの並びを変える。永続して（ui_tag_sort）app.tags をフロントで並べ直すだけ（IPC で取り直さない） */
+export function setTagSort(sort: "alpha" | "count") {
   app.tagSort = sort;
-  await refreshSidebar();
+  saveUiPref("ui_tag_sort", sort);
+  app.tags = app.tags.slice().sort(cmpFor(sort));
 }
 
 /** 新規ラベル（既定色 = 灰）。戻り値 = id（失敗は toast して null） */

@@ -424,7 +424,7 @@ mod tests {
         let (db, _) = db_with_managed(&dir);
         db.conn.execute_batch("ALTER TABLE attachments RENAME TO attachments_gone").unwrap();
         assert!(enable_drive_mode(|| Ok(&db)).is_err());
-        assert_eq!(db.pdf_write_mode(), "managed");
+        assert_eq!(db.pdf_write_mode().unwrap(), "managed");
         std::env::remove_var("OPENREF_MOUNT");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(locks.get(), 1);
         assert!(mount.join("All Papers").is_dir());
         assert!(!mount.join("All Papers/.openref-write-probe").exists());
-        assert_eq!(db.pdf_write_mode(), "drive");
+        assert_eq!(db.pdf_write_mode().unwrap(), "drive");
 
         // migrate: 一覧 1 回 + 1 件ごとに 3 回（原本の確認・コピー先の確認・書換え）。コピーは linked に・原本は残す
         locks.set(0);

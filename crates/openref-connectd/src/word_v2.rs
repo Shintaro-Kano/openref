@@ -760,7 +760,11 @@ async fn render(State(v2): State<Arc<V2>>, body: Bytes) -> Response {
 
 /// `POST /word/v2/prefs` → `P<TAB>app 既定 style<TAB>doi 0/1`（新規文書の初期値）
 async fn prefs(State(v2): State<Arc<V2>>) -> Response {
-    let p = citestyle::prefs(&v2.st.db());
+    // 読めなければ既定スタイルに畳まない（新規文書に app の既定と違うスタイルを黙って付ける）
+    let p = match citestyle::prefs(&v2.st.db()) {
+        Ok(p) => p,
+        Err(e) => return err(&UserErr::new("app の既定スタイルを読めません。", Some(e.to_string()))),
+    };
     let style = p["style"].as_str().unwrap_or(citestyle::DEFAULT_STYLE).to_string();
     let doi = if p["doi_always"].as_bool() == Some(true) { "1" } else { "0" };
     ok(&[line("P", &[&style, doi])])
@@ -1392,7 +1396,7 @@ mod tests {
 
     fn add(st: &St, csl: Value) -> String {
         let mut db = st.db();
-        ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test" }).unwrap().key
+        ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test", warnings: vec![] }).unwrap().key
     }
 
     fn k1() -> Value {

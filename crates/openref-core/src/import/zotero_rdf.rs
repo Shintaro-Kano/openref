@@ -508,7 +508,7 @@ fn csl_type(kind: &str) -> Option<&'static str> {
         "map" => "map",
         "computerProgram" => "software",
         "dataset" => "dataset",
-        "preprint" => "article",
+        "preprint" => "document", // CSL の article は型カタログに無く編集できない。document なら publisher・genre・number が欄にある
         "presentation" => "speech",
         "patent" => "patent",
         "statute" => "legislation",

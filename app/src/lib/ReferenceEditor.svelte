@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { t } from "./i18n.svelte";
   import { api, type TypeDef } from "./api";
+  import { cslToForm, editorType, filledExtras, formToCsl, type Orig } from "./cslForm";
   import { formatBibliography } from "./cite";
   import { app, closeEditor, refreshAll, reloadDetail, reveal, toast } from "./state.svelte";
   import { onEnter } from "./input";
@@ -31,78 +32,21 @@
   /** core types.rs の型名・説明・欄名（日本語のラベルが鍵。"::type" で UI の同じ語と訳を分ける。網羅は i18n.test.mjs が types.rs から検査） */
   const tt = (label: string) => t(`${label}::type`);
 
-  /* ---- CSL ⇄ フォーム値 ---- */
-  function namesToText(arr: any[]): string {
-    return (arr ?? [])
-      .map((a) => (a.literal ? a.literal : [a.family, a.given].filter(Boolean).join(", ")))
-      .join("\n");
-  }
-  function textToNames(s: string): any[] {
-    return String(s)
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((l) => {
-        if (l.includes(",")) {
-          const [fam, ...rest] = l.split(",");
-          const given = rest.join(",").trim();
-          return given ? { family: fam.trim(), given } : { family: fam.trim() };
-        }
-        const parts = l.split(/\s+/);
-        if (parts.length === 2 && /^[A-Za-z.\- ]+$/.test(l)) {
-          return { family: parts[0], given: parts[1] };
-        }
-        return { literal: l }; // 和文氏名・団体名はそのまま
-      });
-  }
-  function dateToText(d: any): string {
-    const p = d?.["date-parts"]?.[0];
-    if (!p) return d?.raw ?? "";
-    return p.filter((x: any) => x != null).join("-");
-  }
-  function textToDate(s: string): any {
-    const parts = String(s)
-      .trim()
-      .split(/[-/.]/)
-      .map((x) => parseInt(x, 10))
-      .filter((n) => !isNaN(n));
-    return parts.length ? { "date-parts": [parts] } : null;
-  }
-
-  function fieldsOf(id: string) {
-    return types.find((t) => t.id === id)?.fields ?? [];
-  }
+  /* ---- CSL ⇄ フォーム値（変換は cslForm.ts） ---- */
+  // 読んだときの欄の文字列と元の値（欄がそのままなら保存は元の値を出す）。描画には使わない = $state にしない
+  let orig: Orig = {};
 
   function loadCsl(csl: any) {
-    typeId = csl.type || "article-journal";
-    subtype = csl.custom?.subtype ?? "";
-    const defs = fieldsOf(typeId);
-    const v: Record<string, any> = {};
-    const extra: string[] = [];
-    for (const fd of defs) {
-      const val = (csl as any)[fd.key];
-      if (val == null) continue;
-      v[fd.key] =
-        fd.kind === "names" ? namesToText(val) : fd.kind === "date" ? dateToText(val) : val;
-      if (!fd.core) extra.push(fd.key);
-    }
-    values = v;
-    extraFields = extra;
+    typeId = editorType(csl);
+    subtype = csl?.custom?.subtype ?? "";
+    const r = cslToForm(csl, types);
+    values = r.values;
+    orig = r.orig;
+    extraFields = filledExtras(types, typeId, r.values);
   }
 
   function buildCsl(): any {
-    const out: any = { type: typeId };
-    for (const f of def?.fields ?? []) {
-      const raw = values[f.key];
-      if (raw == null || (typeof raw === "string" && !raw.trim())) continue;
-      if (f.kind === "names") out[f.key] = textToNames(raw);
-      else if (f.kind === "date") {
-        const d = textToDate(raw);
-        if (d) out[f.key] = d;
-      } else out[f.key] = raw;
-    }
-    if (subtype) out.custom = { subtype };
-    return out;
+    return formToCsl(typeId, subtype, values, orig, types);
   }
 
   async function updatePreview() {
@@ -172,8 +116,9 @@
   });
 </script>
 
-<div class="overlay" onclick={closeEditor} role="presentation">
-  <div class="modal editor" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="reference editor">
+<!-- 背景のクリックでは閉じない（× / キャンセルのみ）: 入力中の書誌を 1 クリックで捨てない・入力欄のドラッグ選択を外で離しても閉じない -->
+<div class="overlay" role="presentation">
+  <div class="modal editor" role="dialog" aria-label="reference editor">
     <div class="modal-head">
       <h3>{app.editorKey ? t("参照を編集") : t("参照を新規作成")}</h3>
       <div class="head-tools">
@@ -191,7 +136,7 @@
     <div class="modal-body">
       <div class="grid">
         <span class="lbl">{t("種類")}</span>
-        <select bind:value={typeId} onchange={() => { extraFields = []; updatePreview(); }}>
+        <select bind:value={typeId} onchange={() => { extraFields = filledExtras(types, typeId, values); updatePreview(); }}>
           {#each types as tp (tp.id)}
             <option value={tp.id}>{tt(tp.label)} — {tt(tp.desc)}</option>
           {/each}

@@ -530,7 +530,7 @@ fn lookup(_db: &mut Db, a: &Value) -> Result<Value> {
 }
 
 fn cite_prefs(db: &mut Db, _a: &Value) -> Result<Value> {
-    Ok(citestyle::prefs(db))
+    citestyle::prefs(db)
 }
 
 fn cite_installed(db: &mut Db, _a: &Value) -> Result<Value> {
@@ -596,6 +596,8 @@ fn quick_add(db: &mut Db, a: &Value) -> Result<Value> {
     let mut v = item_summary(&d.into());
     v["pmcid"] = json!(pmcid);
     v["retraction_warning"] = json!(resolved.retracted);
+    v["source"] = json!(resolved.source);
+    v["warnings"] = json!(resolved.warnings);
     Ok(v)
 }
 
@@ -1003,10 +1005,10 @@ fn build() -> Vec<Command> {
           "書誌を手で作る（csl = CSL-JSON。type は item_types のもの・title 必須・DOI/PMID が既存と同じなら拒否）",
           schema(&[("csl", "object", "CSL-JSON")], &["csl"]), create_manual),
         c("update_item", true, &[],
-          "書誌を差し替える（csl は全体を渡す = get_item の csl を直して渡す。item_types の型の欄は、無ければ消える = 型を変えると旧型の欄は残らない。元の型の欄の外にあったキー（accessed・citation-key 等）は、無ければ温存・空値なら消える。custom は温存）",
+          "書誌を差し替える（csl は全体を渡す = get_item の csl を直して渡す。item_types の型の欄は、無ければ消える = 型を変えると旧型の欄は残らない。元の型の欄の外にあり新しい型の欄にも無いキー（citation-key・型を変えない編集での取込由来の accessed 等）は、無ければ温存・空値なら消える。custom は温存）",
           schema(&[KEY, ("csl", "object", "CSL-JSON（全体）")], &["key", "csl"]), update_item),
         c("quick_add", true, &["create_item"],
-          "PMID / DOI / PubMed URL / doi.org URL から書誌を機械確定して登録（ネットワーク・重複は既存 key を示してエラー）",
+          "PMID / DOI / PubMed URL / doi.org URL から書誌を機械確定して登録（ネットワーク・重複は既存 key を示してエラー。戻り値の source = 書誌の取得元 pubmed / doi.org / isho-ris・warnings = PubMed の照合に失敗して doi.org で代用した等の警告。普段は空）",
           schema(&[("input", "string", "PMID・DOI・URL")], &["input"]), quick_add),
         c("import_pdf", true, &[],
           "手元の PDF を取り込む（本文の DOI/PMID → 書誌確定 → 登録 + 添付。決まらなければラベル「要確認」で登録）",
@@ -1162,6 +1164,7 @@ mod tests {
             }),
             retracted: None,
             source: "test",
+            warnings: vec![],
         };
         let added = crate::ingest::add_item(db, &r).unwrap();
         db.conn.execute_batch("INSERT INTO collections (key, name) VALUES ('CCCC2222', 'Seed Folder')").unwrap();

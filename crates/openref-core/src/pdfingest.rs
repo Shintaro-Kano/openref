@@ -214,6 +214,8 @@ fn ingest_pdf_commit(
     };
     let outcome = match ingest::add_item(db, &resolved) {
         Ok(added) => {
+            // resolver の警告（PubMed の照合に失敗して doi.org で代用 = 抄録・MeSH・撤回を見ていない）は登録に使ったときだけ添える
+            warnings.extend(resolved.warnings.iter().cloned());
             let name = if opts.csl_filename { crate::pdffetch::suggest_filename(&resolved.csl) } else { src_name.to_string() };
             note_placement(edit::attach_auto_with_md5(db, &added.key, &name, bytes, &file_md5)?.placement, &mut warnings);
             PdfIngestOutcome::Added { key: added.key }
@@ -432,16 +434,17 @@ pub fn is_cjk_heavy(text: &str) -> bool {
 /// 「要確認」ラベルが付いている item か（capture / 一括取込 / Connector standalone が識別子なしで作った stub）。
 /// duplicate の案内文に使う。ラベルで判定するので、user が編集で書誌を引き直してラベルを外せば案内は消える
 /// （custom.source で判定すると修正後も案内が出続け、`/capture/save` の題名のみ document まで stub 扱いになる）
-pub fn is_review_stub(db: &Db, key: &str) -> bool {
-    db.conn
+/// 数えられなければ Err（「stub でない」= 案内なしに畳まない。呼び手が案内の代わりに理由を出す）
+pub fn is_review_stub(db: &Db, key: &str) -> Result<bool> {
+    Ok(db
+        .conn
         .query_row(
             "SELECT COUNT(*) FROM item_tags it JOIN tags t ON t.id = it.tag_id JOIN items i ON i.id = it.item_id
              WHERE i.key = ?1 AND t.name = ?2",
             rusqlite::params![key, REVIEW_TAG],
             |r| r.get::<_, i64>(0),
         )
-        .map(|n| n > 0)
-        .unwrap_or(false)
+        .map(|n| n > 0)?)
 }
 
 /// PDF 取込 1 件の結果（GUI の取込モーダルの行・`commands` の import_pdf が同じものを返す）
@@ -494,10 +497,10 @@ fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
             message: "同じ論文が登録済み。別ファイル（md5 不一致）なので 2 本目として添付しました".into(),
         },
         Ok(O::DuplicateFile { key }) => {
-            let hint = if is_review_stub(db, &key) {
-                "（相手は要確認 stub。その item の編集から DOI/PMID を引き直せます）"
-            } else {
-                ""
+            let hint = match is_review_stub(db, &key) {
+                Ok(true) => "（相手は要確認 stub。その item の編集から DOI/PMID を引き直せます）".to_string(),
+                Ok(false) => String::new(),
+                Err(e) => format!("（相手が要確認 stub かを確かめられません: {e}）"),
             };
             ImportSummary {
                 status: "duplicate",
@@ -910,7 +913,7 @@ pub fn create_review_stub(
         }
     };
     // retracted: None なので source は使われない（撤回の印を書くときだけの値）
-    let resolved = resolver::Resolved { csl, retracted: None, source: "pdf-import" };
+    let resolved = resolver::Resolved { csl, retracted: None, source: "pdf-import", warnings: vec![] };
     let added = ingest::add_item(db, &resolved)?;
     note_placement(edit::attach_auto_with_md5(db, &added.key, &filename, bytes, md5)?.placement, warnings);
     // 一覧から見つけられるよう「要確認」ラベル
@@ -1116,13 +1119,17 @@ mod tests {
                 AddInput::Doi(d) if d.eq_ignore_ascii_case("10.1148/rg.250127") => ("10.1148/rg.250127", T1),
                 AddInput::Doi(d) if d == "10.2/multimodal" => ("10.2/multimodal", T2),
                 AddInput::Doi(d) if d == "10.9999/other" => ("10.9999/other", "Structure of the cited protein complex at atomic resolution"),
+                AddInput::Doi(d) if d == "10.5555/fallback" => ("10.5555/fallback", T1),
                 other => return Err(CoreError::Http(format!("stub: {other:?} は 404"))),
             };
+            // 10.5555/fallback = resolver が「PubMed の照合に失敗 → doi.org で代用」の警告を付けた形
+            let warnings = if doi == "10.5555/fallback" { vec![FALLBACK_WARNING.to_string()] } else { vec![] };
             Ok(Resolved {
                 csl: json!({ "type": "article-journal", "title": title, "DOI": doi, "issued": { "date-parts": [[2026]] },
                              "author": [{ "family": "Brandao", "given": "A" }] }),
                 retracted: None,
                 source: "stub",
+                warnings,
             })
         }
         fn search_bibliographic(&self, _q: &str, _rows: usize) -> Result<Vec<Candidate>> {
@@ -1138,6 +1145,26 @@ mod tests {
 
     fn no_gate() -> Stub {
         Stub { gate: None }
+    }
+
+    const FALLBACK_WARNING: &str = "PubMed の照合に失敗（stub）→ doi.org の書誌で代用";
+
+    /// resolver の警告は登録（added）の要約の message に ⚠ で載る。既存に添付（書誌を使わない）は載せない
+    #[test]
+    fn resolver_warnings_reach_the_import_summary() {
+        let (dir, mut db) = temp_db("resolver-warn");
+        let pdf = |t: &str| crate::pdftools::minimal_pdf(t, None);
+        let first = pdf(&format!("RadioGraphics 2026 {T1} Brandao AC doi 10.5555/fallback"));
+        let r = bytes_report_with(&no_gate(), &mut db, &first, "a.pdf", None, &IngestOpts::default());
+        let s = summarize_import(&db, r);
+        assert_eq!(s.status, "added");
+        assert_eq!(s.message, format!("書誌を確定して登録・添付しました。⚠ {FALLBACK_WARNING}"));
+        let other = pdf(&format!("Supplement 2026 {T1} Brandao AC doi 10.5555/fallback appendix"));
+        let r = bytes_report_with(&no_gate(), &mut db, &other, "b.pdf", None, &IngestOpts::default());
+        let s = summarize_import(&db, r);
+        assert_eq!(s.status, "attached_additional");
+        assert!(!s.message.contains("⚠"), "{}", s.message);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn temp_db(tag: &str) -> (std::path::PathBuf, Db) {
@@ -1272,7 +1299,8 @@ mod tests {
     }
 
     /// GUI / CLI の要確認 stub は型 document（capture の stub と同じ）= 型カタログにある型なので、手で書誌を直す
-    /// update_csl（ReferenceEditor の保存）の sanitize を通る。旧の型 article は「未知の参照タイプ」で弾かれていた
+    /// update_csl（ReferenceEditor の保存）の sanitize を通る。旧の型 article は「未知の参照タイプ」で弾かれていた（いまは
+    /// sanitize の入口で document に読み替えるので、1.1.0 までの article の stub も通る）
     #[test]
     fn review_stub_is_document_and_editable() {
         let (dir, mut db) = temp_db("stub-type");
@@ -1291,7 +1319,9 @@ mod tests {
         assert_eq!(after.csl["custom"]["source"], "pdf-import-unresolved", "custom は残る");
         let mut old_type = fixed.clone();
         old_type["type"] = json!("article");
-        assert!(edit::update_csl(&mut db, &key, &old_type).is_err(), "article は型カタログに無い");
+        edit::update_csl(&mut db, &key, &old_type).expect("旧の型 article も document に読み替えて通る");
+        let after = crate::search::get_by_key(&db, &key).unwrap().unwrap();
+        assert_eq!(after.csl["type"], "document");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1328,7 +1358,7 @@ mod tests {
         assert!(matches!(r.outcome, PdfIngestOutcome::NoIdentifier), "{:?}", r.outcome);
         assert!(r.fail.as_deref().is_some_and(|f| f.contains("404")), "入っていなければ失敗のまま: {:?}", r.fail);
         assert_eq!(r.md5, md5e);
-        let stub = ingest::add_item(&mut db, &Resolved { csl: json!({ "type": "document", "title": "stub" }), retracted: None, source: "test" }).unwrap();
+        let stub = ingest::add_item(&mut db, &Resolved { csl: json!({ "type": "document", "title": "stub" }), retracted: None, source: "test", warnings: vec![] }).unwrap();
         edit::attach_auto_with_md5(&db, &stub.key, "s.pdf", err_bytes, &md5e).unwrap();
         let r = ingest_pdf_commit(&mut db, plan_b, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
         assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == stub.key), "{:?}", r.outcome);
@@ -1508,7 +1538,7 @@ mod tests {
             assert_eq!(serde_json::from_str::<serde_json::Value>(csl).unwrap()["title"], title.as_str(), "case {i}");
             assert_eq!(Path::new(&path).file_name().unwrap().to_str().unwrap(), *file, "case {i}");
             assert_eq!(tags, "要確認|peach", "case {i}");
-            assert!(is_review_stub(&db, &key));
+            assert!(is_review_stub(&db, &key).unwrap());
         }
         std::fs::remove_dir_all(&dir).ok();
     }

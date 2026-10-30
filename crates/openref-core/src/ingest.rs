@@ -68,7 +68,8 @@ pub fn add_item(db: &mut Db, resolved: &Resolved) -> Result<Added> {
 /// 戻り値 = 印が新しく付いた・中身が変わった。
 ///
 /// resolver の `retracted: None` の意味は経路で違う: PMID のある item（source = pubmed）なら「PubMed は撤回と言っていない」だが、
-/// DOI だけの item は `resolver::resolve` が PubMed の照合の失敗（該当なし・通信失敗）を飲み込んで Crossref / 医書.jp へ落ちる
+/// DOI だけの item は `resolver::resolve` が PubMed の照合で該当なし（非収載）のときと、照合そのものに失敗したとき（通信失敗。
+/// 失敗は `Resolved.warnings` と stderr に残る）に Crossref / 医書.jp へ落ちる
 /// （どちらも撤回を返さない = 常に None）ので、None が「撤回を見ていない」を意味しうる。
 /// → None では既存の印を消さない（撤回の警告を黙って外す方が危ない）。**印は自動では一度も消えない。消えるのは item を
 /// 削除したときの ON DELETE CASCADE だけ**。印を付けるのは取込（add_item）と enrich（merge_enrichment = refresh・connector の補完）

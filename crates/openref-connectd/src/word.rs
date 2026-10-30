@@ -6,7 +6,7 @@
 use crate::St;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use openref_core::{citestyle, model, search};
@@ -61,42 +61,75 @@ fn asset(bytes: &'static [u8], ctype: &'static str) -> impl IntoResponse {
     )
 }
 
+/// DB が読めないときの応答 = 500 + `{error}`（ダイアログの「検索できません: HTTP 500」に出る。/api/status だけは別扱い）。
+/// 「該当なし」「蔵書に見つかりません」「0 件」に化けさせない（CLAUDE.md §4-3）
+fn db_error(what: &str, e: impl std::fmt::Display) -> Response {
+    let msg = format!("{what}: {e}");
+    eprintln!("openref-connectd: {msg}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))).into_response()
+}
+
 /// 診断（VBA の ORCmd の Show Diagnostics）: デーモンの版・蔵書件数（ゴミ箱外）・DB の migration 版。
-/// DB ロックは件数と user_version を読む間だけ
-async fn api_status(State(st): State<Arc<St>>) -> impl IntoResponse {
+/// DB ロックは件数と user_version を読む間だけ。
+/// VBA の GetRaw は curl -f で、500 だと本文（原因）が捨てられて「接続できません」と誤診される → ここだけは DB が
+/// 読めなくても 200 を返し、読めなかった値を null・`"ok": false`・`"error"` で示す（診断はこの JSON をそのまま表示する）。
+/// 健全時の応答は従来とバイト一致
+async fn api_status(State(st): State<Arc<St>>) -> Response {
     let (items, db_version) = {
         let db = st.db();
-        let n = crate::live_item_count(&db);
-        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-        (n, v)
+        (
+            crate::live_item_count(&db).map_err(|e| e.to_string()),
+            db.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string()),
+        )
     };
-    Json(json!({
+    let mut body = json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
-        "items": items,
-        "db_version": db_version,
-    }))
+        "items": items.as_ref().ok(),
+        "db_version": db_version.as_ref().ok(),
+    });
+    let errs: Vec<String> = [("cannot read item count", items.err()), ("cannot read db version", db_version.err())]
+        .into_iter()
+        .filter_map(|(what, e)| e.map(|e| format!("{what}: {e}")))
+        .collect();
+    if !errs.is_empty() {
+        // 診断は VBA が MacJapanese で読んで表示する（CLAUDE.md §6）= 印字可能な ASCII だけにする
+        // （非 ASCII・制御文字・JSON で \ が付く " と、MacJapanese で化ける \ ~ は ? に）
+        let msg: String = errs
+            .join(" / ")
+            .chars()
+            .map(|c| if (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\\' | '~' | '"') { c } else { '?' })
+            .collect();
+        eprintln!("openref-connectd: /api/status: {msg}");
+        body["ok"] = json!(false);
+        body["error"] = json!(msg);
+    }
+    Json(body).into_response()
 }
 
 /// Word のスタイル一覧 = 同梱 4 種 + app で導入したもの。current / doi_always = app の既定（新規文書の初期値）
 async fn api_styles(State(st): State<Arc<St>>) -> impl IntoResponse {
     let db = st.db();
     let dir = citestyle::styles_dir(&db);
-    let p = citestyle::prefs(&db);
-    Json(json!({
+    let p = match citestyle::prefs(&db) {
+        Ok(p) => p,
+        // 既定スタイルに畳まない（ダイアログが app の既定と違うものを「既定」と表示する）
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    (StatusCode::OK, Json(json!({
         "styles": citestyle::installed(&dir),
         "current": p["style"],
         "doi_always": p["doi_always"],
-    }))
+    })))
 }
 
 async fn api_search(
     State(st): State<Arc<St>>,
     Query(q): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Response {
     let query = q.get("q").cloned().unwrap_or_default();
     let db = st.db();
-    let rows = search::list_items(
+    let listed = search::list_items(
         &db,
         &search::ListFilter {
             search: if query.trim().is_empty() { None } else { Some(query) },
@@ -106,8 +139,11 @@ async fn api_search(
             metadata_only: true,
             ..Default::default()
         },
-    )
-    .unwrap_or_default();
+    );
+    let rows = match listed {
+        Ok(r) => r,
+        Err(e) => return db_error("検索できません", e),
+    };
     let items: Vec<Value> = rows
         .iter()
         .map(|li| {
@@ -122,10 +158,10 @@ async fn api_search(
             })
         })
         .collect();
-    Json(json!({ "items": items }))
+    Json(json!({ "items": items })).into_response()
 }
 
-async fn api_items(State(st): State<Arc<St>>, body: axum::body::Bytes) -> impl IntoResponse {
+async fn api_items(State(st): State<Arc<St>>, body: axum::body::Bytes) -> Response {
     let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     let keys: Vec<String> = payload
         .get("keys")
@@ -135,11 +171,16 @@ async fn api_items(State(st): State<Arc<St>>, body: axum::body::Bytes) -> impl I
     let db = st.db();
     let mut out = serde_json::Map::new();
     for k in keys.iter().take(500) {
-        if let Ok(Some(item)) = search::get_by_key(&db, k) {
-            out.insert(k.clone(), item.csl);
+        // 蔵書に無い key（Ok(None)）は応答に載せない = ダイアログが「蔵書に見つかりません」と出す。DB のエラーは 500
+        match search::get_by_key(&db, k) {
+            Ok(Some(item)) => {
+                out.insert(k.clone(), item.csl);
+            }
+            Ok(None) => {}
+            Err(e) => return db_error("蔵書を読めません", e),
         }
     }
-    Json(Value::Object(out))
+    Json(Value::Object(out)).into_response()
 }
 
 // ---------- TLS（自己署名 localhost cert） ----------
@@ -168,4 +209,128 @@ pub fn ensure_cert(app_dir: &std::path::Path) -> Result<TlsPaths, String> {
         cert_path.display()
     );
     Ok(TlsPaths { cert: cert_path, key: key_path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openref_core::{ingest, resolver, Db};
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    fn test_st() -> Arc<St> {
+        Arc::new(St {
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            sessions: Mutex::new(Default::default()),
+        })
+    }
+
+    async fn serve(st: Arc<St>) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(st, port, std::path::Path::new("/nonexistent"));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    /// 素の HTTP/1.1 を 1 往復（TLS なしの router に直接）。本文は解かず生のまま返す（JSON の部分一致だけ見る）。
+    /// 要求は 1 回の write で送る
+    async fn call(port: u16, method: &'static str, path: String, body: String) -> (u16, String) {
+        tokio::task::spawn_blocking(move || {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let req = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut raw = Vec::new();
+            let _ = s.read_to_end(&mut raw);
+            let raw = String::from_utf8_lossy(&raw).to_string();
+            let (head, rest) = raw.split_once("\r\n\r\n").unwrap();
+            (head.split(' ').nth(1).unwrap().parse().unwrap(), rest.to_string())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// /api/status の応答のキー集合（整列済み）。値は各テストが見る
+    fn status_keys(b: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        let mut ks: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        ks.sort();
+        ks
+    }
+
+    fn add_one(st: &St) -> String {
+        let csl = json!({
+            "type": "article-journal",
+            "title": "Pancreatic cancer: changing epidemiology",
+            "author": [{"family": "Stoffel", "given": "Elena M"}],
+            "container-title": "Gastroenterology",
+            "issued": {"date-parts": [[2023, 2]]},
+        });
+        let mut db = st.db();
+        ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test", warnings: vec![] }).unwrap().key
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_ok_on_healthy_db() {
+        let st = test_st();
+        let key = add_one(&st);
+        let port = serve(st).await;
+        let (c, b) = call(port, "GET", "/api/status".into(), String::new()).await;
+        assert_eq!(c, 200, "{b}");
+        assert!(b.contains("\"items\":1") && b.contains("\"db_version\":") && !b.contains("\"db_version\":null") && b.contains("\"ok\":true") && !b.contains("error"), "{b}");
+        assert_eq!(status_keys(&b), ["db_version", "items", "ok", "version"], "{b}");
+        let (c, b) = call(port, "GET", "/api/search?q=pancreatic".into(), String::new()).await;
+        assert_eq!(c, 200, "{b}");
+        assert!(b.contains(&key), "{b}");
+        // 該当なしは 200 の空配列（DB エラーとは別）
+        let (c, b) = call(port, "GET", "/api/search?q=zzzznothing".into(), String::new()).await;
+        assert_eq!(c, 200, "{b}");
+        assert!(b.contains("\"items\":[]"), "{b}");
+        // 蔵書に無い key は 200 で応答に載らない（ダイアログが「蔵書に見つかりません」と出す枝）
+        let body = json!({"keys": [key, "no-such-key"]}).to_string();
+        let (c, b) = call(port, "POST", "/api/items".into(), body).await;
+        assert_eq!(c, 200, "{b}");
+        assert!(b.contains(&key) && !b.contains("no-such-key"), "{b}");
+        let (c, b) = call(port, "GET", "/api/styles".into(), String::new()).await;
+        assert_eq!(c, 200, "{b}");
+    }
+
+    /// DB が読めないとき（テーブルが無い）は 200 の「該当なし」「0 件」でなく 500 + {error}
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_returns_500_when_db_is_broken() {
+        let st = test_st();
+        let key = add_one(&st);
+        st.db().conn.execute_batch("DROP TABLE items_fts; DROP TABLE items;").unwrap();
+        let port = serve(st).await;
+        for (m, path, body) in [
+            ("GET", "/api/search?q=pancreatic", String::new()),
+            ("GET", "/api/search?q=", String::new()),
+            ("POST", "/api/items", json!({"keys": [key]}).to_string()),
+        ] {
+            let (c, b) = call(port, m, path.into(), body).await;
+            assert_eq!(c, 500, "{path}: {b}");
+            assert!(b.contains("\"error\""), "{path}: {b}");
+            assert!(!b.contains("\"items\":[]"), "{path}: {b}");
+        }
+        // /api/status だけは 200 のまま（VBA の curl -f が本文を捨てるため）。読めない値は null・ok:false・error で示す
+        let (c, b) = call(port, "GET", "/api/status".into(), String::new()).await;
+        assert_eq!(c, 200, "{b}");
+        assert!(b.contains("\"ok\":false") && b.contains("\"error\":\"cannot read item count: ") && b.contains("\"items\":null"), "{b}");
+        assert!(b.contains("\"version\"") && b.contains("\"db_version\":"), "{b}");
+        assert_eq!(status_keys(&b), ["db_version", "error", "items", "ok", "version"], "{b}");
+    }
+
+    /// settings が読めない DB では /api/styles は既定に畳まず 500（prefs の Err）
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_styles_returns_500_when_settings_is_broken() {
+        let st = test_st();
+        st.db().conn.execute_batch("DROP TABLE settings;").unwrap();
+        let port = serve(st).await;
+        let (c, b) = call(port, "GET", "/api/styles".into(), String::new()).await;
+        assert_eq!(c, 500, "{b}");
+        assert!(b.contains("\"error\""), "{b}");
+    }
 }

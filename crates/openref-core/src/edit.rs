@@ -12,9 +12,9 @@ fn sanitize(csl: &Value) -> Result<Value> {
     sanitize_with(csl, &[])
 }
 
-/// sanitize の本体。`carried` は型カタログの外でも通すキー（update_csl が「既存 item の、旧い型のカタログに無かったキー」を渡す）
+/// sanitize の本体。`carried` は型カタログの外でも通すキー（update_csl が「既存 item の、旧い型のカタログにも新しい型のカタログにも無いキー」を渡す）
 fn sanitize_with(csl: &Value, carried: &[String]) -> Result<Value> {
-    let type_id = model::s(csl, "type").unwrap_or("document").to_string();
+    let type_id = types::canonical_type(model::s(csl, "type").unwrap_or("document")).to_string();
     if types::type_def(&type_id).is_none() {
         return Err(CoreError::BadInput(format!("未知の参照タイプ: {type_id}")));
     }
@@ -74,14 +74,17 @@ pub fn create_manual(db: &mut Db, csl: &Value) -> Result<String> {
 /// 既存 item の書誌を差し替える（編集）。custom は既存を温存する。
 ///
 /// 型カタログの外のキー（取込が書く `accessed`・Zotero の `citation-key` 等）は編集の画面に出ないので、
-/// 「旧 CSL のうち、**旧い型**のカタログに無かったキー」は次の扱いにする（それ以外は sanitize のとおり）:
+/// 「旧 CSL のうち、**旧い型**のカタログにも**新しい型**のカタログにも無いキー」は次の扱いにする（それ以外は sanitize のとおり）:
 /// - 入力に無い → 旧い値を引き継ぐ（画面に出せないものを、出さなかったことを理由に消さない）
 /// - 入力にあり空（null・空文字・空配列・空オブジェクト）→ 消す（明示の削除）
 /// - 入力にあり値がある → その値にする（sanitize と同じ trim / DOI 正規化）
 ///
 /// 旧い型のカタログに**あった**キーは、入力に無ければ消える（画面で空にした = 削除）。型を変えたとき、
 /// 旧型の欄が新型の CSL に残らないのはこのため（sanitize の混入防止）。旧い型がカタログに無い型なら、
-/// 旧 CSL の全キーが「カタログに無かったキー」になる。
+/// 旧 CSL の全キーが「旧い型のカタログに無かったキー」になる。ただし旧い型 `article` は例外で、document として扱う
+/// （`types::canonical_type`）= document のカタログにある欄（genre・number 等）は「旧い型にあったキー」なので温存しない。
+/// 新しい型のカタログに**ある**キーも温存しない: 新しい型では欄として見えている（エディタは型に関係なく
+/// CSL の全キーを読む）ので、入力が正（空で保存すれば消える）。型を変えない編集では旧い型 = 新しい型なので、この条件は効かない。
 pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
     let (id, old_s): (i64, String) = db
         .conn
@@ -93,11 +96,13 @@ pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
         .optional()?
         .ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
     let old = serde_json::from_str::<Value>(&old_s).ok();
+    // 新しい型の検証は sanitize_with がする（未知の型なら BadInput）。ここでは温存の判定にだけ使う
+    let new_type = types::canonical_type(model::s(csl, "type").unwrap_or("document"));
     let carried: Vec<(String, Value)> = match old.as_ref().and_then(Value::as_object) {
         Some(o) => {
-            let old_type = o.get("type").and_then(Value::as_str).unwrap_or("document");
+            let old_type = types::canonical_type(o.get("type").and_then(Value::as_str).unwrap_or("document"));
             o.iter()
-                .filter(|(k, _)| !types::is_valid_field(old_type, k))
+                .filter(|(k, _)| !types::is_valid_field(old_type, k) && !types::is_valid_field(new_type, k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         }
@@ -343,7 +348,7 @@ pub fn attach_auto_with_md5(db: &Db, key: &str, filename: &str, bytes: &[u8], md
     if bytes.is_empty() {
         return Err(CoreError::BadInput("空のファイル".into()));
     }
-    let (id, placement) = if db.pdf_write_mode() != "drive" {
+    let (id, placement) = if db.pdf_write_mode()? != "drive" {
         let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
         (att_id, Placement::Managed(path))
     } else {
@@ -492,5 +497,107 @@ mod tests {
         // カタログ外でも、元の CSL に無いキーは入れられない（混入防止は従来どおり）
         update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2", "bogus": "x"})).unwrap();
         assert!(get(&db).get("bogus").is_none());
+    }
+
+    /// 温存は「旧い型のカタログにも新しい型のカタログにも無いキー」だけ。新しい型で欄として見えるキーは入力が正
+    /// （エディタで型を変え、見えている欄を空で保存したら消える）。型を変えない編集は温存する
+    #[test]
+    fn update_carries_only_keys_outside_both_catalogs() {
+        use serde_json::json;
+        let mut db = Db::open_in_memory().unwrap();
+        // article-journal のカタログに accessed は無く、webpage のカタログには有る（どちらにも citation-key は無い）
+        assert!(!types::is_valid_field("article-journal", "accessed") && types::is_valid_field("webpage", "accessed"));
+        assert!(!types::is_valid_field("webpage", "citation-key") && !types::is_valid_field("article-journal", "citation-key"));
+        let old = json!({
+            "type": "article-journal", "title": "T", "URL": "https://example.org/a",
+            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kano2020liver"
+        });
+        let put = |db: &Db, v: &Value| {
+            db.conn.execute("DELETE FROM items WHERE key = 'ITEM0001'", []).unwrap();
+            db.conn.execute("INSERT INTO items (key, csl) VALUES ('ITEM0001', ?1)", [v.to_string()]).unwrap();
+        };
+        let get = |db: &Db| -> Value {
+            let s: String = db.conn.query_row("SELECT csl FROM items WHERE key = 'ITEM0001'", [], |r| r.get(0)).unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+
+        // 型を変えない編集（GUI の形 = カタログの欄だけ）: accessed も citation-key も温存
+        put(&db, &old);
+        update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2"})).unwrap();
+        let c = get(&db);
+        assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}));
+        assert_eq!(c["citation-key"], "kano2020liver");
+
+        // 型を変えて、新しい型の欄（accessed）を空で保存（= 入力に無い）→ 消える。どちらの型にも無い citation-key は温存
+        put(&db, &old);
+        update_csl(&mut db, "ITEM0001", &json!({"type": "webpage", "title": "T", "URL": "https://example.org/a"})).unwrap();
+        let c = get(&db);
+        assert_eq!(c["type"], "webpage");
+        assert!(c.get("accessed").is_none(), "新しい型で見えている欄は入力が正 = 空なら消える");
+        assert_eq!(c["citation-key"], "kano2020liver", "新しい型にも無いキーは温存");
+
+        // 型を変えて accessed を入力に残す（エディタが旧値を欄に読んだまま保存）→ その値で残る
+        put(&db, &old);
+        update_csl(&mut db, "ITEM0001", &json!({
+            "type": "webpage", "title": "T", "accessed": {"date-parts": [[2024, 5, 1]]}
+        })).unwrap();
+        let c = get(&db);
+        assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}));
+        assert_eq!(c["citation-key"], "kano2020liver");
+    }
+
+    /// 型カタログに無い `article`（1.1.0 までの GUI 取込 stub・Zotero 移行の preprint）は document として編集・保存できる
+    #[test]
+    fn legacy_article_type_is_edited_as_document() {
+        use serde_json::json;
+        let mut db = Db::open_in_memory().unwrap();
+        let old = json!({
+            "type": "article", "title": "Preprint", "publisher": "medRxiv", "genre": "Preprint",
+            "number": "2024.01.01.1", "citation-key": "kano2024",
+            "custom": {"source": "zotero"}
+        });
+        db.conn
+            .execute("INSERT INTO items (key, csl) VALUES ('ITEM0001', ?1)", [old.to_string()])
+            .unwrap();
+        let get = |db: &Db| -> Value {
+            let s: String = db.conn.query_row("SELECT csl FROM items WHERE key = 'ITEM0001'", [], |r| r.get(0)).unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+        // 型が article のまま送られても通り、document として保存される（document の欄 = publisher・genre・number はそのまま）
+        update_csl(&mut db, "ITEM0001", &json!({
+            "type": "article", "title": "Preprint 2", "publisher": "medRxiv", "genre": "Preprint", "number": "2024.01.01.1"
+        })).unwrap();
+        let c = get(&db);
+        assert_eq!(c["type"], "document");
+        assert_eq!(c["title"], "Preprint 2");
+        assert_eq!((c["publisher"].as_str(), c["genre"].as_str(), c["number"].as_str()), (Some("medRxiv"), Some("Preprint"), Some("2024.01.01.1")));
+        assert_eq!(c["citation-key"], "kano2024", "どちらの型にも無いキーは温存");
+        assert_eq!(c["custom"], json!({"source": "zotero"}));
+
+        // 旧い型が article の item を document で保存し直しても、document の欄を空にすれば消える（旧型 = document 扱い）
+        update_csl(&mut db, "ITEM0001", &json!({"type": "document", "title": "Preprint 2", "publisher": "medRxiv"})).unwrap();
+        let c = get(&db);
+        assert!(c.get("genre").is_none() && c.get("number").is_none(), "document の欄は入力が正");
+
+        // 温存の判定: 旧 article の item を article-journal に型を変えて保存すると、document のカタログにある genre・number は
+        // 旧型の欄（article を document として扱う）なので残らない。どちらの型にも無い citation-key は温存。
+        // （article をカタログに無い型として扱うと全キーが温存対象になり、genre・number も残ってしまう）
+        db.conn.execute("DELETE FROM items WHERE key = 'ITEM0001'", []).unwrap();
+        db.conn.execute("INSERT INTO items (key, csl) VALUES ('ITEM0001', ?1)", [old.to_string()]).unwrap();
+        update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "Preprint 3"})).unwrap();
+        let c = get(&db);
+        assert_eq!(c["type"], "article-journal");
+        assert!(c.get("genre").is_none() && c.get("number").is_none() && c.get("publisher").is_none());
+        assert_eq!(c["citation-key"], "kano2024");
+
+        // 手動作成・sanitize も同じ
+        let created = create_manual(&mut db, &json!({"type": "article", "title": "New"})).unwrap();
+        let s: String = db.conn.query_row("SELECT csl FROM items WHERE key = ?1", [created], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&s).unwrap()["type"], "document");
+        // 未知の型は従来どおり Err
+        assert!(matches!(
+            update_csl(&mut db, "ITEM0001", &json!({"type": "post-weblog", "title": "x"})),
+            Err(CoreError::BadInput(_))
+        ));
     }
 }

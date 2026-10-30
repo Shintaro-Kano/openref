@@ -2,7 +2,9 @@
 //! `collections.parent_id` による任意段の木。名前は**同じ親の下で大小無視一意**（DB の COLLATE NOCASE と同じ =
 //! ASCII だけ大小無視）、`/` は不可（MCP / CLI / `edit::ensure_collection_path` のパス区切り）。
 //! 削除は即時でサブツリーごと（論文は消えず所属が外れるだけ。`collections.deleted_at` は読むだけで書かない）。
-//! ツールバーの「作成して追加」（パス可・冪等）は従来どおり `edit::ensure_collection_path`。
+//! GUI の作成経路（New folder・Manage folders・ツールバーの「作成して追加」）は全部 `create_collection`
+//! （前段検査は app/src/lib/folders.ts が同じ規則を写す）。パス可・冪等の作成（`ensure_path`）は MCP の create_collection と
+//! `edit::ensure_collection_path`。
 
 use crate::tags::RenameOutcome;
 use crate::{keys, CoreError, Db, Result};

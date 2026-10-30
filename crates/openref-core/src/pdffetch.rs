@@ -176,7 +176,7 @@ pub fn fetch_pdf(db: &Db, key: &str) -> Result<Fetched> {
 
 /// AWS Open Data での OA 判定結果（`pmc_oa_lookup`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OaLookup {
+enum OaLookup {
     /// OA サブセット内で PDF あり。`key` は S3 オブジェクトキー、`md5` は json の `pdf_url` に付く検証値
     Available { key: String, license: String, md5: Option<String> },
     /// 収載はあるが OA サブセット外（author manuscript / TDM 限定ライセンス等）→ 自動取得不可
@@ -189,11 +189,11 @@ pub enum OaLookup {
     Mismatch { reason: String },
 }
 
-pub const AWS_OA: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
+const AWS_OA: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
 const AWS_BUCKET: &str = "pmc-oa-opendata";
 
 /// PMCID の表記ゆれを吸収（`pmc123` / `123` → `PMC123`）。
-pub fn normalize_pmcid(s: &str) -> String {
+fn normalize_pmcid(s: &str) -> String {
     let t = s.trim();
     let digits = t
         .strip_prefix("PMC")
@@ -206,7 +206,7 @@ pub fn normalize_pmcid(s: &str) -> String {
 /// S3 ListObjectsV2（prefix `PMC<id>.`）→ 最新 version の json を読み、OA 可否と PDF キーを返す。
 /// `expect_doi` は item の DOI（json の doi と照合。None なら照合しない）。
 /// ネットワークを使うのはここと `aws_fetch_pdf` だけ（解釈は `interpret_oa` で単体テスト可能）。
-pub fn pmc_oa_lookup(pmcid: &str, expect_doi: Option<&str>) -> std::result::Result<OaLookup, String> {
+fn pmc_oa_lookup(pmcid: &str, expect_doi: Option<&str>) -> std::result::Result<OaLookup, String> {
     let pmcid = normalize_pmcid(pmcid);
     let keys = list_prefix(&format!("{pmcid}."))?;
     let Some(prefix) = latest_version_prefix(&keys, &pmcid) else {
@@ -241,7 +241,7 @@ fn list_prefix(prefix: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 /// `<IsTruncated>true</IsTruncated>` のとき `<NextContinuationToken>` を返す
-pub fn listing_next_token(xml: &str) -> Option<String> {
+fn listing_next_token(xml: &str) -> Option<String> {
     if !xml.contains("<IsTruncated>true</IsTruncated>") {
         return None;
     }
@@ -251,7 +251,7 @@ pub fn listing_next_token(xml: &str) -> Option<String> {
 }
 
 /// S3 ListObjectsV2 の XML から全 Key を拾う（ネットワーク非依存＝テスト可能）
-pub fn listing_keys(xml: &str) -> Vec<String> {
+fn listing_keys(xml: &str) -> Vec<String> {
     xml.split("<Key>")
         .skip(1)
         .filter_map(|seg| seg.split("</Key>").next())
@@ -261,7 +261,7 @@ pub fn listing_keys(xml: &str) -> Vec<String> {
 
 /// 一覧の Key（`PMC<id>.<v>/…`）から最新 version のディレクトリ名（`PMC<id>.<v>`）を返す。
 /// 該当 PMCID のキーが無ければ None（= 未収載）。
-pub fn latest_version_prefix(keys: &[String], pmcid: &str) -> Option<String> {
+fn latest_version_prefix(keys: &[String], pmcid: &str) -> Option<String> {
     let want = format!("{pmcid}.");
     keys.iter()
         .filter_map(|k| k.split('/').next())
@@ -275,7 +275,7 @@ pub fn latest_version_prefix(keys: &[String], pmcid: &str) -> Option<String> {
 }
 
 /// `s3://pmc-oa-opendata/<key>?md5=<hex>` → (`<key>`, Some(hex))。他バケット・不正形式は None。
-pub fn s3_url_parts(url: &str) -> Option<(String, Option<String>)> {
+fn s3_url_parts(url: &str) -> Option<(String, Option<String>)> {
     let rest = url.strip_prefix("s3://")?;
     let (bucket, path) = rest.split_once('/')?;
     if bucket != AWS_BUCKET || path.is_empty() {
@@ -299,7 +299,7 @@ pub fn s3_url_parts(url: &str) -> Option<(String, Option<String>)> {
 /// - `is_pmc_openaccess` が明示的に false → NotOpenAccess（manuscript / TDM）
 /// - 本体 PDF は json の `pdf_url` のみ（`media_urls` の補足 PDF は本体ではない）。無ければ NoPdf
 /// - json が無い / 壊れている（異常系）ときだけ、一覧の `PMC<id>.<v>/PMC<id>.<v>.pdf` 完全一致で代替（license は unknown）
-pub fn interpret_oa(
+fn interpret_oa(
     json: Option<&str>,
     keys: &[String],
     prefix: &str,
@@ -586,7 +586,7 @@ pub fn check_pdf_identity(bytes: &[u8], csl: &Value) -> IdentityCheck {
 ///   2 頁目だけにある場合は、1 頁目に別 DOI が無いときに限り Match（合本の 2 本目は Unknown）
 /// - Mismatch: 目的 DOI が無く、**1 頁目**に別の DOI がある（参考文献が 2 頁目に始まる短報を誤って弾かないため 1 頁目に限る）
 /// - Unknown: それ以外。別 DOI と数えないもの = 表記ゆれ（同じ接頭辞で数字列が同じ）・目的 DOI の前方部分（行末で切れた自己候補）
-pub fn identity_from_pages(pages: &[String], target_doi: &str) -> IdentityCheck {
+fn identity_from_pages(pages: &[String], target_doi: &str) -> IdentityCheck {
     let target = printed_doi(target_doi);
     if target.is_empty() {
         return IdentityCheck::Unchecked { reason: "item に DOI なし".into() };
@@ -652,7 +652,7 @@ fn contains_doi(page: &str, target: &str) -> bool {
         match chars.get(pos) {
             None => true,
             Some(&c) if c.is_whitespace() || !is_doi_char(c) => true,
-            Some(&c) if matches!(c, '.' | ';' | ')' | ':' | ',') => match chars.get(pos + 1) {
+            Some('.' | ';' | ')' | ':' | ',') => match chars.get(pos + 1) {
                 None => true,
                 Some(&n) => n.is_whitespace() || !is_doi_char(n),
             },
@@ -742,7 +742,7 @@ fn read_capped(reader: impl std::io::Read, cap: u64) -> std::io::Result<(Vec<u8>
 /// localhost / IPv6 リテラル以外。`url::Url` でホストを解釈するので数値形 IPv4（`2130706433` `0x7f.0.0.1` `0177.0.0.1`
 /// `127.1` `127.0.0.1.`）も 127.0.0.1 として弾ける。SSRF 対策: 着地ページの `citation_pdf_url` が内部アドレス
 /// （connectd 自身の 127.0.0.1:23119 等）を指しても辿らない。
-pub fn url_allowed(url: &str, allow_http: bool) -> std::result::Result<(), String> {
+fn url_allowed(url: &str, allow_http: bool) -> std::result::Result<(), String> {
     let u = url::Url::parse(url.trim()).map_err(|e| format!("URL を解釈できません（{e}: {}）", truncate_url(url)))?;
     match u.scheme() {
         "https" => {}
@@ -792,7 +792,7 @@ fn truncate_url(u: &str) -> String {
 }
 
 /// DOI を URL のパスとして percent-encode する（`/` は残す。popup の encodeURIComponent と同じ集合を素通し）
-pub fn encode_doi_path(doi: &str) -> String {
+fn encode_doi_path(doi: &str) -> String {
     let mut out = String::with_capacity(doi.len() + 8);
     for b in doi.trim().bytes() {
         let keep = b.is_ascii_alphanumeric() || b"-_.!~*'()/".contains(&b);
@@ -891,7 +891,7 @@ fn crossref_pdf_links(doi: &str) -> std::result::Result<Vec<String>, String> {
 
 /// `works/<doi>` 応答の `message.link[]` から、`content-type: application/pdf` かつ
 /// `intended-application` が text-mining 以外で、取得先として許される URL を順に返す（ネットワーク非依存＝テスト可能）。
-pub fn select_crossref_pdf_links(v: &Value) -> Vec<String> {
+fn select_crossref_pdf_links(v: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let links = v.pointer("/message/link").and_then(|l| l.as_array());
     for l in links.into_iter().flatten() {
@@ -912,7 +912,7 @@ pub fn select_crossref_pdf_links(v: &Value) -> Vec<String> {
 // ---------------- 経路 4: doi.org 着地ページ ----------------
 
 /// 経路 4 の結果。`kind` = 所在の種類（`LocationKind::Declared` = メタタグ / link、`Heuristic` = .pdf リンク 1 本規則）
-pub struct LandingPdf {
+struct LandingPdf {
     pub bytes: Vec<u8>,
     pub host: String,
     pub kind: LocationKind,
@@ -920,7 +920,7 @@ pub struct LandingPdf {
 
 /// 経路 4 の本体: doi.org → 着地ページ → PDF の所在 → ダウンロード。
 /// 書誌には一切使わない（PDF の URL だけを読む）。
-pub fn landing_page_pdf(doi: &str) -> std::result::Result<LandingPdf, String> {
+fn landing_page_pdf(doi: &str) -> std::result::Result<LandingPdf, String> {
     let mut url = format!("https://doi.org/{}", encode_doi_path(doi));
     let mut hops = 0;
     loop {
@@ -970,7 +970,7 @@ pub fn landing_page_pdf(doi: &str) -> std::result::Result<LandingPdf, String> {
 
 /// 着地 HTML から読めた「PDF の所在」。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Located {
+enum Located {
     /// PDF の URL と、宣言された所在かヒューリスティックか
     Pdf(String, LocationKind),
     /// 中継ページ: meta refresh の飛び先
@@ -984,7 +984,7 @@ pub enum Located {
 /// meta refresh（中継ページ。フッターの `.pdf` を拾わないよう `.pdf` 探索より先）→ 同一ホストでパスが `.pdf` で終わる
 /// `<a href>` が **ちょうど 1 つ**のときだけそれ（ヒューリスティック）。
 /// HTML コメント・`<script>` `<style>` `<noscript>` の中は無視・`<base href>` を尊重・書誌は読まない。
-pub fn locate_pdf(html: &str, page_url: &str) -> Located {
+fn locate_pdf(html: &str, page_url: &str) -> Located {
     let html = strip_comments(html);
     let html = strip_blocks(&html, &["script", "style", "noscript"]);
     let tags = scan_tags(&html);
@@ -1261,7 +1261,7 @@ fn decode_entities(s: &str) -> String {
 
 /// 相対 URL を base に対して解決する（http/https のみ・絶対 URL はスキームの大小を問わない）。
 /// `?query` だけの相対 URL はページのパスに対して解決し、`#fragment` だけは同じページなので None。
-pub fn resolve_url(base: &str, href: &str) -> Option<String> {
+fn resolve_url(base: &str, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty() || href.starts_with('#') {
         return None;

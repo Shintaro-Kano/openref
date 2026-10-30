@@ -16,6 +16,8 @@
   import { DEFAULT_LABEL_COLOR, isSolid, labelVars } from "./labels";
   import { Manage, type Panel } from "./manage.svelte";
   import ManageTable from "./ManageTable.svelte";
+  import { sameName } from "./folders";
+  import { byName } from "./sort";
   import {
     app,
     createLabel,
@@ -47,11 +49,7 @@
       const dir = asc ? 1 : -1;
       return app.tags
         .slice()
-        .sort((a, b) =>
-          k === "count"
-            ? (a.nItems - b.nItems) * dir || a.name.localeCompare(b.name)
-            : a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) * dir
-        )
+        .sort((a, b) => (k === "count" ? (a.nItems - b.nItems) * dir || byName(a, b) : byName(a, b) * dir))
         .map((t) => ({ item: t, depth: 0 }));
     },
     nameError: (n, row) => (labelNameTaken(n, row.id) ? t("同名あり") : null),
@@ -119,7 +117,7 @@
   }
 
   /** 確定中の改名の名前と同じか（まだ一覧に無い名前。同名で作ると core の create_tag は既存として色だけ書き換えて返す） */
-  const pendingName = (n: string) => [...m.sending.values()].some((s) => s.toLowerCase() === n.trim().toLowerCase());
+  const pendingName = (n: string) => [...m.sending.values()].some((s) => sameName(s, n));
   /** ＋ New label 欄の名前が既存のラベル・確定中の改名と同じか */
   const inlineTaken = $derived(labelNameTaken(m.newName) || pendingName(m.newName));
   async function createInline() {

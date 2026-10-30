@@ -12,6 +12,7 @@
   import { api } from "./api";
   import LabelBadge from "./LabelBadge.svelte";
   import { composing } from "./input";
+  import { nocase } from "./sort";
   import {
     app,
     askPurgeChecked,
@@ -28,7 +29,9 @@
     applyLabelChanges,
     createLabel as createLabelNamed,
     flatFolders,
+    folderNameError,
     folderPath,
+    labelNameTaken,
     openStyleModal,
     styleTitle,
   } from "./state.svelte";
@@ -54,19 +57,18 @@
   const needle = $derived(q.trim().toLowerCase());
   /** フォルダの候補 = 木の順（名前順・折畳なし）+ 段の字下げ */
   const folderCands = $derived(flatFolders({ sort: "alpha" }).filter((r) => r.c.name.toLowerCase().includes(needle)));
-  /** 別の親の下に同名があるフォルダ名（小文字）。候補に親の名前を添えて見分ける */
+  /** 別の親の下に同名（大小無視 = nocase）があるフォルダ名（nocase で畳んだもの）。候補に親の名前を添えて見分ける */
   const dupNames = $derived.by(() => {
     const n = new Map<string, number>();
-    for (const c of app.collections) n.set(c.name.toLowerCase(), (n.get(c.name.toLowerCase()) ?? 0) + 1);
+    for (const c of app.collections) n.set(nocase(c.name), (n.get(nocase(c.name)) ?? 0) + 1);
     return new Set([...n].filter(([, k]) => k > 1).map(([name]) => name));
   });
   const labelCands = $derived(app.tags.filter((t) => t.name.toLowerCase().includes(needle)));
-  const canCreateFolder = $derived(
-    needle.length > 0 && !app.collections.some((c) => c.name.toLowerCase() === needle)
-  );
-  const canCreateLabel = $derived(
-    needle.length > 0 && !app.tags.some((t) => t.name.toLowerCase() === needle)
-  );
+  /** 「作成して追加」は root に作る = New folder と同じ規則（`/` 不可・root の兄弟の中で大小無視一意）。
+      作れない理由（`/`）は候補が無いときに出す */
+  const folderErr = $derived(folderNameError(q, null));
+  const canCreateFolder = $derived(folderErr === null);
+  const canCreateLabel = $derived(needle.length > 0 && !labelNameTaken(q));
 
   async function loadMember(kind: "folder" | "label") {
     const ms = await api.membership(checkedKeys());
@@ -213,7 +215,7 @@
                 <button class="pop-row" onclick={() => toggleFolder(c.id)}>
                   <span class="cb" class:on={stateOf(c.id) === "all"} class:some={stateOf(c.id) === "some"}></span>
                   <span class="name" style="padding-left:{depth * 14}px"
-                    >{c.name}{#if c.parentId !== null && dupNames.has(c.name.toLowerCase())}<span class="lb-path"> — {folderPath(c.id)}</span>{/if}</span>
+                    >{c.name}{#if c.parentId !== null && dupNames.has(nocase(c.name))}<span class="lb-path"> — {folderPath(c.id)}</span>{/if}</span>
                   <span class="n">{c.nItems}</span>
                 </button>
               {/each}
@@ -221,7 +223,7 @@
                 <button class="pop-row create" onclick={createFolder}>{t("＋ 「")}{q.trim()}{t("」を作成して追加")}</button>
               {/if}
               {#if folderCands.length === 0 && !canCreateFolder}
-                <div class="lb-empty">{t("（フォルダなし）")}</div>
+                <div class="lb-empty">{folderErr || t("（フォルダなし）")}</div>
               {/if}
             </div>
           </div>

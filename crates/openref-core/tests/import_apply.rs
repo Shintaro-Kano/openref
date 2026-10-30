@@ -189,7 +189,7 @@ fn copy_ignores_drive_setting_repeats_without_duplicates_and_preserves_dates() {
     assert_eq!(f.count("attachments"), 2);
     assert_eq!(f.count("import_runs"), 2);
     let db = Db::open(&f.db).unwrap();
-    assert_eq!(db.pdf_write_mode(), "drive");
+    assert_eq!(db.pdf_write_mode().unwrap(), "drive");
     let rows: Vec<(String, String)> = db
         .conn
         .prepare("SELECT mode,path FROM attachments")
@@ -924,7 +924,7 @@ fn automatic_ingestion_serializes_duplicate_checks_with_its_insert() {
     let f = Fixture::new(json!([]));
     drop(Db::open(&f.db).unwrap());
     let barrier = Arc::new(Barrier::new(2));
-    let threads:Vec<_>=(0..2).map(|_|{let path=f.db.clone();let barrier=barrier.clone();std::thread::spawn(move||{let mut db=Db::open(&path).unwrap();barrier.wait();openref_core::ingest::add_item(&mut db,&openref_core::resolver::Resolved{csl:json!({"type":"article-journal","title":"Concurrent automatic import","DOI":"10.5555/concurrent"}),source:"test",retracted:None})})}).collect();
+    let threads:Vec<_>=(0..2).map(|_|{let path=f.db.clone();let barrier=barrier.clone();std::thread::spawn(move||{let mut db=Db::open(&path).unwrap();barrier.wait();openref_core::ingest::add_item(&mut db,&openref_core::resolver::Resolved{csl:json!({"type":"article-journal","title":"Concurrent automatic import","DOI":"10.5555/concurrent"}),source:"test",retracted:None,warnings:vec![]})})}).collect();
     let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
     assert_eq!(

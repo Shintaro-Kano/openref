@@ -452,7 +452,7 @@ fn cmd_style(db: &Db, action: StyleAction) -> anyhow::Result<()> {
         StyleAction::Get { id } => print!("{}", citestyle::style_xml(&dir, &id)?),
         StyleAction::Locale { lang } => print!("{}", citestyle::locale_xml(&dir, &lang)?),
         StyleAction::List => {
-            println!("既定: {}", citestyle::prefs(db));
+            println!("既定: {}", citestyle::prefs(db)?);
             for v in citestyle::installed(&dir) {
                 println!("{v}");
             }
@@ -465,7 +465,7 @@ fn cmd_cutover(db: &Db, action: CutoverAction) -> anyhow::Result<()> {
     use openref_core::mount;
     match action {
         CutoverAction::Status => {
-            println!("pdf_write_mode: {}", db.pdf_write_mode());
+            println!("pdf_write_mode: {}", db.pdf_write_mode()?);
             println!(
                 "attachments: linked {} / managed {}",
                 mount::count_attachments_by_mode(db, "linked")?,
@@ -565,6 +565,10 @@ fn cmd_add(db: &mut Db, input: &str) -> anyhow::Result<()> {
             if let Some(r) = &resolved.retracted {
                 println!("  ⚠ 撤回論文の可能性: {r}");
             }
+            // resolver の警告（PubMed の照合に失敗 → doi.org で代用）は stderr へ（stdout は普段と同じ形・exit 0）
+            for w in &resolved.warnings {
+                eprintln!("⚠ {w}: openref refresh {}", added.key);
+            }
         }
         Err(CoreError::Duplicate {
             existing_key,
@@ -646,7 +650,7 @@ fn cmd_fetch_pdf(db: &Db, key: Option<&str>, missing: bool) -> anyhow::Result<()
              ORDER BY i.id",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<Result<_, _>>()?
     } else {
         vec![key.context("key か --missing を指定してください")?.to_string()]
     };
@@ -681,7 +685,7 @@ fn cmd_refresh(
              ORDER BY id",
         )?;
         let rows = stmt.query_map([source], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<Result<_, _>>()?
     } else {
         bail!("KEY か --source <src> か --all を指定してください");
     };
@@ -1109,7 +1113,11 @@ fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
             }
             Ok(PdfIngestOutcome::DuplicateFile { key }) => {
                 dup += 1;
-                let hint = if is_review_stub(db, &key) { "・相手は要確認 stub = 編集から DOI/PMID を引き直せます" } else { "" };
+                let hint = match is_review_stub(db, &key) {
+                    Ok(true) => "・相手は要確認 stub = 編集から DOI/PMID を引き直せます".to_string(),
+                    Ok(false) => String::new(),
+                    Err(e) => format!("・相手が要確認 stub かを確かめられません: {e}"),
+                };
                 format!("＝ 同一ファイルが添付済み（md5 一致・スキップ{hint}）  {key}")
             }
             Ok(PdfIngestOutcome::NeedsReview { key }) => {

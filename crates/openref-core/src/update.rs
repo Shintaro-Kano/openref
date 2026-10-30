@@ -43,12 +43,13 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
-pub fn cached(db: &Db) -> Cached {
-    Cached {
-        enabled: db.setting(KEY_ENABLED).as_deref() != Some("0"),
-        checked_at: db.setting(KEY_CHECKED_AT).and_then(|v| v.trim().parse().ok()),
-        latest: db.setting(KEY_LATEST).filter(|v| parse_version(v).is_some()),
-    }
+/// settings を読めなければ Err（読めないまま「前回が無い = 取りに行く番」へ倒さない）。読めた壊れた値は無いものとして扱う
+pub fn cached(db: &Db) -> Result<Cached> {
+    Ok(Cached {
+        enabled: db.setting(KEY_ENABLED)?.as_deref() != Some("0"),
+        checked_at: db.setting(KEY_CHECKED_AT)?.and_then(|v| v.trim().parse().ok()),
+        latest: db.setting(KEY_LATEST)?.filter(|v| parse_version(v).is_some()),
+    })
 }
 
 /// 取りに行く番か。止めていれば行かない。前回から 1 日経った・前回が無い・時計が戻っている（前回が 5 分より先の未来。NTP の
@@ -140,7 +141,7 @@ fn lock(db: &Mutex<Db>) -> Result<MutexGuard<'_, Db>> {
 pub fn check(db: &Mutex<Db>, current: &str, url: &str, now: i64) -> Result<Outcome> {
     let c = {
         let g = lock(db)?;
-        cached(&g)
+        cached(&g)?
     };
     let newer =|latest: Option<&str>| latest.filter(|l| is_newer(l, current)).map(str::to_string);
     if !c.enabled {
@@ -216,7 +217,7 @@ mod tests {
         db.set_setting(KEY_CHECKED_AT, "abc").unwrap();
         db.set_setting(KEY_LATEST, "<html>").unwrap();
         db.set_setting(KEY_ENABLED, " 0").unwrap();
-        let c = cached(&db);
+        let c = cached(&db).unwrap();
         assert_eq!(c, Cached { enabled: true, checked_at: None, latest: None }, "読めない値は無いものとして扱う（\"0\" ちょうどだけが opt-out）");
     }
 
@@ -274,9 +275,9 @@ mod tests {
         assert_eq!(out, Outcome { newer: Some("9.9.9".into()), error: None });
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let g = db.lock().unwrap();
-        assert_eq!(g.setting(KEY_CHECKED_AT).as_deref(), Some("1000"));
-        assert_eq!(g.setting(KEY_LATEST).as_deref(), Some("9.9.9"));
-        assert_eq!(g.setting(KEY_ERROR), None, "取れたら前回の失敗の理由は消す");
+        assert_eq!(g.setting(KEY_CHECKED_AT).unwrap().as_deref(), Some("1000"));
+        assert_eq!(g.setting(KEY_LATEST).unwrap().as_deref(), Some("9.9.9"));
+        assert_eq!(g.setting(KEY_ERROR).unwrap(), None, "取れたら前回の失敗の理由は消す");
     }
 
     #[test]
@@ -295,7 +296,7 @@ mod tests {
         let out = check(&db, "0.1.0", &url, 1_000 + INTERVAL_SECS).unwrap();
         assert_eq!(out.newer.as_deref(), Some("9.9.9"));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        assert_eq!(db.lock().unwrap().setting(KEY_CHECKED_AT).as_deref(), Some(&(1_000 + INTERVAL_SECS).to_string()[..]));
+        assert_eq!(db.lock().unwrap().setting(KEY_CHECKED_AT).unwrap().as_deref(), Some(&(1_000 + INTERVAL_SECS).to_string()[..]));
     }
 
     #[test]
@@ -318,11 +319,11 @@ mod tests {
         let (url, _) = serve("200 OK", "0.1.0");
         let db = mem_db();
         assert_eq!(check(&db, "0.1.0", &url, 1_000).unwrap(), Outcome { newer: None, error: None });
-        assert_eq!(db.lock().unwrap().setting(KEY_LATEST).as_deref(), Some("0.1.0"), "同じ版でも結果は書く（次の 1 日は読み直さない）");
+        assert_eq!(db.lock().unwrap().setting(KEY_LATEST).unwrap().as_deref(), Some("0.1.0"), "同じ版でも結果は書く（次の 1 日は読み直さない）");
         let (url, _) = serve("200 OK", "0.0.1");
         let older = mem_db();
         assert_eq!(check(&older, "0.1.0", &url, 1_000).unwrap(), Outcome { newer: None, error: None });
-        assert_eq!(older.lock().unwrap().setting(KEY_LATEST).as_deref(), Some("0.0.1"));
+        assert_eq!(older.lock().unwrap().setting(KEY_LATEST).unwrap().as_deref(), Some("0.0.1"));
     }
 
     #[test]
@@ -338,9 +339,9 @@ mod tests {
         assert_eq!(out.error.as_deref(), Some("HTTP error: HTTP 404"));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let g = db.lock().unwrap();
-        assert_eq!(g.setting(KEY_CHECKED_AT).as_deref(), Some("1000000"), "失敗でも確認した日時は進める = 起動のたびに GET しない");
-        assert_eq!(g.setting(KEY_LATEST).as_deref(), Some("0.5.0"), "前回の版番号はそのまま");
-        assert_eq!(g.setting(KEY_ERROR).as_deref(), Some("1000000: HTTP error: HTTP 404"));
+        assert_eq!(g.setting(KEY_CHECKED_AT).unwrap().as_deref(), Some("1000000"), "失敗でも確認した日時は進める = 起動のたびに GET しない");
+        assert_eq!(g.setting(KEY_LATEST).unwrap().as_deref(), Some("0.5.0"), "前回の版番号はそのまま");
+        assert_eq!(g.setting(KEY_ERROR).unwrap().as_deref(), Some("1000000: HTTP error: HTTP 404"));
         drop(g);
         // 同じ日のうちは取りに行かない（失敗の直後でも）
         let out = check(&db, "0.1.0", &url, 1_000_000 + 60).unwrap();
@@ -357,9 +358,9 @@ mod tests {
         assert_eq!(out.newer, None);
         assert!(out.error.as_deref().unwrap_or("").contains("VERSION の形式が不正"), "{out:?}");
         let g = db.lock().unwrap();
-        assert_eq!(g.setting(KEY_LATEST), None);
-        assert_eq!(g.setting(KEY_CHECKED_AT).as_deref(), Some("1000"));
-        assert!(g.setting(KEY_ERROR).unwrap().starts_with("1000: parse error: VERSION の形式が不正"));
+        assert_eq!(g.setting(KEY_LATEST).unwrap(), None);
+        assert_eq!(g.setting(KEY_CHECKED_AT).unwrap().as_deref(), Some("1000"));
+        assert!(g.setting(KEY_ERROR).unwrap().unwrap().starts_with("1000: parse error: VERSION の形式が不正"));
     }
 
     #[test]
@@ -371,7 +372,7 @@ mod tests {
         let out = check(&db, "0.1.0", &url, 1_000).unwrap();
         assert_eq!(out.newer, None);
         assert!(out.error.as_deref().unwrap_or("").contains("64 バイトを超える"), "{out:?}");
-        assert_eq!(db.lock().unwrap().setting(KEY_LATEST), None);
+        assert_eq!(db.lock().unwrap().setting(KEY_LATEST).unwrap(), None);
     }
 
     #[test]

@@ -53,11 +53,12 @@
     allMatchIndexes,
     buildSnippet,
     buildGeom,
-    squashFlatSpan,
+    squashOrigSpan,
+    quoteSpans,
+    bodySpans,
     fragmentRects,
     makePageText,
     applyReadingOrder,
-    itemIndexAt,
     splitBlocks,
     bodyFontPx,
     runningTable,
@@ -952,15 +953,8 @@
   }
 
   /** Range をこのページの textLayer 内へクランプし、geom.full 上の元 index 区間の列を返す。
-      domAligned なら DOM 位置から直算（文字列照合なし）。そうでなければ squash 照合（squashFlatSpan）。
-      区間の決め方（ブロック規則・帯 / quote / コピー / 注釈描画の全経路で同一）:
-      - 選択の起点ブロックと終点ブロック（user が実際に指した場所）は、その中の選択範囲をそのまま採用
-      - その間にある（起点でも終点でもない）ブロックは kind === "body" のものだけ採用し、
-        柱・ノンブル・ロゴ（running）・キャプション・表・脚注など本文より小さい文字（small / caption）は飛ばす
-      - ページ跨ぎでは、このページの手前/先にある側のブロックは「起点/終点ではない」ので同じ規則で間引かれる
-      この規則が防ぐ例: 次ページの柱 "Abdominal Radiology" が帯に入る / 右カラムから次ページへ
-      引くと DOM 順で後ろにある左下の "Fig. 2 …" キャプションを経由する（同型: 表・脚注・2 カラム内の図説）。
-      単一ブロック内の選択はこれまでどおり無加工。キャプションや表を取りたいときはその中から / その中まで引く。 */
+      domAligned なら DOM 位置から直算（文字列照合なし）。そうでなければ squash 照合（squashOrigSpan = util.ts）。
+      区間の決め方 = ブロック規則（bodySpans = util.ts。帯 / quote / コピー / 注釈描画の全経路で同一）。 */
   function selectionOrigSpans(L: Layer, n: number, range: Range): [number, number][] {
     const geom = L.geom!;
     const pr = document.createRange();
@@ -972,8 +966,8 @@
     if (endsAfter) r2.setEnd(pr.endContainer, pr.endOffset);
     const text = r2.toString();
     if (!text) return [];
-    let oStart: number | undefined;
-    let oEnd: number | undefined;
+    let oStart: number;
+    let oEnd: number;
     if (L.domAligned) {
       const head = document.createRange();
       head.setStart(L.textLayer, 0);
@@ -981,46 +975,13 @@
       oStart = head.toString().length;
       oEnd = oStart + text.length;
     } else {
-      const span = squashFlatSpan(geom, normText(text).replace(/ /g, ""));
+      const span = squashOrigSpan(geom, text);
       if (!span) return [];
-      oStart = geom.posMap[span[0]];
-      oEnd = geom.posMap[Math.min(span[1], geom.posMap.length - 1)];
-      if (oStart == null || oEnd == null) return [];
+      [oStart, oEnd] = span;
     }
     if (oEnd <= oStart) return [];
     const { blocks, itemBlock } = blocksOf(n, L);
-    const bStart = startsBefore ? -1 : itemBlock[itemIndexAt(geom, oStart)] ?? -1;
-    const bEnd = endsAfter ? -1 : itemBlock[itemIndexAt(geom, oEnd - 1)] ?? -1;
-    if (!startsBefore && !endsAfter && bStart === bEnd) return [[oStart, oEnd]]; // 単一ブロック内: 無加工
-    const run = runningSet(n);
-    const out: [number, number][] = [];
-    let cur: [number, number] | null = null;
-    let curBlock = -1;
-    for (let i = 0; i < geom.items.length; i++) {
-      const it = geom.items[i];
-      if (it.start >= oEnd) break;
-      const s0 = Math.max(oStart, it.start);
-      const e0 = Math.min(oEnd, it.start + it.str.length);
-      if (e0 <= s0) continue;
-      const bi = itemBlock[i];
-      const explicit = bi === bStart || bi === bEnd;
-      const include = explicit || (blocks[bi]?.kind === "body" && !run.has(i));
-      if (!include) {
-        if (cur) out.push(cur);
-        cur = null;
-        continue;
-      }
-      // ブロック境界でも区間を切る（quote / コピーが段落ごとに空行で分かれ、hasEOL の無い 2 カラム
-      // ページでも "…centers withFig. 1 …" のように段落末と次段落が連結しない。帯には影響しない）
-      if (cur && cur[1] === s0 && bi === curBlock) cur[1] = e0;
-      else {
-        if (cur) out.push(cur);
-        cur = [s0, e0];
-        curBlock = bi;
-      }
-    }
-    if (cur) out.push(cur);
-    return out.filter(([s0, e0]) => geom.full.slice(s0, e0).trim().length > 0);
+    return bodySpans(geom, blocks, itemBlock, runningSet(n), oStart, oEnd, startsBefore, endsAfter);
   }
 
   // ---------- テキストブロック分割（行 → ブロック → 種別） ----------
@@ -1145,20 +1106,12 @@
     const targets = anns.filter((a) => a.quote && (a.page == null || a.page === pageNo));
     if (!targets.length || !geom.flat) return;
     for (const a of targets) {
-      // quote は空行（"\n\n"）で区切られた区間列になり得る（selectionBodyText: 飛ばしたキャプション等の前後・
-      // ページ間）。区間ごとに照合して描く。旧来の quote（区切りなし）は区間 1 つで従来どおり。
-      // 照合は squash（空白除去）空間で行う。選択 quote は行境界に <br> 由来の空白を含むが、
-      // geom.flat は行末空白なしの無区切り連結になり得るため（buildSquash の注記参照）。
+      // quote の区間ごとの照合 = quoteSpans（util.ts。空行区切り・squash 空間・先頭 40 文字への退避）
       const col = colorForAnnotation(a.color, a.author);
-      for (const seg of a.quote!.split(/\n[ \t]*\n/)) {
-        const q = normText(seg).replace(/ /g, "");
-        if (q.length < 4) continue;
-        // 全体が無ければ先頭 40 文字で探す（部分一致時は一致した接頭辞のみを描く = 余分な後続を着色しない）
-        const span = squashFlatSpan(geom, q) ?? squashFlatSpan(geom, q.slice(0, 40));
-        if (!span) continue;
+      for (const [s0, e0] of quoteSpans(geom, a.quote!)) {
         // 種別はハイライトのみ（descender まで塗る帯 + 背景のみ）。下線 / 取消線は扱わない
         // （線が文字位置とずれる + 機能過剰）。DB に残る旧 kind もハイライトとして描く。
-        placeRects(hlLayer, geom, span[0], span[1] - span[0], (div) => {
+        placeRects(hlLayer, geom, s0, e0 - s0, (div) => {
           div.className = "hl";
           div.dataset.kind = "highlight";
           div.dataset.key = a.key; // ページ上クリックで編集対象を引くため

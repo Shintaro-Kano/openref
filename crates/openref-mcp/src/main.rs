@@ -451,7 +451,7 @@ fn schema_text(db: &Db) -> String {
     let bdir = backup::backup_dir(db).map(|p| p.display().to_string()).unwrap_or_else(|| "(なし)".into());
     out.push_str(&format!("- DB: `{path}`（migration = `PRAGMA user_version` {}）\n", q("PRAGMA user_version")));
     out.push_str(&format!("- app_dir: `{app_dir}`（storage/ = managed の添付・styles/ = 引用スタイル・backup/ = スナップショット）\n"));
-    out.push_str(&format!("- pdf_write_mode: {}\n", db.pdf_write_mode()));
+    out.push_str(&format!("- pdf_write_mode: {}\n", db.pdf_write_mode().unwrap_or_else(|e| format!("?（{e}）"))));
     out.push_str(&format!(
         "- 件数: items {}（うちゴミ箱 {}）・添付 {}・注釈 {}・ノート {}・フォルダ {}・ラベル {}\n",
         q("SELECT count(*) FROM items WHERE deleted_at IS NULL"),
@@ -494,6 +494,7 @@ mod tests {
             }),
             retracted: None,
             source: "test",
+            warnings: vec![],
         };
         openref_core::ingest::add_item(db, &r).unwrap().key
     }

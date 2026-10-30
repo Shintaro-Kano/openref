@@ -272,6 +272,7 @@ pub fn parse_pubmed_xml(xml: &str) -> Result<Resolved> {
         csl: Value::Object(m),
         retracted,
         source: "pubmed",
+        warnings: vec![],
     })
 }
 

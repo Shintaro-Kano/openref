@@ -119,7 +119,7 @@
     const folders = forFolders;
     app.labelMenu = false;
     if (folders) setFolderSort(s);
-    else void setTagSort(s);
+    else setTagSort(s);
   }
   function manage() {
     if (forFolders) openFolderModal("manageFolders");

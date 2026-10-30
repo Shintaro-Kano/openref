@@ -426,7 +426,7 @@ export const en: Record<string, string> = {
   "「/」は使えません（フォルダの区切りに使うため）": "“/” cannot be used (it separates folders)",
   "同じ階層に「": "At this level, “",
   "表示設定を保存できません": "Cannot save display settings",
-  "✗ フォルダの表示設定の読込に失敗: ": "✗ Failed to load folder display settings: ",
+  "✗ フォルダ・ラベルの表示設定の読込に失敗: ": "✗ Failed to load folder and label display settings: ",
   "✗ 言語の設定の読込に失敗: ": "✗ Failed to load the language setting: ",
   "」にフォルダ「": "”, created folder “",
   "」を作成::in": "”",

@@ -1,9 +1,9 @@
 /* util.ts の純関数を node で固定する（依存なし・`node app/src/lib/viewer/util.test.mjs`）。
    **Node 22.18+ が要る**: .ts を直接 import し、Node の type stripping（型注釈を消すだけ・22.18+ / 23.6+ で既定）に依存する。
    util.ts は型を消すだけで動く TS（enum・namespace・parameter property を使わない）であることが前提。
-   入力は手組みの小さな item 列。PdfViewer.svelte から移した ブロック分割・柱検出・読み順・本文組立・索引 の既存の挙動と、
+   入力は手組みの小さな item 列。PdfViewer.svelte から移した ブロック分割・ブロック規則（bodySpans）・柱検出・読み順・本文組立・索引 の既存の挙動と、
    その閾値（行送り 0.5 / 2.2・文字高比 0.88 / 1.14・本文比 0.95 / 0.97・同行 0.45・meta 4 行・読み順 8 item・柱 2 ページ）を固定する。
-   あわせて 文書内検索の出現列・ハイライト矩形（fragmentRects）・注釈の色・注釈 quote の照合（squash 空間）・
+   あわせて 文書内検索の出現列・ハイライト矩形（fragmentRects）・注釈の色・選択と注釈 quote の照合（squash 空間 = squashOrigSpan / quoteSpans）・
    注釈タブの検索（matchParts = 絞り込みと強調が同じ一致）を固定する。 */
 import assert from "node:assert/strict";
 import {
@@ -28,7 +28,9 @@ import {
   isClaudeAuthor,
   normText,
   matchParts,
-  squashFlatSpan,
+  squashOrigSpan,
+  quoteSpans,
+  bodySpans,
   fitScale,
   AUTO_MAX,
 } from "./util.ts";
@@ -268,6 +270,78 @@ test("majorLargestSize / 代表文字高: 同数は先に出た方", () => {
   assert.equal(blocks[0].fh, 10);
 });
 
+// ---------- ブロック規則（bodySpans = 選択帯・quote・コピー・保存後の注釈描画の全経路） ----------
+/** 柱 / 本文 A（2 行）/ 図説 / 表（小さい字）/ 本文 B（2 行目はノンブル = run）/ 空白だけのブロック / 本文 C。bodyFh = 10 */
+function blockPage() {
+  const g = geomOf([
+    item("Abdominal Radiology", 72, 780, 8), // 0 柱（run）
+    item("First body paragraph line one", 72, 700, 10), // 1 本文 A
+    item("first body paragraph line two", 72, 688, 10), // 2 本文 A
+    item("Fig. 1 Axial CT of the liver", 72, 650, 9.6), // 3 caption（本文の 95〜97%・Fig. N）
+    item("Small table cell text here", 72, 620, 8), // 4 small
+    item("Second body paragraph begins", 72, 580, 10), // 5 本文 B
+    item("12", 72, 568, 10), // 6 本文 B の中の run（ノンブル）
+    item("   ", 72, 500, 10), // 7 空白だけ（body）
+    item("Third body paragraph here", 72, 470, 10), // 8 本文 C
+  ]);
+  const run = new Set([0, 6]);
+  const { blocks, itemBlock } = splitBlocks(g, run, 10);
+  const at = (s, k = 0) => {
+    const i = g.full.indexOf(s);
+    assert.ok(i >= 0, s);
+    return i + k;
+  };
+  const spans = (oStart, oEnd, startsBefore = false, endsAfter = false) =>
+    bodySpans(g, blocks, itemBlock, run, oStart, oEnd, startsBefore, endsAfter).map(([a, b]) => g.full.slice(a, b));
+  return { g, run, blocks, itemBlock, at, spans };
+}
+
+test("bodySpans: 前提のブロック分割（柱 / 本文 / caption / small / 本文 / 空白 / 本文）", () => {
+  const { blocks, itemBlock } = blockPage();
+  assert.deepEqual(blocks.map((b) => b.kind), ["running", "body", "caption", "small", "body", "body", "body"]);
+  assert.deepEqual(itemBlock, [0, 1, 1, 2, 3, 4, 4, 5, 6]);
+});
+
+test("bodySpans: 単一ブロック内は無加工（run の item・空白だけでも区間 1 つ）・空区間は []", () => {
+  const { g, run, blocks, itemBlock, at, spans } = blockPage();
+  const a = at("paragraph line one");
+  const b = at("first body paragraph line two", 10);
+  assert.deepEqual(bodySpans(g, blocks, itemBlock, run, a, b, false, false), [[a, b]]);
+  assert.deepEqual(spans(at("begins"), at("12", 2)), ["begins12"]); // run（ノンブル）も起点 = 終点ブロックなら採る
+  assert.deepEqual(spans(at("   ", 1), at("   ", 2)), [" "]); // 空白だけの区間も単一ブロックなら落とさない
+  assert.deepEqual(spans(a, a), []);
+  assert.deepEqual(spans(b, a), []);
+});
+
+test("bodySpans: 起点 / 終点ブロックはそのまま・間は body だけ（柱・図説・表・本文中の run を飛ばす）・ブロック境界で切る・空白だけの区間は落とす", () => {
+  const { at, spans } = blockPage();
+  // 本文 A の途中 → 本文 C の途中: 図説と表を飛ばし、本文 B のノンブルを飛ばし、空白ブロックは落ちる
+  assert.deepEqual(spans(at("paragraph line one"), at("Third body", 10)), ["paragraph line onefirst body paragraph line two", "Second body paragraph begins", "Third body"]);
+  // 起点が図説・終点が表（user が指したブロックは種別を問わず採る）: 隣り合う 2 ブロックでも境界で切る
+  assert.deepEqual(spans(at("Axial CT"), at("Small table", 11)), ["Axial CT of the liver", "Small table"]);
+  // 起点ブロック（本文 B）の中の run は採る・終点ブロック C も採る
+  assert.deepEqual(spans(at("begins"), at("Third", 5)), ["begins12", "Third"]);
+  // 起点が柱（user が柱から引いた）
+  assert.deepEqual(spans(at("Radiology"), at("First body", 10)), ["Radiology", "First body"]);
+});
+
+test("bodySpans: ページ跨ぎ（startsBefore / endsAfter）では手前 / 先の側に起点・終点が無い = 同じ規則で間引く", () => {
+  const { g, at, spans } = blockPage();
+  // 前ページから来て本文 B で終わる: 柱は飛ばす・本文 A は採る
+  assert.deepEqual(spans(0, at("Second body", 11), true, false), ["First body paragraph line onefirst body paragraph line two", "Second body"]);
+  // 本文 A の途中から次ページへ: 先頭ブロック A は起点・以後は body だけ
+  assert.deepEqual(spans(at("line two"), g.full.length, false, true), ["line two", "Second body paragraph begins", "Third body paragraph here"]);
+  // 柱から引いて次ページへ: 起点の柱は採る
+  assert.deepEqual(spans(at("Radiology"), g.full.length, false, true), ["Radiology", "First body paragraph line onefirst body paragraph line two", "Second body paragraph begins", "Third body paragraph here"]);
+  // 3 ページ以上の選択の中間ページ: 起点も終点も無い → body だけ（run・空白は落ちる）
+  assert.deepEqual(spans(0, g.full.length, true, true), ["First body paragraph line onefirst body paragraph line two", "Second body paragraph begins", "Third body paragraph here"]);
+  // 1 ブロックしか無いページでも跨ぎなら規則を通す（柱だけのページは何も採らない）
+  const solo = geomOf([item("Abdominal Radiology", 72, 780, 8)]);
+  const sb = splitBlocks(solo, new Set([0]), 10);
+  assert.deepEqual(bodySpans(solo, sb.blocks, sb.itemBlock, new Set([0]), 0, solo.full.length, true, true), []);
+  assert.deepEqual(bodySpans(solo, sb.blocks, sb.itemBlock, new Set([0]), 0, 5, false, false), [[0, 5]]);
+});
+
 // ---------- 読み順 ----------
 function twoColumnInterleaved() {
   // 左右の行を交互に織り込んだ 6 バンド（x 50..250 と 300..500・ガター 275）
@@ -476,37 +550,26 @@ test("quote の照合: 行境界の空白の有無を無視・一致は最終一
   assert.deepEqual(refQuoteSpan(g, "the", false), [19, 22]);
 });
 
-test("squashFlatSpan: 選択（全体だけ）と注釈（全体 → 先頭 40 文字）の照合が参照と一致（固定例 + 乱択）", () => {
-  // PdfViewer の 2 経路と同じ組み立て: selectionOrigSpans（domAligned でないページ）/ drawAnnotations
-  // （drawAnnotations が 4 文字未満の区間を飛ばすのは呼び手の判定なので、ここでは短い q も突き合わせる）
-  const sel = (g, seg) => squashFlatSpan(g, normText(seg).replace(/ /g, ""));
-  const ann = (g, seg) => {
-    const q = normText(seg).replace(/ /g, "");
-    return squashFlatSpan(g, q) ?? squashFlatSpan(g, q.slice(0, 40));
-  };
-  const g = quoteGeom();
-  const fixed = [
-    "in the\nUnited States",
-    "in theUnited States",
-    "IN  THE \t united\n\nSTATES",
-    "cause of cancer\n",
-    "the second leading cause of cancer death. Imaging plays a central role in NOTHERE",
-    "the second leading cause of cancers",
-    "no such words",
-    "",
-    " \n ",
-    "re-\nstaging",
-    "the",
-  ];
-  for (const seg of fixed) {
-    assert.deepEqual(sel(g, seg), refQuoteSpan(g, seg, false), seg);
-    assert.deepEqual(ann(g, seg), refQuoteSpan(g, seg, true), seg);
-  }
-  // 乱択: 語を並べた行（行末空白あり / なし）から切り出した quote に、空白の揺れと後半の書き換えを加える
-  const rnd = lcg(3);
+const QUOTE_FIXED = [
+  "in the\nUnited States",
+  "in theUnited States",
+  "IN  THE \t united\n\nSTATES",
+  "cause of cancer\n",
+  "the second leading cause of cancer death. Imaging plays a central role in NOTHERE",
+  "the second leading cause of cancers",
+  "no such words",
+  "",
+  " \n ",
+  "re-\nstaging",
+  "the",
+];
+
+/** 区切り（空行）を含まない 1 区間の quote を乱択で作る: 語を並べた行（行末空白あり / なし）から切り出し、空白の揺れと後半の書き換えを加える */
+function randomQuoteCases(seed, count) {
+  const rnd = lcg(seed);
   const words = ["the", "PSMA", "cancer", "prostate", "of", "in", "İstanbul", "ΟΣ", "and", "a", "re-", "staging"];
-  let found = 0;
-  for (let k = 0; k < 3000; k++) {
+  const out = [];
+  for (let k = 0; k < count; k++) {
     const items = [];
     for (let li = 0, lines = 1 + rnd(6); li < lines; li++) {
       let str = "";
@@ -518,12 +581,70 @@ test("squashFlatSpan: 選択（全体だけ）と注釈（全体 → 先頭 40 �
     const a = rnd(gg.full.length + 1);
     let seg = gg.full.slice(a, a + rnd(80)).replace(/ /g, () => [" ", "  ", "\n", "", " \t "][rnd(5)]);
     if (rnd(3) === 0 && seg.length > 10) seg = seg.slice(0, -5) + "zzzzz";
-    const want = refQuoteSpan(gg, seg, true);
-    if (want) found++;
-    assert.deepEqual(sel(gg, seg), refQuoteSpan(gg, seg, false), JSON.stringify(seg));
-    assert.deepEqual(ann(gg, seg), want, JSON.stringify(seg));
+    out.push([gg, seg]);
   }
-  assert.ok(found > 1500, `found ${found}`);
+  return out;
+}
+
+test("squashOrigSpan（domAligned でないページの選択）: 全体だけで照合し、一致を geom.full の元 index 区間で返す（固定例 + 乱択）", () => {
+  const g = quoteGeom();
+  const raw = (sp) => g.full.slice(sp[0], sp[1]);
+  assert.equal(raw(squashOrigSpan(g, "in the\nUnited States")), "in theUnited States");
+  assert.equal(raw(squashOrigSpan(g, "IN  THE \t united\n\nSTATES")), "in theUnited States");
+  assert.equal(raw(squashOrigSpan(g, "cause of cancer\n")), "cause of cancer");
+  assert.equal(raw(squashOrigSpan(g, "re-\nstaging")), "re-staging");
+  // 先頭 40 文字への退避はしない（注釈の描画とは違う）
+  assert.equal(squashOrigSpan(g, "the second leading cause of cancer death. Imaging plays a central role in NOTHERE"), null);
+  for (const seg of ["no such words", "", " \n "]) assert.equal(squashOrigSpan(g, seg), null, seg);
+  // 参照（refQuoteSpan = flat 区間）を posMap で元 index へ写したものと一致
+  const viaRef = (gg, seg) => {
+    const sp = refQuoteSpan(gg, seg, false);
+    return sp && [gg.posMap[sp[0]], gg.posMap[Math.min(sp[1], gg.posMap.length - 1)]];
+  };
+  for (const seg of QUOTE_FIXED) assert.deepEqual(squashOrigSpan(g, seg), viaRef(g, seg), seg);
+  let found = 0;
+  for (const [gg, seg] of randomQuoteCases(3, 3000)) {
+    const want = viaRef(gg, seg);
+    if (want) found++;
+    assert.deepEqual(squashOrigSpan(gg, seg), want, JSON.stringify(seg));
+  }
+  assert.ok(found > 1000, `found ${found}`);
+});
+
+test("quoteSpans（保存した注釈の描画）: 空行で区間に分け、区間ごとに 全体 → 先頭 40 文字 で照合・4 文字未満と不一致の区間は飛ばす", () => {
+  const g = quoteGeom();
+  const ref = (seg) => refQuoteSpan(g, seg, true);
+  // 区切りなしの quote は区間 1 つ（固定例）: squash で 4 文字以上なら参照と同じ 1 区間・それ以外は []
+  for (const seg of QUOTE_FIXED.filter((x) => !/\n[ \t]*\n/.test(x))) {
+    const want = normText(seg).replace(/ /g, "").length >= 4 && ref(seg) ? [ref(seg)] : [];
+    assert.deepEqual(quoteSpans(g, seg), want, seg);
+  }
+  assert.deepEqual(quoteSpans(g, "the"), []); // 一致はするが 3 文字
+  assert.deepEqual(quoteSpans(g, "deat"), [ref("deat")]); // 4 文字は描く
+  // 空行（間に空白・タブがあってよい）で区間に分け、quote の順に返す（選択では 1 続きに一致する "…united\n\nSTATES" も 2 区間）
+  assert.deepEqual(quoteSpans(g, "IN  THE \t united\n\nSTATES"), [ref("in the united"), ref("states")]);
+  assert.deepEqual(quoteSpans(g, "cause of cancer\n\nin the\nUnited States"), [ref("cause of cancer"), ref("in the\nUnited States")]);
+  assert.deepEqual(quoteSpans(g, "re-\nstaging\n \t\nProstate cancer"), [ref("re-\nstaging"), ref("Prostate cancer")]);
+  // 区間ごとに飛ばす: 3 文字の区間・不一致の区間は落ち、残りは描く
+  assert.deepEqual(quoteSpans(g, "the\n\nno such words\n\nUnited States"), [ref("United States")]);
+  // 区間ごとに先頭 40 文字へ退避
+  const long = "the second leading cause of cancer death. Imaging plays a central role in NOTHERE";
+  assert.deepEqual(quoteSpans(g, `${long}\n\nstaging of the disease.`), [ref(long), ref("staging of the disease.")]);
+  // 改行 1 つは区切りでない（行境界）
+  assert.deepEqual(quoteSpans(g, "in the\nUnited"), [ref("in the United")]);
+  assert.deepEqual(quoteSpans(g, ""), []);
+  assert.deepEqual(quoteSpans(g, "\n\n\n\n"), []);
+  // 乱択（区切りを含まない 1 区間）: 参照と同じ
+  let found = 0;
+  for (const [gg, seg] of randomQuoteCases(5, 3000)) {
+    assert.ok(!/\n[ \t]*\n/.test(seg), JSON.stringify(seg));
+    const q = normText(seg).replace(/ /g, "");
+    const sp = refQuoteSpan(gg, seg, true);
+    const want = q.length >= 4 && sp ? [sp] : [];
+    if (want.length) found++;
+    assert.deepEqual(quoteSpans(gg, seg), want, JSON.stringify(seg));
+  }
+  assert.ok(found > 1000, `found ${found}`);
 });
 
 // ---------- 注釈タブの検索（matchParts） ----------

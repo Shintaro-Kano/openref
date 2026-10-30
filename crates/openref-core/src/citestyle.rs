@@ -401,14 +401,15 @@ pub fn installed(dir: &Path) -> Vec<Value> {
 
 /// `{style, locale, doi_always}`。locale = "" は「スタイルの既定」。
 /// doi_always = 文献リストに DOI（無ければ URL）を常に含める（Paperpile の Always include DOI and URL。既定オフ）
-pub fn prefs(db: &Db) -> Value {
+/// settings を読めなければ Err（既定値へ倒すと、部分更新が読めなかった項目を既定で書き戻す・Word が新規文書に既定スタイルを付ける）
+pub fn prefs(db: &Db) -> Result<Value> {
     let style = db
-        .setting("cite_style")
+        .setting("cite_style")?
         .filter(|s| valid_id(s))
         .unwrap_or_else(|| DEFAULT_STYLE.to_string());
-    let locale = db.setting("cite_locale").filter(|s| valid_lang(s)).unwrap_or_default();
-    let doi_always = db.setting("cite_doi_always").as_deref() == Some("1");
-    json!({"style": style, "locale": locale, "doi_always": doi_always})
+    let locale = db.setting("cite_locale")?.filter(|s| valid_lang(s)).unwrap_or_default();
+    let doi_always = db.setting("cite_doi_always")?.as_deref() == Some("1");
+    Ok(json!({"style": style, "locale": locale, "doi_always": doi_always}))
 }
 
 /// 既定スタイルを設定（導入を兼ねる）
@@ -420,7 +421,7 @@ pub fn set_prefs(db: &Db, style: &str, locale: &str, doi_always: bool) -> Result
     db.set_setting("cite_style", style)?;
     db.set_setting("cite_locale", locale)?;
     db.set_setting("cite_doi_always", if doi_always { "1" } else { "0" })?;
-    Ok(prefs(db))
+    prefs(db)
 }
 
 /// 部分更新: 渡さなかった項目（None）は今の設定のまま（style だけ変える等で doi_always を黙って戻さない）。全部 None は BadInput。
@@ -429,7 +430,7 @@ pub fn set_prefs_partial(db: &Db, style: Option<&str>, locale: Option<&str>, doi
     if style.is_none() && locale.is_none() && doi_always.is_none() {
         return Err(CoreError::BadInput("style / locale / doi_always のどれかを指定してください".into()));
     }
-    let cur = prefs(db);
+    let cur = prefs(db)?;
     set_prefs(
         db,
         style.unwrap_or_else(|| cur["style"].as_str().unwrap_or_default()),
@@ -548,18 +549,18 @@ mod tests {
     #[test]
     fn prefs_roundtrip() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(prefs(&db)["style"], DEFAULT_STYLE);
-        assert_eq!(prefs(&db)["doi_always"], false);
+        assert_eq!(prefs(&db).unwrap()["style"], DEFAULT_STYLE);
+        assert_eq!(prefs(&db).unwrap()["doi_always"], false);
         // 同梱スタイルはネットワーク不要
         let p = set_prefs(&db, "radiology", "", true).unwrap();
         assert_eq!(p["style"], "radiology");
         assert_eq!(p["doi_always"], true);
-        assert_eq!(prefs(&db)["doi_always"], true);
+        assert_eq!(prefs(&db).unwrap()["doi_always"], true);
         assert_eq!(set_prefs(&db, "radiology", "", false).unwrap()["doi_always"], false);
         assert!(set_prefs(&db, "radiology", "../x", false).is_err());
         // 不正な style id は settings に書く前に拒否（取得にも行かない）
         assert!(matches!(set_prefs(&db, "../x", "", false), Err(CoreError::BadInput(_))));
-        assert_eq!(prefs(&db)["style"], "radiology");
+        assert_eq!(prefs(&db).unwrap()["style"], "radiology");
     }
 
     /// 部分更新（登録表と GUI の cite_set_prefs が共有）: 渡さない項目は今のまま・全部 None は拒否
@@ -576,7 +577,7 @@ mod tests {
         assert_eq!(set_prefs_partial(&db, None, None, Some(false)).unwrap()["locale"], "en-US");
         assert_eq!(set_prefs_partial(&db, Some("radiology"), Some(""), None).unwrap()["doi_always"], false);
         assert!(matches!(set_prefs_partial(&db, None, None, None), Err(CoreError::BadInput(_))));
-        assert_eq!(prefs(&db)["style"], "radiology", "失敗した呼び出しは書かない");
+        assert_eq!(prefs(&db).unwrap()["style"], "radiology", "失敗した呼び出しは書かない");
     }
 
     /// 実弾: 索引取得 + dependent（European Radiology → springer-basic-brackets）+ ja-JP locale

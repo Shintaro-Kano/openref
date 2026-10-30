@@ -11,7 +11,7 @@ mod unix {
         };
         let db = Db::open(&PathBuf::from(path)).unwrap();
         if let Ok(expected) = std::env::var("OPENREF_SNAPSHOT_EXPECT_GUI") {
-            assert_eq!(db.setting("snapshot_gui"), Some(expected));
+            assert_eq!(db.setting("snapshot_gui").unwrap(), Some(expected));
         }
         db.set_setting("snapshot_cli", "external commit").unwrap();
     }
@@ -54,11 +54,11 @@ mod unix {
         );
         db.set_setting("snapshot_gui", "after preview").unwrap();
         child("after preview");
-        assert_eq!(db.setting("snapshot_cli"), Some("external commit".into()));
+        assert_eq!(db.setting("snapshot_cli").unwrap(), Some("external commit".into()));
         drop(db);
         let reopened = Db::open(&path).unwrap();
         assert_eq!(
-            reopened.setting("snapshot_gui"),
+            reopened.setting("snapshot_gui").unwrap(),
             Some("after preview".into())
         );
         drop(reopened);
@@ -118,9 +118,9 @@ mod unix {
         db.set_setting("snapshot_gui", "after child").unwrap();
         drop(db);
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(reopened.setting("snapshot_gui"), Some("after child".into()));
+        assert_eq!(reopened.setting("snapshot_gui").unwrap(), Some("after child".into()));
         assert_eq!(
-            reopened.setting("snapshot_cli"),
+            reopened.setting("snapshot_cli").unwrap(),
             Some("external commit".into())
         );
         drop(reopened);

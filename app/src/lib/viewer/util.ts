@@ -258,6 +258,35 @@ export function squashFlatSpan(geom: GeomIndex, q: string): [number, number] | n
   return [geom.sqMap[i], geom.sqMap[i + q.length - 1] + 1];
 }
 
+/** 選択文字列 text（Selection.toString()）を squash 空間で照合し、geom.full 上の元 index 区間 [oStart, oEnd) を返す。
+    textLayer の DOM 位置を直算できない（domAligned でない）ページの選択が使う。全体一致だけ（先頭への退避はしない）。不一致は null。 */
+export function squashOrigSpan(geom: GeomIndex, text: string): [number, number] | null {
+  const span = squashFlatSpan(geom, normText(text).replace(/ /g, ""));
+  if (!span) return null;
+  const oStart = geom.posMap[span[0]];
+  const oEnd = geom.posMap[Math.min(span[1], geom.posMap.length - 1)];
+  if (oStart == null || oEnd == null) return null;
+  return [oStart, oEnd];
+}
+
+/** 保存した注釈の quote を geom.flat 上の [start, end) の列にする（drawAnnotations が区間ごとにハイライトを描く）。
+    quote は空行（"\n\n"・間に空白とタブ可）で区切られた区間列になり得る（selectionBodyText: 飛ばしたキャプション等の前後・
+    ページ間）。区間ごとに照合する。区切りの無い quote は区間 1 つ。
+    照合は squash（空白除去）空間で行う。選択 quote は行境界に <br> 由来の空白を含むが、
+    geom.flat は行末空白なしの無区切り連結になり得るため（buildSquash の注記参照）。
+    squash で 4 文字未満の区間は飛ばす。全体が無ければ先頭 40 文字で探す（部分一致時は一致した接頭辞のみ = 余分な後続を着色しない）。
+    一致しない区間は飛ばす。 */
+export function quoteSpans(geom: GeomIndex, quote: string): [number, number][] {
+  const out: [number, number][] = [];
+  for (const seg of quote.split(/\n[ \t]*\n/)) {
+    const q = normText(seg).replace(/ /g, "");
+    if (q.length < 4) continue;
+    const span = squashFlatSpan(geom, q) ?? squashFlatSpan(geom, q.slice(0, 40));
+    if (span) out.push(span);
+  }
+  return out;
+}
+
 export interface Rect {
   left: number;
   top: number;
@@ -948,6 +977,62 @@ export function runningIndexes(items: any[], counts: Map<string, number>): Set<n
     gi++;
   }
   return s;
+}
+
+/** 選択の geom.full 上の区間 [oStart, oEnd) をブロック規則で間引き、元 index 区間の列にする（選択帯 / quote / コピー /
+    注釈描画の全経路が PdfViewer の selectionOrigSpans 経由でこれを使う）。blocks / itemBlock = splitBlocks の結果・run = runningSet。
+    startsBefore / endsAfter = 選択がこのページの手前から始まる / 先まで続く（ページ跨ぎ）。
+    - 選択の起点ブロックと終点ブロック（user が実際に指した場所）は、その中の選択範囲をそのまま採用
+    - その間にある（起点でも終点でもない）ブロックは kind === "body" のものだけ採用し、
+      柱・ノンブル・ロゴ（running）・キャプション・表・脚注など本文より小さい文字（small / caption）は飛ばす。
+      body のブロックの中でも run の item（本文に紛れたノンブル等）は飛ばす
+    - ページ跨ぎでは、このページの手前/先にある側のブロックは「起点/終点ではない」ので同じ規則で間引かれる
+    - ブロック境界でも区間を切る（quote / コピーが段落ごとに空行で分かれ、hasEOL の無い 2 カラム
+      ページでも "…centers withFig. 1 …" のように段落末と次段落が連結しない。帯には影響しない）。空白だけの区間は落とす
+    この規則が防ぐ例: 次ページの柱 "Abdominal Radiology" が帯に入る / 右カラムから次ページへ
+    引くと DOM 順で後ろにある左下の "Fig. 2 …" キャプションを経由する（同型: 表・脚注・2 カラム内の図説）。
+    単一ブロック内の選択（跨ぎなし）は無加工で [[oStart, oEnd]]。キャプションや表を取りたいときはその中から / その中まで引く。
+    oEnd <= oStart は []。 */
+export function bodySpans(
+  geom: GeomIndex,
+  blocks: TextBlock[],
+  itemBlock: number[],
+  run: Set<number>,
+  oStart: number,
+  oEnd: number,
+  startsBefore: boolean,
+  endsAfter: boolean
+): [number, number][] {
+  if (oEnd <= oStart) return [];
+  const bStart = startsBefore ? -1 : itemBlock[itemIndexAt(geom, oStart)] ?? -1;
+  const bEnd = endsAfter ? -1 : itemBlock[itemIndexAt(geom, oEnd - 1)] ?? -1;
+  if (!startsBefore && !endsAfter && bStart === bEnd) return [[oStart, oEnd]]; // 単一ブロック内: 無加工
+  const out: [number, number][] = [];
+  let cur: [number, number] | null = null;
+  let curBlock = -1;
+  for (let i = 0; i < geom.items.length; i++) {
+    const it = geom.items[i];
+    if (it.start >= oEnd) break;
+    const s0 = Math.max(oStart, it.start);
+    const e0 = Math.min(oEnd, it.start + it.str.length);
+    if (e0 <= s0) continue;
+    const bi = itemBlock[i];
+    const explicit = bi === bStart || bi === bEnd;
+    const include = explicit || (blocks[bi]?.kind === "body" && !run.has(i));
+    if (!include) {
+      if (cur) out.push(cur);
+      cur = null;
+      continue;
+    }
+    if (cur && cur[1] === s0 && bi === curBlock) cur[1] = e0;
+    else {
+      if (cur) out.push(cur);
+      cur = [s0, e0];
+      curBlock = bi;
+    }
+  }
+  if (cur) out.push(cur);
+  return out.filter(([s0, e0]) => geom.full.slice(s0, e0).trim().length > 0);
 }
 
 /** geom.full の [oStart, oEnd) を item 単位で組み立て、hasEOL の item 末尾で改行する

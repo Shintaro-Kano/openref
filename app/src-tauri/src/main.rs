@@ -185,7 +185,7 @@ async fn cite_locale_xml(state: tauri::State<'_, AppState>, lang: String) -> Res
 /// `{style, locale, doi_always}`（MCP の cite_prefs と同じ JSON。snake_case のまま = api.ts の CitePrefs 参照）
 #[tauri::command]
 fn cite_prefs(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    Ok(citestyle::prefs(&*lock(&state.db)?))
+    citestyle::prefs(&*lock(&state.db)?).map_err(err)
 }
 
 /// 既定スタイル・言語・「DOI / URL を常に含める」を保存（スタイルの取得・導入を兼ねる）。
@@ -397,12 +397,6 @@ fn membership(state: tauri::State<AppState>, keys: Vec<String>) -> Result<search
     search::membership(&*lock(&state.db)?, &keys).map_err(err)
 }
 
-/// フォルダ作成（'Parent/Child' パス可・既存なら既存 id を返す = 冪等）
-#[tauri::command]
-fn create_collection(state: tauri::State<AppState>, name: String) -> Result<i64, String> {
-    edit::ensure_collection_path(&*lock(&state.db)?, &name).map(|(id, _)| id).map_err(err)
-}
-
 // ---------- フォルダ管理（MY LIBRARY） ----------
 
 /// New folder / Create subfolder（parentId = null なら root）。同じ親の下に大小無視の同名・`/` を含む名前は拒否
@@ -447,7 +441,7 @@ fn ui_pref_key(key: &str) -> Result<&str, String> {
 #[tauri::command]
 fn get_ui_pref(state: tauri::State<AppState>, key: String) -> Result<Option<String>, String> {
     let key = ui_pref_key(&key)?;
-    Ok(lock(&state.db)?.setting(key))
+    lock(&state.db)?.setting(key).map_err(err)
 }
 
 #[tauri::command]
@@ -499,8 +493,16 @@ fn view_counts(state: tauri::State<AppState>) -> Result<search::ViewCounts, Stri
     search::view_counts(&*lock(&state.db)?).map_err(err)
 }
 
+/// quick_add の戻り値 = 一覧の行（ItemSummary のフィールドはそのまま）+ resolver の警告（普段は空）
+#[derive(serde::Serialize)]
+struct QuickAdded {
+    #[serde(flatten)]
+    item: search::ItemSummary,
+    warnings: Vec<String>,
+}
+
 #[tauri::command]
-async fn quick_add(state: tauri::State<'_, AppState>, input: String) -> Result<search::ItemSummary, String> {
+async fn quick_add(state: tauri::State<'_, AppState>, input: String) -> Result<QuickAdded, String> {
     let db = state.db.clone();
     blocking(move || {
         let parsed = resolver::parse_input(&input).map_err(err)?;
@@ -508,7 +510,7 @@ async fn quick_add(state: tauri::State<'_, AppState>, input: String) -> Result<s
         let mut db = lock(&db)?;
         let added = ingest::add_item(&mut db, &resolved).map_err(err)?;
         let d = search::item_detail(&db, &added.key).map_err(err)?.ok_or("登録直後の item が見つかりません")?;
-        Ok(search::ListedItem::from(d).summary())
+        Ok(QuickAdded { item: search::ListedItem::from(d).summary(), warnings: resolved.warnings })
     })
     .await
 }
@@ -983,11 +985,23 @@ fn main() {
         Err(e) => fatal(&e.to_string()),
     };
     // Settings › 起動時に前回のタブを開く（既定 = 開く。"0" のときだけ外す）・起動時に新版を確認（既定 = 確認。"0" のときだけ外す）
-    // ・Language（既定 = 日本語。"en" のときだけ English）・PDF の保存先
-    let restore_tabs = db.setting("ui_restore_tabs").as_deref() != Some("0");
-    let update_check = update::cached(&db).enabled;
-    let lang_en = db.setting("ui_lang").as_deref() == Some("en");
-    let pdf_drive_mode = db.pdf_write_mode() == "drive";
+    // ・Language（既定 = 日本語。"en" のときだけ English）・PDF の保存先。
+    // 読めなければ（BUSY 等）stderr に出して既定で描く = メニューの表示だけ（保存先は添付のたびに core が読み直し、読めなければ添付を失敗にする）
+    let unread = |what: &str, e: openref_core::CoreError| eprintln!("openref-app: 起動時に {what} を読めません（メニューは既定で表示）: {e}");
+    let pref = |key: &str| db.setting(key).unwrap_or_else(|e| {
+        unread(key, e);
+        None
+    });
+    let restore_tabs = pref("ui_restore_tabs").as_deref() != Some("0");
+    let update_check = update::cached(&db).map(|c| c.enabled).unwrap_or_else(|e| {
+        unread("update_check", e);
+        true
+    });
+    let lang_en = pref("ui_lang").as_deref() == Some("en");
+    let pdf_drive_mode = db.pdf_write_mode().unwrap_or_else(|e| {
+        unread("pdf_write_mode", e);
+        "managed".into()
+    }) == "drive";
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .menu(move |app| app_menu(app, restore_tabs, update_check, lang_en, pdf_drive_mode))
@@ -1040,7 +1054,6 @@ fn main() {
             add_to_collection,
             remove_from_collection,
             membership,
-            create_collection,
             open_attachment,
             open_external,
             cite_catalog,
@@ -1120,6 +1133,35 @@ mod parity {
             assert!(cmds.iter().any(|c| c == g), "GUI 専用に載っているが Tauri command に無い: {g}");
             assert!(openref_core::commands::find(g).is_none(), "{g} は登録表にもある（GUI 専用から外す）");
         }
+    }
+}
+
+#[cfg(test)]
+mod quick_added_shape {
+    /// quick_add の戻り値は ItemSummary のキー（camelCase）がそのまま上位にあり、warnings が 1 つ増えるだけ
+    #[test]
+    fn flattens_item_summary_and_adds_warnings() {
+        let item = openref_core::search::ItemSummary {
+            key: "ABCD1234".into(),
+            title: "T".into(),
+            first_author: "A".into(),
+            first_author_given: None,
+            year: Some(2026),
+            container: "J".into(),
+            starred: false,
+            has_pdf: false,
+            retracted: false,
+            has_note: false,
+            fulltext_snippet: None,
+            date_added: "2026-10-30".into(),
+            tags: vec![],
+        };
+        let plain = serde_json::to_value(&item).unwrap();
+        let v = serde_json::to_value(super::QuickAdded { item, warnings: vec!["w".into()] }).unwrap();
+        let mut expected = plain.as_object().unwrap().clone();
+        expected.insert("warnings".into(), serde_json::json!(["w"]));
+        assert_eq!(v, serde_json::Value::Object(expected));
+        assert_eq!(v["firstAuthor"], "A");
     }
 }
 

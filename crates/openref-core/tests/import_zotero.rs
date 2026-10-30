@@ -239,6 +239,29 @@ fn official_zotero_rdf_artifact() {
     assert_eq!(web.csl["URL"], "http://example.com");
 }
 
+/// Zotero の preprint は型カタログにある document に写す。repository（publisher）・種別（genre）・番号（number）は document の欄に入る
+#[test]
+fn preprint_maps_to_document_with_catalog_fields() {
+    let s = Scratch::new();
+    let p = s.write(
+        "preprint.rdf",
+        rdf(r##"<b:Article r:about="#pre"><z:itemType>preprint</z:itemType><d:title>A preprint</d:title><d:date>2024-01-02</d:date>
+ <d:publisher><f:Organization><f:name>medRxiv</f:name></f:Organization></d:publisher>
+ <z:reportNumber>2024.01.01.24300001</z:reportNumber><z:reportType>Preprint</z:reportType></b:Article>"##)
+            .as_bytes(),
+    );
+    let input = import::zotero_rdf::read_input(&p, source()).unwrap();
+    let csl = &input.items[0].csl;
+    assert_eq!(csl["type"], "document");
+    for field in ["publisher", "number", "genre"] {
+        assert!(openref_core::types::is_valid_field("document", field), "{field}");
+    }
+    assert_eq!(csl["publisher"], "medRxiv");
+    assert_eq!(csl["number"], "2024.01.01.24300001");
+    assert_eq!(csl["genre"], "Preprint");
+    assert!(input.items[0].warnings.iter().all(|w| !w.contains("未対応")));
+}
+
 #[test]
 fn book_containers_are_not_items_but_explicit_standalone_books_are() {
     for identifier in [

@@ -151,7 +151,7 @@ fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
 fn map_item_type(t: &str) -> &'static str {
     match t {
         "journalArticle" | "" => "article-journal",
-        "preprint" => "article",
+        "preprint" => "document", // CSL の article は型カタログに無く編集できない（document は publisher・genre・number の欄がある）
         "magazineArticle" => "article-magazine",
         "newspaperArticle" => "article-newspaper",
         "book" => "book",
@@ -257,6 +257,28 @@ mod tests {
         }
         let ci = zotero_to_csl(&json!({"itemType": "journalArticle", "title": "T", "DOI": "doi:"})).unwrap();
         assert!(ci.csl.get("DOI").is_none());
+    }
+
+    /// preprint は型カタログにある document に写す（CSL の article はカタログに無く編集できなかった）
+    #[test]
+    fn zotero_preprint_maps_to_editable_document() {
+        let ci = zotero_to_csl(&json!({
+            "itemType": "preprint", "title": "A preprint", "publisher": "medRxiv",
+            "date": "2024-01-02", "DOI": "10.1101/2024.01.01.1"
+        }))
+        .unwrap();
+        assert_eq!(ci.csl["type"], "document");
+        assert_eq!(ci.csl["publisher"], "medRxiv");
+        assert!(crate::types::type_def(ci.csl["type"].as_str().unwrap()).is_some());
+
+        // 実際の Connector の preprint JSON は発行元を `repository`、番号を `archiveID` で渡すが、
+        // 既存の写し表（map_item_type の隣の表）に無いので写していない
+        let ci = zotero_to_csl(&json!({
+            "itemType": "preprint", "title": "A preprint", "repository": "medRxiv", "archiveID": "2024.01.01.1"
+        }))
+        .unwrap();
+        assert_eq!(ci.csl["type"], "document");
+        assert!(ci.csl.get("publisher").is_none() && ci.csl.get("number").is_none(), "repository・archiveID は写していない");
     }
 
     #[test]

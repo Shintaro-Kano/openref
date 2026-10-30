@@ -37,19 +37,11 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
     // File Provider（Drive for Desktop）配下は環境によって readdir 列挙が空になることがある。
     // その場合は find(1) に fallback（直接 stat は常に通るため existence 判定には影響しない）。
     if mount_files.is_empty() {
-        if let Ok(out) = std::process::Command::new("/usr/bin/find")
-            .arg(mount)
-            .args(["-type", "f", "-name", "*.pdf"])
-            .output()
-        {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    mount_files.push(file_entry(Path::new(line)));
-                }
-                if !mount_files.is_empty() {
-                    eprintln!("(note) ディレクトリ列挙が空だったため find(1) fallback を使用");
-                }
-            }
+        for line in find_pdfs(mount) {
+            mount_files.push(file_entry(Path::new(&line)));
+        }
+        if !mount_files.is_empty() {
+            eprintln!("(note) ディレクトリ列挙が空だったため find(1) fallback を使用");
         }
     }
 
@@ -59,8 +51,7 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
         .prepare("SELECT path FROM attachments WHERE mode = 'linked'")?;
     let linked: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     let linked_nfc: HashSet<String> = linked.iter().map(|p| p.nfc().collect()).collect();
 
     let mut new_files: Vec<String> = mount_files
@@ -90,4 +81,34 @@ pub fn scan(db: &Db, mount: &Path) -> Result<SyncReport> {
         orphans,
         enumeration_blocked,
     })
+}
+
+/// find(1) で mount 配下の PDF を列挙する（拡張子は walkdir 側と同じく大小無視 = `.PDF` も拾う）。find が失敗すれば空
+fn find_pdfs(mount: &Path) -> Vec<String> {
+    match std::process::Command::new("/usr/bin/find").arg(mount).args(["-type", "f", "-iname", "*.pdf"]).output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_fallback_ignores_extension_case() {
+        let dir = std::env::temp_dir().join(format!("openref-sync-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("All Papers/K")).unwrap();
+        for f in ["All Papers/K/a.pdf", "All Papers/K/B.PDF", "All Papers/c.Pdf", "All Papers/note.txt", "All Papers/pdf"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let mut got: Vec<String> = find_pdfs(&dir)
+            .iter()
+            .map(|p| Path::new(p).strip_prefix(&dir).unwrap().to_string_lossy().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["All Papers/K/B.PDF", "All Papers/K/a.pdf", "All Papers/c.Pdf"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

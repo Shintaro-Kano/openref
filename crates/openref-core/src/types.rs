@@ -229,6 +229,16 @@ pub fn catalog() -> Vec<TypeDef> {
     out
 }
 
+/// 型カタログに無い旧い型名を、今のカタログの型に読み替える。`article`（CSL の汎用記事 = 1.1.0 までの GUI 取込の要確認 stub・
+/// Zotero 移行の preprint が書いた）は編集できない型だったので `document`（その他）として扱う。他の型名はそのまま返す
+pub fn canonical_type(id: &str) -> &str {
+    if id == "article" {
+        "document"
+    } else {
+        id
+    }
+}
+
 pub fn type_def(id: &str) -> Option<TypeDef> {
     catalog().into_iter().find(|t| t.id == id)
 }
@@ -247,6 +257,23 @@ pub fn is_valid_field(type_id: &str, field: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同じキーの kind は全型で同じ。参照エディタ（app cslForm.ts の cslToForm）は型に関係なく
+    /// CSL の全キーを「どれかの型のカタログの kind」で欄の値に読むので、これが崩れると型を変えたとき誤変換する
+    #[test]
+    fn same_key_has_same_kind_in_every_type() {
+        let mut seen: std::collections::HashMap<&str, (FieldKind, &str)> = std::collections::HashMap::new();
+        for t in catalog() {
+            for f in &t.fields {
+                if let Some((kind, first)) = seen.get(f.key) {
+                    assert_eq!(*kind, f.kind, "{} の kind が {first} と {} で違う", f.key, t.id);
+                } else {
+                    seen.insert(f.key, (f.kind, t.id));
+                }
+            }
+        }
+        assert!(seen.len() > 10);
+    }
 
     #[test]
     fn catalog_shape() {

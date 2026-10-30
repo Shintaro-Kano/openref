@@ -17,3 +17,7 @@ __pycache__/
 
 # Local library migration QA: generated PDFs, screenshots and machine paths
 /scratchpad/migration-qa/
+
+# エディタの設定・repo 直下の一時置き場
+.obsidian/
+/scratchpad/

@@ -37,6 +37,7 @@ pub fn fetch_by_doi(doi: &str) -> Result<Resolved> {
         csl: normalize(v),
         retracted: None,
         source: "doi.org",
+        warnings: vec![],
     })
 }
 

@@ -23,16 +23,23 @@ run() {
 run "cargo test" cargo test --workspace --locked
 # フロント: Svelte / TS の型検査(errors で失敗・warnings は数だけ出る)
 run "svelte-check" npm --prefix app run --silent check
-# PdfViewer の純関数・PDF 埋め込み注釈の無害化(XSS の防壁)・英語辞書の網羅
+# PdfViewer の純関数・PDF 埋め込み注釈の無害化(XSS の防壁)・英語辞書の網羅・参照エディタの CSL ⇄ フォーム値
 run "viewer util" node app/src/lib/viewer/util.test.mjs
 run "viewer embedded" node app/src/lib/viewer/embedded.test.mjs
 run "i18n" node app/src/lib/i18n.test.mjs
+# フォルダ・ラベルの名前順 / 件数順の比較関数(core の COLLATE NOCASE と同じ並び)
+run "sort" node app/src/lib/sort.test.mjs
+# フォルダ・ラベルの名前の規則(core と同じ = trim・フォルダは `/` 不可で同じ親の下・ラベルは全体で COLLATE NOCASE 一意)
+run "folders" node app/src/lib/folders.test.mjs
+# 参照エディタの CSL ⇄ フォーム変換(cslForm.ts)
+run "editor csl" node app/src/lib/cslForm.test.mjs
 # Word: citeproc 実整形(同梱スタイル・型・誌名スタイル)・OpenRef.dotm の整形とダイアログ・dotm の生成器
 run "word cite" node word/test-cite.cjs
 run "word types" node word/test-types.cjs
 run "word styles" node word/test-styles.cjs
 run "word dotm-render" node word/test-dotm-render.cjs
 run "word dialog-dotm" node word/test-dialog-dotm.cjs
+run "word dialog-pages" node word/test-dialog-pages.cjs
 run "dotm build" python3 word/dotm/test-build.py
 # Chrome 拡張(OpenRef Capture)
 run "capture extension" node --test extension/tests/capture.test.cjs

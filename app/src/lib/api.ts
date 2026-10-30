@@ -280,7 +280,7 @@ export const api = {
   getItem: (key: string) => invoke<ItemDetail | null>("get_item", { key }),
   collectionsTree: () => invoke<CollectionRow[]>("collections_tree"),
   viewCounts: () => invoke<ViewCounts>("view_counts"),
-  quickAdd: (input: string) => invoke<ItemSummary>("quick_add", { input }),
+  quickAdd: (input: string) => invoke<ItemSummary & { warnings: string[] }>("quick_add", { input }),
   importPdf: (path: string) => invoke<ImportSummary>("import_pdf", { path }),
   attachPdf: (key: string, path: string) => invoke("attach_pdf", { key, path }),
   fetchPdf: (key: string) => invoke<string>("fetch_pdf", { key }),
@@ -300,7 +300,6 @@ export const api = {
   removeFromCollection: (key: string, collectionId: number) =>
     invoke("remove_from_collection", { key, collectionId }),
   membership: (keys: string[]) => invoke<Membership>("membership", { keys }),
-  createCollection: (name: string) => invoke<number>("create_collection", { name }),
   openAttachment: (id: number) => invoke("open_attachment", { id }),
   openExternal: (url: string) => invoke("open_external", { url }),
   // ---- 引用スタイル（CSL） ----

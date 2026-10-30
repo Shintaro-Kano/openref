@@ -77,14 +77,13 @@ impl Db {
         Some(self.app_dir()?.join("storage"))
     }
 
-    /// settings テーブルの読み出し（未設定は None）
-    pub fn setting(&self, key: &str) -> Option<String> {
+    /// settings テーブルの読み出し（未設定は Ok(None)）。読めない（BUSY・表が無い等）は Err = 既定値へ倒すかは呼び手が決める
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
-        self.conn
+        Ok(self
+            .conn
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?)
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -96,9 +95,10 @@ impl Db {
         Ok(())
     }
 
-    /// PDF 添付の書込先モード。'drive' = Drive 互換レイアウト / それ以外 = managed storage
-    pub fn pdf_write_mode(&self) -> String {
-        self.setting("pdf_write_mode").unwrap_or_else(|| "managed".into())
+    /// PDF 添付の書込先モード。'drive' = Drive 互換レイアウト / それ以外（未設定を含む）= managed storage。
+    /// 読めなければ Err（黙って managed に倒すと、drive の利用者の添付が気づかれずに storage/ へ行く）
+    pub fn pdf_write_mode(&self) -> Result<String> {
+        Ok(self.setting("pdf_write_mode")?.unwrap_or_else(|| "managed".into()))
     }
 
     fn init(conn: Connection, path: Option<std::path::PathBuf>) -> Result<Self> {

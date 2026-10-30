@@ -134,6 +134,7 @@ fn parse(body: &str, doi: &str) -> Result<Resolved> {
         csl,
         retracted: None,
         source: "isho-ris",
+        warnings: vec![],
     })
 }
 

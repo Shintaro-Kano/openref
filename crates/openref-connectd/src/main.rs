@@ -5,6 +5,8 @@
 //! プロトコルは逆行分析ベース（非公式）。未知エンドポイントは 200 {} で寛容に受け、
 //! stderr にログして観察できるようにする。
 
+#[cfg(test)]
+mod capture_contract;
 mod jsc;
 mod word;
 mod word_v2;
@@ -75,11 +77,10 @@ fn zjson(status: StatusCode, v: Value) -> impl IntoResponse {
     (status, ZHEADERS, Json(v))
 }
 
-/// 蔵書の件数（ゴミ箱外）。読めなければ 0（/capture/status の接続確認と Word の /api/status の診断表示）
-fn live_item_count(db: &Db) -> i64 {
-    db.conn
-        .query_row("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0))
-        .unwrap_or(0)
+/// 蔵書の件数（ゴミ箱外）。/capture/status の接続確認と Word の /api/status の診断表示。
+/// 読めなければ Err（0 件に畳まない。どちらも接続自体は成功なので、呼び手は件数を null・理由を error にして返す）
+fn live_item_count(db: &Db) -> openref_core::Result<i64> {
+    Ok(db.conn.query_row("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0))?)
 }
 
 #[tokio::main]
@@ -107,30 +108,7 @@ async fn main() {
         sessions: Mutex::new(Sessions::default()),
     });
 
-    let app = Router::new()
-        .route("/connector/ping", get(ping_get).post(ping_post))
-        .route("/connector/getSelectedCollection", post(get_selected_collection))
-        .route("/connector/saveItems", post(save_items))
-        .route("/connector/saveAttachment", post(save_attachment))
-        .route("/connector/saveStandaloneAttachment", post(save_standalone_attachment))
-        .route("/connector/hasAttachmentResolvers", post(has_attachment_resolvers))
-        .route("/connector/saveAttachmentFromResolver", post(save_attachment_from_resolver))
-        .route("/connector/saveSnapshot", post(save_snapshot))
-        .route("/connector/updateSession", post(update_session))
-        .route("/connector/sessionProgress", post(session_progress))
-        .route("/connector/delaySync", post(ok_empty))
-        .route("/connector/getClientHostnames", post(ok_empty))
-        // ---- 自作 Capture 拡張用 API（Zotero 非依存の 1 クリック取込）----
-        .route("/capture/status", get(capture_status))
-        .route("/capture/collections", get(capture_collections))
-        .route("/capture/save", post(capture_save))
-        .route("/capture/attachment", post(capture_attachment))
-        .route("/capture/fetch-oa", post(capture_fetch_oa))
-        .route("/capture/pdf", post(capture_pdf))
-        .fallback(fallback)
-        // axum 既定の 2MB では図の多い論文 PDF が 413 で弾かれる（localhost bind のみなので緩めて安全）
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
-        .with_state(st.clone());
+    let app = connector_router(st.clone());
 
     // 検証用: OPENREF_CONNECTD_PORT / OPENREF_WORD_PORT で待受ポートを変えられる（既定 23119 / 23120）。
     // 本番デーモンを止めずに scratch DB で新ビルドを実弾検証するためのもの（拡張・Word は既定ポート固定）
@@ -156,6 +134,36 @@ async fn main() {
     // cert の準備・router の構築は connector の最初の poll より前に走る。
     // Word 配信が失敗して先に終わっても、join! は connector（:23119）の終わりまで待つ
     tokio::join!(word_https(st.clone(), &db_path), connector_fut);
+}
+
+/// :23119 の要求 body の上限（PDF の受け取り）。axum 既定の 2MB では図の多い論文 PDF が 413 で弾かれる（localhost bind のみなので緩めて安全）
+const CONNECTOR_BODY_LIMIT: usize = 512 * 1024 * 1024;
+
+/// :23119 の router（Zotero Connector 互換 + Capture 拡張の /capture/*）。main と契約テスト（tests）が同じものを使う
+fn connector_router(st: Arc<St>) -> Router {
+    Router::new()
+        .route("/connector/ping", get(ping_get).post(ping_post))
+        .route("/connector/getSelectedCollection", post(get_selected_collection))
+        .route("/connector/saveItems", post(save_items))
+        .route("/connector/saveAttachment", post(save_attachment))
+        .route("/connector/saveStandaloneAttachment", post(save_standalone_attachment))
+        .route("/connector/hasAttachmentResolvers", post(has_attachment_resolvers))
+        .route("/connector/saveAttachmentFromResolver", post(save_attachment_from_resolver))
+        .route("/connector/saveSnapshot", post(save_snapshot))
+        .route("/connector/updateSession", post(update_session))
+        .route("/connector/sessionProgress", post(session_progress))
+        .route("/connector/delaySync", post(ok_empty))
+        .route("/connector/getClientHostnames", post(ok_empty))
+        // ---- 自作 Capture 拡張用 API（Zotero 非依存の 1 クリック取込）----
+        .route("/capture/status", get(capture_status))
+        .route("/capture/collections", get(capture_collections))
+        .route("/capture/save", post(capture_save))
+        .route("/capture/attachment", post(capture_attachment))
+        .route("/capture/fetch-oa", post(capture_fetch_oa))
+        .route("/capture/pdf", post(capture_pdf))
+        .fallback(fallback)
+        .layer(DefaultBodyLimit::max(CONNECTOR_BODY_LIMIT))
+        .with_state(st)
 }
 
 fn env_port(name: &str, default: u16) -> u16 {
@@ -305,6 +313,7 @@ async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse
                         csl: ci.csl.clone(),
                         retracted: None,
                         source: "connector",
+                        warnings: vec![],
                     };
                     match ingest::add_item(&mut db, &resolved) {
                         Ok(added) => (added.key, true),
@@ -730,7 +739,7 @@ async fn save_snapshot(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRespo
         "custom": { "source": "connector-snapshot" }
     });
     let mut db = st.db();
-    let resolved = resolver::Resolved { csl, retracted: None, source: "connector" };
+    let resolved = resolver::Resolved { csl, retracted: None, source: "connector", warnings: vec![] };
     match ingest::add_item(&mut db, &resolved) {
         Ok(a) => eprintln!("saveSnapshot: webpage {} 登録（snapshot 本体は非保存・scope=論文のみ）", a.key),
         Err(e) => eprintln!("saveSnapshot: {e}"),
@@ -765,16 +774,27 @@ async fn update_session(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResp
 // 書誌の正確さは resolver（PubMed 第一・doi.org 補完）が担う = translator 不要。
 
 async fn capture_status(State(st): State<Arc<St>>) -> impl IntoResponse {
-    let n = live_item_count(&st.db());
-    zjson(
-        StatusCode::OK,
-        json!({ "ok": true, "app": "openref", "version": env!("CARGO_PKG_VERSION"), "items": n }),
-    )
+    let mut v = json!({ "ok": true, "app": "openref", "version": env!("CARGO_PKG_VERSION"), "items": null });
+    match live_item_count(&st.db()) {
+        Ok(n) => v["items"] = json!(n),
+        Err(e) => {
+            eprintln!("capture: status の件数を数えられません: {e}");
+            v["error"] = json!(format!("件数を数えられません: {e}"));
+        }
+    }
+    zjson(StatusCode::OK, v)
 }
 
 async fn capture_collections(State(st): State<Arc<St>>) -> impl IntoResponse {
     let db = st.db();
-    let rows = search::collections(&db).unwrap_or_default();
+    let rows = match search::collections(&db) {
+        Ok(rows) => rows,
+        Err(e) => {
+            // 空の一覧（= フォルダが無い）に畳まない。popup はフォルダ無しで保存を続けられる
+            eprintln!("capture: フォルダ一覧を読めません: {e}");
+            return zjson(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }));
+        }
+    };
     let paths = search::collection_paths(&rows);
     let path_of = |id: i64| -> String { paths[&id].clone() };
     let out: Vec<Value> = rows
@@ -865,6 +885,8 @@ fn capture_save_unlocked(
 ) -> Result<Value, String> {
     let mut db = st.db();
     let mut dup_retraction: Option<String> = None;
+    // resolver の警告（PubMed の照合に失敗して doi.org で代用した等）。登録に使ったときだけ応答・ログへ
+    let mut warnings: Vec<String> = Vec::new();
     let (key, status) = match search::find_by_ids(&db, req.pmid.as_deref(), req.doi.as_deref()) {
         Ok(Some((_id, key))) => (key, "existing"),
         _ => {
@@ -888,12 +910,16 @@ fn capture_save_unlocked(
                         }),
                         retracted: None,
                         source: "capture",
+                        warnings: vec![],
                     }
                 }
             };
             db = st.db();
             match ingest::add_item(&mut db, &resolved) {
-                Ok(added) => (added.key, "created"),
+                Ok(added) => {
+                    warnings = resolved.warnings;
+                    (added.key, "created")
+                }
                 Err(openref_core::CoreError::Duplicate { existing_key, .. }) => {
                     // ② の間に別経路（同じ connectd の saveItems 等）が先に登録した: resolver が返した撤回を捨てない
                     if let Some(r) = &resolved.retracted {
@@ -912,12 +938,18 @@ fn capture_save_unlocked(
     if status == "created" {
         eprintln!("capture: 新規 {key}");
     }
+    for w in &warnings {
+        eprintln!("capture: {key} ⚠ {w}");
+    }
     let mut v = summarize_item(&db, &key, status)?;
     // 題名ガードで印を書けなかったときも、resolver が撤回と言った警告は応答に出す（警告を黙って外さない）
     if let (Some(r), Some(o)) = (dup_retraction, v.as_object_mut()) {
         if o.get("retraction").is_some_and(Value::is_null) {
             o.insert("retraction".into(), json!(r));
         }
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.insert("warnings".into(), json!(warnings));
     }
     Ok(v)
 }
@@ -1105,8 +1137,12 @@ fn capture_pdf_ingest(
     let (db, Ingested { key, status, note }) = ingest_or_stub(st, bytes, &from)?;
     // 応答の reason: stub になった理由 / 解決失敗の理由（= stub の import_note）/ duplicate の相手が要確認 stub という案内
     let mut reason = note;
-    if status == "duplicate" && pdfingest::is_review_stub(&db, &key) {
-        reason = Some("同一ファイルが要確認 stub に添付済み。その item の詳細 → 編集から DOI/PMID を引き直せます".into());
+    if status == "duplicate" {
+        match pdfingest::is_review_stub(&db, &key) {
+            Ok(true) => reason = Some("同一ファイルが要確認 stub に添付済み。その item の詳細 → 編集から DOI/PMID を引き直せます".into()),
+            Ok(false) => {}
+            Err(e) => eprintln!("capture: {key} が要確認 stub かを確かめられません: {e}"),
+        }
     }
     // ゴミ箱内の item（md5 重複の相手）には触らない: フォルダ所属もしない（撤回表示は summarize_item の trashed の最小形に無い）
     let live = search::get_by_key(&db, &key).map_err(|e| e.to_string())?;
@@ -1184,7 +1220,7 @@ mod tests {
     }
 
     fn resolved(doi: &str, retracted: Option<&str>) -> resolver::Resolved {
-        resolver::Resolved { csl: csl_for(doi), retracted: retracted.map(str::to_string), source: "stub" }
+        resolver::Resolved { csl: csl_for(doi), retracted: retracted.map(str::to_string), source: "stub", warnings: vec![] }
     }
 
     fn req(doi: Option<&str>, title: Option<&str>) -> SaveReq {
@@ -1210,7 +1246,25 @@ mod tests {
         assert_eq!(v["title"], "Paper 10.1234/new");
         assert_eq!(v["doi"], "10.1234/new");
         assert_eq!(v["has_pdf"], false);
+        assert_eq!(v["warnings"], json!([]), "普段は空配列");
         assert_eq!(n_items(&st), 1);
+    }
+
+    /// resolver の警告（PubMed の照合に失敗 → doi.org で代用）は created の応答に載る。既存一致（resolver を呼ばない）は空配列
+    #[test]
+    fn save_reports_resolver_warnings() {
+        let st = test_st();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/w"), None), |_| {
+            let mut r = resolved("10.1234/w", None);
+            r.warnings.push("PubMed の照合に失敗（x）→ doi.org の書誌で代用".into());
+            Ok(r)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "created");
+        assert_eq!(v["warnings"], json!(["PubMed の照合に失敗（x）→ doi.org の書誌で代用"]));
+        let again = capture_save_unlocked(&st, req(Some("10.1234/w"), None), |_| panic!("resolver")).unwrap();
+        assert_eq!(again["status"], "existing");
+        assert_eq!(again["warnings"], json!([]));
     }
 
     /// 登録済みの DOI は ① で existing（resolver を呼ばない）
@@ -1309,7 +1363,7 @@ mod tests {
             let mut db = st.db();
             let mut csl = csl_for("10.1234/race-odd");
             csl["title"] = json!("Completely different hospital newsletter");
-            odd = ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test" }).unwrap().key;
+            odd = ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test", warnings: vec![] }).unwrap().key;
             Ok(resolved("10.1234/race-odd", Some("Retracted")))
         })
         .unwrap();
