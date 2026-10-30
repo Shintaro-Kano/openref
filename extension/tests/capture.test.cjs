@@ -13,6 +13,13 @@ const pmcLink = 'https://pmc.ncbi.nlm.nih.gov/articles/pmid/21620466/';
 const pmcRoute = `{url:'${pmcLink}',pmid:'21620466'}`;
 const htmlError = msg => Object.assign(new Error(msg || 'PDF ではない応答'), { html: true });
 const same = (a, b) => assert.equal(JSON.stringify(a), JSON.stringify(b)); // vm の別 realm の配列を比べる
+/* popup の executeScript({files: ["pdfbytes.js", "content.js"]}) と同じ順に同じ global へ読む */
+function runContent(context) {
+  vm.createContext(context);
+  vm.runInContext(code('pdfbytes.js'), context);
+  vm.runInContext(code('content.js'), context);
+  return context;
+}
 
 function analyze(url, links, fullTextLinks = links) {
   let listener;
@@ -20,7 +27,7 @@ function analyze(url, links, fullTextLinks = links) {
     title: 'Article', contentType: 'text/html', body: { innerText: '' },
     querySelector: () => null, querySelectorAll: selector => (selector === ".full-text-links-list a[href]" ? fullTextLinks : links).map(href => ({ href }))
   }, chrome: { runtime: { onMessage: { addListener: f => listener = f } } } };
-  vm.runInNewContext(code('content.js'), context);
+  runContent(context);
   let result;
   listener({ type: 'openref-analyze' }, {}, r => result = r);
   return result.data;
@@ -69,6 +76,7 @@ function popup() {
       onRemoved: { addListener() {}, removeListener() {} },
     } },
   });
+  vm.runInContext(code('pdfbytes.js'), context); // popup.html の <script> の順
   vm.runInContext(code('popup.js').replace(/\ninit\(\);\s*$/, ''), context);
   vm.runInContext('tab = { id: 1 }; contentScriptOk = true;', context);
   context.fakeMessage = async msg => { registrations.push(msg); return { ok: true }; };
@@ -184,8 +192,9 @@ test('fetchPdfBytes (real) reports html when either attempt saw HTML', async () 
 test('background fetch reports a non-PDF response with the html flag', async () => {
   let listener;
   const noop = { addListener() {} };
-  vm.runInNewContext(code('background.js'), {
+  const ctx = vm.createContext({
     URL, Uint8Array, TextDecoder, btoa,
+    importScripts: (...names) => names.forEach(n => vm.runInContext(code(n), ctx)),
     chrome: {
       runtime: { onMessage: { addListener: f => listener = f }, onConnect: noop, getContexts: async () => [] },
       alarms: { onAlarm: noop }, tabs: { onRemoved: noop },
@@ -193,6 +202,7 @@ test('background fetch reports a non-PDF response with the html flag', async () 
     },
     fetch: async () => ({ ok: true, url: pdf, arrayBuffer: async () => new TextEncoder().encode('<html>Preparing to download ...</html>').buffer }),
   });
+  vm.runInContext(code('background.js'), ctx);
   const res = await new Promise(resolve => listener({ type: 'openref-bg-fetch-pdf', url: pdf }, {}, resolve));
   assert.equal(res.ok, false);
   assert.equal(res.html, true);
@@ -264,7 +274,7 @@ test('ScienceDirect attachment keeps strict link DOI verification', async () => 
 function contentFetch(url, responses, origin = article) {
   let listener;
   const calls = [];
-  vm.runInNewContext(code('content.js'), {
+  runContent({
     window: {}, URL, location: new URL(origin), Uint8Array, btoa, TextDecoder,
     DOMParser: class { parseFromString() { return { querySelector: () => null, querySelectorAll: () => [] }; } },
     chrome: { runtime: { onMessage: { addListener: f => listener = f } } },
@@ -435,4 +445,196 @@ test('PubMed save tries the PMC browser route before server OA or DOI routes', a
     api = async () => { throw new Error('unexpected OA request'); };
   `, h.context);
   assert.equal(await vm.runInContext("attachPdf('KEY')", h.context), 'PMC success');
+});
+
+/* meta refresh の規則（pdfbytes.js）: content.js（取得 HTML の追従・live document の中継判定）と background.js が同じ 1 つを使う */
+const relayBase = 'https://linkinghub.elsevier.com/retrieve/pii/S0140673610623070';
+const refreshCases = [
+  // [名前, head に入れる HTML, 期待する飛び先（null = 追わない）]
+  ['delay 0', '<meta http-equiv="refresh" content="0;url=https://example.org/a.pdf">', 'https://example.org/a.pdf'],
+  ['delay 10 (upper bound)', '<meta http-equiv="refresh" content="10; url=/a.pdf">', 'https://linkinghub.elsevier.com/a.pdf'],
+  ['delay 11 (session timer)', '<meta http-equiv="refresh" content="11; url=/a.pdf">', null],
+  ['1800 s logout', '<meta http-equiv="refresh" content="1800;url=/logout">', null],
+  ['inside noscript', '<noscript><meta http-equiv="refresh" content="0;url=/nojs"></noscript>', null],
+  ['inside a comment', '<!-- <meta http-equiv="refresh" content="0;url=/old"> -->', null],
+  ['relative URL with &amp;', '<meta http-equiv="refresh" content="2; url=../x/y.pdf?a=1&amp;b=2">', 'https://linkinghub.elsevier.com/retrieve/x/y.pdf?a=1&b=2'],
+  ['single quotes', "<meta http-equiv='refresh' content='0; URL=/q.pdf'>", 'https://linkinghub.elsevier.com/q.pdf'],
+  ['upper-case HTTP-EQUIV', '<META HTTP-EQUIV="REFRESH" CONTENT="1;URL=/u.pdf">', 'https://linkinghub.elsevier.com/u.pdf'],
+  ['no url', '<meta http-equiv="refresh" content="5">', null],
+  ['logout first, relay second', '<meta http-equiv="refresh" content="1800;url=/logout"><meta http-equiv="refresh" content="0;url=/r.pdf">', 'https://linkinghub.elsevier.com/r.pdf'],
+  ['noscript first, relay outside', '<noscript><meta http-equiv="refresh" content="0;url=/nojs"></noscript><meta http-equiv="refresh" content="2;url=/r.pdf">', 'https://linkinghub.elsevier.com/r.pdf'],
+];
+const relayPage = html => '<html><head>' + html + '</head><body>Redirecting…</body></html>';
+/* content 側の Document の代役: DOMParser（スクリプト無効）と同じく noscript 内の meta も要素として返し、closest で祖先を答える。
+   コメントは要素にならない。属性は引用符付きだけ読む（本物の DOM との照合は実ブラウザで別に取った） */
+function fakeDoc(html) {
+  const metas = [];
+  const re = /<!--[\s\S]*?-->|<\/?noscript\b[^>]*>|<meta\b[^>]*>/gi;
+  let inNoscript = false, m;
+  while ((m = re.exec(html))) {
+    const tag = m[0];
+    if (tag.startsWith('<!--')) continue;
+    if (/^<noscript/i.test(tag)) { inNoscript = true; continue; }
+    if (/^<\/noscript/i.test(tag)) { inNoscript = false; continue; }
+    const attr = name => {
+      const a = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(tag);
+      return a ? (a[1] ?? a[2]).replace(/&amp;/g, '&') : null;
+    };
+    if ((attr('http-equiv') || '').toLowerCase() !== 'refresh') continue;
+    const ns = inNoscript;
+    metas.push({ getAttribute: n => attr(n), closest: sel => (sel === 'noscript' && ns ? {} : null) });
+  }
+  const pick = sel => (sel === 'meta[http-equiv="refresh" i]' ? metas : []);
+  return {
+    querySelector: sel => pick(sel)[0] || null,
+    querySelectorAll: pick,
+  };
+}
+function shared() {
+  const ctx = vm.createContext({ URL });
+  vm.runInContext(code('pdfbytes.js'), ctx);
+  return ctx.OpenRefShared;
+}
+for (const [name, html, want] of refreshCases) test(`meta refresh rule (string / Document): ${name}`, () => {
+  const s = shared();
+  assert.equal(s.metaRefreshUrl(relayPage(html), relayBase), want);
+  assert.equal(s.metaRefreshUrlInDoc(fakeDoc(relayPage(html)), relayBase), want);
+});
+test('pdfbytes.js injected twice keeps the first definition (no redeclaration error)', () => {
+  const ctx = vm.createContext({ URL });
+  vm.runInContext(code('pdfbytes.js'), ctx);
+  const first = ctx.OpenRefShared;
+  vm.runInContext(code('pdfbytes.js'), ctx);
+  assert.equal(ctx.OpenRefShared, first);
+});
+/* ページの id="OpenRefShared" / id="__openRefCaptureLoaded" の要素は Window の named property として isolated world からも見える */
+const pageElement = () => ({ tagName: 'DIV', id: 'named-property' });
+test('a page element named OpenRefShared does not suppress the shared definitions', () => {
+  let listener;
+  runContent({
+    OpenRefShared: pageElement(), URL, window: {}, location: new URL('https://example.org/doi/10.1000/xyz'),
+    document: { title: 'T', contentType: 'text/html', body: { innerText: '' }, querySelector: () => null, querySelectorAll: () => [] },
+    chrome: { runtime: { onMessage: { addListener: f => listener = f } } },
+  });
+  let res;
+  listener({ type: 'openref-analyze' }, {}, r => res = r);
+  assert.equal(res.ok, true);
+  assert.equal(res.data.doi, '10.1000/xyz');
+});
+test('a page element named __openRefCaptureLoaded does not stop content.js from listening; a real second injection does', () => {
+  const listeners = [];
+  const context = runContent({
+    URL, window: { __openRefCaptureLoaded: pageElement() }, location: new URL('https://example.org/'),
+    document: { title: 'T', contentType: 'text/html', body: { innerText: '' }, querySelector: () => null, querySelectorAll: () => [] },
+    chrome: { runtime: { onMessage: { addListener: f => listeners.push(f) } } },
+  });
+  assert.equal(listeners.length, 1);
+  vm.runInContext(code('pdfbytes.js'), context);
+  vm.runInContext(code('content.js'), context);
+  assert.equal(listeners.length, 1); // 二重注入は従来どおり 1 回だけ登録
+});
+
+/* 取得した HTML への 1 回追従: content.js（DOMParser）と background.js（文字列）が同じ飛び先を選ぶ */
+const fakeFetch = (urls, body) => async u => {
+  urls.push(u);
+  return { ok: true, url: u, arrayBuffer: async () => new TextEncoder().encode(body(u)).buffer };
+};
+function contentFollow(url, body) {
+  let listener;
+  const urls = [];
+  runContent({
+    window: {}, URL, location: new URL(relayBase), Uint8Array, btoa, TextDecoder,
+    DOMParser: class { parseFromString(html) { return fakeDoc(html); } },
+    chrome: { runtime: { onMessage: { addListener: f => listener = f } } },
+    fetch: fakeFetch(urls, body),
+  });
+  return new Promise(resolve => listener({ type: 'openref-fetch-pdf', url, follow: true }, {}, resolve)).then(result => ({ result, urls }));
+}
+function backgroundFollow(url, body) {
+  let listener;
+  const urls = [];
+  const noop = { addListener() {} };
+  const ctx = vm.createContext({
+    URL, Uint8Array, TextDecoder, btoa,
+    importScripts: (...names) => names.forEach(n => vm.runInContext(code(n), ctx)),
+    chrome: {
+      runtime: { onMessage: { addListener: f => listener = f }, onConnect: noop, getContexts: async () => [] },
+      alarms: { onAlarm: noop }, tabs: { onRemoved: noop },
+      storage: { session: { get: async () => ({}), set: async () => {} } },
+    },
+    fetch: fakeFetch(urls, body),
+  });
+  vm.runInContext(code('background.js'), ctx);
+  return new Promise(resolve => listener({ type: 'openref-bg-fetch-pdf', url, follow: true }, {}, resolve)).then(result => ({ result, urls }));
+}
+for (const [name, html, want] of refreshCases) test(`content and background follow the same meta refresh: ${name}`, async () => {
+  for (const run of [contentFollow, backgroundFollow]) {
+    const { result, urls } = await run(relayBase, u => (u === want ? '%PDF-test' : relayPage(html)));
+    same(urls, want ? [relayBase, want] : [relayBase]);
+    assert.equal(result.ok, !!want);
+    if (!want) assert.equal(result.html, true); // 追わない = 「PDF タブで開いて取り直す」経路へ
+  }
+});
+
+/* 背景タブの中継判定（openref-refresh-url）は live document に同じ規則を掛ける（セッション期限の refresh で空回りしない） */
+for (const [name, html, want] of refreshCases) test(`live document relay check: ${name}`, () => {
+  let listener;
+  runContent({
+    window: {}, URL, location: new URL(relayBase), document: fakeDoc(relayPage(html)),
+    chrome: { runtime: { onMessage: { addListener: f => listener = f } } },
+  });
+  let res;
+  listener({ type: 'openref-refresh-url' }, {}, r => res = r);
+  assert.equal(res.ok, true);
+  assert.equal(res.url, want);
+});
+
+/* 壊れた %（URIError）で解析が落ちない: popup の URL だけの解析（init の try の外）と content の analyze。
+   decode できない = 「そこに DOI は無い」として次の手がかり（doi.org リンク・本文冒頭・題名のみ保存）へ進む */
+const brokenPct = '%E0%A4%A';
+test('safeDecode returns null for a broken % sequence and decodes a valid one', () => {
+  const s = shared();
+  assert.equal(s.safeDecode('10.1000/' + brokenPct), null);
+  assert.equal(s.safeDecode('10.1000/a%2Fb%28c%29'), '10.1000/a/b(c)');
+});
+for (const [name, url, doi, isPdf] of [
+  ['/doi/ path', 'https://example.org/doi/10.1000/' + brokenPct, null, false],
+  ['/doi/pdf/ path (still a PDF tab, no DOI)', 'https://example.org/doi/pdf/10.1000/x' + brokenPct, null, true],
+  ['isho PDF viewer (still a PDF tab, no DOI)', 'https://webview.isho.jp/journal/detail/pdf/10.18885/' + brokenPct, null, true],
+  // 正しいエスケープは従来どおり decode する。末尾の ")" を落とすのは popup の現行の後処理（content の cleanDoi と同じ。
+  // URL 規則を共有するときに見直す）をここで固定している
+  ['valid escapes still decoded', 'https://example.org/doi/abs/10.1000/a%28b%29', '10.1000/a(b', false],
+]) test(`popup URL-only analysis survives a broken %: ${name}`, () => {
+  const h = popup();
+  const result = vm.runInContext(`urlOnlyAnalyze(${JSON.stringify(url)})`, h.context);
+  assert.equal(result.doi, doi);
+  assert.equal(result.isPdf, isPdf);
+});
+function analyzeWith(url, doiLink, bodyText = '') {
+  let listener;
+  runContent({
+    URL, window: {}, location: new URL(url),
+    document: {
+      title: 'Article', contentType: 'text/html', body: { innerText: bodyText },
+      querySelector: sel => (sel === 'a[href*="doi.org/10."]' && doiLink ? { href: doiLink } : null),
+      querySelectorAll: () => [],
+    },
+    chrome: { runtime: { onMessage: { addListener: f => listener = f } } },
+  });
+  let res;
+  listener({ type: 'openref-analyze' }, {}, r => res = r);
+  return res;
+}
+for (const [name, url, link, body, doi] of [
+  ['/doi/ path → nothing else', 'https://example.org/doi/full/10.1000/' + brokenPct, null, '', null],
+  ['isho abstract → nothing else', 'https://webview.isho.jp/journal/detail/abs/10.18885/' + brokenPct, null, '', null],
+  ['a broken doi.org link → nothing else', 'https://example.org/article/1', 'https://doi.org/10.1000/' + brokenPct, '', null],
+  ['/doi/ path → the doi.org link', 'https://example.org/doi/full/10.1000/' + brokenPct, 'https://doi.org/10.1000/good.1', '', '10.1000/good.1'],
+  ['/doi/ path → the body text', 'https://example.org/doi/full/10.1000/' + brokenPct, null, 'Cite as doi:10.1000/body.2 (2026)', '10.1000/body.2'],
+  ['a broken doi.org link → the body text', 'https://example.org/article/1', 'https://doi.org/10.1000/' + brokenPct, 'https://doi.org/10.1000/body.3', '10.1000/body.3'],
+]) test(`content analyze stays ok with a broken % and falls through: ${name}`, () => {
+  const res = analyzeWith(url, link, body);
+  assert.equal(res.ok, true); // ok:false だと popup は contentScriptOk=false → HTML ページを「PDF タブ」として取り込もうとする
+  assert.equal(res.data.doi, doi);
+  assert.equal(res.data.title, 'Article'); // 識別子が無くても題名のみの保存に進める
 });

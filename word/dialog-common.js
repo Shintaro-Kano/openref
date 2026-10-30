@@ -1,15 +1,10 @@
-/* OpenRef Word アドイン — ダイアログ共通（cite-dialog / settings-dialog / notice）。
-   親（関数コマンド）へは Office.context.ui.messageParent で JSON 文字列を返す。Office 外（普通のブラウザ）で開いたときは
-   messageParent の代わりに console.log + 画面下の debug 行に出す（プレビュー・検証用）。
-   ?host=dotm&sid=…（Startup テンプレート版 = OpenRef Dialog.app の WKWebView で開く）では
-   同じメッセージを connectd の /word/v2/dialog/<sid>/result へ POST し、届いたら document.title = "openref:done"（窓を閉じる合図）。
-   office.js は読まない（各 HTML が host=dotm のときは読み込まない）・Office を待たない・5 分制限の予告帯も出さない */
-/* global Office */
+/* OpenRef for Word — ダイアログ共通（cite-dialog / settings-dialog / notice）。
+   ?host=dotm&sid=…（OpenRef Dialog.app の WKWebView で開く）: 結果のメッセージ（JSON）を connectd の
+   /word/v2/dialog/<sid>/result へ POST し、届いたら document.title = "openref:done"（窓を閉じる合図）。
+   host=dotm なし（普通のブラウザで開いたプレビュー・検証用）: 送らずに console.log + 画面下の debug 行に出す */
 (function (root) {
   "use strict";
 
-  var host = null; // Office.onReady の host（Office 外 = null）
-  var readyFired = false;
   var QS = new URLSearchParams(location.search);
   var DOTM = QS.get("host") === "dotm";
   var DONE = "openref:done";
@@ -63,46 +58,18 @@
     return true;
   }
 
-  /** 親へ JSON を返す。Office の中なら messageParent、外なら debug 表示 */
+  /** 結果を返す。戻り値 false = 送っていない（プレビュー。呼び手は操作を戻す） */
   function send(msg) {
     if (DOTM) return sendDotm(msg);
     var s = JSON.stringify(msg);
-    var sent = false;
-    try {
-      if (readyFired && root.Office && Office.context && Office.context.ui && typeof Office.context.ui.messageParent === "function") {
-        Office.context.ui.messageParent(s);
-        sent = true;
-      }
-    } catch (e) {
-      console.warn("OpenRef: messageParent に失敗", e);
-    }
-    if (!sent || !host) {
-      console.log("[OpenRef dialog → parent]", s);
-      debug("messageParent: " + s);
-    }
-    return sent;
+    console.log("[OpenRef dialog → result]", s);
+    debug("result: " + s);
+    return false;
   }
 
-  /** Office.onReady の後に fn(info)。office.js が読めない・Office 外でも動く（onReady が来ない環境は 3 秒で見切る） */
+  /** ページの初期化。待つものは無い（呼び手の形を保つための入口） */
   function ready(fn) {
-    var started = false;
-    function go(info) {
-      if (started) return;
-      started = true;
-      fn(info || {});
-    }
-    if (DOTM || typeof root.Office === "undefined" || typeof Office.onReady !== "function") {
-      go({});
-      return;
-    }
-    Office.onReady(function (info) {
-      readyFired = true;
-      host = (info && info.host) || null;
-      go(info);
-    });
-    setTimeout(function () {
-      go({});
-    }, 3000);
+    fn({});
   }
 
   /** WKWebView は autofocus を無視しうる → 明示 focus()（描画直後と少し後にもう一度） */
@@ -118,20 +85,6 @@
     f();
     setTimeout(f, 60);
     setTimeout(f, 300);
-  }
-
-  /** 関数コマンドの runtime は 5 分で閉じる（親は 4:45 で自動キャンセル）→ 4:15 で予告帯を出す。
-      Startup テンプレート版には 5 分制限が無いので出さない */
-  function limitBanner() {
-    if (DOTM) return;
-    setTimeout(function () {
-      var el = document.createElement("div");
-      el.className = "rd-limit";
-      el.textContent = "Word の制限でまもなく閉じます（約 30 秒後）。必要な操作はお早めに。";
-      // 縦いっぱいの flex 枠（.rd-page）の先頭に入れる = 下端のボタン・フッターを押し出さない
-      var page = document.querySelector(".rd-page") || document.body;
-      page.insertBefore(el, page.firstChild);
-    }, (4 * 60 + 15) * 1000);
   }
 
   function esc(s) {
@@ -179,7 +132,6 @@
     send: send,
     ready: ready,
     focus: focus,
-    limitBanner: limitBanner,
     esc: esc,
     fetchJson: fetchJson,
     copyText: copyText,

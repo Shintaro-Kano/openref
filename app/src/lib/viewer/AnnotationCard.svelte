@@ -6,7 +6,8 @@
      扱わない。DB に残る旧 underline / strikethrough もハイライトとして表示・描画する）。
      Claude 注釈（author が claude 系）は色を purple 固定のまま変更不可（予約色の意味を守る）。 */
   import type { AnnotationRow } from "../api";
-  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, isClaudeAuthor } from "./util";
+  import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, isClaudeAuthor, matchParts, type MatchPart } from "./util";
+  import { composing } from "../input";
 
   let {
     a,
@@ -38,26 +39,9 @@
 
   const isClaude = $derived(isClaudeAuthor(a.author));
 
-  /** text を検索語との一致 / 非一致の断片に分ける（大小無視）。長さの変わる lowercase（例 'İ'）があれば強調しない */
-  function parts(text: string, q: string): { t: string; m: boolean }[] {
-    if (!q) return [{ t: text, m: false }];
-    const lower = text
-      .split("")
-      .map((c) => c.toLowerCase())
-      .join("");
-    const ql = q.toLowerCase();
-    if (lower.length !== text.length || !ql) return [{ t: text, m: false }];
-    const out: { t: string; m: boolean }[] = [];
-    let from = 0;
-    for (;;) {
-      const i = lower.indexOf(ql, from);
-      if (i < 0) break;
-      if (i > from) out.push({ t: text.slice(from, i), m: false });
-      out.push({ t: text.slice(i, i + ql.length), m: true });
-      from = i + ql.length;
-    }
-    if (from < text.length) out.push({ t: text.slice(from), m: false });
-    return out;
+  /** text を検索語との一致 / 非一致の断片に分ける（親の絞り込みと同じ matchParts。一致が無い欄は強調なし） */
+  function parts(text: string, q: string): MatchPart[] {
+    return matchParts(text, q) ?? [{ t: text, m: false }];
   }
   // 表示色: 編集中は draft、通常時は確定値（保存前に色が変わって見えないようにする）
   const displayColor = $derived(colorForAnnotation(editing ? draftColor : a.color, a.author));
@@ -71,9 +55,10 @@
   }
 
   /** 編集中の Esc はカード編集をキャンセルするだけ。window の Esc ハンドラ（ビューア閉）へ
-      バブルさせない（過去バグ: 入力の Esc が window onKey まで伝播し closeViewer が発火した）。 */
+      バブルさせない（過去バグ: 入力の Esc が window onKey まで伝播し closeViewer が発火した）。
+      IME の変換取消の Esc は下書きを消さない（window onKey も composing を無視する） */
   function onEditKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
+    if (e.key === "Escape" && !composing(e)) {
       e.preventDefault();
       e.stopPropagation();
       onEditCancel();

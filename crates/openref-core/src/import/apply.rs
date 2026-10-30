@@ -1545,8 +1545,7 @@ pub fn execute(
                             }
                             let applied = applied_bibliography(&tx, &legacy_keys, &item_key)?;
                             if fill_missing(&mut existing, &incoming, &applied) {
-                                tx.execute("UPDATE items SET csl=?1,date_modified=datetime('now') WHERE id=?2",params![existing.to_string(),id])?;
-                                crate::ingest::reindex_item(&tx, id, &existing)?;
+                                crate::ingest::replace_csl(&tx, id, &existing)?;
                             }
                             result.status = "merged".into();
                             (item_key, id)
@@ -1693,8 +1692,7 @@ pub fn execute(
         .flat_map(|r| r.attachments.iter().filter_map(|a| a.target_key.as_deref()))
         .collect();
     for key in targets {
-        let pending:bool=db.conn.query_row("SELECT EXISTS(SELECT 1 FROM attachments a LEFT JOIN fulltext f ON f.attachment_id=a.id WHERE a.key=?1 AND (f.status IS NULL OR f.status IN ('error','partial') OR f.md5 IS NOT a.md5))",[key],|r|r.get(0))?;
-        report.fulltext_pending += usize::from(pending);
+        report.fulltext_pending += usize::from(fulltext_pending(&db.conn, key)?);
     }
     report.complete = report_complete(&report);
     db.conn.execute(
@@ -1702,6 +1700,24 @@ pub fn execute(
         params![report.state, serde_json::to_string(&report)?, run],
     )?;
     Ok(report)
+}
+
+/// 全文索引を待っている添付なら、その id（索引済み・添付が無い = None）。
+/// 結果の target_key は利用者が後で消した添付（blocked）も指すので、消えた添付は待ちに数えない。
+fn pending_attachment(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT a.id FROM attachments a LEFT JOIN fulltext f ON f.attachment_id=a.id \
+             WHERE a.key=?1 AND (f.status IS NULL OR f.status IN ('error','partial') OR f.md5 IS NOT a.md5)",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// execute 末・index_report・history が同じ定義で数える索引待ち
+fn fulltext_pending(conn: &Connection, key: &str) -> Result<bool> {
+    Ok(pending_attachment(conn, key)?.is_some())
 }
 
 fn report_complete(report: &ImportReport) -> bool {
@@ -2194,13 +2210,9 @@ pub fn index_report(
             total: keys.len(),
             bytes: 0,
         });
-        let row:Option<(i64,bool)>=db.conn.query_row("SELECT a.id, f.attachment_id IS NULL OR f.status IN ('error','partial') OR f.md5 IS NOT a.md5 FROM attachments a LEFT JOIN fulltext f ON f.attachment_id=a.id WHERE a.key=?1",[key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let Some((attachment, pending)) = row else {
+        let Some(attachment) = pending_attachment(&db.conn, key)? else {
             continue;
         };
-        if !pending {
-            continue;
-        }
         let reason = match fulltext::index_attachment(&db.conn, attachment) {
             Ok(IndexOutcome::Failed(reason) | IndexOutcome::Skipped(reason)) => Some(reason),
             Err(e) => Some(e.to_string()),
@@ -2215,8 +2227,7 @@ pub fn index_report(
     }
     report.fulltext_pending = 0;
     for key in &keys {
-        let unresolved:bool=db.conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM attachments a JOIN fulltext f ON f.attachment_id=a.id WHERE a.key=?1 AND f.status NOT IN ('error','partial') AND f.md5 IS a.md5)",[key],|r|r.get(0))?;
-        report.fulltext_pending += usize::from(unresolved);
+        report.fulltext_pending += usize::from(fulltext_pending(&db.conn, key)?);
     }
     progress(&Progress {
         phase: "fulltext",
@@ -2276,8 +2287,7 @@ pub fn history(db_path: &Path) -> Result<Vec<Value>> {
                 for result in results {
                     for att in result["attachments"].as_array().into_iter().flatten() {
                         if let Some(key) = att["target_key"].as_str() {
-                            let needs_index: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attachments a LEFT JOIN fulltext f ON f.attachment_id=a.id WHERE a.key=?1 AND (f.status IS NULL OR f.status IN ('error','partial') OR f.md5 IS NOT a.md5))", [key], |r|r.get(0))?;
-                            if needs_index { pending.insert(key.to_string()); }
+                            if fulltext_pending(conn, key)? { pending.insert(key.to_string()); }
                         }
                     }
                 }

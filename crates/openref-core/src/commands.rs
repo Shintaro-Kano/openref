@@ -698,12 +698,7 @@ fn update_tag(db: &mut Db, a: &Value) -> Result<Value> {
     if new_name.is_none() && color.is_none() {
         return Err(bad("new_name か color を指定してください"));
     }
-    if let Some(n) = new_name {
-        tags::rename_tag(db, id, &n)?;
-    }
-    if let Some(c) = color {
-        tags::set_tag_color(db, id, Some(&c))?;
-    }
+    tags::update_tag(db, id, new_name.as_deref(), color.as_deref())?;
     tag_json(db, id)
 }
 
@@ -1026,7 +1021,7 @@ fn build() -> Vec<Command> {
           "書誌を手で作る（csl = CSL-JSON。type は item_types のもの・title 必須・DOI/PMID が既存と同じなら拒否）",
           schema(&[("csl", "object", "CSL-JSON")], &["csl"]), create_manual),
         c("update_item", true, &[],
-          "書誌を差し替える（csl は全体を渡す = get_item の csl を直して渡す。無いフィールドは消える・custom は温存）",
+          "書誌を差し替える（csl は全体を渡す = get_item の csl を直して渡す。item_types の型の欄は、無ければ消える = 型を変えると旧型の欄は残らない。元の型の欄の外にあったキー（accessed・citation-key 等）は、無ければ温存・空値なら消える。custom は温存）",
           schema(&[KEY, ("csl", "object", "CSL-JSON（全体）")], &["key", "csl"]), update_item),
         c("quick_add", true, &["create_item"],
           "PMID / DOI / PubMed URL / doi.org URL から書誌を機械確定して登録（ネットワーク・重複は既存 key を示してエラー）",
@@ -1369,6 +1364,9 @@ mod tests {
         call_ok(&mut db, "add_tag", json!({"key": key, "tag": "膵臓"}));
         assert_eq!(call_ok(&mut db, "remove_tag", json!({"key": key, "tag": "膵臓"}))["tags"], json!([]));
         assert_eq!(call_ok(&mut db, "create_tag", json!({"name": "liver", "color": "sky"}))["color"], "sky");
+        // 改名 + 不正な色 → エラー、改名も残らない
+        assert!(call(&mut db, "update_tag", &json!({"name": "LIVER", "new_name": "y", "color": "bogus"})).is_err());
+        assert_eq!(call_ok(&mut db, "list_tags", json!({}))[0]["name"], "liver", "色が不正なら改名も残らない");
         assert_eq!(call_ok(&mut db, "update_tag", json!({"name": "LIVER", "new_name": "hepatic", "color": "red"}))["name"], "hepatic");
         call_ok(&mut db, "attach_tag", json!({"key": key, "tag": "hepatic"}));
         call_ok(&mut db, "create_tag", json!({"name": "肝"}));

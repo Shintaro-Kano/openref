@@ -1,6 +1,6 @@
 /* OpenRef — Citation Style... / Document Settings... ダイアログ（tab=style / tab=doc）。
-   初期値 d = {style, doiAlways, fontName, fontSize, cites, pinned}（文書の effectivePrefs・書式・引用数）。
-   親へ: {type:"apply", style, doiAlways, fontName, fontSize} / {type:"cancel"} */
+   初期値 d = {style, doiAlways, fontName, fontSize, cites, pinned}（文書の実効のスタイル・DOI 設定・書式・引用数。VBA の ORDoc.EffectivePrefs）。
+   結果: {type:"apply", style, doiAlways, fontName, fontSize} / {type:"cancel"} */
 (function () {
   "use strict";
   var RD = window.OpenRefDialog;
@@ -224,7 +224,6 @@
     renderStyles(false);
     renderFoot();
     loadStyles();
-    RD.limitBanner();
     showTab(S.tab);
   });
 })();

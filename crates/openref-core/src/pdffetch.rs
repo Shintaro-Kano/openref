@@ -924,15 +924,15 @@ fn pdf_body(page: Page) -> std::result::Result<Vec<u8>, String> {
 // ---------------- 経路 3: Crossref link[] ----------------
 
 fn crossref_pdf_links(doi: &str) -> std::result::Result<Vec<String>, String> {
-    let resp = match agent()
-        .get(&format!("https://api.crossref.org/works/{}", encode_doi_path(doi)))
-        .call()
-    {
-        Ok(r) => r,
-        Err(ureq::Error::Status(404, _)) => return Err(format!("{doi} は Crossref 未登録")),
-        Err(e) => return Err(e.to_string()),
-    };
-    let body = resp.into_string().map_err(|e| e.to_string())?;
+    // 書誌検索・doi.org と同じ Crossref の門（同時 1 本 + 1.1 s 間隔）を通す。本文の受信まで門の中
+    let body = crate::resolver::with_crossref_gate(|pace| {
+        pace();
+        match agent().get(&format!("https://api.crossref.org/works/{}", encode_doi_path(doi))).call() {
+            Ok(r) => r.into_string().map_err(|e| e.to_string()),
+            Err(ureq::Error::Status(404, _)) => Err(format!("{doi} は Crossref 未登録")),
+            Err(e) => Err(e.to_string()),
+        }
+    })?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(select_crossref_pdf_links(&v))
 }

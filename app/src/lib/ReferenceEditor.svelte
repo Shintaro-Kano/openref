@@ -4,6 +4,7 @@
   import { api, type TypeDef } from "./api";
   import { formatBibliography } from "./cite";
   import { app, closeEditor, refreshAll, reloadDetail, reveal, toast } from "./state.svelte";
+  import { onEnter } from "./input";
 
   let types = $state<TypeDef[]>([]);
   let subs = $state<string[]>([]);
@@ -180,7 +181,7 @@
           class="lookup"
           placeholder={t("DOI / PMID / URL から自動入力")}
           bind:value={lookupInput}
-          onkeydown={(e) => e.key === "Enter" && doLookup()}
+          onkeydown={(e) => onEnter(e, doLookup)}
         />
         <button onclick={doLookup} disabled={busy || !lookupInput.trim()}>{t("取得")}</button>
         <button class="x" onclick={closeEditor}>×</button>

@@ -1,5 +1,5 @@
 //! Library migration. Adapters produce normalized data; planning is read-only.
-//! The existing Paperpile `import` remains the legacy application path.
+//! The Paperpile and Zotero adapters feed the one `apply` path (there is no other import route).
 pub mod apply;
 pub mod decisions;
 pub mod files;

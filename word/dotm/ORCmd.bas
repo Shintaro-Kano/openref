@@ -1,7 +1,7 @@
 Attribute VB_Name = "ORCmd"
 Option Explicit
 
-' リボンの 7 コマンドの流れ（旧 word/commands.js）。各コマンドは引数なしの Public Sub = マクロとしても呼べる
+' リボンの 7 コマンドの流れ。各コマンドは引数なしの Public Sub = マクロとしても呼べる
 ' （ツール > ユーザー設定 > キーボード でショートカットを割り当てられる）。
 ' ダイアログは connectd に頼んで OpenRef Dialog.app に出し、結果を long-poll で待つ（待つ間も Word は操作できる = DoEvents）。
 

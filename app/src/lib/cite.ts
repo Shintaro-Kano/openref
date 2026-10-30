@@ -5,7 +5,7 @@
    取得 → 本番の構築、の 2 段で用意する（取れない言語は en-US の語彙で代用）。
    「DOI / URL を常に含める」は Word アドインと同じ実装（word/cite-core.js の withIdentifiers）を使う。 */
 import { api, type StyleEntry } from "./api";
-// OpenRefCite（globalThis）を定義する。node テスト（word/test-*.cjs）と Word taskpane も同じファイル
+// OpenRefCite（globalThis）を定義する。node テスト（word/test-*.cjs）と connectd の Word 整形（word_v2.rs）も同じファイル
 import "../../../word/cite-core.js";
 import { t } from "./i18n.svelte";
 

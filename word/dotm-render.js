@@ -1,6 +1,6 @@
 /* OpenRef for Word（Startup テンプレート版 OpenRef.dotm）— 整形の段取りと「citeproc の HTML → 本文 + 書式 run」の変換。
    connectd が JavaScriptCore で vendor/citeproc.js・cite-core.js の後に評価する
-   （ブラウザ・Office には読み込まない）。整形の規則は Office JS 版 doc.js の updateAll と同じ:
+   （ブラウザには読み込まない）。整形の規則:
    番号 = 文書順の初出順・書誌は蔵書（fresh）の最新を優先し、蔵書に無い key は payload の snapshot。
    run は UTF-16 単位（JS の文字列長そのまま）の `<開始>:<長さ>:<書式>` をカンマ区切り。書式の無い部分は run を作らない。
    node でテストできる（word/test-dotm-render.cjs）。 */
@@ -300,7 +300,7 @@
     };
   }
 
-  // ---------- 整形の段取り（doc.js updateAll と同じ規則） ----------
+  // ---------- 整形の段取り（規則は冒頭のコメント） ----------
   /** input = {styleXml, locales: {lang: xml}, doiAlways, cites: [payload…]（文書順の引用 CC ごと = {items:[{key, csl}]}）,
       fresh: {key: csl}（蔵書にあった分）}。
       戻り値 {cites: [{text, runs}]（cites と同順）, bib: {text, runs}, items: 文献数, warnings: [citeproc の警告]} */

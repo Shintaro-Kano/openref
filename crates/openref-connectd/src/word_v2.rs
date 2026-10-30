@@ -5,7 +5,8 @@
 //!   （0x5C = ¥・0x7E = ‾）ため、欄は `%` でエスケープする（`%%` `%t` `%n` `%r`・それ以外は `%uXXXX` = UTF-16 単位。[`esc`]）
 //! - ダイアログのページ・アプレット向け（params / result / next / closed）は JSON
 //! - すべて `X-OpenRef: word` ヘッダ必須（無ければ 403。カスタムヘッダは CORS preflight を起こすので他サイトのページから呼べない）
-//! - 整形 = citeproc を JavaScriptCore で（jsc.rs + word/dotm-render.js）。規則は Office JS 版 doc.js の updateAll と同じ
+//! - 整形 = citeproc を JavaScriptCore で（jsc.rs + word/dotm-render.js）。番号 = 文書順の初出順・書誌は蔵書の最新を優先し、
+//!   蔵書に無い key は文書内の payload（snapshot）
 
 use crate::{jsc, St};
 use axum::body::Bytes;
@@ -28,15 +29,15 @@ macro_rules! word_src {
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../word/", $p))
     };
 }
-// static = バイナリに 1 コピー（Office JS 版の配信 word.rs もこれを返す。const だと使う場所ごとに埋め込まれる）
-pub(crate) static CITEPROC_JS: &str = word_src!("vendor/citeproc.js");
-pub(crate) static CITE_CORE_JS: &str = word_src!("cite-core.js");
+// static = バイナリに 1 コピー（const だと使う場所ごとに埋め込まれる）
+static CITEPROC_JS: &str = word_src!("vendor/citeproc.js");
+static CITE_CORE_JS: &str = word_src!("cite-core.js");
 const DOTM_RENDER_JS: &str = word_src!("dotm-render.js");
 
 const DEFAULT_FONT: &str = "Century";
 const DEFAULT_SIZE: f64 = 10.5;
 
-/// ダイアログの窓の大きさ（pt）。Office JS 版の画面比（commands.js の SIZE）を 1440×900 前後の画面で見た大きさ
+/// ダイアログの窓の大きさ（pt。1440×900 前後の画面に合わせた値）
 const SIZE_CITE: (u32, u32) = (640, 480);
 const SIZE_SETTINGS: (u32, u32) = (600, 560);
 const SIZE_NOTICE: (u32, u32) = (460, 270);
@@ -179,7 +180,7 @@ pub fn ok_text(lines: &[String]) -> String {
     s
 }
 
-/// `ERR<TAB>文言[<TAB>補足]`（利用者に見せる。補足 = Office JS 版の userError の detail に当たる 1 行。VBA の Parse が読む）
+/// `ERR<TAB>文言[<TAB>補足]`（利用者に見せる。補足 = 原因や対処の 1 行。VBA の Parse が読む）
 pub fn err_text(msg: &str, detail: Option<&str>) -> String {
     match detail {
         Some(d) => format!("ERR\t{}\t{}\n", esc(msg), esc(d)),
@@ -365,8 +366,8 @@ pub fn ascii_json(v: &Value) -> String {
     out
 }
 
-/// 選んだ key（順序どおり・重複なし）から payload を作る: 蔵書（ゴミ箱外）の書誌 → 無ければ snapshot（後の方が勝つ =
-/// commands.js の commitCitation と同じ）。csl から abstract を除く。どちらにも無い key があれば Err(その key 一覧)
+/// 選んだ key（順序どおり・重複なし）から payload を作る: 蔵書（ゴミ箱外）の書誌 → 無ければ snapshot（snapshot に同じ key が
+/// 複数あれば後の方が勝つ）。csl から abstract を除く。どちらにも無い key があれば Err(その key 一覧)
 pub fn build_payload(db: &Db, keys: &[String], snapshot: &[(String, Value)]) -> Result<Value, Vec<String>> {
     let mut items = Vec::new();
     let mut missing = Vec::new();
@@ -391,7 +392,7 @@ pub fn build_payload(db: &Db, keys: &[String], snapshot: &[(String, Value)]) -> 
     }
 }
 
-/// 筆頭著者 + 年（旧 commands.js の labelOf と同じ: family → literal → "?"・年が無ければ著者だけ）
+/// 筆頭著者 + 年（著者 = 筆頭の family → literal → "?"・年が無ければ著者だけ）
 pub fn label_of(csl: &Value) -> String {
     let a0 = csl.get("author").and_then(|a| a.get(0));
     let truthy_str = |v: Option<&Value>| match v {
@@ -591,7 +592,7 @@ fn js_lit(s: &str) -> String {
 }
 
 /// citeproc で整形する（word/dotm-render.js の render）。cites = 文書順の payload（{items:[{key,csl}]}）・
-/// fresh = 蔵書にあった key の CSL。locale = 言語 → XML（取れなければ None = en-US の語彙で代用。doc.js の loadLocales と同じ）
+/// fresh = 蔵書にあった key の CSL。locale = 言語 → XML（取れなければ None = en-US の語彙で代用）
 pub fn render_js(
     style_xml: &str,
     doi_always: bool,
@@ -685,7 +686,7 @@ fn render_doc(st: &St, style: &str, doi_always: bool, cites: &[Vec<(String, Valu
         }
         (m, citestyle::styles_dir(&db))
     };
-    // スタイルが取れなければここで失敗 = 文書は無傷（updateAll と同じ）
+    // スタイルが取れなければここで失敗 = 文書は無傷
     let style_xml = citestyle::style_xml(&dir, style)
         .map_err(|e| UserErr::new(format!("引用スタイル {style} を読み込めません。"), Some(e.to_string())))?;
     let payloads: Vec<Value> = cites.iter().map(|c| payload_value(c)).collect();
@@ -711,7 +712,7 @@ fn render_doc(st: &St, style: &str, doi_always: bool, cites: &[Vec<(String, Valu
 }
 
 /// `POST /word/v2/render` `{"style","doiAlways","cites":[<payload>…]}` → `C<TAB>本文<TAB>run`（cites と同順）… `B` `S`。
-/// 引用 0 件は `S<TAB>style<TAB>0` だけ（文書に触れない = updateAll の {citations: 0}）
+/// 引用 0 件は `S<TAB>style<TAB>0` だけ（文書に触れない）
 async fn render(State(v2): State<Arc<V2>>, body: Bytes) -> Response {
     let req = match parse_body(&body) {
         Ok(v) => v,
@@ -832,7 +833,7 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
     match kind {
         "cite" => {
             let edit = str_of(req, "mode") == Some("edit");
-            // 読めない引用データは「データなし」として開く（Office JS 版と同じ = ダイアログで付け直すか削除できる）
+            // 読めない引用データは「データなし」として開く（ダイアログで付け直すか削除できる）
             let mut broken = false;
             let snapshot = match req.get("existing") {
                 None | Some(Value::Null) => Vec::new(),
@@ -896,7 +897,7 @@ pub fn dialog_spec(req: &Value, style_title: &dyn Fn(&str) -> String) -> Result<
                 Some("info") => "info",
                 _ => "error",
             };
-            // commands.js の notice と同じ: 空・null の欄は渡さない
+            // 空・null の欄は渡さない
             let mut d = json!({ "kind": nk });
             for k in ["title", "message", "detail", "ok", "danger", "copy"] {
                 match req.get(k) {
@@ -940,7 +941,7 @@ pub fn dialog_url(base: &str, sid: &str, spec: &Spec) -> String {
     u
 }
 
-/// ページの結果メッセージ（Office JS 版と同じ {type:…}）→ VBA への応答本文（`OK` + `R` 行、または `ERR`）
+/// ページの結果メッセージ（{type:…}）→ VBA への応答本文（`OK` + `R` 行、または `ERR`）
 pub fn result_text(db: &Db, kind: &Kind, msg: &Value) -> String {
     let ty = str_of(msg, "type").unwrap_or("");
     let r = |fields: &[&str]| ok_text(&[line("R", fields)]);
@@ -958,7 +959,6 @@ pub fn result_text(db: &Db, kind: &Kind, msg: &Value) -> String {
                 if keys.is_empty() {
                     return err_text("引用する文献が選ばれていません。", None);
                 }
-                // 文言は commands.js の commitCitation と同じ
                 match build_payload(db, &keys, snapshot) {
                     Ok(p) => r(&["ok", &ascii_json(&p)]),
                     Err(missing) => err_text(
@@ -968,7 +968,7 @@ pub fn result_text(db: &Db, kind: &Kind, msg: &Value) -> String {
                 }
             }
             "delete" if *edit => r(&["delete"]),
-            // cancel・× で閉じた・不正なメッセージ（commands.js と同じ扱い）
+            // cancel・× で閉じた・不正なメッセージ = キャンセル
             _ => r(&["cancel"]),
         },
         Kind::Settings { style, doi_always } => {
@@ -987,7 +987,7 @@ pub fn result_text(db: &Db, kind: &Kind, msg: &Value) -> String {
                 Some(Value::Bool(b)) => *b,
                 _ => *doi_always,
             };
-            // doc.js の applySettings と同じ既定（空のフォント名 = Century・不正な大きさ = 10.5）
+            // 既定: 空のフォント名 = Century・不正な大きさ = 10.5
             let name = match msg.get("fontName") {
                 None | Some(Value::Null) => String::new(),
                 Some(Value::String(s)) => s.trim().to_string(),
@@ -1313,7 +1313,7 @@ async fn dialog_params(State(v2): State<Arc<V2>>, AxPath(sid): AxPath<String>) -
     }
 }
 
-/// `POST /word/v2/dialog/<sid>/result`（ページ。Office JS 版と同じメッセージ {type:…}）→ `{ok}`。
+/// `POST /word/v2/dialog/<sid>/result`（ページの結果メッセージ {type:…}）→ `{ok}`。
 /// cite の insert / replace はここで payload を作る（蔵書 → snapshot。無ければ VBA には ERR）
 async fn dialog_result(State(v2): State<Arc<V2>>, AxPath(sid): AxPath<String>, body: Bytes) -> Response {
     let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -1386,7 +1386,7 @@ mod tests {
     fn test_st() -> Arc<St> {
         Arc::new(St {
             db: Mutex::new(Db::open_in_memory().unwrap()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Default::default()),
         })
     }
 
@@ -1589,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn label_matches_commands_js() {
+    fn label_first_author_and_year() {
         assert_eq!(label_of(&k1()), "Stoffel 2023");
         assert_eq!(label_of(&json!({"author": [{"family": "", "literal": "WHO"}], "issued": {"date-parts": [["2020"]]}})), "WHO 2020");
         assert_eq!(label_of(&json!({})), "?");

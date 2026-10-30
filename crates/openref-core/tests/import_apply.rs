@@ -76,6 +76,16 @@ impl Fixture {
             .unwrap()
     }
 }
+/// history の中で run_id の実行が持つ索引待ち（history は date_added 秒単位 + 乱数 id の順なので [0] で引かない）
+fn history_pending(db: &std::path::Path, run_id: &str) -> Value {
+    apply::history(db)
+        .unwrap()
+        .into_iter()
+        .find(|h| h["id"] == run_id)
+        .expect("run in history")["report"]["fulltext_pending"]
+        .clone()
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -1051,6 +1061,52 @@ fn fulltext_is_independent_cancellable_and_reports_failures_without_losing_items
     assert!(report.warnings.iter().any(|w| w.contains("全文索引")));
 }
 
+/// execute 末・index_report・history の索引待ちが同じ定義（添付が無い = 待ちなし）で数える。
+/// 利用者が消した添付（再実行で blocked・target_key は消えた key）が index_report 後も待ちに残ると、
+/// 全文索引ボタンが消えない（履歴から開き直すと 0 に戻る）。
+#[test]
+fn fulltext_pending_agrees_across_execute_index_and_history_for_deleted_attachments() {
+    let f = Fixture::new(json!([
+        {"_id":"good","title":"Indexed","attachments":[{"_id":"g","filename":"good.pdf"}]},
+        {"_id":"bad","title":"Unindexable","attachments":[{"_id":"b","filename":"bad.pdf"}]},
+        {"_id":"gone","title":"Attachment removed by user","attachments":[{"_id":"r","filename":"gone.pdf"}]},
+        {"_id":"bare","title":"No attachment"}
+    ]));
+    f.file(
+        "good.pdf",
+        &openref_core::pdftools::minimal_pdf("Searchable pending fixture", None),
+    );
+    f.file("bad.pdf", b"%PDF-invalid header-only fixture");
+    f.file(
+        "gone.pdf",
+        &openref_core::pdftools::minimal_pdf("Removed pending fixture", None),
+    );
+    let input = f.input();
+    let first = f.run(&input, AttachmentMode::Copy);
+    assert_eq!(first.fulltext_pending, 3);
+    let db = Db::open(&f.db).unwrap();
+    db.conn
+        .execute("DELETE FROM attachments WHERE path LIKE '%gone.pdf'", [])
+        .unwrap();
+    drop(db);
+    assert_eq!(f.count("attachments"), 2);
+
+    let mut report = f.run(&input, AttachmentMode::Copy);
+    let gone = &report.results[2];
+    assert_eq!(gone.attachments[0].status, "blocked");
+    assert!(gone.attachments[0].target_key.is_some());
+    assert!(report.results[3].attachments.is_empty());
+    // 未索引 = good・bad（消えた添付と添付の無い文献は数えない）
+    assert_eq!(report.fulltext_pending, 2);
+    assert_eq!(history_pending(&f.db, &report.run_id), 2);
+
+    apply::index_report(&f.db, &mut report, &AtomicBool::new(false), |_| {}).unwrap();
+    // good は索引済み・bad は失敗で待ちに残る
+    assert_eq!(report.fulltext_pending, 1);
+    assert_eq!(history_pending(&f.db, &report.run_id), 1);
+    assert_eq!(f.count("attachments"), 2);
+}
+
 #[test]
 #[ignore = "requires explicitly provided real Paperpile JSON/PDF sample; scratch DB only"]
 fn real_paperpile_copy_roundtrip_in_scratch_database() {
@@ -1179,10 +1235,17 @@ fn review_removed_memberships_are_not_restored_and_missing_pdf_still_is() {
     db.conn.execute("DELETE FROM item_tags", []).unwrap();
     drop(db);
     f.file("a.pdf", b"%PDF-added later");
-    let report = f.run(&input, AttachmentMode::Copy);
+    let mut report = f.run(&input, AttachmentMode::Copy);
     assert_eq!(f.count("collection_items"), 0);
     assert_eq!(f.count("item_tags"), 0);
     assert_eq!(f.count("attachments"), 1);
+    // 整合の確認: index_report 後と history の索引待ちが一致する。添付を消していないので
+    // 旧新の定義の差は出ない（差の検出は fulltext_pending_agrees_… が担う）
+    apply::index_report(&f.db, &mut report, &AtomicBool::new(false), |_| {}).unwrap();
+    assert_eq!(
+        history_pending(&f.db, &report.run_id),
+        report.fulltext_pending
+    );
     assert!(report.results[0]
         .warnings
         .iter()

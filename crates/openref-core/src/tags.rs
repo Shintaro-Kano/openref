@@ -128,6 +128,40 @@ pub fn set_tag_color(db: &Db, id: i64, color: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// ラベルの改名と色の変更を 1 トランザクションで行う（`None` = 変えない）。検証（存在・名前・色）をすべて済ませてから書くので、
+/// 色が不正なら改名も残らない。両方 `None` は存在確認だけ。色を消す（NULL に戻す）操作は無い（`set_tag_color` を使う）
+pub fn update_tag(db: &Db, id: i64, new_name: Option<&str>, color: Option<&str>) -> Result<()> {
+    let exists: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)", [id], |r| r.get(0))?;
+    if !exists {
+        return Err(CoreError::NotFound(format!("tag {id}")));
+    }
+    let new_name = match new_name {
+        Some(n) => {
+            let n = n.trim();
+            if n.is_empty() {
+                return Err(CoreError::BadInput("タグ名が空です".into()));
+            }
+            if let Some(other) = tag_id_by_name(db, n)? {
+                if other != id {
+                    return Err(CoreError::BadInput(format!("タグ '{n}' は既に存在します")));
+                }
+            }
+            Some(n)
+        }
+        None => None,
+    };
+    check_color(color)?;
+    let tx = db.conn.unchecked_transaction()?;
+    if let Some(n) = new_name {
+        tx.execute("UPDATE tags SET name = ?1 WHERE id = ?2", rusqlite::params![n, id])?;
+    }
+    if let Some(c) = color {
+        tx.execute("UPDATE tags SET color = ?1 WHERE id = ?2", rusqlite::params![c, id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// タグを削除する（item_tags は FK ON DELETE CASCADE で自動的に外れる＝論文は消えない）
 pub fn delete_tag(db: &Db, id: i64) -> Result<()> {
     let n = db.conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
@@ -336,6 +370,44 @@ mod tests {
         assert_eq!(list_tags(&db, TagSort::Alphabetical).unwrap().len(), 1);
         let cnt: i64 = db.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
         assert_eq!(cnt, 1);
+    }
+
+    #[test]
+    fn update_tag_is_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        let a = create_tag(&db, "alpha", Some("sky")).unwrap();
+        let b = create_tag(&db, "beta", Some("red")).unwrap();
+        let get = |id: i64| -> (String, Option<String>) {
+            db.conn.query_row("SELECT name, color FROM tags WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        let orig = (get(a), get(b));
+
+        // 改名 + 不正な色 → エラー、改名も残らない
+        assert!(matches!(update_tag(&db, a, Some("gamma"), Some("bogus")), Err(CoreError::BadInput(_))));
+        // 改名 + 同名衝突（色は有効）→ エラー、色も変わらない
+        assert!(matches!(update_tag(&db, a, Some("BETA"), Some("green")), Err(CoreError::BadInput(_))));
+        // 空の名前 → エラー、色も変わらない
+        assert!(matches!(update_tag(&db, a, Some("  "), Some("green")), Err(CoreError::BadInput(_))));
+        // 無い id
+        assert!(matches!(update_tag(&db, 9999, Some("x"), None), Err(CoreError::NotFound(_))));
+        assert!(matches!(update_tag(&db, 9999, None, None), Err(CoreError::NotFound(_))));
+        assert_eq!((get(a), get(b)), orig, "失敗した更新は何も変えない");
+
+        // 改名だけ（前後の空白は落とす）
+        update_tag(&db, a, Some(" gamma "), None).unwrap();
+        assert_eq!(get(a), ("gamma".to_string(), Some("sky".to_string())));
+        // 色だけ（#rrggbb も可）
+        update_tag(&db, a, None, Some("#00ff00")).unwrap();
+        assert_eq!(get(a), ("gamma".to_string(), Some("#00ff00".to_string())));
+        // 両方
+        update_tag(&db, a, Some("delta"), Some("forest")).unwrap();
+        assert_eq!(get(a), ("delta".to_string(), Some("forest".to_string())));
+        // 同名（自分自身・大文字小文字違い）への改名は通る
+        update_tag(&db, a, Some("DELTA"), None).unwrap();
+        assert_eq!(get(a).0, "DELTA");
+        // 両方 None = 存在確認だけ
+        update_tag(&db, a, None, None).unwrap();
+        assert_eq!(get(b), orig.1);
     }
 
     fn seed_items(db: &Db, keys: &[&str]) {

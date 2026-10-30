@@ -9,6 +9,11 @@ use std::path::Path;
 /// 手動入力・編集の共通サニタイズ: 型の妥当性 → 未知フィールド除去 → 空値除去 → DOI 正規化。
 /// 「型カタログで検証する」の実行点。
 fn sanitize(csl: &Value) -> Result<Value> {
+    sanitize_with(csl, &[])
+}
+
+/// sanitize の本体。`carried` は型カタログの外でも通すキー（update_csl が「既存 item の、旧い型のカタログに無かったキー」を渡す）
+fn sanitize_with(csl: &Value, carried: &[String]) -> Result<Value> {
     let type_id = model::s(csl, "type").unwrap_or("document").to_string();
     if types::type_def(&type_id).is_none() {
         return Err(CoreError::BadInput(format!("未知の参照タイプ: {type_id}")));
@@ -18,7 +23,7 @@ fn sanitize(csl: &Value) -> Result<Value> {
         .ok_or_else(|| CoreError::BadInput("CSL がオブジェクトではありません".into()))?;
     let mut out = serde_json::Map::new();
     for (k, v) in obj {
-        if !types::is_valid_field(&type_id, k) {
+        if !types::is_valid_field(&type_id, k) && !carried.contains(k) {
             continue; // 型に無いフィールドは黙って落とす（混入防止）
         }
         let keep = match v {
@@ -74,6 +79,16 @@ pub fn create_manual(db: &mut Db, csl: &Value) -> Result<String> {
 }
 
 /// 既存 item の書誌を差し替える（編集）。custom は既存を温存する。
+///
+/// 型カタログの外のキー（取込が書く `accessed`・Zotero の `citation-key` 等）は編集の画面に出ないので、
+/// 「旧 CSL のうち、**旧い型**のカタログに無かったキー」は次の扱いにする（それ以外は sanitize のとおり）:
+/// - 入力に無い → 旧い値を引き継ぐ（画面に出せないものを、出さなかったことを理由に消さない）
+/// - 入力にあり空（null・空文字・空配列・空オブジェクト）→ 消す（明示の削除）
+/// - 入力にあり値がある → その値にする（sanitize と同じ trim / DOI 正規化）
+///
+/// 旧い型のカタログに**あった**キーは、入力に無ければ消える（画面で空にした = 削除）。型を変えたとき、
+/// 旧型の欄が新型の CSL に残らないのはこのため（sanitize の混入防止）。旧い型がカタログに無い型なら、
+/// 旧 CSL の全キーが「カタログに無かったキー」になる。
 pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
     let (id, old_s): (i64, String) = db
         .conn
@@ -84,9 +99,28 @@ pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
         )
         .optional()?
         .ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
-    let mut new = sanitize(csl)?;
+    let old = serde_json::from_str::<Value>(&old_s).ok();
+    let carried: Vec<(String, Value)> = match old.as_ref().and_then(Value::as_object) {
+        Some(o) => {
+            let old_type = o.get("type").and_then(Value::as_str).unwrap_or("document");
+            o.iter()
+                .filter(|(k, _)| !types::is_valid_field(old_type, k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let carried_keys: Vec<String> = carried.iter().map(|(k, _)| k.clone()).collect();
+    let mut new = sanitize_with(csl, &carried_keys)?;
+    if let (Some(o), Some(input)) = (new.as_object_mut(), csl.as_object()) {
+        for (k, v) in carried {
+            if !input.contains_key(&k) {
+                o.insert(k, v);
+            }
+        }
+    }
     // custom（取込元・paperpile 情報・MeSH 等）は UI に出さないので既存から引き継ぐ
-    if let Ok(old) = serde_json::from_str::<Value>(&old_s) {
+    if let Some(old) = old {
         if let (Some(o), Some(custom)) = (new.as_object_mut(), old.get("custom")) {
             let merged = match o.get("custom") {
                 Some(Value::Object(edited)) => {
@@ -102,11 +136,7 @@ pub fn update_csl(db: &mut Db, key: &str, csl: &Value) -> Result<()> {
         }
     }
     let tx = db.conn.transaction()?;
-    tx.execute(
-        "UPDATE items SET csl = ?1, date_modified = datetime('now') WHERE id = ?2",
-        rusqlite::params![new.to_string(), id],
-    )?;
-    ingest::reindex_item(&tx, id, &new)?;
+    ingest::replace_csl(&tx, id, &new)?;
     tx.commit()?;
     Ok(())
 }
@@ -424,5 +454,74 @@ mod tests {
         assert!(names(&db).is_empty());
         // 付いていない / 存在しない名前は従来どおり no-op（エラーにしない）
         remove_tag(&db, "ITEM0001", "nope").unwrap();
+    }
+
+    /// 旧い型のカタログに無かったキー（取込由来の accessed・Zotero の citation-key）は編集で消えない。
+    /// カタログ内のキーは入力から外せば消え、型を変えれば旧型の欄は残らない
+    #[test]
+    fn update_keeps_keys_outside_old_type_catalog() {
+        use serde_json::json;
+        let mut db = Db::open_in_memory().unwrap();
+        let old = json!({
+            "type": "article-journal", "title": "T", "author": [{"family": "Kano", "given": "S"}],
+            "container-title": "Radiology", "volume": "1", "PMID": "123",
+            "issued": {"date-parts": [[2020]]},
+            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kano2020liver",
+            "custom": {"source": "zotero"}
+        });
+        db.conn
+            .execute("INSERT INTO items (key, csl) VALUES ('ITEM0001', ?1)", [old.to_string()])
+            .unwrap();
+        let get = |db: &Db| -> Value {
+            let s: String = db.conn.query_row("SELECT csl FROM items WHERE key = 'ITEM0001'", [], |r| r.get(0)).unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+        let bibkey = |db: &Db| crate::bibtex::citekey(&get(db), "ITEM0001");
+
+        // GUI の形（その型のカタログの欄だけ・空欄は送らない）: volume を空にし、PMID を外し、title を直す
+        let before_key = bibkey(&db);
+        update_csl(&mut db, "ITEM0001", &json!({
+            "type": "article-journal", "title": "T2", "author": [{"family": "Kano", "given": "S"}],
+            "container-title": "Radiology", "issued": {"date-parts": [[2020]]}, "custom": {"subtype": "review"}
+        })).unwrap();
+        let c = get(&db);
+        assert_eq!(c["title"], "T2");
+        assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}), "accessed は残る");
+        assert_eq!(c["citation-key"], "kano2020liver", "citation-key は残る");
+        assert!(c.get("volume").is_none() && c.get("PMID").is_none(), "カタログ内のキーは入力から外すと消える");
+        assert_eq!(c["custom"], json!({"source": "zotero", "subtype": "review"}));
+        assert_eq!(before_key, "kano2020liver");
+        assert_eq!(bibkey(&db), before_key, "BibTeX の引用キーが変わらない");
+
+        // MCP の形（get_item の csl を直して渡す）: 値を変えれば変わり、空にすれば消える
+        let mut m = get(&db);
+        m["citation-key"] = json!("  kano2020b ");
+        m["accessed"] = json!(null);
+        update_csl(&mut db, "ITEM0001", &m).unwrap();
+        let c = get(&db);
+        assert_eq!(c["citation-key"], "kano2020b");
+        assert!(c.get("accessed").is_none(), "空値は明示の削除");
+
+        // 型を変える: 旧型（article-journal）の欄で新型（webpage）に無いものは残らない。カタログ外の citation-key は残る
+        update_csl(&mut db, "ITEM0001", &json!({
+            "type": "webpage", "title": "T2", "URL": "https://example.org/x",
+            "container-title": "Radiology", "issued": {"date-parts": [[2020]]}
+        })).unwrap();
+        let c = get(&db);
+        assert_eq!(c["type"], "webpage");
+        assert!(c.get("author").is_none(), "入力に無いカタログ内のキーは消える");
+        assert_eq!(c["citation-key"], "kano2020b");
+        // webpage の accessed（カタログ内）を入れてから article-journal へ戻すと、旧型の欄なので残らない
+        let mut w = get(&db);
+        w["accessed"] = json!({"date-parts": [[2025, 1, 2]]});
+        update_csl(&mut db, "ITEM0001", &w).unwrap();
+        assert!(get(&db).get("accessed").is_some());
+        update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2"})).unwrap();
+        let c = get(&db);
+        assert!(c.get("accessed").is_none() && c.get("URL").is_none(), "旧型の欄は新型に混ざらない");
+        assert_eq!(c["citation-key"], "kano2020b");
+        // カタログ外でも、元の CSL に無いキーは入れられない（混入防止は従来どおり）
+        update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2", "bogus": "x"})).unwrap();
+        assert!(get(&db).get("bogus").is_none());
     }
 }

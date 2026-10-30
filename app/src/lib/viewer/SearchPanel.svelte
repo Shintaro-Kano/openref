@@ -5,6 +5,7 @@
      結果はページごとに見出しを挟み、各ヒットは前後文脈つきスニペット（語は <mark>）。クリックでそのヒットへ。
      class は sr- 接頭辞（app.css は単一グローバル）。 */
   import type { SearchHit } from "./util";
+  import { composing } from "../input";
 
   let {
     query,
@@ -53,6 +54,7 @@
       value={query}
       oninput={(e) => onInput(e.currentTarget.value)}
       onkeydown={(e) => {
+        if (composing(e)) return; // IME の確定 Enter・取消 Esc は巡回 / クリアにしない
         if (e.key === "Enter") {
           e.preventDefault();
           if (e.shiftKey) onPrev();

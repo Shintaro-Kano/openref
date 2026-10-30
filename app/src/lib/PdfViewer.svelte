@@ -34,6 +34,7 @@
   import "pdfjs-dist/web/pdf_viewer.css"; // v6: textLayer は公式 CSS + --total-scale-factor が前提
   import { api, type AnnotationRow, type AnnotationPatch } from "./api";
   import { app, toast, type TabViewer } from "./state.svelte";
+  import { composing } from "./input";
   import Toolbar from "./viewer/Toolbar.svelte";
   import SearchPanel from "./viewer/SearchPanel.svelte";
   import HighlightPopover from "./viewer/HighlightPopover.svelte";
@@ -44,6 +45,7 @@
   import { embeddedComments, inertMarkup, type EmbeddedComment } from "./viewer/embedded";
   import {
     normText,
+    matchParts,
     absRotation,
     normRotation,
     fitScale,
@@ -95,7 +97,8 @@
   let embedded = $state<EmbeddedComment[]>([]);
   let embeddedLoading = $state(false);
   let embeddedError = $state("");
-  const filteredEmbedded = $derived(embedded.filter(a=>normText(a.text+" "+a.author).includes(normText(annQuery).trim())));
+  // 本文と著者は別々に照合する（繋いで照合すると本文末尾と著者名を跨いで一致しうる）。照合は自前注釈と同じ matchParts
+  const filteredEmbedded = $derived(embedded.filter((a) => matchParts(a.text, annQuery) || matchParts(a.author, annQuery)));
   let selInfo = $state<{ text: string; page: number } | null>(null);
   let popPos = $state<PopoverPos | null>(null);
   let selColor = $state("yellow");
@@ -125,11 +128,8 @@
   let searchPending = $state(false); // 入力中（デバウンス / prefetch 待ち）
   let searchPanel = $state<{ focusInput: () => void } | null>(null); // SearchPanel インスタンス（⌘F でフォーカス）
   let annQuery = $state(""); // 注釈タブの検索語（quote / コメントに部分一致・大小無視）
-  const filteredAnns = $derived.by(() => {
-    const q = normText(annQuery).trim();
-    if (!q) return anns;
-    return anns.filter((a) => normText(a.quote ?? "").includes(q) || normText(a.comment ?? "").includes(q));
-  });
+  // 絞り込みとカードの強調は同じ matchParts（util.ts）= 一致の有無と <mark> の断片が食い違わない
+  const filteredAnns = $derived(anns.filter((a) => matchParts(a.quote ?? "", annQuery) || matchParts(a.comment ?? "", annQuery)));
   // ページ上のハイライト編集ポップオーバー（クリックで開く）
   let hlEdit = $state<{ key: string; pos: PopoverPos } | null>(null);
   let hlComment = $state("");
@@ -245,21 +245,23 @@
     finally {if(!disposed)embeddedLoading=false;}
   }
 
-  async function renderEmbeddedLayer(page:any,wrap:HTMLElement,viewport:any,gen:number,n:number) {
+  /** L0 = 呼び手の ensureRendered が立てた Layer。layers.get(n) が L0 でなくなったら（解放・描き直し）古い継続なので何もしない */
+  async function renderEmbeddedLayer(page:any,L0:Layer,viewport:any,n:number) {
+    const wrap=L0.wrap;
     try {
       const annotations=inertMarkup(await page.getAnnotations({intent:"display"}));
-      if(disposed || gen!==renderGen || !rendered.has(n) || !annotations.length)return;
+      if(disposed || layers.get(n)!==L0 || !annotations.length)return;
       const div=document.createElement("div");div.className="annotationLayer embedded-annotation-layer";
       div.setAttribute("aria-hidden","true");div.inert=true;
       const layer=new pdfjs.AnnotationLayer({div,page,viewport:viewport.clone({dontFlip:true}),accessibilityManager:null,annotationCanvasMap:null,annotationEditorUIManager:null,structTreeLayer:null,commentManager:null,linkService:null,annotationStorage:null});
       await layer.render({div,page,viewport:viewport.clone({dontFlip:true}),annotations,linkService:null as any,renderForms:false,enableScripting:false,hasJSActions:false});
       // Bundle a local icon rather than resolving PDF-controlled icon names.
       for(const img of div.querySelectorAll("img"))img.src=noteIconUrl;
-      if(disposed || gen!==renderGen || !rendered.has(n)){layer.destroy();return;}
+      if(disposed || layers.get(n)!==L0){layer.destroy();return;}
       // Canvas paints PDF appearances once. This inert layer supplies markup
       // geometry only; comment text is rendered as plain text in the sidebar.
       wrap.appendChild(div);
-    } catch(e){if(!disposed && gen===renderGen)embeddedError=String(e);}
+    } catch(e){if(!disposed && layers.get(n)===L0)embeddedError=String(e);}
   }
 
   // 描画帯（active）と保持帯（keep）を別マージンで二段化＝解放ヒステリシス。
@@ -415,9 +417,13 @@
     if (!wrap) return;
     rendered.add(n);
     const gen = renderGen;
+    // この呼び出しが立てる Layer。以降の継続は layers.get(n) === L0 の間だけ進む（解放 = delete・描き直し = 別の Layer）。
+    // releasePage は renderGen を上げないので、gen と rendered だけでは「同じ世代の解放 → 再描画」の古い継続を止められない
+    let L0: Layer | undefined;
     try {
       const page = await doc.getPage(n);
-      if (gen !== renderGen || !rendered.has(n)) return;
+      // layers.has(n): 解放 → 再描画で重なった同じページの別の呼び出しが先に Layer を立てた（そちらが描く）
+      if (gen !== renderGen || !rendered.has(n) || layers.has(n)) return;
       const rot = absRotation(pageRotates[n], userRotation);
       const viewport = page.getViewport({ scale, rotation: rot });
       const dpr = window.devicePixelRatio || 1;
@@ -447,7 +453,7 @@
       wrap.style.setProperty("--scale-factor", String(scale));
       wrap.style.setProperty("--scale-round-x", "1px");
       wrap.style.setProperty("--scale-round-y", "1px");
-      layers.set(n, {
+      L0 = {
         wrap,
         textLayer,
         hlLayer,
@@ -460,7 +466,8 @@
         blocks: null,
         itemBlock: null,
         selKey: "",
-      });
+      };
+      layers.set(n, L0);
 
       // canvas は render に渡さない（渡すと canvasContext が無視され DPR 変換が失われる v6 挙動）
       const task = page.render({ canvasContext: ctx, viewport });
@@ -470,12 +477,12 @@
       } finally {
         if (renderTasks.get(n) === task) renderTasks.delete(n);
       }
-      if (gen !== renderGen || !rendered.has(n)) return;
+      if (layers.get(n) !== L0) return;
 
-      await renderTextLayer(n, page, textLayer, viewport);
-      if (gen !== renderGen || !rendered.has(n)) return;
-      await renderEmbeddedLayer(page,wrap,viewport,gen,n);
-      if (gen !== renderGen || !rendered.has(n)) return;
+      await renderTextLayer(n, page, L0, viewport);
+      if (layers.get(n) !== L0) return;
+      await renderEmbeddedLayer(page,L0,viewport,n);
+      if (layers.get(n) !== L0) return;
 
       // ハイライト幾何は現在の viewport（scale + rotation）から確定させる。
       const L = layers.get(n);
@@ -501,6 +508,7 @@
       redrawOverlays(n);
     } catch (e) {
       if (disposed || isCancelledRender(e)) return; // invalidateAll/解放/unmount による意図的キャンセルは診断に流さない
+      if (L0 && layers.get(n) !== L0) return; // 古い継続の失敗で、今描いている（または解放済みの）ページを壊さない
       // ページ単位で例外を隔離し、該当ページの位置にエラーを可視化する（握りつぶさない）
       console.error("page", n, e);
       rendered.delete(n);
@@ -613,7 +621,10 @@
     }
   }
 
-  async function renderTextLayer(n: number, page: any, textLayer: HTMLElement, viewport: any) {
+  /** L0 = 呼び手の ensureRendered が立てた Layer（テキスト層は L0.textLayer）。待つ間に解放・描き直しされたら（layers.get(n) !== L0）
+      選択ガードを付けない = 新しい Layer の endDiv を古いテキスト層で上書きしない */
+  async function renderTextLayer(n: number, page: any, L0: Layer, viewport: any) {
+    const textLayer = L0.textLayer;
     let entry = pageTexts.get(n);
     if (!entry) {
       try {
@@ -639,6 +650,7 @@
       if (!tlErr) tlErr = () => `p.${n} TextLayer: ${String(e)}`;
       count = 0;
     }
+    if (layers.get(n) !== L0) return;
     if (count === 0) {
       textLayer.innerHTML = "";
       count = manualTextLayer(content, viewport, textLayer);
@@ -648,7 +660,7 @@
       }
     }
     if (count > 0) {
-      attachSelectionGuard(n, textLayer);
+      attachSelectionGuard(L0);
       ensureSelectionListeners();
     }
   }
@@ -748,9 +760,8 @@
   let guardPrevRange: Range | null = null; // pdf.js の prevRange（start 側が動いているかの判定）
 
   /** テキスト層描画後に endOfContent を付け、mousedown で .selecting を立てる（pdf.js #bindMouse 相当）。 */
-  function attachSelectionGuard(n: number, textLayer: HTMLElement) {
-    const L = layers.get(n);
-    if (!L) return;
+  function attachSelectionGuard(L: Layer) {
+    const textLayer = L.textLayer;
     const end = document.createElement("div");
     end.className = "endOfContent";
     textLayer.append(end);
@@ -1559,9 +1570,12 @@
     }, () => t("✓ ハイライトを保存"));
   }
 
+  /** 注釈カードの × 削除（ページ上の hlDelete と同じ mutateAnn 経路 = 失敗は「✗ …」の toast）。
+      消すカードを編集中 / ページ上で編集ポップオーバーを開いていれば閉じる */
   async function removeAnnotation(key: string) {
-    await api.deleteAnnotation(key);
-    await reloadAnnotations();
+    if (editingKey === key) editingKey = null;
+    if (hlEdit?.key === key) closeHighlightEdit();
+    await mutateAnn(() => api.deleteAnnotation(key), () => t("✓ ハイライトを削除"));
   }
 
   function startAnnotationEdit(a: AnnotationRow) {
@@ -1611,6 +1625,8 @@
   function onKey(e: KeyboardEvent) {
     // 隠れていたビューア（前面でないタブ）・上にエディタ / モーダル / 取込があったときは何もしない（Esc はそちらが扱う）
     if (!frontAtKey || coveredAtKey) return;
+    // IME の変換中のキー（取消の Esc を含む）は入力欄のもの = 選択の取消・編集の取消・タブを閉じるにしない
+    if (composing(e)) return;
     const meta = e.metaKey || e.ctrlKey;
     const el = document.activeElement as HTMLElement | null;
     const inField = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA");
@@ -1886,7 +1902,7 @@
               value={annQuery}
               oninput={(e) => (annQuery = e.currentTarget.value)}
               onkeydown={(e) => {
-                if (e.key === "Escape") {
+                if (e.key === "Escape" && !composing(e)) {
                   e.preventDefault();
                   e.stopPropagation(); // window の Esc ハンドラ（ビューア閉）まで伝播させない
                   if (annQuery) annQuery = "";

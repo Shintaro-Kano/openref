@@ -1253,8 +1253,9 @@ async function runImport() {
   job.cancel = false;
   busyBegin();
   try {
-    // 直列（NCBI 3req/s・DB ロック）。中止はファイル境界で効く
-    let started = 0;
+    // 1 件ずつ await して直列に回す（core は抽出・照会の間 DB ロックを離すので並列にもできるが、Crossref の匿名枠は
+    // 同時 1 本・1 req/s = 並べても core の門で待つだけ。進捗の順序もファイル順のまま）。中止はファイル境界で効く。
+    // NCBI 3 req/s・Crossref の間隔は core（resolver/pubmed.rs・crossref.rs）が要求ごとに守る
     for (let i = 0; i < job.files.length; i++) {
       const f = job.files[i];
       if (f.status !== "pending") continue;
@@ -1262,8 +1263,6 @@ async function runImport() {
         f.status = "canceled";
         continue;
       }
-      // 1 件 = esearch + efetch の 2 連打になるので、ファイル間に 400ms 置いて 3 req/s を守る
-      if (started++ > 0) await new Promise((r) => setTimeout(r, 400));
       f.status = "running";
       try {
         const r = await api.importPdf(f.path);
@@ -1310,7 +1309,12 @@ export function closeImport() {
 export async function restoreSelected() {
   const d = app.detail;
   if (!d) return;
-  await api.restoreItem(d.key);
+  try {
+    await api.restoreItem(d.key);
+  } catch (e) {
+    toast(`✗ ${t("復元できません")}: ${String(e).slice(0, 200)}`);
+    return;
+  }
   toast(t("復元しました"));
   await refreshAll();
 }

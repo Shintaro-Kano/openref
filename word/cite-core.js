@@ -1,5 +1,5 @@
 /* OpenRef cite-core — citeproc-js ラッパ（純ロジック・Office 非依存・node でテスト可能）。
-   引用クラスタの整形と bibliography 生成のみを担う。文書操作は doc.js（Office 層）。 */
+   引用クラスタの整形と bibliography 生成のみを担う。文書操作は呼び手（Word = VBA の ORDoc・app = cite.ts）。 */
 (function (root) {
   "use strict";
 

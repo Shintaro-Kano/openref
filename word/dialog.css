@@ -281,15 +281,6 @@ button {
 .rd-msg.rd-err {
   color: var(--rd-danger);
 }
-.rd-limit {
-  flex: none;
-  background: #fdecea;
-  color: #a50e0e;
-  border-bottom: 1px solid #f5c2bd;
-  font-size: 12px;
-  padding: 6px 16px;
-}
-
 /* ---- 設定 ---- */
 .rd-tabs {
   flex: none;
@@ -481,7 +472,7 @@ button {
   font-size: 12px;
 }
 
-/* ---- Office 外で開いたとき（プレビュー・検証用） ---- */
+/* ---- debug 行（結果を送れなかった理由・プレビューの結果） ---- */
 .rd-debug {
   position: fixed;
   left: 0;

@@ -16,6 +16,8 @@
   /** 並べ替えで掴んでいるタブの id と、見た目のずれ（配列上の枠の左端から px。transform で指に追わせる） */
   let dragId = $state<number | null>(null);
   let dragX = $state(0);
+  /** 追っている最中のドラッグを解く（次の pointerdown で前のが残っていたら先に解く） */
+  let endTabDrag: (() => void) | null = null;
 
   function tip(tab: Tab, v: View): string {
     const front = tab.id === app.tab;
@@ -60,13 +62,17 @@
       DOM の i 番目の rect で測れる（DOM は前回の move までの配列順 = 枠の位置は変わらない）。
       動かずに離した = 従来のクリック（onclick が切替）。ドラッグになったら、離した直後の click は 1 回だけ奪う（指の下が別のタブや
       × に変わっていても切替・閉じるに飛ばない）。離したら掴んだタブを前面に（ブラウザと同じ。処理中なら切替だけ見送られる）。
-      Esc = 掴んだときの順に戻して終える（押したままの指を離したときの click も奪う）。pointerup が来ない経路 = その位置で終える
-      （前面にしない）: pointercancel・window の blur（⌘Tab で他のアプリへ）・contextmenu（⌃クリック・掴んだまま右クリック = OS の
-      メニューが mouseup を飲む）・左ボタンが離れている move（ev.buttons）。
+      Esc = 掴んだときの順に戻して見た目を解く（追跡のリスナーは残す = 押したままの指を離したときの click も奪う）。残したリスナーも
+      pointerup が来ない経路で解ける（下）ので、取りこぼしても後日の無関係な click を奪わない。pointerup が来ない経路 = その位置で
+      終える（前面にしない）: pointercancel・window の blur（⌘Tab で他のアプリへ）・contextmenu（⌃クリック・掴んだまま右クリック =
+      OS のメニューが mouseup を飲む。capture = 一覧の行・サイドバーの oncontextmenu が stopPropagation しても届く）・左ボタンが
+      離れている move（ev.buttons。Esc の後も move は外さず見る）・次の pointerdown（window の capture。別の場所の押下は前の指が離れた印）。
+      一覧の行・ラベルのドラッグ（state.svelte.ts の trackDrag）と骨格は同じ。Esc 用にタブは ended と window capture の redown を足す。
       ドラッグの最中にタブが閉じられた・開かれた（⌘W ⌘T）ら枠を測り直して続け、掴んだタブが消えた・1 枚になったら終える。
       離した後にフォーカスが body へ落ちていたら（動いた DOM = 掴んだタブ自身が外れて戻ると外れる）掴んだタブに戻す（← → が続く） */
   function onTabDown(e: PointerEvent, id: number) {
     if (e.button !== 0 || e.ctrlKey || !e.isPrimary || app.tabs.length < 2 || !listEl) return;
+    endTabDrag?.();
     const list = listEl;
     const item = (e.target as HTMLElement | null)?.closest<HTMLElement>(".tabs-item");
     if (!item) return;
@@ -75,8 +81,10 @@
     const grab = e.clientX - item.getBoundingClientRect().left; // 掴んだ点のタブ内の位置
     let started = false;
     let order: number[] = []; // 掴んだときの順（Esc で戻す）
+    let ended = false; // 見た目は解いた（Esc・タブが消えた）。指が離れる（pointerup・取りこぼしの検知）まで追跡だけ残す
     const move = (ev: PointerEvent) => {
       if (!(ev.buttons & 1)) return cancel(); // 左ボタンが離れている = pointerup を取りこぼした
+      if (ended) return;
       if (!started) {
         if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) return;
         started = true;
@@ -86,7 +94,7 @@
         window.addEventListener("keydown", key, true); // Esc はドラッグが始まってから奪う（押しているだけなら App の Esc）
       }
       const from = app.tabs.findIndex((t) => t.id === id);
-      if (from < 0 || app.tabs.length < 2) return stop(); // 掴んだタブが閉じられた（⌘W）・1 枚だけ残った
+      if (from < 0 || app.tabs.length < 2) return stop(); // 掴んだタブが閉じられた（⌘W）・1 枚だけ残った（離すまで追跡は残る）
       // 枠 i の左端（レイアウト上の位置）。掴んだタブ（DOM では from 番目）の rect は transform の分ずれているので戻す
       // （dragX は前回の move で書いた値 = この時点で DOM に反映済み）
       const items = [...list.querySelectorAll<HTMLElement>(".tabs-item")];
@@ -103,26 +111,29 @@
       if (to !== from) moveTab(id, to);
       dragX = left - slots[to];
     };
-    /** 見た目と move を解く（pointerup のリスナーは残す = 離したときの click を奪う） */
+    /** 見た目を解く（pointermove・pointerup 等のリスナーは残す = 離したときの click を奪う・取りこぼしは move が検知する） */
     const stop = () => {
-      window.removeEventListener("pointermove", move);
+      ended = true;
       window.removeEventListener("keydown", key, true);
       document.body.classList.remove("dragging");
       if (dragId === id) dragId = null;
       dragX = 0;
     };
-    /** 終わり。activate = pointerup で離した（pointercancel / blur は前面にしない） */
-    const finish = (activate: boolean) => {
+    /** 終わり。activate = pointerup で離した（pointercancel / blur は前面にしない）。swallow = 直後の click を奪う（次の押下で解く
+        ときは、その押下の click を奪わないよう false） */
+    const finish = (activate: boolean, swallow = true) => {
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
       window.removeEventListener("blur", cancel);
-      window.removeEventListener("contextmenu", cancel);
+      window.removeEventListener("contextmenu", cancel, true);
+      window.removeEventListener("pointerdown", redown, true);
       window.removeEventListener("pointermove", move);
       window.removeEventListener("keydown", key, true);
+      if (endTabDrag === endForNext) endTabDrag = null;
       if (!started) return; // クリック → onclick が切替
       const dropped = dragId === id && activate; // Esc で取り消していない・掴んだタブが消えていない
       stop();
-      swallowClick();
+      if (swallow) swallowClick();
       if (dropped && app.tab !== id) void activateTab(id);
       void tick().then(() => {
         if (document.activeElement !== document.body) return; // 入力欄などにあるフォーカスは奪わない
@@ -132,6 +143,11 @@
     };
     const up = () => finish(true);
     const cancel = () => finish(false);
+    /** 次の押下が来た = 前の指はもう離れている（pointerup を取りこぼした）。その click を奪わないよう先に解く（click を奪わない） */
+    const endForNext = () => finish(false, false);
+    const redown = (ev: PointerEvent) => {
+      if (ev.isPrimary) endForNext();
+    };
     const key = (ev: KeyboardEvent) => {
       if (ev.key !== "Escape") return;
       ev.preventDefault();
@@ -140,11 +156,13 @@
       // 掴んだときの順に戻す（その間に開いたタブは後ろに残る・閉じたタブは飛ばす）
       order.filter((x) => app.tabs.some((t) => t.id === x)).forEach((x, i) => moveTab(x, i));
     };
+    endTabDrag = endForNext;
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", cancel);
     window.addEventListener("blur", cancel);
-    window.addEventListener("contextmenu", cancel);
+    window.addEventListener("pointerdown", redown, true);
+    window.addEventListener("contextmenu", cancel, true); // capture = フォルダ行などの oncontextmenu が stopPropagation しても届く
   }
 
   /** ドラッグの直後の click と dblclick を 1 回ずつ奪う（タブの切替・× の閉じる・列の空きのダブルクリック = 新しいタブに飛ばない）。

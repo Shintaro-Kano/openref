@@ -15,6 +15,7 @@
     toggleFolderCollapsed,
     type View,
   } from "./state.svelte";
+  import { composing } from "./input";
 
   function isActive(kind: string, id?: number): boolean {
     const v = app.view as any;
@@ -227,7 +228,7 @@
         bind:value={labelQ}
         placeholder="Search labels"
         onkeydown={(e) => {
-          if (e.key === "Escape") {
+          if (e.key === "Escape" && !composing(e)) {
             e.stopPropagation();
             if (labelQ) labelQ = "";
             else toggleSearch();

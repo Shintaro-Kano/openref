@@ -518,6 +518,88 @@ fn retraction_flag_persisted() {
     assert!(flag.unwrap().contains("RetractionIn"));
 }
 
+/// resolver の応答に見立てる（撤回なし・PubMed 由来）
+fn enriched(csl: serde_json::Value) -> Resolved {
+    Resolved { csl, retracted: None, source: "pubmed" }
+}
+
+/// refresh / enrich（merge_enrichment）が resolver の撤回情報を印に写す（以前は取込時の add_item しか書かず、
+/// 登録後に撤回された論文は refresh しても印が付かなかった）。None は「分からない」なので既存の印を消さない
+#[test]
+fn refresh_writes_retraction_flag() {
+    let mut db = Db::open_in_memory().unwrap();
+    let added = ingest::add_item(&mut db, &fake_resolved()).unwrap();
+    assert!(search::retraction_of(&db, added.id).unwrap().is_none());
+    let flag_row = |db: &Db| -> (String, String, String) {
+        db.conn
+            .query_row(
+                "SELECT status, detail, source FROM retraction_flags WHERE item_id = ?1",
+                [added.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+
+    // 書誌は同じ・撤回だけが新しく付く → 変化あり
+    let mut r = fake_resolved();
+    r.source = "pubmed";
+    r.retracted = Some("PubMed PublicationType: Retracted Publication".into());
+    assert!(ingest::merge_enrichment(&mut db, added.id, &r).unwrap());
+    assert_eq!(
+        flag_row(&db),
+        ("retracted".into(), "PubMed PublicationType: Retracted Publication".into(), "pubmed".into())
+    );
+    assert!(search::list_items(&db, &search::ListFilter::default()).unwrap()[0].retracted);
+    // 同じ撤回をもう一度 → 変化なし（行は 1 つのまま）
+    assert!(!ingest::merge_enrichment(&mut db, added.id, &r).unwrap());
+    // 撤回の詳細が変わった（撤回通知が付いた）→ UPSERT で更新
+    r.retracted = Some("RetractionIn: Test Journal 2027".into());
+    assert!(ingest::merge_enrichment(&mut db, added.id, &r).unwrap());
+    assert_eq!(flag_row(&db).1, "RetractionIn: Test Journal 2027");
+    let n: i64 = db
+        .conn
+        .query_row("SELECT count(*) FROM retraction_flags WHERE item_id = ?1", [added.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    // resolver が撤回を返さない（Crossref は撤回を見ない）→ 印は残す
+    r.retracted = None;
+    r.source = "crossref";
+    assert!(!ingest::merge_enrichment(&mut db, added.id, &r).unwrap());
+    assert_eq!(flag_row(&db).1, "RetractionIn: Test Journal 2027");
+
+    // 同一性ガードで弾かれた（識別子が別論文を指す）ときは撤回も写さない
+    let mut other = fake_resolved();
+    other.csl["DOI"] = json!("10.9999/openref.test.2");
+    other.csl["PMID"] = json!("99999998");
+    other.csl["title"] = json!("Another unrelated paper about cardiac MRI");
+    let k2 = ingest::add_item(&mut db, &other).unwrap();
+    let mut wrong = fake_resolved();
+    wrong.retracted = Some("PubMed PublicationType: Retracted Publication".into());
+    assert!(matches!(
+        ingest::merge_enrichment(&mut db, k2.id, &wrong),
+        Err(CoreError::BadInput(_))
+    ));
+    assert!(search::retraction_of(&db, k2.id).unwrap().is_none());
+}
+
+/// reindex_keys の件数は実際に貼り直した item の数（同じ key を重ねても 1 件）・知らない key があれば何も書かない
+#[test]
+fn reindex_keys_counts_distinct_items() {
+    let mut db = Db::open_in_memory().unwrap();
+    let k = ingest::add_item(&mut db, &fake_resolved()).unwrap().key;
+    assert_eq!(ingest::reindex_keys(&mut db, &[k.clone(), k.clone()]).unwrap(), 1);
+    assert_eq!(ingest::reindex_keys(&mut db, std::slice::from_ref(&k)).unwrap(), 1);
+    assert!(matches!(
+        ingest::reindex_keys(&mut db, &[k.clone(), "NOPE0000".into()]),
+        Err(CoreError::NotFound(_))
+    ));
+    let creators: i64 = db
+        .conn
+        .query_row("SELECT count(*) FROM creators_index", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(creators, 2, "重ねて貼り直しても著者の索引は 2 行のまま");
+}
+
 #[test]
 fn membership_counts_for_bulk_toolbar() {
     use openref_core::{edit, tags};
@@ -1229,7 +1311,7 @@ fn enrich_replaces_scraped_type_with_registry_type() {
         "PMID": "42490331",
         "custom": {"source": "pubmed"}
     });
-    assert!(ingest::merge_enrichment(&mut db, added.id, &richer).unwrap());
+    assert!(ingest::merge_enrichment(&mut db, added.id, &enriched(richer.clone())).unwrap());
     let item = search::get_by_key(&db, &added.key).unwrap().unwrap();
     assert_eq!(item.csl["type"], "article-journal");
     assert_eq!(item.csl["URL"], "https://pubs.rsna.org/doi/epdf/10.1148/rg.250127", "URL は既存を保持");
@@ -1239,10 +1321,124 @@ fn enrich_replaces_scraped_type_with_registry_type() {
         .unwrap();
     assert_eq!(t, "article-journal", "生成列も追随");
     // 2 回目は変更なし
-    assert!(!ingest::merge_enrichment(&mut db, added.id, &richer).unwrap());
+    assert!(!ingest::merge_enrichment(&mut db, added.id, &enriched(richer.clone())).unwrap());
     // CSL に無い型名は受けない（type は据え置き・他に差分が無ければ false）
     let odd = json!({"type": "posted-content", "title": title});
-    assert!(!ingest::merge_enrichment(&mut db, added.id, &odd).unwrap());
+    assert!(!ingest::merge_enrichment(&mut db, added.id, &enriched(odd)).unwrap());
     let item = search::get_by_key(&db, &added.key).unwrap().unwrap();
     assert_eq!(item.csl["type"], "article-journal");
+}
+
+/// enrich が著者を差し替えたら creators_index（著者チップの絞り込み）も追随する（以前は FTS と
+/// journal_keys だけを貼り替え、creators_index は connector の壊れた姓名分割のまま残っていた）。
+#[test]
+fn enrich_reindexes_creators() {
+    let mut db = Db::open_in_memory().unwrap();
+    let title = "Diagnostic Performance of PET in Recurrent Disease";
+    let scraped = Resolved {
+        csl: json!({
+            "type": "article-journal",
+            "title": title,
+            "DOI": "10.1234/x1",
+            "author": [{"family": "S", "given": "Houshmand"}]
+        }),
+        retracted: None,
+        source: "connector",
+    };
+    let added = ingest::add_item(&mut db, &scraped).unwrap();
+    let creators = |db: &Db| -> Vec<(i64, Option<String>, Option<String>)> {
+        let mut st = db
+            .conn
+            .prepare("SELECT position, family, given FROM creators_index WHERE item_id = ?1 AND role = 'author' ORDER BY position")
+            .unwrap();
+        st.query_map([added.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(creators(&db), vec![(0, Some("S".into()), Some("Houshmand".into()))]);
+    let richer = json!({
+        "type": "article-journal",
+        "title": title,
+        "DOI": "10.1234/x1",
+        "author": [{"family": "Houshmand", "given": "Sina"}, {"family": "Alavi", "given": "Abass"}]
+    });
+    assert!(ingest::merge_enrichment(&mut db, added.id, &enriched(richer.clone())).unwrap());
+    assert_eq!(
+        creators(&db),
+        vec![
+            (0, Some("Houshmand".into()), Some("Sina".into())),
+            (1, Some("Alavi".into()), Some("Abass".into())),
+        ],
+        "creators_index が CSL の author と一致する"
+    );
+    // 著者チップ（creators_index の family）で引ける・古い姓では引けない
+    let by_family = |fam: &str| {
+        search::list_items(
+            &db,
+            &search::ListFilter { author_family: Some(fam.into()), ..Default::default() },
+        )
+        .unwrap()
+        .len()
+    };
+    assert_eq!(by_family("Houshmand"), 1);
+    assert_eq!(by_family("S"), 0);
+}
+
+/// 移行（apply）で取り込んだ書誌も和文 FTS（cjk per-char phrase）と英語の複語で引ける。
+/// 旧 Paperpile importer のテスト（tests/import_paperpile.rs・2-1 で削除）が守っていた検査を、現行の取込経路で守る。
+#[test]
+fn migrated_records_are_searchable_in_japanese_and_english() {
+    use openref_core::import::{self, apply, files::AttachmentRoots, ImportSource};
+    use std::sync::atomic::AtomicBool;
+    let dir = std::env::temp_dir().join(format!(
+        "openref-fts-apply-{}-{}",
+        std::process::id(),
+        openref_core::keys::new_key()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let json_path = dir.join("lib.json");
+    std::fs::write(
+        &json_path,
+        json!([
+            {
+                "_id": "r1", "pubtype": "PP_ARTICLE",
+                "title": "Import Test Article",
+                "author": [{"first": "Taro", "last": "Test"}],
+                "journalfull": "Test Journal",
+                "doi": "10.5555/import.test", "pmid": "55555555",
+                "published": {"year": "2026", "month": "7"},
+                "abstract": "An abstract about importing references."
+            },
+            {
+                "_id": "r2", "pubtype": "PP_ARTICLE",
+                "title": "和文誌テスト論文（DOI・PMID なし）",
+                "author": [{"first": "花子", "last": "検証"}],
+                "journalfull": "日本テスト放射線学会雑誌",
+                "published": {"year": "2025"}
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let input = import::paperpile::read_input(
+        &json_path,
+        ImportSource { id: "fts-test".into(), format: "paperpile".into() },
+    )
+    .unwrap();
+    let roots = AttachmentRoots::new(std::slice::from_ref(&dir)).unwrap();
+    let db_path = dir.join("library/openref.sqlite");
+    let preview = apply::prepare(&db_path, &input, &roots, import::AttachmentMode::Copy).unwrap();
+    apply::execute(&db_path, &json_path, &input, &preview, &roots, &AtomicBool::new(false), |_| {})
+        .unwrap();
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(search::counts(&db).unwrap().items, 2);
+    assert_eq!(search::search(&db, "テスト論文", 5).unwrap().len(), 1);
+    assert_eq!(search::search(&db, "胆道", 5).unwrap().len(), 0); // 収載外の語は当然ヒットしない
+    assert_eq!(search::search(&db, "検証", 5).unwrap().len(), 1); // 和文著者 family
+    assert_eq!(search::search(&db, "放射線学会雑誌", 5).unwrap().len(), 1); // 誌名の部分一致
+    assert_eq!(search::search(&db, "importing references", 5).unwrap().len(), 1); // 英語の複語
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

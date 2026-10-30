@@ -1,16 +1,36 @@
 //! doi.org content negotiation（Accept: CSL-JSON）。
 //! Crossref / DataCite 両 agency をこの 1 経路でカバーする（PubMed 非収載 DOI の fallback）。
 
+use super::pubmed::{call_with_retry_paced, Throttle};
 use super::Resolved;
 use crate::Result;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Crossref への要求どうしの最小間隔。匿名（mailto なし）の公開プールは応答ヘッダで `x-rate-limit-limit: 1`・
+/// `x-rate-limit-interval: 1s`・`x-concurrency-limit: 1` を返す → 同時 1 本（前の応答を受け取るまで次を送らない）・
+/// 前の送信から間隔を空ける。間隔は 1 s ちょうどにしない: 要求ごとに agent を作り直すので TLS / DNS の揺らぎで Crossref 側の
+/// 到着間隔は送信間隔より縮みうる（EUTILS_INTERVAL の 333 → 400 ms と同じ理由）→ 余裕を取って 1.1 s
+const CROSSREF_INTERVAL: Duration = Duration::from_millis(1100);
+
+/// Crossref の門（**プロセス単位の static**・同時 1 本 + `CROSSREF_INTERVAL`）。api.crossref.org の書誌検索・
+/// works/{doi}（pdffetch の link[]）と、doi.org の content negotiation（Crossref 登録の DOI は api.crossref.org の
+/// transform へ転送され、同じ公開プールの上限に数えられる）が通る。DB ロックの外で並行に呼ばれる connectd /
+/// Tauri の取込でも直列に並ぶ。app・connectd・MCP をまたぐ協調は無い（EUTILS_THROTTLE と同じ）
+static CROSSREF_GATE: Throttle = Throttle::new(CROSSREF_INTERVAL);
+
+/// Crossref の門を通して `f` を 1 本だけ走らせる。`f` は各送信の直前に渡された `pace` を呼ぶ
+pub(crate) fn with_crossref_gate<T>(f: impl FnOnce(&dyn Fn()) -> T) -> T {
+    CROSSREF_GATE.exclusive(f)
+}
 
 pub fn fetch_by_doi(doi: &str) -> Result<Resolved> {
     let url = format!("https://doi.org/{doi}");
     let req = super::pubmed::agent()
         .get(&url)
         .set("Accept", "application/vnd.citationstyles.csl+json");
-    let body = super::pubmed::call_with_retry(req, &format!("doi.org negotiation ({doi})"))?;
+    let what = format!("doi.org negotiation ({doi})");
+    let body = with_crossref_gate(|pace| call_with_retry_paced(req, &what, pace))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(Resolved {
         csl: normalize(v),
@@ -37,7 +57,7 @@ pub fn search_bibliographic(q: &str, rows: usize) -> Result<Vec<Candidate>> {
         .query("query.bibliographic", q)
         .query("rows", &rows.to_string())
         .query("select", "DOI,title,author,issued,container-title,type");
-    let body = super::pubmed::call_with_retry(req, "crossref search")?;
+    let body = with_crossref_gate(|pace| call_with_retry_paced(req, "crossref search", pace))?;
     let v: Value = serde_json::from_str(&body)?;
     let items = v
         .pointer("/message/items")

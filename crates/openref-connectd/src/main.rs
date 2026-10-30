@@ -22,8 +22,37 @@ use std::sync::{Arc, Mutex};
 
 pub struct St {
     pub db: Mutex<Db>,
-    /// sessionID → (connector item id → openref item key)
-    sessions: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// sessionID → (connector item id → openref item key)。直近 `MAX_SESSIONS` 件だけ
+    sessions: Mutex<Sessions>,
+}
+
+/// Zotero Connector の session（保存 1 回ごとに新しい sessionID）を覚えておく数。saveAttachment / updateSession /
+/// hasAttachmentResolvers は saveItems の直後に同じ session で来る → 直近の数十件で足りる。常駐（KeepAlive）でも増え続けない
+const MAX_SESSIONS: usize = 64;
+
+/// sessionID → (connector item id → openref item key)。上限を超えたら最後に書き込まれたのが最も古い session を捨てる
+#[derive(Default)]
+struct Sessions {
+    map: HashMap<String, (u64, HashMap<String, String>)>,
+    tick: u64,
+}
+
+impl Sessions {
+    fn insert(&mut self, session: &str, connector_id: &str, key: &str) {
+        self.tick += 1;
+        let e = self.map.entry(session.to_string()).or_default();
+        e.0 = self.tick;
+        e.1.insert(connector_id.to_string(), key.to_string());
+        if self.map.len() > MAX_SESSIONS {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, session: &str) -> Option<&HashMap<String, String>> {
+        self.map.get(session).map(|(_, m)| m)
+    }
 }
 
 impl St {
@@ -32,7 +61,7 @@ impl St {
     pub fn db(&self) -> std::sync::MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
-    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<String, String>>> {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -75,7 +104,7 @@ async fn main() {
     };
     let st = Arc::new(St {
         db: Mutex::new(db),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(Sessions::default()),
     });
 
     let app = Router::new()
@@ -293,10 +322,7 @@ async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse
             add_to_folder(&st.db(), &key, cid, "connector");
         }
         if let Some(cid_str) = &ci.connector_id {
-            st.sessions()
-                .entry(session.clone())
-                .or_default()
-                .insert(cid_str.clone(), key.clone());
+            st.sessions().insert(&session, cid_str, &key);
         }
 
         // 非同期 enrich: PMID/DOI があれば PubMed/doi.org でリッチ書誌を補完
@@ -311,13 +337,27 @@ async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse
             tokio::task::spawn_blocking(move || {
                 if let Ok(richer) = resolver::resolve(&input) {
                     let mut db = st2.db();
-                    let id: Option<i64> = db
+                    // 変化の中身（書誌の補完 / 撤回の印）をログで分けるため、前の CSL を控える
+                    let row: Option<(i64, String)> = db
                         .conn
-                        .query_row("SELECT id FROM items WHERE key = ?1", [key2.as_str()], |r| r.get(0))
+                        .query_row("SELECT id, csl FROM items WHERE key = ?1", [key2.as_str()], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })
                         .ok();
-                    if let Some(id) = id {
-                        match ingest::merge_enrichment(&mut db, id, &richer.csl) {
-                            Ok(true) => eprintln!("enrich: {key2} に abstract/MeSH 等を補完"),
+                    if let Some((id, before)) = row {
+                        match ingest::merge_enrichment(&mut db, id, &richer) {
+                            Ok(true) => {
+                                let after: Option<String> = db
+                                    .conn
+                                    .query_row("SELECT csl FROM items WHERE id = ?1", [id], |r| r.get(0))
+                                    .ok();
+                                if after.as_deref() != Some(before.as_str()) {
+                                    eprintln!("enrich: {key2} に abstract/MeSH 等を補完");
+                                }
+                                if let Some(r) = &richer.retracted {
+                                    eprintln!("enrich: {key2} に撤回の印: {r}");
+                                }
+                            }
                             Ok(false) => {}
                             Err(e) => eprintln!("enrich: {key2} 失敗: {e}"),
                         }
@@ -524,6 +564,19 @@ fn fetch_pdf_unlocked(st: &St, key: &str) -> openref_core::Result<pdffetch::Fetc
     pdffetch::fetch_pdf_attach(&db, &plan, dl)
 }
 
+/// PDF 取込（pdfingest の 3 段）: ① md5 照合と ③ 登録・添付だけロックを取り、② 冒頭 2 頁の抽出・resolver・題名検索は
+/// ロックの外（取込中も /capture/status・Word・他の保存を止めない）。戻り値の guard は ③ のロック = 呼び手は続けて
+/// 同じロックの中で要確認 stub を作る（③ の md5 再照合と stub 作成の間に同じ PDF の別の取込が割り込まない）
+fn ingest_pdf_unlocked<'a>(
+    st: &'a St,
+    bytes: &[u8],
+    src_name: &str,
+    opts: &pdfingest::IngestOpts,
+) -> (std::sync::MutexGuard<'a, Db>, openref_core::Result<pdfingest::IngestReport>) {
+    let Ok(r) = pdfingest::ingest_pdf_bytes_unlocked(|| Ok::<_, std::convert::Infallible>(st.db()), bytes, src_name, None, opts);
+    r
+}
+
 /// 誌面 PDF が取れなかった時に connector が問い合わせてくる: OA 経路の当てがあるか
 async fn has_attachment_resolvers(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
     let p: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
@@ -586,12 +639,12 @@ async fn save_standalone_attachment(
     let st2 = st.clone();
     // body（axum の Bytes）をそのまま blocking 側へ渡す（複製もファイルへの書き出しもしない）
     let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut db = st2.db();
         // /capture/pdf と同じ報告経路（理由・警告・要確認ラベル・import_note・Err のログ）
         let opts = pdfingest::IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
         let src_name = format!("{}.pdf", safe_filename_stem(&strip_pdf_suffix(&title)));
+        let (mut db, res) = ingest_pdf_unlocked(&st2, &body, &src_name, &opts);
         let (outcome, warnings, stub_reason, fail, info_title, md5) =
-            match pdfingest::ingest_pdf_bytes_report(&mut db, &body, &src_name, None, &opts) {
+            match res {
                 Ok(r) => (Some(r.outcome), r.warnings, r.reason, None, r.info_title, Some(r.md5)),
                 Err(e) => (None, Vec::new(), None, Some(e.to_string()), None, None),
             };
@@ -703,7 +756,8 @@ async fn capture_collections(State(st): State<Arc<St>>) -> impl IntoResponse {
 
 /// `/capture/save` と `/capture/pdf` の共通戻り値（popup がそのまま表示する）。
 /// ゴミ箱内の item（`get_by_key` が返さない）は trashed=true の最小形で返す（md5 重複の相手がゴミ箱のとき）。
-fn summarize_item(db: &Db, key: &str, status: &str, retraction: &Option<String>) -> Result<Value, String> {
+/// 撤回の印は DB（retraction_flags）から引く = 新規・既存一致・Duplicate のどれでも同じ警告（popup の「撤回論文の可能性」）
+fn summarize_item(db: &Db, key: &str, status: &str) -> Result<Value, String> {
     let Some(it) = search::get_by_key(db, key).map_err(|e| e.to_string())? else {
         return Ok(json!({ "key": key, "status": status, "trashed": true }));
     };
@@ -715,6 +769,11 @@ fn summarize_item(db: &Db, key: &str, status: &str, retraction: &Option<String>)
             |r| r.get(0),
         )
         .unwrap_or(0);
+    // 読めなければ応答は null のまま（保存は成功している）だが、黙って落とさずログに残す
+    let retraction = search::retraction_of(db, it.id).unwrap_or_else(|e| {
+        eprintln!("capture: {key} の撤回の印を読めず（応答は null）: {e}");
+        None
+    });
     Ok(json!({
         "key": key,
         "status": status,
@@ -730,6 +789,15 @@ fn summarize_item(db: &Db, key: &str, status: &str, retraction: &Option<String>)
     }))
 }
 
+/// `/capture/save` の要求（trim 済み・空は None・DOI は小文字）
+struct SaveReq {
+    doi: Option<String>,
+    pmid: Option<String>,
+    title: Option<String>,
+    url: Option<String>,
+    collection_id: Option<i64>,
+}
+
 /// {doi?, pmid?, url?, title?, collection_id?} → 書誌確定して登録（既存なら existing を返す）
 async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
     let p: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
@@ -740,60 +808,100 @@ async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRespon
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let doi = clean("doi").map(|d| d.to_lowercase());
-    let pmid = clean("pmid");
-    let title = clean("title");
-    let url = clean("url");
-    let collection_id = p.get("collection_id").and_then(|v| v.as_i64());
+    let req = SaveReq {
+        doi: clean("doi").map(|d| d.to_lowercase()),
+        pmid: clean("pmid"),
+        title: clean("title"),
+        url: clean("url"),
+        collection_id: p.get("collection_id").and_then(|v| v.as_i64()),
+    };
 
     let st2 = st.clone();
-    let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        let mut db = st2.db();
-        // dedup 先行（登録済みなら resolver を呼ばない）
-        let (key, status, retraction) = match search::find_by_ids(&db, pmid.as_deref(), doi.as_deref()) {
-            Ok(Some((_id, key))) => (key, "existing", None),
-            _ => {
-                let input = pmid
-                    .clone()
-                    .map(resolver::AddInput::Pmid)
-                    .or_else(|| doi.clone().map(resolver::AddInput::Doi));
-                let resolved = match input {
-                    Some(i) => resolver::resolve(&i).map_err(|e| e.to_string())?,
-                    None => {
-                        // 識別子ゼロ: 捏造せず、ページ情報だけで document を作る
-                        let t = title.ok_or("DOI / PMID もタイトルも見つかりません")?;
-                        resolver::Resolved {
-                            csl: json!({
-                                "type": "document",
-                                "title": t,
-                                "URL": url,
-                                "custom": { "source": "capture" }
-                            }),
-                            retracted: None,
-                            source: "capture",
-                        }
-                    }
-                };
-                match ingest::add_item(&mut db, &resolved) {
-                    Ok(added) => (added.key, "created", resolved.retracted),
-                    Err(openref_core::CoreError::Duplicate { existing_key, .. }) => (existing_key, "existing", None),
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        };
-        if let Some(cid) = collection_id {
-            add_to_folder(&db, &key, cid, "capture");
-        }
-        if status == "created" {
-            eprintln!("capture: 新規 {key}");
-        }
-        summarize_item(&db, &key, status, &retraction)
-    })
-    .await;
+    let res = tokio::task::spawn_blocking(move || capture_save_unlocked(&st2, req, resolver::resolve)).await;
     match res {
         Ok(Ok(v)) => zjson(StatusCode::OK, v),
         Ok(Err(e)) => zjson(StatusCode::UNPROCESSABLE_ENTITY, json!({ "error": e })),
         Err(e) => zjson(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `/capture/save` の本体（blocking）。① ロックして dedup（登録済みなら resolver を呼ばない）→ ② **ロックを離して** resolver
+/// （PubMed / doi.org・Crossref の門の列に並ぶ = 数秒〜数十秒。その間も Word・他の /capture/* を止めない）→ ③ 再ロックして登録。
+/// ① と ③ の間に同じ識別子が別経路で入っていたら、③ の add_item が Duplicate を返す → existing（新しい分岐は要らない）
+fn capture_save_unlocked(
+    st: &St,
+    req: SaveReq,
+    resolve: impl FnOnce(&resolver::AddInput) -> openref_core::Result<resolver::Resolved>,
+) -> Result<Value, String> {
+    let mut db = st.db();
+    let mut dup_retraction: Option<String> = None;
+    let (key, status) = match search::find_by_ids(&db, req.pmid.as_deref(), req.doi.as_deref()) {
+        Ok(Some((_id, key))) => (key, "existing"),
+        _ => {
+            drop(db);
+            let input = req
+                .pmid
+                .clone()
+                .map(resolver::AddInput::Pmid)
+                .or_else(|| req.doi.clone().map(resolver::AddInput::Doi));
+            let resolved = match input {
+                Some(i) => resolve(&i).map_err(|e| e.to_string())?,
+                None => {
+                    // 識別子ゼロ: 捏造せず、ページ情報だけで document を作る
+                    let t = req.title.ok_or("DOI / PMID もタイトルも見つかりません")?;
+                    resolver::Resolved {
+                        csl: json!({
+                            "type": "document",
+                            "title": t,
+                            "URL": req.url,
+                            "custom": { "source": "capture" }
+                        }),
+                        retracted: None,
+                        source: "capture",
+                    }
+                }
+            };
+            db = st.db();
+            match ingest::add_item(&mut db, &resolved) {
+                Ok(added) => (added.key, "created"),
+                Err(openref_core::CoreError::Duplicate { existing_key, .. }) => {
+                    // ② の間に別経路（同じ connectd の saveItems 等）が先に登録した: resolver が返した撤回を捨てない
+                    if let Some(r) = &resolved.retracted {
+                        dup_retraction = Some(r.clone());
+                        record_retraction(&mut db, &existing_key, &resolved, r);
+                    }
+                    (existing_key, "existing")
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    };
+    if let Some(cid) = req.collection_id {
+        add_to_folder(&db, &key, cid, "capture");
+    }
+    if status == "created" {
+        eprintln!("capture: 新規 {key}");
+    }
+    let mut v = summarize_item(&db, &key, status)?;
+    // 題名ガードで印を書けなかったときも、resolver が撤回と言った警告は応答に出す（警告を黙って外さない）
+    if let (Some(r), Some(o)) = (dup_retraction, v.as_object_mut()) {
+        if o.get("retraction").is_some_and(Value::is_null) {
+            o.insert("retraction".into(), json!(r));
+        }
+    }
+    Ok(v)
+}
+
+/// ③ の Duplicate の相手に resolver の撤回の印を書く（merge_enrichment = 題名ガード付き・権威フィールドの補完も同じ応答で）。
+/// 失敗・ガードでの却下はエラーにせずログへ（保存そのものは existing で成功）
+fn record_retraction(db: &mut Db, key: &str, resolved: &resolver::Resolved, detail: &str) {
+    match search::get_by_key(db, key) {
+        Ok(Some(it)) => match ingest::merge_enrichment(db, it.id, resolved) {
+            Ok(_) => eprintln!("capture: {key} に撤回の印: {detail}"),
+            Err(e) => eprintln!("capture: {key} に撤回の印を書けず: {e}"),
+        },
+        Ok(None) => eprintln!("capture: {key} はゴミ箱内 → 撤回の印を書かない"),
+        Err(e) => eprintln!("capture: {key} を読めず撤回の印を書けない: {e}"),
     }
 }
 
@@ -878,7 +986,7 @@ async fn capture_attachment(
                 doi_check
             }
         };
-        // ③ 再ロックして添付。md5 の意味論は GUI 一括取込(ingest_pdf_report → attach_or_skip_with_md5)と同じ:
+        // ③ 再ロックして添付。md5 の意味論は GUI 一括取込(pdfingest の ③ → attach_or_skip_with_md5)と同じ:
         // 未添付なら添付 / 同一ファイル（md5 一致）ならスキップ / 別ファイルなら 2 本目として添付
         let db = st2.db();
         match pdfingest::attach_or_skip_with_md5(&db, &key, &filename, &body, &md5) {
@@ -922,7 +1030,7 @@ fn not_pdf(body: &[u8]) -> Value {
 
 /// body = PDF バイト列、query = collection_id / title / url（ヒント）。**PDF タブからの取込の本命経路**。
 /// 冒頭テキストの DOI/PMID → resolver → 新規登録 or 既存 item へ添付（GUI の一括取込と同じ
-/// `pdfingest::ingest_pdf_report`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
+/// pdfingest の 3 段 = `ingest_pdf_unlocked`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
 /// 識別子が無い・本文の識別子を解決できない（doi.org 404 等）ときは、従来どおりの capture stub（type document・題名は
 /// Info /Title が妥当ならそれ、無ければタブ題名・URL・custom.source=capture）を作って添付し、ラベル「要確認」を付ける
 /// （PDF を失わない = save_standalone_attachment と同じ方針）。
@@ -964,12 +1072,12 @@ fn capture_pdf_ingest(
     collection_id: Option<i64>,
 ) -> Result<Value, String> {
     use pdfingest::PdfIngestOutcome as O;
-    let mut db = st.db();
     let opts = pdfingest::IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
     // 元ファイル名はタブ題名から（csl_filename=true なので添付名には使われない。stub の題名は capture_stub が決める）
     let src_name = format!("{}.pdf", safe_filename_stem(&title_hint.as_deref().map(strip_pdf_suffix).unwrap_or_default()));
+    let (mut db, res) = ingest_pdf_unlocked(st, bytes, &src_name, &opts);
     let (outcome, warnings, stub_reason, fail, info_title, md5) =
-        match pdfingest::ingest_pdf_bytes_report(&mut db, bytes, &src_name, None, &opts) {
+        match res {
             Ok(r) => (Some(r.outcome), r.warnings, r.reason, None, r.info_title, Some(r.md5)),
             Err(e) => (None, Vec::new(), None, Some(e.to_string()), None, None),
         };
@@ -1005,19 +1113,13 @@ fn capture_pdf_ingest(
             ("stub", key)
         }
     };
-    // ゴミ箱内の item（md5 重複の相手）には触らない: フォルダ所属も撤回表示もしない
+    // ゴミ箱内の item（md5 重複の相手）には触らない: フォルダ所属もしない（撤回表示は summarize_item の trashed の最小形に無い）
     let live = search::get_by_key(&db, &key).map_err(|e| e.to_string())?;
-    let retraction = match (&live, collection_id) {
-        (Some(it), cid) => {
-            if let Some(cid) = cid {
-                add_to_folder(&db, &key, cid, "capture");
-            }
-            search::retraction_of(&db, it.id).unwrap_or(None)
-        }
-        (None, _) => None,
-    };
+    if let (Some(_), Some(cid)) = (&live, collection_id) {
+        add_to_folder(&db, &key, cid, "capture");
+    }
     eprintln!("capture: pdf {} bytes → {status} {key}{}", bytes.len(), reason.as_deref().map(|r| format!("（{r}）")).unwrap_or_default());
-    let mut v = summarize_item(&db, &key, status, &retraction)?;
+    let mut v = summarize_item(&db, &key, status)?;
     if let (Some(o), Some(r)) = (v.as_object_mut(), reason) {
         o.insert("reason".into(), json!(r));
     }
@@ -1140,4 +1242,185 @@ async fn ok_empty() -> impl IntoResponse {
 async fn fallback(uri: Uri) -> impl IntoResponse {
     eprintln!("(未実装エンドポイント) {uri} → 200 {{}}");
     zjson(StatusCode::OK, json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_st() -> St {
+        St {
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            sessions: Mutex::new(Sessions::default()),
+        }
+    }
+
+    fn csl_for(doi: &str) -> Value {
+        json!({ "type": "article-journal", "title": format!("Paper {doi}"), "DOI": doi,
+                "author": [{ "family": "Brandao", "given": "A" }], "issued": { "date-parts": [[2026]] } })
+    }
+
+    fn resolved(doi: &str, retracted: Option<&str>) -> resolver::Resolved {
+        resolver::Resolved { csl: csl_for(doi), retracted: retracted.map(str::to_string), source: "stub" }
+    }
+
+    fn req(doi: Option<&str>, title: Option<&str>) -> SaveReq {
+        SaveReq { doi: doi.map(str::to_string), pmid: None, title: title.map(str::to_string), url: Some("https://example.org/x".into()), collection_id: None }
+    }
+
+    fn n_items(st: &St) -> i64 {
+        st.db().conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap()
+    }
+
+    /// 新規: ② の resolver は DB のロックを握らずに呼ばれ（中で try_lock が取れる）、③ で登録して created を返す
+    #[test]
+    fn save_resolves_outside_the_lock() {
+        let st = test_st();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/new"), None), |i| {
+            assert!(matches!(i, resolver::AddInput::Doi(d) if d == "10.1234/new"));
+            let g = st.db.try_lock().expect("② の間に DB のロックが握られている");
+            drop(g);
+            Ok(resolved("10.1234/new", None))
+        })
+        .unwrap();
+        assert_eq!(v["status"], "created");
+        assert_eq!(v["title"], "Paper 10.1234/new");
+        assert_eq!(v["doi"], "10.1234/new");
+        assert_eq!(v["has_pdf"], false);
+        assert_eq!(n_items(&st), 1);
+    }
+
+    /// 登録済みの DOI は ① で existing（resolver を呼ばない）
+    #[test]
+    fn save_existing_does_not_resolve() {
+        let st = test_st();
+        let first = capture_save_unlocked(&st, req(Some("10.1234/a"), None), |_| Ok(resolved("10.1234/a", None))).unwrap();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/a"), None), |_| panic!("登録済みなのに resolver を呼んだ")).unwrap();
+        assert_eq!(v["status"], "existing");
+        assert_eq!(v["key"], first["key"]);
+        assert_eq!(n_items(&st), 1);
+    }
+
+    /// ① と ③ の間（② = ロックを離している間）に同じ DOI が別経路で入ったら、③ は Duplicate → その item の existing
+    #[test]
+    fn same_doi_between_check_and_commit_is_existing() {
+        let st = test_st();
+        let mut other = String::new();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/race"), None), |_| {
+            let mut db = st.db();
+            other = ingest::add_item(&mut db, &resolved("10.1234/race", None)).unwrap().key;
+            Ok(resolved("10.1234/race", None))
+        })
+        .unwrap();
+        assert_eq!(v["status"], "existing");
+        assert_eq!(v["key"], other.as_str());
+        assert_eq!(n_items(&st), 1);
+    }
+
+    /// 識別子なし: 題名があれば document（resolver を呼ばない）・題名も無ければ Err。resolver の失敗は Err のまま（登録しない）
+    #[test]
+    fn save_without_identifier_and_resolver_error() {
+        let st = test_st();
+        let v = capture_save_unlocked(&st, req(None, Some("Page title")), |_| panic!("識別子なしで resolver")).unwrap();
+        assert_eq!(v["status"], "created");
+        let it = search::get_by_key(&st.db(), v["key"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(it.csl["type"], "document");
+        assert_eq!(it.csl["URL"], "https://example.org/x");
+        let e = capture_save_unlocked(&st, req(None, None), |_| panic!("resolver")).unwrap_err();
+        assert_eq!(e, "DOI / PMID もタイトルも見つかりません");
+        let e = capture_save_unlocked(&st, req(Some("10.1234/404"), None), |_| Err(openref_core::CoreError::Http("404".into()))).unwrap_err();
+        assert!(e.contains("404"), "{e}");
+        assert_eq!(n_items(&st), 1);
+    }
+
+    /// 撤回の印は経路によらず出る: 新規（resolver が撤回を返した）・既存一致（① の existing）・Duplicate（③ の existing）・
+    /// 印の無い item は null。ゴミ箱の item（md5 重複の相手）は trashed の最小形のまま（retraction を出さない）
+    #[test]
+    fn retraction_is_reported_for_existing_items_too() {
+        let st = test_st();
+        let created = capture_save_unlocked(&st, req(Some("10.1234/retracted"), None), |_| Ok(resolved("10.1234/retracted", Some("Retraction in: X 2026")))).unwrap();
+        assert_eq!(created["status"], "created");
+        assert_eq!(created["retraction"], "Retraction in: X 2026");
+        let existing = capture_save_unlocked(&st, req(Some("10.1234/retracted"), None), |_| panic!("resolver")).unwrap();
+        assert_eq!(existing["status"], "existing");
+        assert_eq!(existing["retraction"], "Retraction in: X 2026", "既存一致でも撤回の警告");
+        // ③ の Duplicate: ② の間に同じ DOI が入った（印はその item に付いている）
+        let st2 = test_st();
+        let v = capture_save_unlocked(&st2, req(Some("10.1234/race-r"), None), |_| {
+            let mut db = st2.db();
+            ingest::add_item(&mut db, &resolved("10.1234/race-r", Some("Retracted"))).unwrap();
+            Ok(resolved("10.1234/race-r", None))
+        })
+        .unwrap();
+        assert_eq!(v["status"], "existing");
+        assert_eq!(v["retraction"], "Retracted", "Duplicate でも撤回の警告");
+        let plain = capture_save_unlocked(&st, req(Some("10.1234/plain"), None), |_| Ok(resolved("10.1234/plain", None))).unwrap();
+        assert_eq!(plain["retraction"], Value::Null);
+        let key = existing["key"].as_str().unwrap();
+        edit::trash(&st.db(), key).unwrap();
+        let t = summarize_item(&st.db(), key, "duplicate").unwrap();
+        assert_eq!(t, json!({ "key": key, "status": "duplicate", "trashed": true }));
+    }
+
+    /// ② の間に同じ DOI が印なしで先に入り（同じ connectd の saveItems 等）、resolver は撤回を返した: ③ の Duplicate で
+    /// resolver の撤回を捨てず、応答にも DB（retraction_flags）にも残す。題名ガードで却下されても応答の警告は出す（DB には書かない）
+    #[test]
+    fn duplicate_keeps_retraction_from_resolver() {
+        let st = test_st();
+        let mut other = String::new();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/race-new"), None), |_| {
+            let mut db = st.db();
+            other = ingest::add_item(&mut db, &resolved("10.1234/race-new", None)).unwrap().key;
+            Ok(resolved("10.1234/race-new", Some("Retraction in: Y 2026")))
+        })
+        .unwrap();
+        assert_eq!(v["status"], "existing");
+        assert_eq!(v["key"], other.as_str());
+        assert_eq!(v["retraction"], "Retraction in: Y 2026");
+        let id = search::get_by_key(&st.db(), &other).unwrap().unwrap().id;
+        assert_eq!(search::retraction_of(&st.db(), id).unwrap().as_deref(), Some("Retraction in: Y 2026"));
+
+        // 先に入った item の題名が違う（識別子の誤り）: merge_enrichment のガードで DB には書かないが、応答には警告
+        let mut odd = String::new();
+        let v = capture_save_unlocked(&st, req(Some("10.1234/race-odd"), None), |_| {
+            let mut db = st.db();
+            let mut csl = csl_for("10.1234/race-odd");
+            csl["title"] = json!("Completely different hospital newsletter");
+            odd = ingest::add_item(&mut db, &resolver::Resolved { csl, retracted: None, source: "test" }).unwrap().key;
+            Ok(resolved("10.1234/race-odd", Some("Retracted")))
+        })
+        .unwrap();
+        assert_eq!(v["key"], odd.as_str());
+        assert_eq!(v["retraction"], "Retracted");
+        let id = search::get_by_key(&st.db(), &odd).unwrap().unwrap().id;
+        assert_eq!(search::retraction_of(&st.db(), id).unwrap(), None);
+    }
+
+    /// session は直近 MAX_SESSIONS 件だけ残る: 上限を超えると最後の書き込みが最も古いものから消え、
+    /// 書き込み直した session（同じ保存の 2 件目）は新しい扱いで残る。key_for の引き方（item id あり / 唯一の item）は変わらない
+    #[test]
+    fn sessions_are_bounded() {
+        let st = test_st();
+        st.sessions().insert("S0", "a", "KEY0A");
+        for i in 1..MAX_SESSIONS {
+            st.sessions().insert(&format!("S{i}"), "a", &format!("KEY{i}"));
+        }
+        assert_eq!(key_for(&st, "S0", None).as_deref(), Some("KEY0A"));
+        // S0 に 2 件目 → S0 は最新。上限を 1 つ超えると最古の S1 が消える
+        st.sessions().insert("S0", "b", "KEY0B");
+        st.sessions().insert("NEW", "a", "KEYN");
+        assert_eq!(st.sessions().map.len(), MAX_SESSIONS);
+        assert_eq!(key_for(&st, "S1", None), None);
+        assert_eq!(key_for(&st, "S2", Some("a")).as_deref(), Some("KEY2"));
+        assert_eq!(key_for(&st, "S0", Some("b")).as_deref(), Some("KEY0B"));
+        assert_eq!(key_for(&st, "S0", None), None, "2 件ある session は item id なしでは引かない");
+        assert_eq!(key_for(&st, "NEW", None).as_deref(), Some("KEYN"));
+        for i in 0..200 {
+            st.sessions().insert(&format!("X{i}"), "a", "K");
+        }
+        assert_eq!(st.sessions().map.len(), MAX_SESSIONS);
+        assert_eq!(key_for(&st, "X199", None).as_deref(), Some("K"));
+        assert_eq!(key_for(&st, "X135", None), None);
+        assert_eq!(key_for(&st, "X136", None).as_deref(), Some("K"));
+    }
 }

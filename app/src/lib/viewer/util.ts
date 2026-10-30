@@ -94,6 +94,38 @@ export function allMatchIndexes(full: string, q: string): number[] {
   return out;
 }
 
+/** text の断片。m = 検索語との一致（注釈カードが <mark> で描く） */
+export type MatchPart = { t: string; m: boolean };
+
+/** 注釈タブの検索: text を q との一致 / 非一致の断片に分ける。絞り込み（null か否か）と強調（m の断片）が同じ一致を見る。
+    照合は normText の空間（空白畳み + per-unit lowercase。q は normText + trim）で行い、一致を buildFlat の posMap で
+    text の元の位置へ戻す（"in  the"・改行・長さの変わる lowercase 'İ'・語末シグマを含んでも一致と強調が食い違わない）。
+    q が空（空白だけ）なら [{ t: text, m: false }]（絞り込まない）、一致が無ければ null。 */
+export function matchParts(text: string, q: string): MatchPart[] | null {
+  const qn = normText(q).trim();
+  if (!qn) return [{ t: text, m: false }];
+  const { flat, posMap } = buildFlat(text);
+  const hits = allMatchIndexes(flat, qn);
+  if (!hits.length) return null;
+  const out: MatchPart[] = [];
+  let from = 0; // text 上の、まだ断片にしていない先頭
+  for (const i of hits) {
+    const s = posMap[i];
+    const e = posMap[i + qn.length - 1] + 1; // 一致の最後の字を生んだ元の字まで（'İ' → "i̇" の途中で終わっても字を割らない）
+    if (s < from) {
+      // 直前の一致と同じ元の字を共有する（'İ' の展開の途中で区切れた）: 前の強調を延ばす
+      if (e > from) out[out.length - 1].t += text.slice(from, e);
+      from = Math.max(from, e);
+      continue;
+    }
+    if (s > from) out.push({ t: text.slice(from, s), m: false });
+    out.push({ t: text.slice(s, e), m: true });
+    from = e;
+  }
+  if (from < text.length) out.push({ t: text.slice(from), m: false });
+  return out;
+}
+
 /** 検索結果 1 件（サイドバー一覧用）。before/hit/after はページ元テキストからの前後文脈。 */
 export interface SearchHit {
   page: number;

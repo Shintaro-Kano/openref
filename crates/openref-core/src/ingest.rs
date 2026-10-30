@@ -57,14 +57,42 @@ pub fn add_item(db: &mut Db, resolved: &Resolved) -> Result<Added> {
     index_item(&tx, id, csl)?;
 
     if let Some(detail) = &resolved.retracted {
-        tx.execute(
-            "INSERT INTO retraction_flags (item_id, status, detail, source) VALUES (?1, 'retracted', ?2, ?3)",
-            rusqlite::params![id, detail, resolved.source],
-        )?;
+        upsert_retraction(&tx, id, detail, resolved.source)?;
     }
 
     tx.commit()?;
     Ok(Added { id, key })
+}
+
+/// 撤回の印を書く（resolver が撤回を返したときだけ呼ぶ）。既にあれば detail / source / checked_at を今回の値に更新する。
+/// 戻り値 = 印が新しく付いた・中身が変わった。
+///
+/// resolver の `retracted: None` の意味は経路で違う: PMID のある item（source = pubmed）なら「PubMed は撤回と言っていない」だが、
+/// DOI だけの item は `resolver::resolve` が PubMed の照合の失敗（該当なし・通信失敗）を飲み込んで Crossref / 医書.jp へ落ちる
+/// （どちらも撤回を返さない = 常に None）ので、None が「撤回を見ていない」を意味しうる。
+/// → None では既存の印を消さない（撤回の警告を黙って外す方が危ない）。**印は自動では一度も消えない。消えるのは item を
+/// 削除したときの ON DELETE CASCADE だけ**。印を付けるのは取込（add_item）と enrich（merge_enrichment = refresh・connector の補完）
+fn upsert_retraction(
+    conn: &rusqlite::Connection,
+    id: i64,
+    detail: &str,
+    source: &str,
+) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let before: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, detail, source FROM retraction_flags WHERE item_id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    conn.execute(
+        "INSERT INTO retraction_flags (item_id, status, detail, source) VALUES (?1, 'retracted', ?2, ?3)
+         ON CONFLICT(item_id) DO UPDATE SET status = excluded.status, detail = excluded.detail,
+           source = excluded.source, checked_at = datetime('now')",
+        rusqlite::params![id, detail, source],
+    )?;
+    Ok(before != Some(("retracted".to_string(), Some(detail.to_string()), Some(source.to_string()))))
 }
 
 /// creators_index + items_fts への索引付け（insert 専用。update は delete+insert で行う）
@@ -179,7 +207,7 @@ pub fn refresh_item(db: &mut Db, key: &str) -> Result<RefreshOutcome> {
         },
     };
     let resolved = crate::resolver::resolve(&input)?;
-    match merge_enrichment(db, id, &resolved.csl) {
+    match merge_enrichment(db, id, &resolved) {
         Ok(true) => Ok(RefreshOutcome::Updated),
         Ok(false) => Ok(RefreshOutcome::Unchanged),
         Err(CoreError::BadInput(msg)) => Ok(RefreshOutcome::Rejected(msg)),
@@ -209,7 +237,8 @@ pub fn titles_match(a: &str, b: &str) -> bool {
     inter / union >= 0.5 || containment >= 0.8
 }
 
-/// creators_index と FTS を丸ごと貼り替える（CSL を書き換えた後に必ず呼ぶ）
+/// 索引（creators_index / journal_keys / FTS / import_match_keys）を今の CSL から丸ごと貼り替える。
+/// CSL を書き換える経路はこれを直接呼ばず、必ず `replace_csl` を通す。直接呼ぶのは CSL を変えない修復（`reindex_keys`）だけ
 pub fn reindex_item(
     conn: &rusqlite::Connection,
     id: i64,
@@ -217,13 +246,39 @@ pub fn reindex_item(
 ) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM creators_index WHERE item_id = ?1", [id])?;
     conn.execute("DELETE FROM items_fts WHERE rowid = ?1", [id])?;
-    index_item(conn, id, csl) // creators_index / journal_keys / FTS
+    index_item(conn, id, csl) // creators_index / journal_keys / FTS（+ import_match_keys）
 }
 
-/// FTS 行を貼り替える（update 用。contentless_delete=1 前提で DELETE→INSERT）
-pub fn reindex_fts(conn: &rusqlite::Connection, id: i64, csl: &serde_json::Value) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM items_fts WHERE rowid = ?1", [id])?;
-    index_fts(conn, id, csl)
+/// 索引（creators_index / journal_keys / FTS / import_match_keys）を今の CSL から貼り直す（CSL・date_modified は触らない）。
+/// 索引がずれた item の修復用（`openref reindex`）。1 tx・知らない key が 1 つでもあれば何も書かない。
+/// 戻り値 = 貼り直した item の数（同じ key を重ねて渡しても 1 件）
+pub fn reindex_keys(db: &mut Db, keys: &[String]) -> Result<usize> {
+    use rusqlite::OptionalExtension;
+    let keys: std::collections::BTreeSet<&String> = keys.iter().collect();
+    let tx = db.conn.transaction()?;
+    for key in &keys {
+        let (id, csl_s): (i64, String) = tx
+            .query_row("SELECT id, csl FROM items WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
+        reindex_item(&tx, id, &serde_json::from_str(&csl_s)?)?;
+    }
+    tx.commit()?;
+    Ok(keys.len())
+}
+
+/// 既存 item の CSL を書き換え、索引（creators_index / journal_keys / FTS / import_match_keys）を丸ごと貼り替える。
+/// CSL を書き換える経路（編集・enrich・取込の merge）は必ずここを通す（索引の貼り忘れを構造で防ぐ）
+pub fn replace_csl(
+    conn: &rusqlite::Connection,
+    id: i64,
+    csl: &serde_json::Value,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE items SET csl = ?1, date_modified = datetime('now') WHERE id = ?2",
+        rusqlite::params![csl.to_string(), id],
+    )?;
+    reindex_item(conn, id, csl)
 }
 
 /// レジストリ（PubMed / Crossref）が権威を持つフィールド。
@@ -247,13 +302,16 @@ const AUTHORITATIVE_FIELDS: &[&str] = &[
     "language",
 ];
 
-/// 既存 item を resolver（PubMed / doi.org）の権威データで是正する（connector 保存後の非同期 enrich）。
-/// 権威フィールドは上書き、それ以外（title・URL 等）は既存を保持。変更時は FTS も貼り替える。
+/// 既存 item を resolver（PubMed / doi.org）の権威データで是正する（connector 保存後の非同期 enrich・`openref refresh`）。
+/// 権威フィールドは上書き、それ以外（title・URL 等）は既存を保持。変更時は `replace_csl` で 4 索引（creators_index / journal_keys / FTS / 取込照合の import_match_keys）をすべて貼り替える。
+/// resolver が撤回を返していれば撤回の印も書く（`upsert_retraction`。撤回の照会のために要求を増やさない = 同じ応答を使う）。
+/// 戻り値 = CSL か撤回の印のどちらかが変わった。
 ///
 /// **同一性ガード（必須）**: connector が渡す DOI/PMID が誤っていると、別論文の書誌が
 /// 混入した「キメラレコード」が黙って生まれる（live 検証で実際に発生）。title 類似度で照合し、
 /// 一致しない場合は enrich を拒否する（捏造データを作らない = 誠実性ポリシー）。
-pub fn merge_enrichment(db: &mut Db, id: i64, richer: &serde_json::Value) -> Result<bool> {
+pub fn merge_enrichment(db: &mut Db, id: i64, resolved: &Resolved) -> Result<bool> {
+    let richer = &resolved.csl;
     let csl_s: String = db
         .conn
         .query_row("SELECT csl FROM items WHERE id = ?1", [id], |r| r.get(0))?;
@@ -307,14 +365,15 @@ pub fn merge_enrichment(db: &mut Db, id: i64, richer: &serde_json::Value) -> Res
             }
         }
     }
-    if changed {
+    let flagged = resolved.retracted.is_some();
+    if changed || flagged {
         let tx = db.conn.transaction()?;
-        tx.execute(
-            "UPDATE items SET csl = ?1, date_modified = datetime('now') WHERE id = ?2",
-            rusqlite::params![csl.to_string(), id],
-        )?;
-        reindex_fts(&tx, id, &csl)?;
-        index_journal(&tx, id, &csl)?; // enrich は container-title / ISSN も差し替えうる
+        if changed {
+            replace_csl(&tx, id, &csl)?; // enrich は author / container-title / ISSN も差し替えうる
+        }
+        if let Some(detail) = &resolved.retracted {
+            changed |= upsert_retraction(&tx, id, detail, resolved.source)?;
+        }
         tx.commit()?;
     }
     Ok(changed)

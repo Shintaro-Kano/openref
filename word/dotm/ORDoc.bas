@@ -1,11 +1,11 @@
 Attribute VB_Name = "ORDoc"
 Option Explicit
 
-' 文書の操作（旧 word/doc.js）。
+' 文書の操作。
 ' 引用 = inline の content control（tag refract-cite-<8桁>）+ 同名の Document Variable に payload（connectd が作る JSON。不透明に扱う）。
 ' 文献リスト = CC tag refract-bib / 見出し = CC tag refract-bib-heading（どちらも段落ごと包む block CC）。
-' Add/Edit の仮置き = CC tag refract-pending-<8桁>。識別子は Office JS 版と同じ（旧文書の引用をそのまま認識する）。
-' Office JS の cc.delete(keepContent) と VBA の cc.Delete(DeleteContents) は真偽が逆。
+' Add/Edit の仮置き = CC tag refract-pending-<8桁>。識別子は旧版（Office JS アドイン）の文書と同じ（旧文書の引用をそのまま認識する）。
+' cc.Delete(DeleteContents) の引数は True = 中身ごと消す・False = 中身を残して CC だけ外す。
 
 Public Const OR_PREFIX As String = "refract-"
 Public Const OR_CITE As String = "refract-cite-"
@@ -155,7 +155,7 @@ Public Function NumStr(ByVal x As Double) As String
     NumStr = Trim$(Str$(x))
 End Function
 
-' スタイル・DOI が未保存の文書で使う値（旧 effectivePrefs）: 引用が既にあれば従来既定（vancouver・付け足し無し）、
+' スタイル・DOI が未保存の文書で使う値: 引用が既にあれば従来既定（vancouver・付け足し無し）、
 ' 引用がまだ無い新規文書なら OpenRef app の既定。仮置きは引用に数えない
 Public Sub EffectivePrefs(ByVal doc As Document, ByRef style As String, ByRef doi As Boolean, ByRef pinned As Boolean)
     Dim s As String, d As String, r() As String, appStyle As String, appDoi As Boolean, hadCites As Boolean, cc As ContentControl
@@ -366,7 +366,7 @@ Public Function LegacyXml(ByVal doc As Document) As String
     LegacyXml = out
 End Function
 
-' ---------- 一括更新（旧 updateAll） ----------
+' ---------- 一括更新 ----------
 ' 文書内の全引用を初出順に番号付けし直し、文献リスト（無ければ見出しごと作る）を作り直す。戻り値 = 引用データのある引用の数（変更履歴の記録が残って書き換えを見送った分も含む。0 = 文書に触れない）。
 ' 仮置きには触れない。入れ子があれば文書に触れずにエラー
 Public Function RenderAll(ByVal doc As Document) As Long
@@ -417,7 +417,7 @@ Public Function RenderAll(ByVal doc As Document) As Long
             ApplyRich doc, ccs(i), texts(i), runs(i), fname, fsize, False
         End If
     Next
-    ' 2 つ以上あるときは最後のもの（旧 doc.js の updateAll と同じ）
+    ' 2 つ以上あるときは最後のもの
     If heads.Count > 0 Then Set head = heads(heads.Count)
     If bibs.Count > 0 Then Set bib = bibs(bibs.Count)
     ' 見出し（既存文書に素の "References" 段落があれば取り込む）
@@ -580,7 +580,7 @@ Private Function AfterCC(ByVal doc As Document, ByVal cc As ContentControl) As R
     Set AfterCC = doc.Range(cc.Range.End + 1, cc.Range.End + 1)
 End Function
 
-' 仮置き […] を選択範囲の末尾（replaceCC があればその直後）に入れる（旧 insertPlaceholder）。直前の引用の境界で押すと
+' 仮置き […] を選択範囲の末尾（replaceCC があればその直後）に入れる。直前の引用の境界で押すと
 ' 新しい CC がその引用の中に入ることがある → 親の直後に作り直す。それでも中なら消してエラー。最後にカーソルを仮置きの直後へ
 Public Function InsertPlaceholder(ByVal doc As Document, ByVal replaceCC As ContentControl) As ContentControl
     Dim tag As String, r As Range, cc As ContentControl, parent As ContentControl
@@ -659,7 +659,7 @@ Private Sub NotFound(ByVal isNew As Boolean)
     End If
 End Sub
 
-' payload を引用として確定する（旧 commitCitation）。cc = 仮置き（追加）または引用（編集）。tag = ダイアログを開く前の tag。
+' payload を引用として確定する。cc = 仮置き（追加）または引用（編集）。tag = ダイアログを開く前の tag。
 ' 未固定文書なら style / DOI を固定。編集で同じ tag の CC がほかにもある（コピー＆ペーストの複製）なら、編集した CC だけ新しい tag に分ける
 Public Sub CommitCitation(ByVal doc As Document, ByVal cc As ContentControl, ByVal tag As String, ByVal payload As String)
     Dim isNew As Boolean, pinStyle As String, pinDoi As Boolean, pinned As Boolean, dupes As Long, c As ContentControl, citeTag As String
@@ -743,7 +743,7 @@ Public Function ValidStyleId(ByVal id As String) As Boolean
     ValidStyleId = True
 End Function
 
-' 設定ダイアログの [適用]（旧 applySettings）。入れ子があると後の更新が止まるので、保存する前に検査する
+' 設定ダイアログの [適用]。入れ子があると後の更新が止まるので、保存する前に検査する
 Public Sub ApplySettings(ByVal doc As Document, ByVal style As String, ByVal doi As Boolean, ByVal fname As String, ByVal fsize As Double)
     Dim cites As Collection, pending As Collection, bibs As Collection, heads As Collection
     Scan doc, cites, pending, bibs, heads
@@ -764,7 +764,7 @@ Private Function Overlaps(ByVal a As Range, ByVal b As Range) As Boolean
     Overlaps = (a.Start < b.End And b.Start < a.End)
 End Function
 
-' 文献リスト（と見出し）をカーソル段落の直後へ作り直す（旧 moveBibliographyHere）。新しいものを先に作り、旧いものは後で消す
+' 文献リスト（と見出し）をカーソル段落の直後へ作り直す。新しいものを先に作り、旧いものは後で消す
 ' （途中で失敗しても文献リストが無くならない順）。選択の段落が旧い文献リスト・見出しと重なるなら何も変えずにエラー
 Public Sub MoveBibliographyHere(ByVal doc As Document)
     Dim cites As Collection, pending As Collection, bibs As Collection, heads As Collection, c As ContentControl

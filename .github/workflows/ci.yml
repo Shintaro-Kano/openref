@@ -30,30 +30,10 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Cargo tests (workspace)
-        run: cargo test --workspace --locked
-
-      - name: Frontend build & Svelte check
+      - name: Frontend build
         working-directory: app
         run: npm run build
 
-      - name: Viewer & i18n unit tests
-        run: |
-          node app/src/lib/viewer/util.test.mjs
-          node app/src/lib/i18n.test.mjs
-
-      - name: Word add-in tests & XSD validation
-        run: |
-          node word/test-cite.cjs
-          node word/test-types.cjs
-          node word/test-styles.cjs
-          node word/test-commands.cjs
-          node word/test-dotm-render.cjs
-          node word/test-dialog-dotm.cjs
-          xmllint --noout --schema word/xsd/OfficeAppManifestV1_1.xsd word/manifest.xml
-          python3 word/dotm/test-build.py
-
-      - name: Shell script syntax & License audit
-        run: |
-          bash -n site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh
-          python3 scripts/check-licenses.py
+      # cargo test, svelte-check, node / python tests, shell syntax, license audit (the list lives in scripts/test-all.sh)
+      - name: Test suite
+        run: bash scripts/test-all.sh

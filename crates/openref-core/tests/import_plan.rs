@@ -123,6 +123,25 @@ fn actual_paperpile_shape_preserves_all_records_and_exact_zip_layout() {
     assert_eq!(plan.counts.copy_bytes_upper_bound, 0);
 }
 
+/// JSON の添付パスが絶対パスでルートの外を指すとき、事前確認は Failed にする(読まない・Available にしない)
+#[test]
+fn absolute_attachment_path_outside_root_fails_in_preview() {
+    let root = Scratch::new();
+    let external = Scratch::new();
+    let outside = external.write("outside.pdf", b"%PDF-1.4 external");
+    let i = input(
+        &root,
+        json!([{"_id":"bad","title":"Outside root",
+            "attachments":[{"article_pdf":1,"filename":outside.to_str().unwrap()}]}]),
+    );
+    let roots = AttachmentRoots::new(std::slice::from_ref(&root.0)).unwrap();
+    let plan = plan::preview(&i, &ExistingLibrary::default(), &roots, AttachmentMode::Link).unwrap();
+    assert_eq!(plan.counts.failed_pdfs, 1);
+    assert_eq!(plan.counts.available_pdfs, 0);
+    assert!(matches!(plan.items[0].attachments[0], AttachmentPlan::Failed { .. }));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"%PDF-1.4 external");
+}
+
 #[test]
 fn observed_named_labels_are_mapped_and_legacy_id_adoption_is_explicit() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -489,28 +508,6 @@ fn inventory_reads_legacy_schema_without_migration_or_disk_changes() {
     drop(conn);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 1);
-}
-
-#[test]
-fn legacy_paperpile_import_resolves_zip_layout_but_does_not_link_outside_root() {
-    let s = Scratch::new();
-    let external = Scratch::new();
-    let outside = external.write("outside.pdf", b"%PDF-1.4 external");
-    let inside = s.write("Paperpile files/F/Fixture.pdf", b"%PDF-1.4 fixture");
-    let json = s.write("legacy.json", json!([
-        {"_id":"ok","title":"In ZIP","attachments":[{"article_pdf":1,"filename":"All Papers/F/Fixture.pdf"}]},
-        {"_id":"bad","title":"Outside root","attachments":[{"article_pdf":1,"filename":outside.to_str().unwrap()}]}
-    ]).to_string().as_bytes());
-    let mut db = openref_core::Db::open_in_memory().unwrap();
-    let report = import::paperpile::import(&mut db, &json, Some(s.0.clone()), true).unwrap();
-    assert_eq!(report.pdf_linked, 1);
-    assert_eq!(report.pdf_missing.len(), 1);
-    assert_eq!(std::fs::read(&inside).unwrap(), b"%PDF-1.4 fixture");
-    let count: i64 = db
-        .conn
-        .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
 }
 
 /// Explicit paths only: never discovers or opens the user's live OpenRef DB.

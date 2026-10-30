@@ -45,7 +45,7 @@ fn sibling_taken(db: &Db, name: &str, parent: Option<i64>, except: Option<i64>) 
 }
 
 /// 同じ親の下で大小無視の同名のフォルダ（soft-delete 済みは見ない・複数あれば最初の 1 行）。
-/// パスで辿る経路（MCP の resolve_collection・`edit::ensure_collection_path`・Paperpile 取込）の照合の基準
+/// パスで辿る経路（`edit::ensure_collection_path`・`commands.rs` のフォルダ解決）の照合の基準
 pub(crate) fn child_id(conn: &rusqlite::Connection, parent: Option<i64>, name: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(

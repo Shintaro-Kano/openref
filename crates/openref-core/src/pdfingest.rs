@@ -14,7 +14,9 @@
 //! 閾値以上のときだけ DOI を採用（捏造しない）。それでも決まらなければ「要確認」stub（添付は保全）。
 //! 重複は PMID/DOI に加えファイル md5 で判定（同一ファイルはスキップ・別ファイルは 2 本目として添付）。
 //! バイト列は 1 度だけ読み・md5 は 1 度だけ取り（添付と索引へ渡す）・解析は冒頭 2 頁（Info /Title も同じ解析から）と
-//! 本文索引の 2 回（`ingest_pdf_bytes_report` = connectd はファイルに落とさず届いた本文をそのまま渡す）。
+//! 本文索引の 2 回（`ingest_pdf_bytes_unlocked` = connectd はファイルに落とさず届いた本文をそのまま渡す）。
+//! 流れは 3 段（① md5 照合 → ② 抽出・resolver・題名照合 = DB なし → ③ 登録・添付）。DB を Mutex で共有する
+//! Tauri / connectd は `*_unlocked` で ② をロックの外に出す（CLI / MCP は便宜関数で続けて呼ぶ）。
 
 use crate::resolver::{self, Candidate, Resolved};
 use crate::{edit, ingest, model, pdftools, search, tags, CoreError, Db, Result};
@@ -75,21 +77,33 @@ pub const REVIEW_TAG: &str = "要確認";
 pub const REVIEW_TAG_COLOR: &str = "peach"; // 橙（tags::LABEL_COLORS）
 
 pub fn ingest_pdf_report(db: &mut Db, pdf: &Path, opts: &IngestOpts) -> Result<IngestReport> {
+    check_pdf_file(db, pdf)?;
+    let (bytes, src_name) = read_pdf_file(pdf)?;
+    ingest_pdf_bytes_report(db, &bytes, &src_name, Some(pdf), opts)
+}
+
+/// 手元のファイルの存在確認と、DB 自身のファイル（本体・WAL）の拒否（DB のパスが要る）
+fn check_pdf_file(db: &Db, pdf: &Path) -> Result<()> {
     if !pdf.exists() {
         return Err(CoreError::NotFound(format!("file {}", pdf.display())));
     }
-    crate::db::reject_connection_file(&db.conn, pdf)?;
+    crate::db::reject_connection_file(&db.conn, pdf)
+}
+
+/// 手元のファイルを読む（DB に触らない）。戻り値 = (本文, 元ファイル名)
+fn read_pdf_file(pdf: &Path) -> Result<(Vec<u8>, String)> {
     let bytes = std::fs::read(pdf)?;
     let src_name = pdf
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "file.pdf".into());
-    ingest_pdf_bytes_report(db, &bytes, &src_name, Some(pdf), opts)
+    Ok((bytes, src_name))
 }
 
-/// バイト列版（connectd の `/capture/pdf` / standalone: 届いた本文をファイルに落とさず取り込む）。
+/// バイト列版（CLI / MCP など DB を排他で持つ呼び手向けの便宜関数 = ①②③を同じ `db` で続けて行う）。
 /// `src_name` = 元ファイル名（csl_filename=false の添付名・要確認 stub の題名の既定）。
-/// `file` = 同じ内容が置いてあるファイル（pdftotext fallback 用。None なら必要なときだけ一時ファイルに落とす）
+/// `file` = 同じ内容が置いてあるファイル（pdftotext fallback 用。None なら必要なときだけ一時ファイルに落とす）。
+/// DB を Mutex で共有する呼び手（Tauri・connectd）は `ingest_pdf_bytes_unlocked` を使う
 pub fn ingest_pdf_bytes_report(
     db: &mut Db,
     bytes: &[u8],
@@ -97,55 +111,89 @@ pub fn ingest_pdf_bytes_report(
     file: Option<&Path>,
     opts: &IngestOpts,
 ) -> Result<IngestReport> {
-    let mut warnings: Vec<String> = Vec::new();
-    // 同一ファイルが既にどこかの item に添付済みなら、抽出も照会もせず即スキップ
-    // （要確認 stub の二重作成・同じ PDF の再ドロップを防ぐ。md5 未記録の旧添付は DOI 経路で拾う）
-    let file_md5 = crate::pdffetch::md5_hex(bytes);
-    if let Some(key) = find_item_by_md5(db, &file_md5)? {
-        return Ok(IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings, reason: None, info_title: None, md5: file_md5 });
-    }
-    let ex = pdftools::extract_pages_bytes(bytes, file, 1, 2)?;
-    let text = ex.pages.join("\n");
-    let lenient = lenient_reason(&ex.pages, &text).is_some();
-    // 先頭の識別子 1 件だけ（後続候補は見ない）。解決失敗は従来どおり Err（connectd は stub にする）
-    let (resolved, reason): (Option<Resolved>, Option<String>) = match find_ids_in_text(&text) {
-        Some(input) => {
-            let r = resolver::resolve(&input)?;
-            let title = model::s(&r.csl, "title").unwrap_or("");
-            match guard_first_candidate(title, &text, lenient) {
-                Guard::Accept => (Some(r), None),
-                Guard::Reject => {
-                    let label = match &input {
-                        resolver::AddInput::Doi(d) => format!("DOI {d}"),
-                        resolver::AddInput::Pmid(p) => format!("PMID {p}"),
-                    };
-                    let why = format!(
-                        "本文の {label} の題名「{}」が本文に見当たらず不採用（別論文の識別子の可能性。DOI/PMID を確認して書誌を引き直してください）",
-                        model::truncate_chars(&model::strip_markup(title), 120)
-                    );
-                    (None, Some(why))
-                }
-            }
-        }
-        None if opts.title_search => match title_lookup(ex.info_title.as_deref(), &text)? {
-            Some(doi) => (Some(resolver::resolve(&resolver::AddInput::Doi(doi))?), None),
-            None => (None, None),
-        },
-        None => (None, None),
+    bytes_report_with(&Net, db, bytes, src_name, file, opts)
+}
+
+fn bytes_report_with(
+    net: &dyn Lookup,
+    db: &mut Db,
+    bytes: &[u8],
+    src_name: &str,
+    file: Option<&Path>,
+    opts: &IngestOpts,
+) -> Result<IngestReport> {
+    let plan = match ingest_pdf_prepare(db, crate::pdffetch::md5_hex(bytes))? {
+        Prepared::Fresh(plan) => plan,
+        Prepared::Duplicate(report) => return Ok(report),
     };
+    let analyzed = analyze_with(net, bytes, file, opts);
+    ingest_pdf_commit(db, plan, analyzed, bytes, src_name, opts)
+}
+
+// ---------- 3 段 API（pdffetch の fetch_pdf_prepare / download / attach と同型）----------
+// Tauri / connectd は DB を Mutex で持つ。② の抽出（冒頭 2 頁）とネットワーク（resolver・Crossref 書誌検索。
+// timeout 30 s・429 で再試行）の間にロックを握ると、一括取込中に一覧・Word・/capture/status が止まるので、
+// 「① md5 照合（DB 読取）→ ② ロック外で抽出・識別子・resolver・題名照合 → ③ 再ロックして登録・添付」に分ける。
+// ① と ③ の間に同じファイルが別経路で入った場合は、③ の md5 再照合が ① と同じ DuplicateFile で受ける
+// （DOI / PMID の重複は add_item の Duplicate → 既存 item への添付判断 = 1 段のときと同じ枝）。
+// ③ の添付（edit::write_managed のファイル書込と本文索引）はロックの中のまま。
+
+/// ① の結果: 計画（② へ進む）か、同一ファイルが添付済みで完了か
+enum Prepared {
+    Fresh(IngestPlan),
+    Duplicate(IngestReport),
+}
+
+/// ①〜③で持ち回る計画（入力バイト列の 16 進 md5）
+struct IngestPlan {
+    md5: String,
+}
+
+/// ② の結果（DB に触れずに決めたこと）: 確定した書誌（None = 要確認 / 識別子なし）・その理由・Info /Title
+struct Analyzed {
+    resolved: Option<Resolved>,
+    reason: Option<String>,
+    info_title: Option<String>,
+}
+
+/// ① 同一ファイル（md5）が既にどこかの item に添付済みなら、抽出も照会もせず完了（DB 読取のみ・短い）。
+/// 要確認 stub の二重作成・同じ PDF の再ドロップを防ぐ。md5 未記録の旧添付は DOI 経路（③）で拾う。
+/// `md5` = 本文の 16 進 md5（`pdffetch::md5_hex`。ロックの外で取っておく）
+fn ingest_pdf_prepare(db: &Db, md5: String) -> Result<Prepared> {
+    Ok(match find_item_by_md5(db, &md5)? {
+        Some(key) => Prepared::Duplicate(duplicate_file_report(key, md5)),
+        None => Prepared::Fresh(IngestPlan { md5 }),
+    })
+}
+
+fn duplicate_file_report(key: String, md5: String) -> IngestReport {
+    IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings: Vec::new(), reason: None, info_title: None, md5 }
+}
+
+/// ③ 再ロックして登録・添付。② の間にロックを離していたので、まず md5 を取り直す（同じファイルが別経路で
+/// 入っていれば ① と同じ DuplicateFile）。② が Err ならその後で Err を返す
+fn ingest_pdf_commit(
+    db: &mut Db,
+    plan: IngestPlan,
+    analyzed: Result<Analyzed>,
+    bytes: &[u8],
+    src_name: &str,
+    opts: &IngestOpts,
+) -> Result<IngestReport> {
+    let file_md5 = plan.md5;
+    if let Some(key) = find_item_by_md5(db, &file_md5)? {
+        return Ok(duplicate_file_report(key, file_md5));
+    }
+    let Analyzed { resolved, reason, info_title } = analyzed?;
+    let mut warnings: Vec<String> = Vec::new();
     let Some(resolved) = resolved else {
-        let reason = reason.unwrap_or_else(|| {
-            if pdftools::has_text(&ex.pages) {
-                "識別子なし・タイトル検索も未一致（DOI/PMID を入力して書誌を引き直してください）".to_string()
-            } else {
-                "テキスト層なし（スキャン PDF の可能性。OCR は未対応）".to_string()
-            }
-        });
+        // ② は書誌が決まらないとき理由を必ず入れる
+        let reason = reason.unwrap_or_default();
         if !opts.stub_on_fail {
-            return Ok(IngestReport { outcome: PdfIngestOutcome::NoIdentifier, warnings, reason: Some(reason), info_title: ex.info_title, md5: file_md5 });
+            return Ok(IngestReport { outcome: PdfIngestOutcome::NoIdentifier, warnings, reason: Some(reason), info_title, md5: file_md5 });
         }
-        let outcome = create_review_stub(db, ex.info_title.as_deref(), bytes, &file_md5, src_name, &reason, &mut warnings)?;
-        return Ok(IngestReport { outcome, warnings, reason: Some(reason), info_title: ex.info_title, md5: file_md5 });
+        let outcome = create_review_stub(db, info_title.as_deref(), bytes, &file_md5, src_name, &reason, &mut warnings)?;
+        return Ok(IngestReport { outcome, warnings, reason: Some(reason), info_title, md5: file_md5 });
     };
     let outcome = match ingest::add_item(db, &resolved) {
         Ok(added) => {
@@ -163,7 +211,132 @@ pub fn ingest_pdf_bytes_report(
         }
         Err(e) => return Err(e),
     };
-    Ok(IngestReport { outcome, warnings, reason: None, info_title: ex.info_title, md5: file_md5 })
+    Ok(IngestReport { outcome, warnings, reason: None, info_title, md5: file_md5 })
+}
+
+/// DB を Mutex で共有する呼び手（Tauri・connectd）向け: ①と③だけ `lock` でロックを取り、② はロックの外で行う。
+/// 戻り値の guard = 最後に取ったロック（③。① で完了したときは ①）。呼び手は続けて同じロックの中で要約・
+/// 要確認 stub の作成をしてよい（③ の md5 再照合と stub 作成の間に別の取込が割り込まない）。
+/// 外側の Err は `lock` の失敗だけ。内側が取込の結果（`ingest_pdf_bytes_report` と同じ）
+pub fn ingest_pdf_bytes_unlocked<G, E>(
+    lock: impl Fn() -> std::result::Result<G, E>,
+    bytes: &[u8],
+    src_name: &str,
+    file: Option<&Path>,
+    opts: &IngestOpts,
+) -> std::result::Result<(G, Result<IngestReport>), E>
+where
+    G: std::ops::DerefMut<Target = Db>,
+{
+    bytes_unlocked_with(&Net, lock, bytes, src_name, file, opts)
+}
+
+/// `ingest_pdf_report` の Mutex 版（手元のファイル。存在確認・DB 自身のファイルの拒否は短いロックで、読み込みはロックの外）
+fn report_unlocked_with<G, E>(
+    net: &dyn Lookup,
+    lock: impl Fn() -> std::result::Result<G, E>,
+    pdf: &Path,
+    opts: &IngestOpts,
+) -> std::result::Result<(G, Result<IngestReport>), E>
+where
+    G: std::ops::DerefMut<Target = Db>,
+{
+    let checked = {
+        let g = lock()?;
+        check_pdf_file(&g, pdf)
+    };
+    match checked.and_then(|()| read_pdf_file(pdf)) {
+        Ok((bytes, src_name)) => bytes_unlocked_with(net, lock, &bytes, &src_name, Some(pdf), opts),
+        Err(e) => Ok((lock()?, Err(e))),
+    }
+}
+
+fn bytes_unlocked_with<G, E>(
+    net: &dyn Lookup,
+    lock: impl Fn() -> std::result::Result<G, E>,
+    bytes: &[u8],
+    src_name: &str,
+    file: Option<&Path>,
+    opts: &IngestOpts,
+) -> std::result::Result<(G, Result<IngestReport>), E>
+where
+    G: std::ops::DerefMut<Target = Db>,
+{
+    let md5 = crate::pdffetch::md5_hex(bytes);
+    let plan = {
+        let g = lock()?;
+        match ingest_pdf_prepare(&g, md5) {
+            Ok(Prepared::Fresh(plan)) => plan,
+            Ok(Prepared::Duplicate(report)) => return Ok((g, Ok(report))),
+            Err(e) => return Ok((g, Err(e))),
+        }
+    };
+    let analyzed = analyze_with(net, bytes, file, opts); // ② ロックの外
+    let mut g = lock()?;
+    let res = ingest_pdf_commit(&mut g, plan, analyzed, bytes, src_name, opts);
+    Ok((g, res))
+}
+
+/// ② のネットワーク（resolver・Crossref 書誌検索）。テストでは遅い / 固定のスタブに差し替える
+trait Lookup {
+    fn resolve(&self, input: &resolver::AddInput) -> Result<Resolved>;
+    fn search_bibliographic(&self, q: &str, rows: usize) -> Result<Vec<Candidate>>;
+}
+
+struct Net;
+
+impl Lookup for Net {
+    fn resolve(&self, input: &resolver::AddInput) -> Result<Resolved> {
+        resolver::resolve(input)
+    }
+    fn search_bibliographic(&self, q: &str, rows: usize) -> Result<Vec<Candidate>> {
+        resolver::search_bibliographic(q, rows)
+    }
+}
+
+/// ② 冒頭 2 頁の抽出 → 識別子 → resolver（題名ガード）/ 題名検索。**DB に触らない**（ロックの外で呼ぶ）。
+/// Err（抽出できない・resolver の失敗）は `ingest_pdf_commit` へそのまま渡す（③ が md5 を取り直してから返す）
+fn analyze_with(net: &dyn Lookup, bytes: &[u8], file: Option<&Path>, opts: &IngestOpts) -> Result<Analyzed> {
+    let ex = pdftools::extract_pages_bytes(bytes, file, 1, 2)?;
+    let text = ex.pages.join("\n");
+    let lenient = lenient_reason(&ex.pages, &text).is_some();
+    // 先頭の識別子 1 件だけ（後続候補は見ない）。解決失敗は Err（connectd は stub にする）
+    let (resolved, reason): (Option<Resolved>, Option<String>) = match find_ids_in_text(&text) {
+        Some(input) => {
+            let r = net.resolve(&input)?;
+            let title = model::s(&r.csl, "title").unwrap_or("");
+            match guard_first_candidate(title, &text, lenient) {
+                Guard::Accept => (Some(r), None),
+                Guard::Reject => {
+                    let label = match &input {
+                        resolver::AddInput::Doi(d) => format!("DOI {d}"),
+                        resolver::AddInput::Pmid(p) => format!("PMID {p}"),
+                    };
+                    let why = format!(
+                        "本文の {label} の題名「{}」が本文に見当たらず不採用（別論文の識別子の可能性。DOI/PMID を確認して書誌を引き直してください）",
+                        model::truncate_chars(&model::strip_markup(title), 120)
+                    );
+                    (None, Some(why))
+                }
+            }
+        }
+        None if opts.title_search => match title_lookup(net, ex.info_title.as_deref(), &text)? {
+            Some(doi) => (Some(net.resolve(&resolver::AddInput::Doi(doi))?), None),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+    let reason = match resolved {
+        Some(_) => None,
+        None => Some(reason.unwrap_or_else(|| {
+            if pdftools::has_text(&ex.pages) {
+                "識別子なし・タイトル検索も未一致（DOI/PMID を入力して書誌を引き直してください）".to_string()
+            } else {
+                "テキスト層なし（スキャン PDF の可能性。OCR は未対応）".to_string()
+            }
+        })),
+    };
+    Ok(Analyzed { resolved, reason, info_title: ex.info_title })
 }
 
 /// 題名ガードの判定（resolver 非依存＝単体テスト可能）。
@@ -259,8 +432,24 @@ pub struct ImportSummary {
 
 /// 手元の PDF 1 本を取り込み（`ingest_pdf_report`・既定の opts）、結果を 1 行の要約にする。失敗も Err にせず status = error で返す
 pub fn import_summary(db: &mut Db, pdf: &Path) -> ImportSummary {
+    let res = ingest_pdf_report(db, pdf, &IngestOpts::default());
+    summarize_import(db, res)
+}
+
+/// `import_summary` の Mutex 版（Tauri の取込モーダル）: ② の抽出・ネットワークをロックの外で行い、
+/// 要約は ③ のロックの中で作る。外側の Err は `lock` の失敗だけ
+pub fn import_summary_unlocked<G, E>(lock: impl Fn() -> std::result::Result<G, E>, pdf: &Path) -> std::result::Result<ImportSummary, E>
+where
+    G: std::ops::DerefMut<Target = Db>,
+{
+    let (db, res) = report_unlocked_with(&Net, lock, pdf, &IngestOpts::default())?;
+    Ok(summarize_import(&db, res))
+}
+
+/// 取込 1 件の結果を 1 行の要約にする（duplicate の相手が要確認 stub かを DB で見る）
+fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
     use PdfIngestOutcome as O;
-    let (res, warnings, reason) = match ingest_pdf_report(db, pdf, &IngestOpts::default()) {
+    let (res, warnings, reason) = match res {
         Ok(r) => (Ok(r.outcome), r.warnings, r.reason),
         Err(e) => (Err(e), Vec::new(), None),
     };
@@ -516,12 +705,12 @@ pub fn plausible_title(t: &str) -> bool {
 
 /// 候補クエリで Crossref を引き、本文テキストと照合して閾値を満たした DOI を返す。
 /// `info_title` = 冒頭解析で得た Info /Title（解析し直さない）
-fn title_lookup(info_title: Option<&str>, text: &str) -> Result<Option<String>> {
+fn title_lookup(net: &dyn Lookup, info_title: Option<&str>, text: &str) -> Result<Option<String>> {
     if !pdftools::has_text(&[text.to_string()]) {
         return Ok(None);
     }
     for q in title_candidates(info_title, text).iter().take(2) {
-        let cands = resolver::search_bibliographic(q, 5)?;
+        let cands = net.search_bibliographic(q, 5)?;
         if let Some(m) = pick_match(&cands, text) {
             return Ok(Some(m.doi));
         }
@@ -655,8 +844,10 @@ fn create_review_stub(
         .filter(|t| plausible_title(t))
         .map(str::to_string)
         .unwrap_or_else(|| if stem.trim().is_empty() { filename.to_string() } else { stem });
+    // 型は document（connectd の capture_stub と同じ）。型カタログ（types.rs の 9 型）に無い型だと編集の sanitize が
+    // 「未知の参照タイプ」で弾き、ReferenceEditor も空のフォームになる = 要確認 stub を手で直せない
     let csl = json!({
-        "type": "article",
+        "type": "document",
         "title": title,
         "custom": { "source": "pdf-import-unresolved", "import_note": note, "import_file": filename }
     });
@@ -811,5 +1002,314 @@ mod tests {
     fn normalize_folds_unicode_and_punct() {
         assert_eq!(normalize("Ｉｍａｇｉｎｇ: of—Deep (Endometriosis)!"), "imaging of deep endometriosis");
         assert_eq!(normalize("Brandão, Müller"), "brandao muller");
+    }
+
+    // ---------- 3 段 API（resolver はスタブ = ネットワークなし）----------
+
+    /// 固定の書誌を返すスタブ。`gate` があれば resolve の中で「入った」を送り、「離せ」を待つ（ロック保持の検査用）
+    struct Stub {
+        gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    }
+
+    const T1: &str = "Imaging of Deep Endometriosis Involving Lateral Pelvic Structures";
+    const T2: &str = "Multimodal Large Language Model Retrieval for Follow-up Recommendations";
+
+    impl Lookup for Stub {
+        fn resolve(&self, input: &AddInput) -> Result<Resolved> {
+            if let Some((entered, release)) = &self.gate {
+                entered.send(()).unwrap();
+                release.recv_timeout(std::time::Duration::from_secs(10)).expect("テスト側が離さない");
+            }
+            let (doi, title) = match input {
+                AddInput::Doi(d) if d.eq_ignore_ascii_case("10.1148/rg.250127") => ("10.1148/rg.250127", T1),
+                AddInput::Doi(d) if d == "10.2/multimodal" => ("10.2/multimodal", T2),
+                AddInput::Doi(d) if d == "10.9999/other" => ("10.9999/other", "Structure of the cited protein complex at atomic resolution"),
+                other => return Err(CoreError::Http(format!("stub: {other:?} は 404"))),
+            };
+            Ok(Resolved {
+                csl: json!({ "type": "article-journal", "title": title, "DOI": doi, "issued": { "date-parts": [[2026]] },
+                             "author": [{ "family": "Brandao", "given": "A" }] }),
+                retracted: None,
+                source: "stub",
+            })
+        }
+        fn search_bibliographic(&self, _q: &str, _rows: usize) -> Result<Vec<Candidate>> {
+            Ok(vec![Candidate {
+                doi: "10.2/multimodal".into(),
+                title: T2.into(),
+                year: Some(2026),
+                first_author_family: None,
+                kind: Some("journal-article".into()),
+            }])
+        }
+    }
+
+    fn no_gate() -> Stub {
+        Stub { gate: None }
+    }
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!("openref-ingest3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.sqlite")).unwrap();
+        (dir, db)
+    }
+
+    /// 区分ごとの PDF（本文 1 行）。同じ DOI でも本文が違えば別ファイル（md5 不一致）
+    fn cases() -> Vec<(&'static str, Vec<u8>)> {
+        let pdf = |t: &str, info: Option<&str>| crate::pdftools::minimal_pdf(t, info);
+        vec![
+            ("added", pdf(&format!("RadioGraphics 2026 {T1} Brandao AC doi 10.1148/rg.250127"), None)),
+            ("same file", pdf(&format!("RadioGraphics 2026 {T1} Brandao AC doi 10.1148/rg.250127"), None)),
+            ("same doi other file", pdf(&format!("Supplement 2026 {T1} Brandao AC doi 10.1148/RG.250127 appendix"), None)),
+            ("guard reject", pdf("Footer of another journal issue 2026 with doi 10.9999/other and nothing else here", None)),
+            ("title search", pdf(&format!("2026 {T2} discussion of results"), Some(T2))),
+            ("no match", pdf("A local hospital newsletter with no identifiers at all inside it", None)),
+            ("resolver error", pdf("Some text long enough for the extractor doi 10.4040/missing here", None)),
+            ("unparsable", b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n".to_vec()),
+        ]
+    }
+
+    fn kind(o: &PdfIngestOutcome) -> &'static str {
+        match o {
+            PdfIngestOutcome::Added { .. } => "Added",
+            PdfIngestOutcome::AttachedToExisting { .. } => "AttachedToExisting",
+            PdfIngestOutcome::AttachedAdditional { .. } => "AttachedAdditional",
+            PdfIngestOutcome::DuplicateFile { .. } => "DuplicateFile",
+            PdfIngestOutcome::NeedsReview { .. } => "NeedsReview",
+            PdfIngestOutcome::NoIdentifier => "NoIdentifier",
+        }
+    }
+
+    /// 結果区分・理由・Info /Title・警告・md5（key は乱数なので除く）
+    fn label(r: &Result<IngestReport>) -> String {
+        match r {
+            Ok(r) => format!("{} reason={:?} info={:?} warn={:?} md5={}", kind(&r.outcome), r.reason, r.info_title, r.warnings, r.md5),
+            Err(e) => format!("Err {e}"),
+        }
+    }
+
+    /// DB の中身（item の題名・型・import_note・ラベル・添付の名前と md5）を 1 行ずつ
+    fn digest(db: &Db) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT i.title, json_extract(i.csl,'$.type'), json_extract(i.csl,'$.custom.import_note'),
+                        (SELECT group_concat(a.mode||'|'||a.path||'|'||a.md5, ';') FROM attachments a WHERE a.item_id = i.id),
+                        (SELECT group_concat(t.name) FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id)
+                 FROM items i ORDER BY i.id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(format!(
+                    "{:?}|{:?}|{:?}|{:?}|{:?}",
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?
+                ))
+            })
+            .unwrap();
+        // 添付のパスは DB ごとの一時ディレクトリと乱数の key を含むので伏せる
+        let dir = db.path.as_ref().and_then(|p| p.parent()).map(|d| d.display().to_string()).unwrap_or_default();
+        let key = regex::Regex::new(r"/storage/[A-Za-z0-9]+/").unwrap();
+        rows.map(|r| key.replace_all(&r.unwrap().replace(&dir, "<DIR>"), "/storage/<KEY>/").into_owned()).collect()
+    }
+
+    /// 便宜関数（①②③を同じ db で）と Mutex 版（①③だけロック）で、同じ入力列の結果・DB の中身が一致する。
+    /// stub_on_fail の両方（GUI/CLI = true、connectd = false）で
+    #[test]
+    fn three_stage_unlocked_matches_convenience() {
+        for stub_on_fail in [true, false] {
+            let opts = IngestOpts { title_search: true, stub_on_fail, csl_filename: !stub_on_fail };
+            let (dir_a, mut a) = temp_db(&format!("conv-{stub_on_fail}"));
+            let (dir_b, b) = temp_db(&format!("lock-{stub_on_fail}"));
+            let b = std::sync::Mutex::new(b);
+            for (name, bytes) in cases() {
+                let src = format!("{name}.pdf");
+                let ra = bytes_report_with(&no_gate(), &mut a, &bytes, &src, None, &opts);
+                let (_g, rb) = bytes_unlocked_with(&no_gate(), || b.lock(), &bytes, &src, None, &opts).unwrap();
+                assert_eq!(label(&ra), label(&rb), "{name} (stub_on_fail={stub_on_fail})");
+            }
+            let da = digest(&a);
+            assert_eq!(da, digest(&b.lock().unwrap()), "stub_on_fail={stub_on_fail}");
+            // 新規 2 件（DOI・題名検索）+ stub_on_fail なら要確認 stub 2 件（題名ガード不採用・未一致）
+            assert_eq!(da.len(), if stub_on_fail { 4 } else { 2 }, "{da:#?}");
+            std::fs::remove_dir_all(&dir_a).ok();
+            std::fs::remove_dir_all(&dir_b).ok();
+        }
+    }
+
+    /// 区分の表（GUI/CLI = stub_on_fail=true）: 新規 / 同一ファイル / 同 DOI の別ファイル / 題名ガード不採用 / 題名検索 / 未一致 / resolver 失敗 / 解析不能
+    #[test]
+    fn three_stage_outcomes() {
+        let (dir, mut db) = temp_db("outcomes");
+        let opts = IngestOpts::default();
+        let got: Vec<String> = cases()
+            .into_iter()
+            .map(|(name, bytes)| match bytes_report_with(&no_gate(), &mut db, &bytes, &format!("{name}.pdf"), None, &opts) {
+                Ok(r) => format!("{name}: {}{}", kind(&r.outcome), r.reason.map(|x| format!(" {}", x.chars().take(8).collect::<String>())).unwrap_or_default()),
+                Err(_) => format!("{name}: Err"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "added: Added",
+                "same file: DuplicateFile",
+                "same doi other file: AttachedAdditional",
+                "guard reject: NeedsReview 本文の DOI ",
+                "title search: Added",
+                "no match: NeedsReview 識別子なし・タイ",
+                "resolver error: Err",
+                "unparsable: Err",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GUI / CLI の要確認 stub は型 document（capture の stub と同じ）= 型カタログにある型なので、手で書誌を直す
+    /// update_csl（ReferenceEditor の保存）の sanitize を通る。旧の型 article は「未知の参照タイプ」で弾かれていた
+    #[test]
+    fn review_stub_is_document_and_editable() {
+        let (dir, mut db) = temp_db("stub-type");
+        let bytes = cases().into_iter().find(|(n, _)| *n == "no match").unwrap().1;
+        let r = bytes_report_with(&no_gate(), &mut db, &bytes, "newsletter.pdf", None, &IngestOpts::default()).unwrap();
+        let PdfIngestOutcome::NeedsReview { key } = r.outcome else { panic!("{:?}", r.outcome) };
+        let it = crate::search::get_by_key(&db, &key).unwrap().unwrap();
+        assert_eq!(it.csl["type"], "document");
+        assert!(crate::types::type_def("document").is_some());
+        let mut fixed = it.csl.clone();
+        fixed["title"] = json!("Hand-corrected title");
+        fixed["URL"] = json!("https://example.org/n");
+        edit::update_csl(&mut db, &key, &fixed).expect("要確認 stub の手直しが sanitize を通る");
+        let after = crate::search::get_by_key(&db, &key).unwrap().unwrap();
+        assert_eq!(after.csl["title"], "Hand-corrected title");
+        assert_eq!(after.csl["custom"]["source"], "pdf-import-unresolved", "custom は残る");
+        let mut old_type = fixed.clone();
+        old_type["type"] = json!("article");
+        assert!(edit::update_csl(&mut db, &key, &old_type).is_err(), "article は型カタログに無い");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ① と ③ の間（② = ロックを離している間）に同じファイルが別経路で入ったら、③ は ① と同じ DuplicateFile を返す。
+    /// ② が Err（resolver 失敗）でも同じ（connectd が二重に stub を作らない）。入っていなければ Err はそのまま
+    #[test]
+    fn same_file_between_prepare_and_commit_is_duplicate() {
+        let (dir, mut db) = temp_db("race");
+        let opts = IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
+        let all = cases();
+        let bytes = &all[0].1;
+        let md5 = crate::pdffetch::md5_hex(bytes);
+        let Prepared::Fresh(plan) = ingest_pdf_prepare(&db, md5.clone()).unwrap() else { panic!("初回は Fresh") };
+        let analyzed = analyze_with(&no_gate(), bytes, None, &opts);
+        // ② の間に別の取込が同じファイルを入れる
+        let other = bytes_report_with(&no_gate(), &mut db, bytes, "other.pdf", None, &opts).unwrap();
+        let PdfIngestOutcome::Added { key: other_key } = other.outcome else { panic!("{:?}", other.outcome) };
+        let r = ingest_pdf_commit(&mut db, plan, analyzed, bytes, "late.pdf", &opts).unwrap();
+        assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == other_key), "{:?}", r.outcome);
+        assert_eq!(r.md5, md5);
+        let n_att = |db: &Db| db.conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n_att(&db), 1);
+
+        // ② が Err: 同じファイルが入っていなければ Err のまま、入っていれば DuplicateFile（stub を作らせない）
+        let err_bytes = &all[6].1;
+        let md5e = crate::pdffetch::md5_hex(err_bytes);
+        let fresh = |db: &Db| match ingest_pdf_prepare(db, md5e.clone()).unwrap() {
+            Prepared::Fresh(p) => p,
+            Prepared::Duplicate(_) => panic!("まだ入っていない"),
+        };
+        let (plan_a, plan_b) = (fresh(&db), fresh(&db));
+        let r = ingest_pdf_commit(&mut db, plan_a, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts);
+        assert!(r.is_err(), "入っていなければ Err のまま");
+        let stub = ingest::add_item(&mut db, &Resolved { csl: json!({ "type": "document", "title": "stub" }), retracted: None, source: "test" }).unwrap();
+        edit::attach_auto_with_md5(&db, &stub.key, "s.pdf", err_bytes, &md5e).unwrap();
+        let r = ingest_pdf_commit(&mut db, plan_b, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
+        assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == stub.key), "{:?}", r.outcome);
+        assert_eq!(n_att(&db), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ② の間は DB のロックを握らない: resolver（スタブ）の中で止めている間に、別スレッドがロックを取り DB を読める。
+    /// 手元ファイル版（Tauri の import_pdf）とバイト列版（connectd）の両方
+    #[test]
+    fn lock_is_released_during_network() {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let (dir, db) = temp_db("lock");
+        let pdf_path = dir.join("added.pdf");
+        std::fs::write(&pdf_path, &cases()[0].1).unwrap();
+        let db = Arc::new(Mutex::new(db));
+        for by_path in [true, false] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let worker = {
+                let db = db.clone();
+                let pdf_path = pdf_path.clone();
+                std::thread::spawn(move || {
+                    let stub = Stub { gate: Some((entered_tx, release_rx)) };
+                    let opts = IngestOpts::default();
+                    let (_g, r) = if by_path {
+                        report_unlocked_with(&stub, || db.lock(), &pdf_path, &opts).unwrap()
+                    } else {
+                        let bytes = crate::pdftools::minimal_pdf(&format!("Second copy 2026 {T1} Brandao doi 10.1148/rg.250127"), None);
+                        bytes_unlocked_with(&stub, || db.lock(), &bytes, "b.pdf", None, &opts).unwrap()
+                    };
+                    r.map(|r| kind(&r.outcome))
+                })
+            };
+            entered_rx.recv_timeout(Duration::from_secs(10)).expect("resolver に入らない");
+            // resolver の中で止まっている間に、こちらのスレッドがロックを取れる（握られていれば 2 秒で失敗）
+            let t0 = Instant::now();
+            let n: i64 = loop {
+                match db.try_lock() {
+                    Ok(g) => break g.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap(),
+                    Err(_) if t0.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("② の間に DB のロックが取れない（by_path={by_path}）: {e}"),
+                }
+            };
+            assert_eq!(n, if by_path { 0 } else { 1 }, "② の時点ではまだ登録していない");
+            release_tx.send(()).unwrap();
+            let outcome = worker.join().unwrap().unwrap();
+            assert_eq!(outcome, if by_path { "Added" } else { "AttachedAdditional" });
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tauri の `import_summary_unlocked` と MCP の `import_summary` が同じ要約を返す（ネットワークに出ない枝:
+    /// ファイルなし・DB 自身のファイル・解析できない PDF・md5 一致 = 相手が要確認 stub なら案内付き）
+    #[test]
+    fn import_summary_unlocked_matches_locked() {
+        let (dir_a, mut a) = temp_db("sum-a");
+        let (dir_b, b) = temp_db("sum-b");
+        let b = std::sync::Mutex::new(b);
+        let unparsable = dir_a.join("broken.pdf");
+        std::fs::write(&unparsable, b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n").unwrap();
+        let dup = dir_a.join("dup.pdf");
+        let dup_bytes = crate::pdftools::minimal_pdf("A scanned page that is already attached to a review stub item", None);
+        std::fs::write(&dup, &dup_bytes).unwrap();
+        for db in [&mut a, &mut *b.lock().unwrap()] {
+            let mut w = Vec::new();
+            create_review_stub(db, None, &dup_bytes, &crate::pdffetch::md5_hex(&dup_bytes), "dup.pdf", "test", &mut w).unwrap();
+        }
+        let strip = |s: ImportSummary| (s.status, s.key.is_some(), s.message.replace(&dir_a.display().to_string(), "<A>").replace(&dir_b.display().to_string(), "<B>"));
+        for (name, pa, pb) in [
+            ("missing", dir_a.join("missing.pdf"), dir_a.join("missing.pdf")),
+            ("connection file", dir_a.join("t.sqlite"), dir_b.join("t.sqlite")),
+            ("unparsable", unparsable.clone(), unparsable.clone()),
+            ("md5 dup of stub", dup.clone(), dup.clone()),
+        ] {
+            let sa = strip(import_summary(&mut a, &pa));
+            let sb = strip(import_summary_unlocked(|| b.lock(), &pb).unwrap());
+            assert_eq!(sa.0, sb.0, "{name}");
+            assert_eq!(sa.1, sb.1, "{name}");
+            assert_eq!(sa.2.replace("<A>", "<D>"), sb.2.replace("<B>", "<D>").replace("<A>", "<D>"), "{name}");
+        }
+        assert_eq!(strip(import_summary_unlocked(|| b.lock(), &dup).unwrap()).0, "duplicate");
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
     }
 }

@@ -150,8 +150,8 @@ CLI の候補確定は `--decisions /path/choices.json` を使います。まず
 
 OpenRef はテレメトリ・アナリティクスを一切行いません。また、LLM の API キーをアプリ内に保持しません。バックグラウンドの通信は、アプリ起動時の新版確認（配布サイトの版番号ファイルを 24 時間に 1 回まで取得・識別子なし・Settings で無効化可）だけで、それ以外の外部への HTTP(S) 通信は以下の機能を実行した際に限定されます（詳細は [SECURITY.md](SECURITY.md)）:
 
-- **DOI / PubMed 書誌解決**: `eutils.ncbi.nlm.nih.gov`, `api.crossref.org`, `doi.org`
-- **OA PDF 自動取得**: `pmc-oa-opendata.s3.amazonaws.com`（PMC AWS Open Data）、および環境変数 `OPENREF_EMAIL` をユーザーが明示設定した場合のみ `api.unpaywall.org`（Unpaywall・opt-in）
+- **DOI / PubMed 書誌解決**: `eutils.ncbi.nlm.nih.gov`, `api.crossref.org`, `doi.org`（医書.jp の DOI がまだ doi.org で解決できないときだけ `webview.isho.jp`）
+- **OA PDF 自動取得**: `pmc-oa-opendata.s3.amazonaws.com`（PMC AWS Open Data）、出版社のサイト（DOI の着地ページ・Crossref が示す PDF の URL・ページが宣言する `citation_pdf_url` へ通常の GET。Cookie なし・プライベート IP は拒否）、および環境変数 `OPENREF_EMAIL` をユーザーが明示設定した場合のみ `api.unpaywall.org`（Unpaywall・opt-in）
 - **引用スタイル追加**: GitHub `citation-style-language` リポジトリ（同梱 4 スタイル以外を追加選択したときのみ取得しローカルキャッシュ）
 - **新版の確認**: `openref.unitedradiology.jp/dl/VERSION`（起動時・前回から 24 時間以上経っていれば 1 回。版番号 1 行を読むだけで、User-Agent に動いている版が載る以外は何も送りません。新版があれば画面上部にお知らせ。自動では入れ替えません。**Settings › 起動時に新版を確認** のチェックを外すと取りに行きません）
 
@@ -175,11 +175,8 @@ OpenRef はテレメトリ・アナリティクスを一切行いません。ま
 必要環境: Rust (`rustup`)・Node.js (22.18+)
 
 ```bash
-# テスト一式
-cargo test --workspace
-node word/test-cite.cjs && node word/test-types.cjs && node word/test-styles.cjs && node word/test-commands.cjs
-node app/src/lib/viewer/util.test.mjs && node app/src/lib/i18n.test.mjs
-xmllint --noout --schema word/xsd/OfficeAppManifestV1_1.xsd word/manifest.xml
+# テスト一式（cargo・svelte-check・node / python のテスト。先に cd app && npm ci）
+bash scripts/test-all.sh
 
 # リリースビルド
 cargo build --release -p openref-cli -p openref-mcp -p openref-connectd

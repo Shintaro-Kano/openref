@@ -1,12 +1,10 @@
-//! Paperpile JSON export の一括 import（初回 seed）。
+//! Paperpile JSON export の adapter。`read_input` が export を `ImportInput`（正規化済みの中間表現）に変えるだけで、
+//! DB 書込・突合・添付の取り込みは共通の移行経路（`apply`）が行う。
 //! API-free 決定論: export 内の書誌をそのまま CSL-JSON 化する（PubMed 再確定はしない）。
-//! 既存 item と PMID/DOI が一致した場合は skip でなく **merge**（folder/添付/由来を既存へ付与）。
 
-use crate::{ingest, keys, model, CoreError, Db, Result};
-use rusqlite::{Connection, OptionalExtension};
+use crate::{CoreError, Result};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Normalize without opening a database or contacting any network service.
 /// Current array/attachment shape verified with a 2026-10-27 Paperpile export.
@@ -35,7 +33,7 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
         }
         let mut warnings = Vec::new();
         let (csl, folder_paths) = match record_to_csl(rec) {
-            Some((csl, extras)) => (csl, extras.folders),
+            Some((csl, folders)) => (csl, folders),
             None => {
                 warnings.push(
                     "題名のない元レコードを document として保持します。書誌は補っていません".into(),
@@ -247,160 +245,8 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
     Ok(input)
 }
 
-#[derive(Debug)]
-pub struct ImportReport {
-    pub total: usize,
-    pub inserted: usize,
-    pub merged: usize,
-    pub skipped_bad: usize,
-    pub without_ids: usize,
-    pub collections_created: usize,
-    pub pdf_linked: usize,
-    pub pdf_missing: Vec<String>,
-    /// リンクした PDF のうち本文を索引できた本数（dry-run は 0）
-    pub fulltext_indexed: usize,
-    /// リンクしたが本文を索引しなかった本数（テキスト層なし / 抽出失敗 / 未ダウンロード。`openref fulltext index` で再試行可）
-    pub fulltext_unindexed: usize,
-    pub dry_run: bool,
-}
-
-pub struct Extras {
-    pub folders: Vec<String>,
-    pub filename: Option<String>,
-    pub created_sqlite: Option<String>,
-}
-
-pub fn import(
-    db: &mut Db,
-    json_path: &Path,
-    mount: Option<PathBuf>,
-    dry_run: bool,
-) -> Result<ImportReport> {
-    let raw = std::fs::read_to_string(json_path)?;
-    let data: Value = serde_json::from_str(&raw)?;
-    let records = data
-        .as_array()
-        .ok_or_else(|| CoreError::Parse("Paperpile JSON: 配列ではありません".into()))?;
-
-    let mut report = ImportReport {
-        total: records.len(),
-        inserted: 0,
-        merged: 0,
-        skipped_bad: 0,
-        without_ids: 0,
-        collections_created: 0,
-        pdf_linked: 0,
-        pdf_missing: Vec::new(),
-        fulltext_indexed: 0,
-        fulltext_unindexed: 0,
-        dry_run,
-    };
-
-    let tx = db.conn.transaction()?;
-    let mut col_cache: HashMap<String, i64> = HashMap::new();
-    // 本文索引は commit 後に 1 本ずつ（抽出中に書込ロックを握り続けて connectd / GUI を database is locked にしない）
-    let mut pending_fulltext: Vec<(i64, PathBuf)> = Vec::new();
-
-    for rec in records {
-        let Some((csl, extras)) = record_to_csl(rec) else {
-            report.skipped_bad += 1;
-            continue;
-        };
-        let pmid = model::s(&csl, "PMID").map(str::to_string);
-        let doi = model::s(&csl, "DOI").map(|d| d.to_lowercase());
-        let pp_id = csl
-            .pointer("/custom/paperpile/id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if pmid.is_none() && doi.is_none() {
-            report.without_ids += 1;
-        }
-
-        let item_id = match find_existing(&tx, pmid.as_deref(), doi.as_deref(), pp_id.as_deref())? {
-            Some((id, csl_s)) => {
-                if let Ok(mut existing) = serde_json::from_str::<Value>(&csl_s) {
-                    if let Some(pp) = csl.pointer("/custom/paperpile") {
-                        merge_custom_paperpile(&mut existing, pp.clone());
-                        tx.execute(
-                            "UPDATE items SET csl = ?1, date_modified = datetime('now') WHERE id = ?2",
-                            rusqlite::params![existing.to_string(), id],
-                        )?;
-                    }
-                }
-                report.merged += 1;
-                id
-            }
-            None => {
-                let key = keys::new_key();
-                match &extras.created_sqlite {
-                    Some(ts) => tx.execute(
-                        "INSERT INTO items (key, csl, date_added, date_modified) VALUES (?1, ?2, ?3, ?3)",
-                        rusqlite::params![key, csl.to_string(), ts],
-                    )?,
-                    None => tx.execute(
-                        "INSERT INTO items (key, csl) VALUES (?1, ?2)",
-                        rusqlite::params![key, csl.to_string()],
-                    )?,
-                };
-                let id = tx.last_insert_rowid();
-                ingest::index_item(&tx, id, &csl)?;
-                report.inserted += 1;
-                id
-            }
-        };
-
-        for folder in &extras.folders {
-            let cid = ensure_collection_path(&tx, folder, &mut col_cache, &mut report.collections_created)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO collection_items (collection_id, item_id) VALUES (?1, ?2)",
-                rusqlite::params![cid, item_id],
-            )?;
-        }
-
-        // 添付リンク（item がまだ添付を持たない場合のみ）
-        let has_att: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM attachments WHERE item_id = ?1",
-            [item_id],
-            |r| r.get(0),
-        )?;
-        if has_att == 0 {
-            if let Some(f) = extras.filename.as_deref() {
-                match mount.as_deref().and_then(|m| resolve_in_mount(m, f)) {
-                    Some(abs) => {
-                        tx.execute(
-                            "INSERT INTO attachments (key, item_id, kind, mode, path) VALUES (?1, ?2, 'pdf', 'linked', ?3)",
-                            rusqlite::params![keys::new_key(), item_id, abs.to_string_lossy()],
-                        )?;
-                        report.pdf_linked += 1;
-                        pending_fulltext.push((tx.last_insert_rowid(), abs));
-                    }
-                    None => report.pdf_missing.push(f.to_string()),
-                }
-            }
-        }
-    }
-
-    if dry_run {
-        tx.rollback()?;
-    } else {
-        tx.commit()?;
-        // 本文の全文索引（dry-run では抽出しない。失敗・空・未ダウンロードは件数だけ数える。1 本ごとに autocommit）
-        for (att_id, abs) in pending_fulltext {
-            match crate::fulltext::index_attachment(&db.conn, att_id) {
-                Ok(crate::fulltext::IndexOutcome::Indexed { .. }) => report.fulltext_indexed += 1,
-                Ok(_) => report.fulltext_unindexed += 1,
-                Err(e) => {
-                    eprintln!("fulltext: {} の本文索引でエラー: {e}", abs.display());
-                    report.fulltext_unindexed += 1;
-                }
-            }
-        }
-    }
-    Ok(report)
-}
-
-/// Paperpile record → (CSL-JSON, extras)。title 欠落のみ不採用。
-pub fn record_to_csl(rec: &Value) -> Option<(Value, Extras)> {
+/// Paperpile record → (CSL-JSON, foldersNamed のパス)。title 欠落のみ不採用。
+pub fn record_to_csl(rec: &Value) -> Option<(Value, Vec<String>)> {
     let title = rec.get("title").and_then(|v| v.as_str())?.trim();
     if title.is_empty() {
         return None;
@@ -524,19 +370,7 @@ pub fn record_to_csl(rec: &Value) -> Option<(Value, Extras)> {
     custom.insert("paperpile".into(), Value::Object(pp));
     m.insert("custom".into(), Value::Object(custom));
 
-    let created_sqlite = rec
-        .get("created")
-        .and_then(|v| v.as_f64())
-        .and_then(unix_to_sqlite);
-
-    Some((
-        Value::Object(m),
-        Extras {
-            folders,
-            filename,
-            created_sqlite,
-        },
-    ))
+    Some((Value::Object(m), folders))
 }
 
 fn map_pubtype(pt: Option<&str>) -> &'static str {
@@ -591,92 +425,6 @@ fn zip_layout_paths(filename: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Legacy CLI still links PDFs, but uses the same explicit-root safety checks
-/// and the observed ZIP layout. Ambiguous/unsafe paths remain unresolved.
-fn resolve_in_mount(mount: &Path, rel: &str) -> Option<PathBuf> {
-    let roots = super::files::AttachmentRoots::new(&[mount.to_path_buf()]).ok()?;
-    let alternatives = zip_layout_paths(rel);
-    let paths: Vec<_> = std::iter::once(rel)
-        .chain(alternatives.iter().map(String::as_str))
-        .collect();
-    match roots.resolve_candidates(&paths).ok()? {
-        super::files::ResolvedPath::Found { path } => Some(path),
-        _ => None,
-    }
-}
-
-/// dedup 三段キー: PMID → DOI → Paperpile _id（DOI・PMID を持たない和文誌等の再 import 重複防止）
-fn find_existing(
-    conn: &Connection,
-    pmid: Option<&str>,
-    doi: Option<&str>,
-    pp_id: Option<&str>,
-) -> Result<Option<(i64, String)>> {
-    for (val, sql) in [
-        (pmid, "SELECT id, csl FROM items WHERE deleted_at IS NULL AND pmid = ?1"),
-        (doi, "SELECT id, csl FROM items WHERE deleted_at IS NULL AND doi = ?1"),
-        (
-            pp_id,
-            "SELECT id, csl FROM items WHERE deleted_at IS NULL AND json_extract(csl, '$.custom.paperpile.id') = ?1",
-        ),
-    ] {
-        if let Some(v) = val {
-            let row = conn
-                .query_row(sql, [v], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-                .optional()?;
-            if row.is_some() {
-                return Ok(row);
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn merge_custom_paperpile(existing: &mut Value, pp: Value) {
-    let Some(o) = existing.as_object_mut() else {
-        return;
-    };
-    let custom = o.entry("custom").or_insert_with(|| json!({}));
-    if let Some(c) = custom.as_object_mut() {
-        c.insert("paperpile".into(), pp);
-        c.entry("source").or_insert(json!("paperpile"));
-    }
-}
-
-fn ensure_collection_path(
-    conn: &Connection,
-    path: &str,
-    cache: &mut HashMap<String, i64>,
-    created: &mut usize,
-) -> Result<i64> {
-    let mut parent: Option<i64> = None;
-    let mut acc = String::new();
-    for seg in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        acc = if acc.is_empty() {
-            seg.to_string()
-        } else {
-            format!("{acc}/{seg}")
-        };
-        if let Some(&id) = cache.get(&acc) {
-            parent = Some(id);
-            continue;
-        }
-        // 兄弟の照合は大小無視（edit::ensure_collection_path・collections::create_collection と同じ基準）。
-        // GUI で "Liver" → "liver" と改名した後に再 import しても同じ親の下に "Liver" をもう 1 つ作らない
-        let id = match crate::collections::child_id(conn, parent, seg)? {
-            Some(id) => id,
-            None => {
-                let id = crate::collections::insert_child(conn, parent, seg)?;
-                *created += 1;
-                id
-            }
-        };
-        cache.insert(acc.clone(), id);
-        parent = Some(id);
-    }
-    parent.ok_or_else(|| CoreError::Parse(format!("空のフォルダパス: {path}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,7 +447,7 @@ mod tests {
             "attachments": [{"article_pdf": 1, "filename": "All Papers/T/Test 2026 - A.pdf"}],
             "created": 1750000000.0
         });
-        let (csl, ex) = record_to_csl(&rec).unwrap();
+        let (csl, folders) = record_to_csl(&rec).unwrap();
         assert_eq!(csl["type"], "article-journal");
         assert_eq!(csl["DOI"], "10.5555/upper.case");
         assert_eq!(csl["container-title"], "Test Journal");
@@ -708,10 +456,11 @@ mod tests {
         assert_eq!(csl["author"][1]["literal"], "Some Working Group");
         assert_eq!(csl["issued"]["date-parts"][0][0], 2026);
         assert_eq!(csl["custom"]["paperpile"]["citekey"], "Test2026-xy");
-        assert_eq!(ex.folders, vec!["Parent/Child"]);
-        assert_eq!(ex.filename.as_deref(), Some("All Papers/T/Test 2026 - A.pdf"));
-        // 1750000000 = 2025-06-15 UTC
-        assert!(ex.created_sqlite.unwrap().starts_with("2025-06-15"));
+        assert_eq!(folders, vec!["Parent/Child"]);
+        assert_eq!(
+            csl["custom"]["paperpile"]["filename"],
+            "All Papers/T/Test 2026 - A.pdf"
+        );
     }
 
     #[test]

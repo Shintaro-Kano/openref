@@ -1,9 +1,11 @@
 /* OpenRef Capture — content script（popup から都度注入・activeTab）。
    役割は 2 つだけ: ①識別子（DOI/PMID）と PDF URL の抽出 ②ページ内 fetch での PDF 取得。
-   書誌の組み立ては一切しない（PubMed/Crossref が正 = translator 不要の設計）。 */
+   書誌の組み立ては一切しない（PubMed/Crossref が正 = translator 不要の設計）。
+   popup は pdfbytes.js（OpenRefShared）を先に注入する。 */
 (function () {
   "use strict";
-  if (window.__openRefCaptureLoaded) return;
+  // === true で見る（ページの id="__openRefCaptureLoaded" の要素は Window の named property として見え、真値になる）
+  if (window.__openRefCaptureLoaded === true) return;
   window.__openRefCaptureLoaded = true;
 
   function meta(name) {
@@ -38,19 +40,19 @@
       var md = location.pathname.match(
         /\/doi\/(?:full\/|abs\/|pdf\/|epdf\/|pdfdirect\/)?(10\.\d{4,9}\/[^\s?#]+)/
       );
-      if (md) doi = cleanDoi(decodeURIComponent(md[1]));
+      if (md) doi = cleanDoi(OpenRefShared.safeDecode(md[1]));
     }
     // 医書.jp: PDF 自体に DOI の印字がなくても出版社 URL に識別子がある。
     if (!doi && location.hostname === "webview.isho.jp") {
       var isho = location.pathname.match(/^\/journal\/detail\/(?:pdf|abs)\/(10\.\d{4,9}\/.+)$/);
-      if (isho) doi = cleanDoi(decodeURIComponent(isho[1]));
+      if (isho) doi = cleanDoi(OpenRefShared.safeDecode(isho[1]));
     }
     // doi.org リンク
     if (!doi) {
       var a = document.querySelector('a[href*="doi.org/10."]');
       if (a) {
         var ma = a.href.match(/doi\.org\/(10\.[^\s?#]+)/);
-        if (ma) doi = cleanDoi(decodeURIComponent(ma[1]));
+        if (ma) doi = cleanDoi(OpenRefShared.safeDecode(ma[1]));
       }
     }
     // 最終手段: 本文冒頭から DOI
@@ -137,27 +139,15 @@
     };
   }
 
-  function metaRefreshUrl(doc, base) {
-    var m = doc.querySelector('meta[http-equiv="refresh" i]');
-    if (!m) return null;
-    var mm = /url\s*=\s*['"]?([^'"]+)/i.exec(m.getAttribute("content") || "");
-    if (!mm) return null;
-    try {
-      return new URL(mm[1].trim(), base).href;
-    } catch (e) {
-      return null;
-    }
-  }
-
   /* PDF の代わりに HTML が返ったときの「1 回だけ」の追従先（背景タブ経路からの要求時のみ使う）:
      meta refresh があればその先。無ければ、文書中の **同一オリジンでパスが .pdf で終わる URL**
      （a / iframe / embed / object / citation_pdf_url）が **ちょうど 1 つ**のときだけそれ。
      ホスト名の ".pdf" やクエリだけの ".pdf"、別オリジン（補遺配信ホスト等）は数えない。
      ScienceDirect の pdfft → pdf.sciencedirectassets.com 署名 URL の中継ページは meta refresh で拾う
-     （出版社名で分岐しない汎用規則）。 */
+     （出版社名で分岐しない汎用規則）。meta refresh の規則は pdfbytes.js（background.js と共有）。 */
   function nextPdfUrlFromHtml(html, base) {
     var doc = new DOMParser().parseFromString(html, "text/html");
-    var r = metaRefreshUrl(doc, base);
+    var r = OpenRefShared.metaRefreshUrlInDoc(doc, base);
     if (r) return r;
     var origin;
     try {
@@ -244,8 +234,9 @@
     }
     if (msg && msg.type === "openref-refresh-url") {
       // 中継ページ（linkinghub.elsevier.com 等）の meta refresh の飛び先。popup の背景タブ経路が着地を待つのに使う
+      // （規則は取得した HTML への追従と同じ = pdfbytes.js。delay > 10 秒のセッション期限タイマーを中継と誤認しない）
       try {
-        sendResponse({ ok: true, url: metaRefreshUrl(document, location.href) });
+        sendResponse({ ok: true, url: OpenRefShared.metaRefreshUrlInDoc(document, location.href) });
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });
       }

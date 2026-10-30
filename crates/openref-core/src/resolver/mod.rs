@@ -3,6 +3,7 @@ mod isho;
 mod pubmed;
 
 pub use crossref::{search_bibliographic, Candidate};
+pub(crate) use crossref::with_crossref_gate;
 
 use crate::{CoreError, Result};
 use serde_json::Value;

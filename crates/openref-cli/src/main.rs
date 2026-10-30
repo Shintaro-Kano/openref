@@ -74,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// 索引（著者・誌名・検索）を今の書誌から貼り直す（書誌は変えない。索引がずれた item の修復用）
+    Reindex {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     /// DB パスと件数
     Info,
     /// PDF 本文の全文索引（検索ボックスで本文もヒットさせる。Paperpile の full-text search 相当）
@@ -156,7 +161,7 @@ enum ImportSrc {
         #[arg(long)]
         decisions: Option<PathBuf>,
     },
-    /// Paperpile JSON export（初回 seed。folders/添付リンク込み）
+    /// Paperpile JSON export（共通の移行処理: 事前確認 → 適用。同じ入力の再実行は重複せず、GUI で削除・改名したフォルダ/タグは戻さない。--mount の PDF は既定でリンク）
     Paperpile {
         json: PathBuf,
         /// 旧 CLI の Paperpile ID が同じライブラリに属することを確認して照合する
@@ -388,6 +393,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Refresh { key, source, all } => {
             cmd_refresh(&mut db, key.as_deref(), source.as_deref(), all)?
         }
+        Cmd::Reindex { keys } => {
+            println!("索引を貼り直しました: {} 件", ingest::reindex_keys(&mut db, &keys)?);
+        }
         Cmd::Info => {
             let c = search::counts(&db)?;
             println!("DB: {}", path.display());
@@ -452,8 +460,8 @@ fn cmd_cutover(db: &Db, action: CutoverAction) -> anyhow::Result<()> {
             println!("pdf_write_mode: {}", db.pdf_write_mode());
             println!(
                 "attachments: linked {} / managed {}",
-                mount::count_attachments_by_mode(db, "linked"),
-                mount::count_attachments_by_mode(db, "managed")
+                mount::count_attachments_by_mode(db, "linked")?,
+                mount::count_attachments_by_mode(db, "managed")?
             );
             match mount::detect() {
                 Some(m) => println!("mount: {}", m.display()),
@@ -461,7 +469,7 @@ fn cmd_cutover(db: &Db, action: CutoverAction) -> anyhow::Result<()> {
             }
         }
         CutoverAction::Enable => {
-            let enabled = mount::enable_drive_mode(db)?;
+            let enabled = mount::enable_drive_mode(|| Ok(db))?;
             println!("✓ cutover 有効化: 以後の新規 PDF 添付は Drive 互換レイアウトへ書きます");
             println!("  mount: {}", enabled.mount.display());
             if enabled.managed_remaining > 0 {
@@ -476,17 +484,26 @@ fn cmd_cutover(db: &Db, action: CutoverAction) -> anyhow::Result<()> {
             println!("✓ managed モードへ戻しました（既存の linked 添付には影響しません）");
         }
         CutoverAction::MigrateManaged { dry_run } => {
-            let migrated = mount::migrate_managed_to_drive(db, dry_run)?;
-            if migrated.is_empty() {
+            let migration = mount::migrate_managed_to_drive(|| Ok(db), dry_run)?;
+            if migration.moved.is_empty() && migration.skipped.is_empty() {
                 println!("managed 添付はありません（移行済み）");
                 return Ok(());
             }
-            for m in migrated {
+            for m in migration.moved {
                 if dry_run {
                     println!("[dry-run] {}: {}\n  → {}", m.item_key, m.src_path, m.dest_path.display());
                 } else {
                     println!("✓ {}: → {}", m.item_key, m.dest_path.display());
                     println!("  (storage 原本は保険で残置: {})", m.src_path);
+                }
+            }
+            if !migration.skipped.is_empty() {
+                println!("※ 移行の間に変わった添付 {} 件は移していません", migration.skipped.len());
+            }
+            for s in &migration.skipped {
+                println!("- {}: {}（{}）", s.item_key, s.reason, s.src_path);
+                if let Some((p, e)) = &s.leftover {
+                    println!("  ⚠ 書いたコピーを消せませんでした: {} ({e})", p.display());
                 }
             }
         }
@@ -666,18 +683,22 @@ fn cmd_refresh(
     }
     println!("対象 {} 件を引き直します", keys.len());
     let (mut upd, mut same, mut skip) = (0, 0, 0);
-    for (i, k) in keys.iter().enumerate() {
-        if i > 0 {
-            // NCBI への礼儀（3 req/sec 制限）
-            std::thread::sleep(NCBI_INTERVAL);
-        }
+    // NCBI 3 req/s の間隔は core（resolver/pubmed.rs の EUTILS_THROTTLE）が要求ごとに守る
+    for k in &keys {
         match ingest::refresh_item(db, k) {
             Ok(ingest::RefreshOutcome::Updated) => {
                 upd += 1;
-                let t = search::get_by_key(db, k)?
-                    .and_then(|it| model::s(&it.csl, "title").map(|s| s.to_string()))
+                let item = search::get_by_key(db, k)?;
+                let t = item
+                    .as_ref()
+                    .and_then(|it| model::s(&it.csl, "title"))
                     .unwrap_or_default();
-                println!("✓ {k}  更新  {}", model::truncate_chars(&t, 56));
+                println!("✓ {k}  更新  {}", model::truncate_chars(t, 56));
+                if let Some(it) = &item {
+                    if let Some(r) = search::retraction_of(db, it.id)? {
+                        println!("  ⚠ 撤回論文の可能性: {r}");
+                    }
+                }
             }
             Ok(ingest::RefreshOutcome::Unchanged) => same += 1,
             Ok(ingest::RefreshOutcome::NoIdentifier) => skip += 1,
@@ -813,9 +834,6 @@ fn print_row(r: &model::ItemRow) {
         model::truncate_chars(model::s(c, "title").unwrap_or("(no title)"), 70)
     );
 }
-
-/// 連続して NCBI（E-utilities・3 req/s）を引くときの間隔
-const NCBI_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// ライブラリ移行の安全な中止フラグ。
 static IMPORT_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1065,11 +1083,8 @@ fn cmd_library_import(
 fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
     use openref_core::pdfingest::{ingest_pdf_report, is_review_stub, IngestOpts, PdfIngestOutcome};
     let (mut added, mut attached, mut review, mut dup, mut failed) = (0, 0, 0, 0, 0);
+    // NCBI 3 req/s の間隔は core（resolver/pubmed.rs の EUTILS_THROTTLE）が要求ごとに守る
     for (i, p) in paths.iter().enumerate() {
-        if i > 0 {
-            // NCBI 3 req/s（1 件 = esearch + efetch）を超えないよう間隔を空ける
-            std::thread::sleep(NCBI_INTERVAL);
-        }
         let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         // 理由（要確認の根拠・Drive → managed 降格）も出す
         let (res, warnings, reason) = match ingest_pdf_report(db, p, &IngestOpts::default()) {

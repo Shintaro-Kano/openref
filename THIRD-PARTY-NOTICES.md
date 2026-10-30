@@ -1,6 +1,6 @@
 # Third-Party Notices (`THIRD-PARTY-NOTICES.md`)
 
-OpenRef 本体のソースコード（`crates/*`, `app/src/*`, `app/src-tauri/*`, `extension/*`, `word/*.{js,html,xml}`, `site/*`, `scripts/*`）は **MIT License**（[LICENSE](LICENSE)）の下で提供されます。
+OpenRef 本体のソースコード（`crates/*`, `app/src/*`, `app/src-tauri/*`, `extension/*`, `word/*.{js,html,css}`, `site/*`, `scripts/*`）は **MIT License**（[LICENSE](LICENSE)）の下で提供されます。
 
 本プロジェクトが同梱またはビルド時にリンクする第三者ソフトウェア・アセットのライセンスおよび著作権表示は以下の通りです。
 
@@ -55,11 +55,8 @@ OpenRef の各バイナリ（`OpenRef.app`, `openref`, `openref-mcp`, `openref-c
 
 ---
 
-## 3. 外部ツールおよび開発時検証用ファイル（非同梱）
+## 3. 外部ツール（非同梱）
 
 ### 3.1 Poppler (`pdftotext`) — **非同梱**
 - OpenRef は Poppler (`pdftotext`, GPL) を**一切同梱・配布していません**。
 - 内蔵の PDF テキスト抽出器（`pdf-extract` / MIT）で文字化けが検出された場合に限り、ユーザーの Mac に `/opt/homebrew/bin/pdftotext` 等が導入されていれば外部プロセスとして呼び出す任意フォールバック構成をとっています。
-
-### 3.2 Office Add-in XML Schema (`word/xsd/*.xsd`) — **ビルド・配布物には非同梱**
-- リポジトリ内の `word/xsd/` は、`word/manifest.xml` の構文検証（`xmllint --schema`）にのみ使用する Microsoft Open Specifications（`MS-OWEMXML`）のスキーマ定義であり、配布バイナリやインストーラには含まれません。

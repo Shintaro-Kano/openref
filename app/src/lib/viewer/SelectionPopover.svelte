@@ -6,6 +6,7 @@
      ※ ボタン/色ドットは mousedown で preventDefault し、選択（::selection）を消さない。
        コメント入力にフォーカスすると DOM 選択は消えるが、親は選択テキストを確定保持済みなので問題ない。 */
   import { USER_COLOR_CHOICES, ANNOT_PALETTE, type PopoverPos } from "./util";
+  import { onEnter } from "../input";
 
   let {
     pos,
@@ -59,12 +60,7 @@
       placeholder={t("コメント（任意）")}
       value={comment}
       oninput={(e) => onComment(e.currentTarget.value)}
-      onkeydown={(e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          onSave();
-        }
-      }}
+      onkeydown={(e) => onEnter(e, onSave)}
     />
     <button class="sp-save" title={t("保存")} onmousedown={keepSel} onclick={onSave}>p.{page} {t("保存")}</button>
     <button class="sp-cancel" title={t("閉じる")} onmousedown={keepSel} onclick={onCancel}>×</button>

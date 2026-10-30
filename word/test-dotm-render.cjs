@@ -122,7 +122,7 @@ check("render AMA: 上付きの引用と斜体の誌名（run の位置）", () 
   assert.ok(out.bib.text.startsWith("1. Stoffel EM"), out.bib.text);
 });
 
-check("render: 蔵書（fresh）の最新を優先・無い key は snapshot（後の payload の snapshot が勝つ = updateAll と同じ）", () => {
+check("render: 蔵書（fresh）の最新を優先・無い key は snapshot（後の payload の snapshot が勝つ）", () => {
   const fresh = { K1: { ...K1, title: "Fresh title from library" } };
   const oldK3 = { items: [{ key: "K3", csl: { ...K3, title: "First snapshot" } }] };
   const out = R.render(input("vancouver", [P("K1"), oldK3, P("K3")], { fresh }));

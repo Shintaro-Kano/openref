@@ -12,6 +12,8 @@
      通常は SW が停止しないようにする。閉じ損ねは最長で alarm の 90 秒。 */
 "use strict";
 
+importScripts("pdfbytes.js"); // OpenRefShared.metaRefreshUrl（content.js と同じ規則）
+
 const TAB_KEY = "openref_hidden_tabs"; // {tabId: openedAt(ms)}
 const TAB_TTL_MS = 90 * 1000;
 const ALARM_PREFIX = "openref-hidden-tab-"; // + tabId
@@ -123,24 +125,9 @@ function isPdfBytes(b) {
 
 /* SW 側の 1 回追従は **meta refresh だけ**（content.js は加えて「同一オリジンの .pdf パスがちょうど 1 つ」も見る。
    SW には DOMParser が無く同じ規則を忠実に再現できないので、規則を狭めて差を無くす方を選んだ）。
-   HTML コメントと noscript は無視。 */
+   meta refresh の規則そのもの（コメント・noscript を無視・delay > 10 秒は追わない）は pdfbytes.js の 1 つを content.js と共有する。 */
 function nextPdfUrlFromHtml(html, base) {
-  html = html.replace(/<!--[\s\S]*?-->/g, "").replace(/<noscript\b[\s\S]*?<\/noscript>/gi, "");
-  const metas = html.match(/<meta\b[^>]*>/gi) || [];
-  for (const m of metas) {
-    if (!/http-equiv\s*=\s*["']?refresh["']?/i.test(m)) continue;
-    const c = /content\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(m);
-    const content = (c ? c[1] || c[2] || "" : "").replace(/&amp;/g, "&").replace(/&#x2f;/gi, "/").replace(/&#47;/g, "/");
-    const delay = parseInt(content, 10);
-    if (!isNaN(delay) && delay > 10) continue; // logout タイマー等は中継ではない
-    const mm = /url\s*=\s*['"]?([^'"]+)/i.exec(content);
-    if (mm) {
-      try {
-        return new URL(mm[1].trim(), base).href;
-      } catch (e) { /* 次へ */ }
-    }
-  }
-  return null;
+  return OpenRefShared.metaRefreshUrl(html, base);
 }
 
 async function fetchPdf(url, follow, hopped) {

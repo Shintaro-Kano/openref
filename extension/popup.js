@@ -73,7 +73,8 @@ function urlOnlyAnalyze(url) {
   const mp = url.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d{4,9})/);
   if (mp) out.pmid = mp[1];
   const md = url.match(/\/doi\/(?:full\/|abs\/|pdf\/|epdf\/|pdfdirect\/)?(10\.\d{4,9}\/[^\s?#]+)/);
-  if (md) out.doi = decodeURIComponent(md[1]).replace(/[).,;\]]+$/, "");
+  const mdDoi = md && OpenRefShared.safeDecode(md[1]); // 壊れた % = DOI なし
+  if (mdDoi) out.doi = mdDoi.replace(/[).,;\]]+$/, "");
   if (/\.pdf(\?|$)/i.test(url) || /\/doi\/e?pdf\//.test(url) || /\/pdfft\b/.test(url)) {
     out.pdfUrl = url;
     out.pdfSource = "self";
@@ -83,7 +84,7 @@ function urlOnlyAnalyze(url) {
     const u = new URL(url);
     const isho = u.pathname.match(/^\/journal\/detail\/(pdf|abs)\/(10\.\d{4,9}\/.+)$/);
     if (u.hostname === "webview.isho.jp" && isho) {
-      out.doi = decodeURIComponent(isho[2]);
+      out.doi = OpenRefShared.safeDecode(isho[2]); // 壊れた % = DOI なし（null）
       if (isho[1] === "pdf") {
         out.pdfUrl = url;
         out.pdfSource = "self";
@@ -178,7 +179,7 @@ async function init() {
   // ページ解析
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["pdfbytes.js", "content.js"] });
     const res = await sendToTab({ type: "openref-analyze" });
     if (res.ok) {
       page = res.data;
@@ -571,7 +572,7 @@ async function viaDoiTab(key, doi, pmc = null) {
       const seen = w.gen(); // この読込の世代。以後に増えたら次のページへ移り始めた
       host = hostOf(url || "");
       try {
-        await withTimeout(chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["content.js"] }), STEP_TIMEOUT_MS, "content script の注入");
+        await withTimeout(chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["pdfbytes.js", "content.js"] }), STEP_TIMEOUT_MS, "content script の注入");
         injected = true;
       } catch (e) {
         injected = false;

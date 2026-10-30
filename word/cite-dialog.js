@@ -1,6 +1,6 @@
 /* OpenRef — Add/Edit Citation ダイアログ（Paperpile の検索ダイアログ相当・文書の上に浮く）。
    初期データ d = {mode:"add"|"edit", items:[{key, label?}], style:{id, title}, missing?}（URL クエリ）。
-   親（commands.js）へ返すメッセージ（JSON 文字列）:
+   結果のメッセージ（JSON。dialog-common.js の send が connectd へ送る）:
      {type:"insert"|"replace", keys:[...]} / {type:"delete"}（編集で 0 件を確定）/ {type:"cancel"} */
 (function () {
   "use strict";
@@ -32,11 +32,6 @@
     return S.chips.some(function (c) {
       return c.key === key;
     });
-  }
-  function cslLabel(csl) {
-    var a = (csl.author && csl.author[0] && (csl.author[0].family || csl.author[0].literal)) || "?";
-    var y = (csl.issued && csl.issued["date-parts"] && csl.issued["date-parts"][0] && csl.issued["date-parts"][0][0]) || "";
-    return a + (y ? " " + y : "");
   }
   function resultLabel(it) {
     return (it.first_author || "?") + (it.year ? " " + it.year : "");
@@ -302,7 +297,7 @@
     el.q.disabled = true;
     renderButtons();
     if (!RD.send(m)) {
-      // Office 外（プレビュー）: 送れないので操作を戻す
+      // プレビュー（host=dotm なし）: 送っていないので操作を戻す
       setTimeout(function () {
         S.sent = false;
         el.q.disabled = false;
@@ -323,7 +318,7 @@
     else if (mode === "edit" && fromButton) finish({ type: "delete" });
   }
 
-  /** 編集: チップの title 属性に論文タイトル（d に label が無ければ書誌から作る） */
+  /** 編集: チップの title 属性に論文タイトル（label は connectd が d に入れて渡す） */
   function loadChipTitles() {
     if (!S.chips.length) return;
     RD.fetchJson("/api/items", {
@@ -340,7 +335,6 @@
           var csl = m && m[c.key];
           if (csl) {
             c.title = csl.title || "";
-            if (c.label === c.key) c.label = cslLabel(csl);
           } else {
             c.title = "蔵書に見つかりません（文書内のデータで整形されます）";
           }
@@ -404,7 +398,6 @@
 
     changed();
     loadChipTitles();
-    RD.limitBanner();
     RD.focus(el.q);
   });
 })();

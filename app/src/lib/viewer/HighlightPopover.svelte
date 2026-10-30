@@ -6,6 +6,7 @@
      Claude 注釈（author が claude 系）は色を purple 固定のまま変更不可（サイドバーの編集と同じ規則）。 */
   import type { AnnotationRow } from "../api";
   import { USER_COLOR_CHOICES, ANNOT_PALETTE, colorForAnnotation, isClaudeAuthor, normalizedColor, type PopoverPos } from "./util";
+  import { composing } from "../input";
 
   let {
     pos,
@@ -67,6 +68,7 @@
       value={comment}
       oninput={(e) => onComment(e.currentTarget.value)}
       onkeydown={(e) => {
+        if (composing(e)) return; // IME の確定 Enter・取消 Esc は保存 / 閉じるにしない
         if (e.key === "Enter") {
           e.preventDefault();
           onSave();

@@ -1,6 +1,6 @@
-// dialog-common.js の送信先の切り替え（?host=dotm = Startup テンプレート版の OpenRef Dialog.app）の node テスト。
-// dotm: 結果を /word/v2/dialog/<sid>/result へ POST（X-OpenRef ヘッダ）→ 届いたら document.title = "openref:done"・
-// ready は即時・5 分制限の予告帯なし。Office: 従来どおり messageParent・onReady 待ち・予告帯あり。
+// dialog-common.js の送信先の切り替え（?host=dotm = OpenRef Dialog.app）の node テスト。
+// dotm: 結果を /word/v2/dialog/<sid>/result へ POST（X-OpenRef ヘッダ）→ 届いたら document.title = "openref:done"・ready は即時。
+// host=dotm なし（プレビュー）: 送らずに debug 行へ出す（send は false = 呼び手が操作を戻す）。
 // 実行: node word/test-dialog-dotm.cjs
 "use strict";
 const fs = require("fs");
@@ -40,7 +40,6 @@ function load(search, extra) {
       return extra.fetch(url, opts);
     },
   };
-  if (extra.Office) win.Office = extra.Office;
   win.window = win;
   const ctx = vm.createContext(win);
   vm.runInContext(SRC, ctx);
@@ -60,13 +59,12 @@ async function check(name, fn) {
 }
 
 (async () => {
-  await check("dotm: ready は即時・予告帯なし・結果を POST して届いたら openref:done", async () => {
+  await check("dotm: ready は即時・結果を POST して届いたら openref:done", async () => {
     const env = load("?host=dotm&sid=ab12&d=%7B%7D", { fetch: () => Promise.resolve({ ok: true, status: 200 }) });
     let ran = false;
     env.RD.ready(() => (ran = true));
-    assert.ok(ran, "ready は同期で呼ぶ（Office を待たない）");
-    env.RD.limitBanner();
-    assert.strictEqual(env.timers.length, 0, "5 分制限の予告帯は出さない");
+    assert.ok(ran, "ready は同期で呼ぶ");
+    assert.strictEqual(env.timers.length, 0);
     assert.strictEqual(env.RD.params().sid, "ab12");
     assert.strictEqual(env.RD.send({ type: "insert", keys: ["K1"] }), true);
     assert.strictEqual(env.calls.length, 1);
@@ -89,25 +87,15 @@ async function check(name, fn) {
     assert.ok(/HTTP 404/.test(env.els["rd-debug"].textContent), env.els["rd-debug"] && env.els["rd-debug"].textContent);
   });
 
-  await check("Office: 従来どおり onReady を待って messageParent・予告帯は 4:15", async () => {
-    const sent = [];
-    let onReady = null;
-    const Office = {
-      onReady: (cb) => (onReady = cb),
-      context: { ui: { messageParent: (s) => sent.push(s) } },
-    };
-    const env = load("?d=%7B%7D", { Office, fetch: () => assert.fail("fetch しない") });
+  await check("プレビュー（host=dotm なし）: ready は即時・送らずに debug 行へ・send は false", async () => {
+    const env = load("?d=%7B%7D", { fetch: () => assert.fail("fetch しない") });
     let ran = false;
     env.RD.ready(() => (ran = true));
-    assert.ok(!ran, "onReady を待つ");
-    assert.ok(env.timers.some((t) => t.ms === 3000), "3 秒で見切る");
-    onReady({ host: "Word" });
     assert.ok(ran);
-    assert.strictEqual(env.RD.send({ type: "cancel" }), true);
-    assert.deepStrictEqual(sent, ['{"type":"cancel"}']);
+    assert.strictEqual(env.RD.send({ type: "cancel" }), false);
     assert.strictEqual(env.calls.length, 0);
-    env.RD.limitBanner();
-    assert.ok(env.timers.some((t) => t.ms === (4 * 60 + 15) * 1000), "予告帯");
+    assert.strictEqual(env.els["rd-debug"].textContent, 'result: {"type":"cancel"}');
+    assert.notStrictEqual(env.document.title, "openref:done");
   });
 
   console.log(failures ? `\n${failures} FAILED` : "\nALL PASS");

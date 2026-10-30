@@ -47,6 +47,7 @@
     tabsPref,
     toast,
   } from "./lib/state.svelte";
+  import { composing } from "./lib/input";
 
   let searchInput = $state("");
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -121,7 +122,7 @@
     else if (cmd && !e.shiftKey && /^[1-9]$/.test(k)) act = () => activateTabAt(Number(k));
     else return false;
     e.preventDefault();
-    if (!e.repeat && !e.isComposing && e.keyCode !== 229) act();
+    if (!e.repeat && !composing(e)) act();
     return true;
   }
 
@@ -141,8 +142,8 @@
       // ⌘A = 一覧をすべてチェック（Paperpile 準拠）
       e.preventDefault();
       checkAll();
-    } else if (e.key === "Escape") {
-      // Esc の優先順位: モーダル → PDF ビューア → ＋新規メニュー → サイドバーのメニュー → ツールバーのメニュー → 取込モーダル（実行中は無視）→ チェック解除。
+    } else if (e.key === "Escape" && !composing(e)) {
+      // IME の変換取消の Esc は入力欄のもの（メニュー・チェックを畳まない）。Esc の優先順位: モーダル → PDF ビューア → ＋新規メニュー → サイドバーのメニュー → ツールバーのメニュー → 取込モーダル（実行中は無視）→ チェック解除。
       // モーダルは各コンポーネントが自分の window keydown で内側から閉じる。window の keydown は App が先に受けるので
       // （モーダル側の stopPropagation はここに届かない）、モーダルが開いている間はここで背後のもの（メモ欄など）を閉じない。
       // 前面の PDF ビューアは自分の window keydown で扱う（ハイライトの編集・選択の取消 → 入力欄から抜ける → タブを閉じる）。
@@ -173,14 +174,21 @@
       選んでいる = 一覧にあれば詳細も読む）。フォルダ / ラベルを読めなければタブは戻さず、このセッションでは保存もしない
       （保存済みのタブを既定の 1 枚で上書きしない） */
   async function startup() {
+    let sidebarFailed = false;
     try {
       await refreshSidebar();
       await restoreTabs();
     } catch (e) {
+      sidebarFailed = true;
       toast(t("✗ フォルダ・ラベルの読込に失敗（タブは戻さず・保存もしません）: ") + String(e).slice(0, 160));
     }
-    await refreshList();
-    await reloadDetail();
+    // 一覧の失敗も握りつぶさない。ただし上の具体的な知らせ（たいてい同じ原因）を汎用の文言で上書きしない
+    try {
+      await refreshList();
+      await reloadDetail();
+    } catch (e) {
+      if (!sidebarFailed) toast(`✗ ${t("一覧の読込に失敗")}: ${String(e).slice(0, 160)}`);
+    }
   }
 
   // PDF ビューアを置いたタブ。ビューアはそのタブが初めて前面になったときに作り（起動時に戻した PDF タブを全部は読まない）、

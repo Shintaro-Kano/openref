@@ -18,9 +18,12 @@
     select,
     toggleCheck,
   } from "./state.svelte";
+  import { composing } from "./input";
 
-  /** メモ欄のキー: ⌘Enter = 保存して閉じる / Esc = 未編集なら閉じる（編集中は何もしない）。一覧の Esc 連鎖には渡さない */
+  /** メモ欄のキー: ⌘Enter = 保存して閉じる / Esc = 未編集なら閉じる（編集中は何もしない）。一覧の Esc 連鎖には渡さない。
+      IME の変換中（取消の Esc・確定前の ⌘Enter）は何もしない = 取消で本文が保存済みに戻った瞬間に閉じない */
   function onNoteKey(e: KeyboardEvent) {
+    if (composing(e)) return;
     if (e.key === "Escape") {
       e.stopPropagation();
       closeNoteEditor();

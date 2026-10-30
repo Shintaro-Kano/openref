@@ -3,7 +3,8 @@
    util.ts は型を消すだけで動く TS（enum・namespace・parameter property を使わない）であることが前提。
    入力は手組みの小さな item 列。PdfViewer.svelte から移した ブロック分割・柱検出・読み順・本文組立・索引 の既存の挙動と、
    その閾値（行送り 0.5 / 2.2・文字高比 0.88 / 1.14・本文比 0.95 / 0.97・同行 0.45・meta 4 行・読み順 8 item・柱 2 ページ）を固定する。
-   あわせて 文書内検索の出現列・ハイライト矩形（fragmentRects）・注釈の色・注釈 quote の照合（squash 空間）を固定する。 */
+   あわせて 文書内検索の出現列・ハイライト矩形（fragmentRects）・注釈の色・注釈 quote の照合（squash 空間）・
+   注釈タブの検索（matchParts = 絞り込みと強調が同じ一致）を固定する。 */
 import assert from "node:assert/strict";
 import {
   makePageText,
@@ -26,6 +27,7 @@ import {
   normalizedColor,
   isClaudeAuthor,
   normText,
+  matchParts,
   squashFlatSpan,
   fitScale,
   AUTO_MAX,
@@ -522,6 +524,98 @@ test("squashFlatSpan: 選択（全体だけ）と注釈（全体 → 先頭 40 �
     assert.deepEqual(ann(gg, seg), want, JSON.stringify(seg));
   }
   assert.ok(found > 1500, `found ${found}`);
+});
+
+// ---------- 注釈タブの検索（matchParts） ----------
+// 旧（検索の正規化を共通化する前）: 絞り込み = normText(text).includes(normText(q).trim())・カードの強調 = per-char lowercase の indexOf
+// （q は trim + 文字列全体の toLowerCase・長さの変わる lowercase があれば強調しない）。2 つの正規化が食い違う入力で
+// 「絞り込みに残るのに <mark> が付かない」が起きていた。新は両方とも matchParts の結果（null か否か / m の断片）
+const oldFilter = (text, q) => normText(text).includes(normText(q).trim());
+function oldParts(text, q) {
+  q = q.trim();
+  if (!q) return [{ t: text, m: false }];
+  const lower = text.split("").map((c) => c.toLowerCase()).join("");
+  const ql = q.toLowerCase();
+  if (lower.length !== text.length || !ql) return [{ t: text, m: false }];
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const i = lower.indexOf(ql, from);
+    if (i < 0) break;
+    if (i > from) out.push({ t: text.slice(from, i), m: false });
+    out.push({ t: text.slice(i, i + ql.length), m: true });
+    from = i + ql.length;
+  }
+  if (from < text.length) out.push({ t: text.slice(from), m: false });
+  return out;
+}
+const marked = (parts) => (parts ?? []).filter((p) => p.m).map((p) => p.t);
+const joined = (parts) => parts.map((p) => p.t).join("");
+
+test("matchParts: 旧の 2 つの正規化が食い違う入力（空白 2 個・改行・İ・ΟΣ）で、絞り込みと強調が同じ一致を見る", () => {
+  const cases = [
+    // [text, q, 新の強調の断片]
+    ["seen in  the liver", "in the", ["in  the"]], // text 側の空白 2 個
+    ["seen in the liver", "in  the", ["in the"]], // 検索語側の空白 2 個
+    ["seen in\nthe liver", "in the", ["in\nthe"]], // 改行（選択由来の quote）
+    ["İstanbul hepatic", "stan", ["stan"]], // 長さの変わる lowercase（'İ' → "i̇"）
+    ["ΟΣ sign", "ΟΣ", ["ΟΣ"]], // 語末シグマ（文字列全体の toLowerCase は "ος"・per-unit は "οσ"）
+  ];
+  for (const [text, q, want] of cases) {
+    // 旧: 絞り込みには残るのに強調が無い（= 食い違いの実例であることを固定）
+    assert.equal(oldFilter(text, q), true, `old filter ${JSON.stringify([text, q])}`);
+    assert.deepEqual(marked(oldParts(text, q)), [], `old parts ${JSON.stringify([text, q])}`);
+    // 新: 一致あり（絞り込みに残る）+ 強調はその断片・断片を繋ぐと元の text
+    const p = matchParts(text, q);
+    assert.ok(p, `new ${JSON.stringify([text, q])}`);
+    assert.deepEqual(marked(p), want, JSON.stringify([text, q]));
+    assert.equal(joined(p), text);
+  }
+});
+
+test("matchParts: 空の検索語は絞り込まない・一致なしは null・大小無視・非重複の全出現・断片は元の text に戻る", () => {
+  assert.deepEqual(matchParts("Liver CT", ""), [{ t: "Liver CT", m: false }]);
+  assert.deepEqual(matchParts("Liver CT", "  \n "), [{ t: "Liver CT", m: false }]);
+  assert.deepEqual(matchParts("", ""), [{ t: "", m: false }]);
+  assert.equal(matchParts("Liver CT", "mri"), null);
+  assert.equal(matchParts("", "ct"), null);
+  assert.deepEqual(matchParts("CT and ct", " Ct "), [
+    { t: "CT", m: true },
+    { t: " and ", m: false },
+    { t: "ct", m: true },
+  ]);
+  assert.deepEqual(marked(matchParts("aaaa", "aa")), ["aa", "aa"]); // allMatchIndexes と同じ非重複
+  // 'İ'（"i̇" = 2 単位）の途中で始まる / 終わる一致は元の字を割らない: "i" は 'İ' 1 字を強調
+  assert.deepEqual(matchParts("İ CT", "i"), [{ t: "İ", m: true }, { t: " CT", m: false }]);
+  // 隣の一致が同じ元の字を共有する（"̇i" の 2 回目は 2 字目の 'İ' の途中から）: 1 つの強調に延ばす
+  assert.deepEqual(matchParts("İİİ", "̇i"), [{ t: "İİİ", m: true }]);
+  // 先頭 / 末尾の空白・連続空白を含む text でも断片を繋ぐと元に戻る（照合空間の畳み込みは表示に漏れない）
+  for (const [text, q] of [["  a  b  ", "a b"], ["\tx\n\ny ", "y"], ["İı ΟΣ", "ı"]]) {
+    const p = matchParts(text, q);
+    assert.ok(p, JSON.stringify([text, q]));
+    assert.equal(joined(p), text);
+  }
+});
+
+test("matchParts: 乱択 2,000 件で 一致あり ⇔ normText(text).includes(normText(q).trim())（旧の絞り込みと同じ件数が残る）", () => {
+  let seed = 7;
+  const rnd = (k) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % k);
+  const alpha = ["a", "B", "c", " ", "  ", "\n", "İ", "Σ", "ς", "\t"];
+  let hit = 0;
+  for (let it = 0; it < 2000; it++) {
+    let text = "";
+    for (let k = 0, m = rnd(20); k < m; k++) text += alpha[rnd(alpha.length)];
+    let q = "";
+    for (let k = 0, m = 1 + rnd(4); k < m; k++) q += alpha[rnd(alpha.length)];
+    const p = matchParts(text, q);
+    assert.equal(p !== null, oldFilter(text, q), JSON.stringify([text, q]));
+    if (p) {
+      hit++;
+      assert.equal(joined(p), text, JSON.stringify([text, q]));
+      if (normText(q).trim()) assert.ok(p.some((x) => x.m), JSON.stringify([text, q]));
+    }
+  }
+  assert.ok(hit > 200, `hit ${hit}`);
 });
 
 // ---------- ズーム ----------

@@ -5,8 +5,67 @@ use super::Resolved;
 use crate::{CoreError, Result};
 use roxmltree::{Document, Node};
 use serde_json::{json, Map, Value};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const EUTILS: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+
+/// E-utilities の要求どうしの最小間隔（NCBI の上限 3 req/s = 333.3 ms）。要求ごとに agent を作り直すので
+/// TLS / DNS の揺らぎで NCBI 側の到着間隔は送信間隔より縮みうる → 余裕を取って 400 ms。
+/// 1 件の DOI 解決 = esearch + efetch の 2 要求で、その間も空ける。
+/// Crossref（api.crossref.org・doi.org の content negotiation）は別の門 `crossref::CROSSREF_GATE`（同時 1 本 + 1.1 s 間隔）。
+/// PMC の S3 には掛けない（NCBI の 3 req/s とは別の基盤）。
+const EUTILS_INTERVAL: Duration = Duration::from_millis(400);
+
+/// E-utilities 全要求（429 の再試行を含む）が通る間隔待ち。入口（CLI・GUI・connectd・MCP）側で待たない。
+/// **プロセス単位の static** = 同じプロセスのスレッドどうしは直列に並ぶが、app・connectd・MCP をまたぐ協調は無い。
+static EUTILS_THROTTLE: Throttle = Throttle::new(EUTILS_INTERVAL);
+
+/// 「前回の通過から `interval` 経つまで待つ」門。Mutex を握ったまま眠るので、並行に呼ばれても 1 本ずつ間隔を空けて通る。
+pub(super) struct Throttle {
+    interval: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    pub(super) const fn new(interval: Duration) -> Self {
+        Self { interval, last: Mutex::new(None) }
+    }
+
+    /// 間隔だけ空ける（要求そのものは並行してよい相手 = E-utilities）
+    fn wait(&self) {
+        // 他スレッドが panic しても時刻 1 つの状態は壊れない → poison は無視して続ける
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        Self::pace(self.interval, &mut last);
+    }
+
+    /// 同時 1 本: `f` の間も門を閉じたままにする（Crossref = 匿名の同時接続 1）。`f` は各送信の直前に渡された `pace` を呼ぶ
+    /// （前回の送信から `interval` 経つまで眠る）。記録するのは送信の時刻だけ = 次の呼び手は前の `f` の終了（応答の受信）を
+    /// 待ってから、前の送信から `interval` 以上後に送る（応答が `interval` より遅ければ待たずに送る）。`f` が一度も
+    /// `pace` を呼ばなければ（送らずに返った）前回の時刻のまま
+    pub(super) fn exclusive<T>(&self, f: impl FnOnce(&dyn Fn()) -> T) -> T {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let cell = std::cell::Cell::new(*last);
+        let pace = || {
+            let mut l = cell.get();
+            Self::pace(self.interval, &mut l);
+            cell.set(l);
+        };
+        let r = f(&pace);
+        *last = cell.get();
+        r
+    }
+
+    fn pace(interval: Duration, last: &mut Option<Instant>) {
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < interval {
+                std::thread::sleep(interval - elapsed);
+            }
+        }
+        *last = Some(Instant::now());
+    }
+}
 
 /// resolver 共通の HTTP agent（timeout 30s・UA 固定。crossref.rs も使う）
 pub(super) fn agent() -> ureq::Agent {
@@ -17,10 +76,12 @@ pub(super) fn agent() -> ureq::Agent {
 }
 
 /// 429（E-utilities は 3 req/s 超・Crossref も混雑時）なら 1s, 2s 待って最大 2 回再試行。成功したら本文を文字列で返す。
-/// PDF 一括取込では 1 件あたり esearch+efetch の 2 連打になり、素のままでは実測で 429 が出た。
-pub(super) fn call_with_retry(req: ureq::Request, what: &str) -> Result<String> {
+/// PDF 一括取込では 1 件あたり esearch+efetch の 2 連打になり、素のままでは実測で 429 が出た（今は EUTILS_THROTTLE が要求ごとに空ける）。
+/// `pace` = 各送信（再試行を含む）の直前に呼ぶ待ち（E-utilities は `EUTILS_THROTTLE`・Crossref は `CROSSREF_GATE` が渡す）。
+pub(super) fn call_with_retry_paced(req: ureq::Request, what: &str, pace: impl Fn()) -> Result<String> {
     let mut attempt: u64 = 0;
     loop {
+        pace();
         match req.clone().call() {
             Ok(r) => return r.into_string().map_err(|e| CoreError::Http(e.to_string())),
             Err(ureq::Error::Status(429, _)) if attempt < 2 => {
@@ -39,7 +100,7 @@ pub fn find_pmid_by_doi(doi: &str) -> Result<Option<String>> {
         .query("term", &format!("\"{doi}\"[DOI]"))
         .query("retmode", "json")
         .query("tool", "openref");
-    let body = call_with_retry(req, "esearch")?;
+    let body = call_with_retry_paced(req, "esearch", || EUTILS_THROTTLE.wait())?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(v.pointer("/esearchresult/idlist")
         .and_then(|x| x.as_array())
@@ -55,7 +116,7 @@ pub fn fetch_by_pmid(pmid: &str) -> Result<Resolved> {
         .query("id", pmid)
         .query("retmode", "xml")
         .query("tool", "openref");
-    let xml = call_with_retry(req, "efetch")?;
+    let xml = call_with_retry_paced(req, "efetch", || EUTILS_THROTTLE.wait())?;
     parse_pubmed_xml(&xml)
 }
 
@@ -298,6 +359,142 @@ fn month_num(m: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 連続 3 回: 1 回目は待たず、以降は前回の通過から EUTILS_INTERVAL 以上空く（実ネット不要）
+    #[test]
+    fn throttle_spaces_sequential_calls() {
+        assert!(EUTILS_INTERVAL >= Duration::from_millis(400), "3 req/s に対する余裕が足りない間隔");
+        let t = Throttle::new(EUTILS_INTERVAL);
+        let start = Instant::now();
+        let mut at = Vec::new();
+        for _ in 0..3 {
+            t.wait();
+            at.push(Instant::now());
+        }
+        assert!(at[0] - start < Duration::from_millis(50), "初回は待たない");
+        for w in at.windows(2) {
+            assert!(w[1] - w[0] >= EUTILS_INTERVAL, "間隔 {:?}", w[1] - w[0]);
+        }
+    }
+
+    /// 並行に呼ばれても（DB ロックを外して呼ぶ connectd を想定）通過時刻は互いに EUTILS_INTERVAL 以上空く
+    #[test]
+    fn throttle_serializes_concurrent_callers() {
+        let t = std::sync::Arc::new(Throttle::new(EUTILS_INTERVAL));
+        let start = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    t.wait();
+                    Instant::now()
+                })
+            })
+            .collect();
+        let mut at: Vec<Instant> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        at.sort();
+        // 4 本 = 間隔 3 つ分は必ずかかる
+        assert!(at[3] - start >= EUTILS_INTERVAL * 3, "全体 {:?}", at[3] - start);
+        for w in at.windows(2) {
+            // 通過の記録（wait 内）と Instant::now()（wait 後）の差でわずかに縮みうる → 5ms の許容
+            assert!(w[1] - w[0] + Duration::from_millis(5) >= EUTILS_INTERVAL, "間隔 {:?}", w[1] - w[0]);
+        }
+    }
+
+    /// exclusive（Crossref の門）: 並行に呼ばれても `f` は同時に 1 本だけ走り（次の送信は前の `f` の終了の後）、
+    /// 前の送信から次の送信（pace の後）まで interval 以上空く。f の中の 2 回目の pace（429 の再試行）も前の送信から
+    /// interval 空ける（実ネット不要）
+    #[test]
+    fn exclusive_is_one_at_a_time_and_spaced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let iv = Duration::from_millis(60);
+        let t = Arc::new(Throttle::new(iv));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // (最初の送信, 最後の送信, 終了)
+        let spans = Arc::new(Mutex::new(Vec::<(Instant, Instant, Instant)>::new()));
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let (t, active, peak, spans) = (t.clone(), active.clone(), peak.clone(), spans.clone());
+                std::thread::spawn(move || {
+                    t.exclusive(|pace| {
+                        pace();
+                        let sent = Instant::now();
+                        let mut last_sent = sent;
+                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(15));
+                        if i == 0 {
+                            // 再試行の 2 回目の送信も前の送信から interval 空く
+                            pace();
+                            last_sent = Instant::now();
+                            assert!(sent.elapsed() >= iv, "再試行の間隔 {:?}", sent.elapsed());
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        spans.lock().unwrap().push((sent, last_sent, Instant::now()));
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "同時に 2 本走った");
+        let mut s = spans.lock().unwrap().clone();
+        s.sort();
+        for w in s.windows(2) {
+            assert!(w[1].0 >= w[0].2, "重なった");
+            // 送信の記録（pace 内）は test 側の Instant::now() より前 = 差は interval よりわずかに短くなりうる → 5ms の許容
+            assert!(w[1].0 - w[0].1 + Duration::from_millis(5) >= iv, "前の送信 → 次の送信 {:?}", w[1].0 - w[0].1);
+        }
+    }
+
+    /// 間隔は「前の送信」から数える: 前の応答（`f` の終了）が interval より遅ければ、次の呼び手は終了の直後に送る
+    /// （旧 = 終了から数え直して、直列でも 1 要求ごとに interval が上乗せされていた）
+    #[test]
+    fn exclusive_counts_from_previous_send() {
+        let iv = Duration::from_millis(60);
+        let t = Throttle::new(iv);
+        let ended = t.exclusive(|pace| {
+            pace();
+            std::thread::sleep(Duration::from_millis(100)); // 応答が interval より遅い
+            Instant::now()
+        });
+        let sent = t.exclusive(|pace| {
+            pace();
+            Instant::now()
+        });
+        assert!(sent - ended < Duration::from_millis(30), "終了 → 次の送信 {:?}（前の送信から数えていない）", sent - ended);
+        // 応答が速ければ、前の送信から interval 待つ
+        let first = t.exclusive(|pace| {
+            pace();
+            Instant::now()
+        });
+        let second = t.exclusive(|pace| {
+            pace();
+            Instant::now()
+        });
+        assert!(second - first + Duration::from_millis(5) >= iv, "{:?}", second - first);
+        // 送らずに返った呼び手（pace を呼ばない）は時刻を進めない
+        t.exclusive(|_| ());
+        let third = t.exclusive(|pace| {
+            pace();
+            Instant::now()
+        });
+        assert!(third - second + Duration::from_millis(5) >= iv, "{:?}", third - second);
+    }
+
+    /// 間隔より後に来た呼び出しは待たない
+    #[test]
+    fn throttle_does_not_wait_after_interval() {
+        let t = Throttle::new(Duration::from_millis(20));
+        t.wait();
+        std::thread::sleep(Duration::from_millis(30));
+        let s = Instant::now();
+        t.wait();
+        assert!(s.elapsed() < Duration::from_millis(15));
+    }
 
     const FIXTURE: &str = r#"<?xml version="1.0" ?>
 <!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2023//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_230101.dtd">

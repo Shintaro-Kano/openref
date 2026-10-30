@@ -83,7 +83,6 @@
         finish(kind === "confirm" ? "cancel" : "close");
       }
     });
-    RD.limitBanner();
     // 破壊的な確認は既定をキャンセルに（Enter で消さない）
     RD.focus(kind === "confirm" && d.danger ? cancel : ok);
   });

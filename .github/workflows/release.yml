@@ -51,15 +51,7 @@ jobs:
         run: npm ci
 
       - name: Run test suite before packaging
-        run: |
-          cargo test --workspace --locked
-          node app/src/lib/viewer/util.test.mjs
-          node app/src/lib/i18n.test.mjs
-          node word/test-cite.cjs && node word/test-types.cjs && node word/test-styles.cjs && node word/test-commands.cjs
-          node word/test-dotm-render.cjs && node word/test-dialog-dotm.cjs
-          python3 word/dotm/test-build.py
-          xmllint --noout --schema word/xsd/OfficeAppManifestV1_1.xsd word/manifest.xml
-          python3 scripts/check-licenses.py
+        run: bash scripts/test-all.sh
 
       - name: Build CLI, MCP, connectd, and OpenRef.app
         run: |

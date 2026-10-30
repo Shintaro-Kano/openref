@@ -14,7 +14,17 @@
     openViewer,
     restoreSelected,
     setView,
+    toast,
   } from "./state.svelte";
+
+  /** 「外部で開く」・DOI / PMID / PMCID のリンク（失敗を無言にしない） */
+  async function openOutside(open: () => Promise<unknown>) {
+    try {
+      await open();
+    } catch (e) {
+      toast(`✗ ${t("外部で開けません")}: ${String(e).slice(0, 200)}`);
+    }
+  }
 
   const d = $derived(app.detail);
   const c = $derived(d?.csl ?? {});
@@ -72,7 +82,7 @@
         <button class="primary" title={t("新しいタブで開く")} onclick={() => void openViewer(d.key, primaryPdf.id, c.title ?? "")}>
           {t("PDF を読む")}
         </button>
-        <button onclick={() => api.openAttachment(primaryPdf.id)}>{t("外部で開く")}</button>
+        <button onclick={() => openOutside(() => api.openAttachment(primaryPdf.id))}>{t("外部で開く")}</button>
       {:else}
         <button class="primary" onclick={fetchPdfSelected}>{t("PDF 自動取得")}</button>
         <button onclick={attachViaDialog}>{t("添付…")}</button>
@@ -83,15 +93,15 @@
     <dl class="ids">
       {#if c.DOI}
         <dt>DOI</dt>
-        <dd><button class="link" onclick={() => api.openExternal(`https://doi.org/${c.DOI}`)}>{c.DOI}</button></dd>
+        <dd><button class="link" onclick={() => openOutside(() => api.openExternal(`https://doi.org/${c.DOI}`))}>{c.DOI}</button></dd>
       {/if}
       {#if c.PMID}
         <dt>PMID</dt>
-        <dd><button class="link" onclick={() => api.openExternal(`https://pubmed.ncbi.nlm.nih.gov/${c.PMID}/`)}>{c.PMID}</button></dd>
+        <dd><button class="link" onclick={() => openOutside(() => api.openExternal(`https://pubmed.ncbi.nlm.nih.gov/${c.PMID}/`))}>{c.PMID}</button></dd>
       {/if}
       {#if c.PMCID}
         <dt>PMCID</dt>
-        <dd><button class="link" onclick={() => api.openExternal(`https://pmc.ncbi.nlm.nih.gov/articles/${c.PMCID}/`)}>{c.PMCID}</button></dd>
+        <dd><button class="link" onclick={() => openOutside(() => api.openExternal(`https://pmc.ncbi.nlm.nih.gov/articles/${c.PMCID}/`))}>{c.PMCID}</button></dd>
       {/if}
     </dl>
 

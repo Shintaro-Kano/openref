@@ -24,6 +24,11 @@ fn lock(m: &Mutex<Db>) -> Result<MutexGuard<'_, Db>, String> {
     m.lock().map_err(err)
 }
 
+/// core の関数に渡す DB のロック（core の Result。ロックを短く取り直す mount::enable_drive_mode / migrate_managed_to_drive 用）
+fn core_lock(m: &Mutex<Db>) -> openref_core::Result<MutexGuard<'_, Db>> {
+    m.lock().map_err(|e| openref_core::CoreError::BadInput(format!("DB lock failed: {e}")))
+}
+
 fn migration_db(state: &AppState) -> Result<PathBuf, String> {
     lock(&state.db)?
         .conn
@@ -344,14 +349,7 @@ fn create_tag(state: tauri::State<AppState>, name: String, color: Option<String>
 
 #[tauri::command]
 fn update_tag(state: tauri::State<AppState>, id: i64, name: Option<String>, color: Option<String>) -> Result<(), String> {
-    let db = lock(&state.db)?;
-    if let Some(n) = name {
-        tags::rename_tag(&db, id, &n).map_err(err)?;
-    }
-    if color.is_some() {
-        tags::set_tag_color(&db, id, color.as_deref()).map_err(err)?;
-    }
-    Ok(())
+    tags::update_tag(&*lock(&state.db)?, id, name.as_deref(), color.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -513,11 +511,12 @@ async fn quick_add(state: tauri::State<'_, AppState>, input: String) -> Result<s
     .await
 }
 
-/// PDF 取込 1 件（取込モーダルの行に対応）。結果の区分と文言は core（MCP の import_pdf と同じ要約）。理由・降格の警告も message に入る
+/// PDF 取込 1 件（取込モーダルの行に対応）。結果の区分と文言は core（MCP の import_pdf と同じ要約）。理由・降格の警告も message に入る。
+/// ① md5 照合 → ② ロック外で抽出・resolver・題名検索 → ③ 再ロックして登録・添付（一括取込中も一覧・検索を止めない）
 #[tauri::command]
 async fn import_pdf(state: tauri::State<'_, AppState>, path: String) -> Result<pdfingest::ImportSummary, String> {
     let db = state.db.clone();
-    blocking(move || Ok(pdfingest::import_summary(&mut *lock(&db)?, Path::new(&path)))).await
+    blocking(move || pdfingest::import_summary_unlocked(|| lock(&db), Path::new(&path))).await
 }
 
 #[tauri::command]
@@ -574,20 +573,44 @@ fn remove_from_collection(state: tauri::State<AppState>, key: String, collection
     edit::remove_from_collection(&*lock(&state.db)?, &key, collection_id).map_err(err)
 }
 
-#[tauri::command]
-fn open_attachment(state: tauri::State<AppState>, id: i64) -> Result<(), String> {
-    let path = attachment_path(&*lock(&state.db)?, id)?;
-    std::process::Command::new("/usr/bin/open").arg(&path).spawn().map_err(err)?;
-    Ok(())
+/// `/usr/bin/open` で既定のアプリに渡す。終了を待つ（子を回収する）ので、ファイルが無い・Drive の本体が取れない等で
+/// open が非 0 で終わったら stderr の 1 行目を Err にする（spawn だと起動した時点で Ok になり、失敗が UI に届かなかった）。
+/// open は LaunchServices に渡すだけですぐ戻るが、同期 command は main thread で走るので呼び手は `blocking` の中で呼ぶ
+fn open_with_default_app(target: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/open").arg(target).output().map_err(err)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match stderr.lines().map(str::trim).find(|l| !l.is_empty()) {
+        Some(line) => Err(line.to_string()),
+        None => Err(format!("open が失敗しました（{}）", out.status)),
+    }
 }
 
 #[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
+async fn open_attachment(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    let path = attachment_path(&*lock(&state.db)?, id)?; // パスを引いたらロックを外す（open の終了待ちで他の command を止めない）
+    blocking(move || open_file(&path)).await
+}
+
+/// 添付を開く。open の stderr は「The file <フルパス> does not exist.」= パスが 128〜256 字だと toast（先頭 200 字）で
+/// 理由が切れ、Drive のパスはアカウント名（CloudStorage/GoogleDrive-<メール>）も出る → フルパスをファイル名に置き換える。
+/// open はパスを NFD で書き出す（DB の値は NFC のことがある = 文字列置換では当たらない）ので、最初の `/` から最後の `/`
+/// まで（= ディレクトリ部分）を落とす。ファイル名に `/` は入らない
+fn open_file(path: &str) -> Result<(), String> {
+    open_with_default_app(path).map_err(|e| match (e.find('/'), e.rfind('/')) {
+        (Some(i), Some(j)) => format!("{}{}", &e[..i], &e[j + 1..]),
+        _ => e,
+    })
+}
+
+#[tauri::command]
+async fn open_external(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("http(s) のみ許可".into());
     }
-    std::process::Command::new("/usr/bin/open").arg(&url).spawn().map_err(err)?;
-    Ok(())
+    blocking(move || open_with_default_app(&url)).await
 }
 
 /// Settings › 起動時に前回のタブを開く（CheckMenuItem の id）。チェック = ui_tabs を復元（既定）・外す = 次回は「すべて」1 枚
@@ -820,76 +843,96 @@ fn on_menu_event(app: &tauri::AppHandle, ev: tauri::menu::MenuEvent) {
                 let _ = items.pdf_managed.set_checked(!want_drive).and(items.pdf_drive.set_checked(want_drive));
                 return;
             }
-            let st = app.state::<AppState>();
-            let res = match st.db.lock() {
-                Ok(db) => {
-                    if want_drive {
-                        openref_core::mount::enable_drive_mode(&db).map(|info| {
-                            if en {
-                                if info.managed_remaining > 0 {
-                                    format!(
-                                        "✓ PDF storage set to Google Drive ({} local PDFs can be moved from Settings › PDF storage)",
-                                        info.managed_remaining
-                                    )
-                                } else {
-                                    "✓ PDF storage set to Google Drive".to_string()
-                                }
-                            } else if info.managed_remaining > 0 {
+            // Drive の検出・作成・書込プローブは Drive（File Provider）の応答待ちで秒単位になりうる → main thread から外す
+            // （「Drive へ移行」と同じ型）。DB のロックは設定の保存と件数の間だけ（core mount::enable_drive_mode）
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let st = app.state::<AppState>();
+                let items = app.state::<SettingsItems>();
+                let res = if want_drive {
+                    openref_core::mount::enable_drive_mode(|| core_lock(&st.db)).map(|info| {
+                        if en {
+                            if info.managed_remaining > 0 {
                                 format!(
-                                    "✓ PDF の保存先を Google Drive に切り替えました（ローカル保存済みの {} 件は Settings › PDF の保存先 から移行できます）",
+                                    "✓ PDF storage set to Google Drive ({} local PDFs can be moved from Settings › PDF storage)",
                                     info.managed_remaining
                                 )
                             } else {
-                                "✓ PDF の保存先を Google Drive に切り替えました".to_string()
+                                "✓ PDF storage set to Google Drive".to_string()
                             }
-                        })
-                    } else {
-                        openref_core::mount::disable_drive_mode(&db).map(|()| {
-                            if en {
-                                "✓ PDF storage set to Local (on this Mac)".to_string()
-                            } else {
-                                "✓ PDF の保存先をローカル (Mac 内) に切り替えました".to_string()
-                            }
-                        })
+                        } else if info.managed_remaining > 0 {
+                            format!(
+                                "✓ PDF の保存先を Google Drive に切り替えました（ローカル保存済みの {} 件は Settings › PDF の保存先 から移行できます）",
+                                info.managed_remaining
+                            )
+                        } else {
+                            "✓ PDF の保存先を Google Drive に切り替えました".to_string()
+                        }
+                    })
+                } else {
+                    core_lock(&st.db).and_then(|db| openref_core::mount::disable_drive_mode(&db)).map(|()| {
+                        if en {
+                            "✓ PDF storage set to Local (on this Mac)".to_string()
+                        } else {
+                            "✓ PDF の保存先をローカル (Mac 内) に切り替えました".to_string()
+                        }
+                    })
+                };
+                match res {
+                    Ok(msg) => {
+                        let _ = items.pdf_managed.set_checked(!want_drive).and(items.pdf_drive.set_checked(want_drive));
+                        let _ = app.emit("menu-toast", msg);
+                    }
+                    Err(e) => {
+                        let _ = items.pdf_managed.set_checked(want_drive).and(items.pdf_drive.set_checked(!want_drive));
+                        let prefix = if en { "✗ Could not switch PDF storage: " } else { "✗ PDF 保存先の切替に失敗: " };
+                        let _ = app.emit("menu-toast", format!("{prefix}{e}"));
                     }
                 }
-                Err(e) => Err(openref_core::CoreError::BadInput(format!("DB lock failed: {e}"))),
-            };
-            match res {
-                Ok(msg) => {
-                    let _ = items.pdf_managed.set_checked(!want_drive).and(items.pdf_drive.set_checked(want_drive));
-                    let _ = app.emit("menu-toast", msg);
-                }
-                Err(e) => {
-                    let _ = items.pdf_managed.set_checked(want_drive).and(items.pdf_drive.set_checked(!want_drive));
-                    let prefix = if en { "✗ Could not switch PDF storage: " } else { "✗ PDF 保存先の切替に失敗: " };
-                    let _ = app.emit("menu-toast", format!("{prefix}{e}"));
-                }
-            }
+            });
         }
         PDF_MIGRATE_DRIVE_ID => {
             let en = items.lang_en.is_checked().unwrap_or(false);
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let st = app.state::<AppState>();
-                let res = match st.db.lock() {
-                    Ok(db) => openref_core::mount::migrate_managed_to_drive(&db, false),
-                    Err(e) => Err(openref_core::CoreError::BadInput(format!("DB lock failed: {e}"))),
-                };
+                // ロックは一覧の読出しと 1 件ごとの確認・書換えの間だけ（コピーと読み戻しはロックの外 = core mount::migrate_managed_to_drive）
+                let res = openref_core::mount::migrate_managed_to_drive(|| core_lock(&st.db), false);
                 let msg = match res {
-                    Ok(list) if list.is_empty() => {
+                    Ok(mig) if mig.moved.is_empty() && mig.skipped.is_empty() => {
                         if en {
                             "No local PDFs to move (all PDFs are already on Google Drive)".to_string()
                         } else {
                             "移行対象のローカル PDF はありません（移行済み）".to_string()
                         }
                     }
-                    Ok(list) => {
-                        if en {
-                            format!("✓ Moved {} local PDF(s) to Google Drive", list.len())
+                    Ok(mig) => {
+                        let mut msg = if en {
+                            format!("✓ Moved {} local PDF(s) to Google Drive", mig.moved.len())
                         } else {
-                            format!("✓ ローカル保存済みの PDF {} 件を Google Drive へ移行しました", list.len())
+                            format!("✓ ローカル保存済みの PDF {} 件を Google Drive へ移行しました", mig.moved.len())
+                        };
+                        // 移行の間に変わった（削除・置換）添付は移さない = 件数と、消せなかったコピーがあればその場所を出す
+                        if !mig.skipped.is_empty() {
+                            msg += &if en {
+                                format!(" ({} changed during the move and were left as they are)", mig.skipped.len())
+                            } else {
+                                format!("（移行の間に変わった {} 件は移していません）", mig.skipped.len())
+                            };
                         }
+                        let left: Vec<String> = mig
+                            .skipped
+                            .iter()
+                            .filter_map(|s| s.leftover.as_ref().map(|(p, e)| format!("{} ({e})", p.display())))
+                            .collect();
+                        if !left.is_empty() {
+                            msg += &if en {
+                                format!(" — could not remove copies: {}", left.join(", "))
+                            } else {
+                                format!("・消せなかったコピー: {}", left.join("、"))
+                            };
+                        }
+                        msg
                     }
                     Err(e) => {
                         let prefix = if en { "✗ Failed to move PDFs to Google Drive: " } else { "✗ Google Drive への PDF 移行に失敗: " };
@@ -1075,5 +1118,32 @@ mod parity {
             assert!(cmds.iter().any(|c| c == g), "GUI 専用に載っているが Tauri command に無い: {g}");
             assert!(openref_core::commands::find(g).is_none(), "{g} は登録表にもある（GUI 専用から外す）");
         }
+    }
+}
+
+#[cfg(test)]
+mod open_default_app {
+    /// open が非 0 で終わる（ファイルが無い）と Err で stderr の 1 行目が返る（spawn だった頃は Ok で UI に届かなかった）。
+    /// 存在しないパスなので GUI のアプリは起動しない
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn missing_file_is_err_with_stderr() {
+        let e = super::open_file("/nonexistent/openref-open-test.pdf").unwrap_err();
+        assert!(e.contains("openref-open-test.pdf"), "stderr の 1 行目を返す: {e}");
+        assert!(!e.contains("/nonexistent/"), "フルパスはファイル名に置き換える: {e}");
+        assert!(!e.contains('\n'));
+    }
+
+    /// 実 DB（本番の .backup コピー）で open_attachment と同じ経路（attachment_path → open）。
+    /// OPENREF_DB=<コピー> OPENREF_OPEN_ID=<path を存在しない値に書き換えた添付の id> cargo test -p openref-app -- --ignored open_default_app
+    #[test]
+    #[ignore]
+    fn real_db_missing_attachment_is_err() {
+        let db = openref_core::db::Db::open(std::path::Path::new(&std::env::var("OPENREF_DB").unwrap())).unwrap();
+        let id: i64 = std::env::var("OPENREF_OPEN_ID").unwrap().parse().unwrap();
+        let path = super::attachment_path(&db, id).unwrap();
+        let e = super::open_file(&path).unwrap_err();
+        assert!(e.ends_with("does not exist."), "{e}");
+        assert!(!e.contains('/'), "フルパスを出さない: {e}");
     }
 }
