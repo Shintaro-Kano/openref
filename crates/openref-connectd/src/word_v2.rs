@@ -1780,19 +1780,29 @@ mod tests {
 
     // ---------- HTTP（ヘッダ・render・prefs・legacy・ダイアログの往復） ----------
 
-    /// 素の HTTP/1.1 を 1 往復（テスト用。TLS なしの router に直接）
+    /// 素の HTTP/1.1 を 1 往復（テスト用。TLS なしの router に直接）。
+    /// X-OpenRef ヘッダの無い 403 は、サーバが本文を読まずに応答して閉じる。受信バッファに未読の本文が残ったまま
+    /// close するとカーネルが RST を送り、こちらの read が ECONNRESET になりうる（クライアント側の都合であって製品の不具合ではない）。
+    /// → 要求は 1 回の write で送り（`write!` は断片ごとに write するので本文が遅れて届き、閉じた後の socket に当たって RST になる。
+    /// これが主因）、それでも read が ConnectionReset で終わったら読めた分で解釈する（応答の頭が無ければ panic）。
+    /// 送信後の shutdown(Write) はしない（hyper は半閉じを EOF と見て応答なしで切る）
     fn http(port: u16, method: &str, path: &str, header: bool, body: &str) -> (u16, String) {
-        use std::io::{Read, Write};
+        use std::io::{ErrorKind, Read, Write};
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let h = if header { "X-OpenRef: word\r\n" } else { "" };
-        write!(
-            s,
+        let req = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{h}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
-        )
-        .unwrap();
+        );
+        // 応答を返して先に閉じたサーバへの write は RST・EPIPE になりうる（応答は読める）ので、その 2 種は無視
+        if let Err(e) = s.write_all(req.as_bytes()) {
+            assert!(matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe), "write: {e}");
+        }
         let mut raw = Vec::new();
-        s.read_to_end(&mut raw).unwrap();
+        if let Err(e) = s.read_to_end(&mut raw) {
+            assert_eq!(e.kind(), ErrorKind::ConnectionReset, "read: {e}");
+            assert!(raw.starts_with(b"HTTP/1.1 "), "RST で応答の頭が読めなかった: {e}: {:?}", String::from_utf8_lossy(&raw));
+        }
         let raw = String::from_utf8(raw).unwrap();
         let (head, rest) = raw.split_once("\r\n\r\n").unwrap();
         let code: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
