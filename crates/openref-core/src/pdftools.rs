@@ -25,24 +25,50 @@ pub struct Extracted {
     /// "builtin" | "pdftotext" | "builtin-garbled"（内蔵が文字化けしたが pdftotext が無く、化けたまま）
     pub backend: &'static str,
     /// PDF Info 辞書の /Title（同じ解析から取る = 取込の題名推定・要確認 stub の題名に使う。無ければ None）。
-    /// 内蔵解析が失敗して pdftotext だけで取れたときも None
+    /// 内蔵解析が文書を読めずに（読込で panic したときも）pdftotext だけで取れたときも None。
+    /// 文書を読めて頁の抽出だけ失敗（panic 含む）したときは入る
     pub info_title: Option<String>,
+}
+
+/// `extract_pages_bytes` の失敗。内蔵解析が文書を読めて頁だけ取り出せなかったときは、同じ解析で得た
+/// Info /Title も添える（connectd の要確認 stub の題名に使う = 解析し直さない）。表示は `error` と同じ
+#[derive(Debug)]
+pub struct ExtractError {
+    pub error: CoreError,
+    pub info_title: Option<String>,
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl From<ExtractError> for CoreError {
+    fn from(e: ExtractError) -> Self {
+        e.error
+    }
 }
 
 /// 1-based・両端含む。`to` は総頁数で丸める。ファイルは 1 度だけ読む（解析はバイト列から）
 pub fn extract_pages(pdf: &Path, from: usize, to: usize) -> Result<Extracted> {
     let bytes = read_file(pdf)?;
-    extract(&bytes, Some(pdf), Some((from, to)))
+    Ok(extract(&bytes, Some(pdf), Some((from, to)))?)
 }
 
 /// バイト列版（取込・添付・照合の経路: 手元のバイト列を解析し、ファイルは読み直さない）。
 /// `file` = 同じ内容が置いてあるパス（pdftotext fallback に渡す）。None なら fallback が要るときだけ一時ファイルに落とす
-pub fn extract_pages_bytes(bytes: &[u8], file: Option<&Path>, from: usize, to: usize) -> Result<Extracted> {
+pub fn extract_pages_bytes(
+    bytes: &[u8],
+    file: Option<&Path>,
+    from: usize,
+    to: usize,
+) -> std::result::Result<Extracted, ExtractError> {
     extract(bytes, file, Some((from, to)))
 }
 
 pub fn extract_all_bytes(bytes: &[u8], file: Option<&Path>) -> Result<Extracted> {
-    extract(bytes, file, None)
+    Ok(extract(bytes, file, None)?)
 }
 
 fn read_file(pdf: &Path) -> Result<Vec<u8>> {
@@ -52,7 +78,7 @@ fn read_file(pdf: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(pdf)?)
 }
 
-fn extract(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> Result<Extracted> {
+fn extract(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> std::result::Result<Extracted, ExtractError> {
     let (builtin, info_title) = builtin_pages(bytes, range);
     if let Ok(pages) = &builtin {
         if has_text(pages) && !looks_garbled(pages) {
@@ -64,14 +90,17 @@ fn extract(bytes: &[u8], file: Option<&Path>, range: Option<(usize, usize)>) -> 
     if let Some(bin) = find_pdftotext() {
         match pdftotext_pages(&bin, bytes, file, range) {
             Ok(pages) => return Ok(Extracted { pages, backend: "pdftotext", info_title }),
-            Err(e) if builtin.is_err() => return Err(e),
+            Err(error) if builtin.is_err() => return Err(ExtractError { error, info_title }),
             Err(_) => {}
         }
     }
-    builtin.map(|pages| {
-        let backend = if looks_garbled(&pages) { "builtin-garbled" } else { "builtin" };
-        Extracted { pages, backend, info_title }
-    })
+    match builtin {
+        Ok(pages) => {
+            let backend = if looks_garbled(&pages) { "builtin-garbled" } else { "builtin" };
+            Ok(Extracted { pages, backend, info_title })
+        }
+        Err(error) => Err(ExtractError { error, info_title }),
+    }
 }
 
 /// 非空白文字に占める U+FFFD（復号できなかったグリフ）の割合
@@ -111,37 +140,39 @@ pub fn has_text(pages: &[String]) -> bool {
 /// 内蔵抽出（解析 1 回）。文書を読めたら頁抽出の成否に関わらず Info /Title も返す
 fn builtin_pages(bytes: &[u8], range: Option<(usize, usize)>) -> (Result<Vec<String>>, Option<String>) {
     use pdf_extract::{output_doc_page, Document, PlainTextOutput};
-    // pdf-extract は想定外のフォント/構造で panic し得るので、1 件の失敗で一括取込を落とさない
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || -> (std::result::Result<Vec<String>, String>, Option<String>) {
-            let doc = match Document::load_mem(bytes) {
-                Ok(d) => d,
-                Err(e) => return (Err(e.to_string()), None),
-            };
+    // pdf-extract は想定外のフォント/構造で panic し得るので、1 件の失敗で一括取込を落とさない。
+    // 読込（+ /Title）と頁の抽出は別々に受ける = 頁の抽出（フォントの復号）で panic しても読めた /Title は返す
+    let failed = |e: String| CoreError::Parse(format!("内蔵 PDF 抽出に失敗: {e}"));
+    let panicked = || CoreError::Parse("内蔵 PDF 抽出が panic しました（想定外のフォント/構造）".into());
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Document::load_mem(bytes).map(|doc| {
             let title = info_title_of(&doc);
-            let n = doc.get_pages().len();
-            let (from, to) = match range {
-                Some((f, t)) => (f.max(1), t.min(n)),
-                None => (1, n),
-            };
-            let mut pages = Vec::new();
-            for p in from..=to {
-                let mut s = String::new();
-                {
-                    let mut out = PlainTextOutput::new(&mut s);
-                    if let Err(e) = output_doc_page(&doc, &mut out, p as u32) {
-                        return (Err(e.to_string()), title);
-                    }
-                }
-                pages.push(s);
-            }
-            (Ok(pages), title)
-        },
-    ));
+            (doc, title)
+        })
+    }));
+    let (doc, title) = match loaded {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(e)) => return (Err(failed(e.to_string())), None),
+        Err(_) => return (Err(panicked()), None),
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::result::Result<Vec<String>, String> {
+        let n = doc.get_pages().len();
+        let (from, to) = match range {
+            Some((f, t)) => (f.max(1), t.min(n)),
+            None => (1, n),
+        };
+        let mut pages = Vec::new();
+        for p in from..=to {
+            let mut s = String::new();
+            output_doc_page(&doc, &mut PlainTextOutput::new(&mut s), p as u32).map_err(|e| e.to_string())?;
+            pages.push(s);
+        }
+        Ok(pages)
+    }));
     match res {
-        Ok((Ok(p), t)) => (Ok(p), t),
-        Ok((Err(e), t)) => (Err(CoreError::Parse(format!("内蔵 PDF 抽出に失敗: {e}"))), t),
-        Err(_) => (Err(CoreError::Parse("内蔵 PDF 抽出が panic しました（想定外のフォント/構造）".into())), None),
+        Ok(Ok(p)) => (Ok(p), title),
+        Ok(Err(e)) => (Err(failed(e)), title),
+        Err(_) => (Err(panicked()), title),
     }
 }
 
@@ -204,20 +235,20 @@ fn temp_pdf(bytes: &[u8]) -> Result<TempPdf> {
     Ok(tmp)
 }
 
-/// PDF Info 辞書の /Title（出版社 PDF は論文題名が入っていることが多い）。
-/// UTF-16BE（BOM 付き）/ PDFDocEncoding（ASCII 域）を復号。無ければ None。
-/// 取込経路は `Extracted::info_title`（同じ解析から取る）を使い、これは単独で題名だけ要るとき（1 回の解析）
-pub fn info_title_bytes(bytes: &[u8]) -> Option<String> {
-    use pdf_extract::Document;
+/// テストの基準: 文書を単独で読み直して /Title を取る（頁は抽出しない）。取込が冒頭解析から返す `info_title`
+/// （失敗の報告に添えるものを含む）がこれと一致することを確かめる
+#[cfg(test)]
+pub(crate) fn info_title_reparse(bytes: &[u8]) -> Option<String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let doc = Document::load_mem(bytes).ok()?;
+        let doc = pdf_extract::Document::load_mem(bytes).ok()?;
         info_title_of(&doc)
     }))
     .ok()
     .flatten()
 }
 
-/// 解析済み文書から /Title を復号（panic は呼び手の catch_unwind が受ける）
+/// 解析済み文書から PDF Info 辞書の /Title（出版社 PDF は論文題名が入っていることが多い）を復号する。
+/// UTF-16BE（BOM 付き）/ PDFDocEncoding（ASCII 域）。無ければ None（panic は呼び手の catch_unwind が受ける）
 fn info_title_of(doc: &pdf_extract::Document) -> Option<String> {
     use pdf_extract::Object;
     let info = match doc.trailer.get(b"Info").ok()? {
@@ -394,7 +425,7 @@ mod tests {
         let bytes = std::fs::read(&p).unwrap();
         let exb = extract_pages_bytes(&bytes, None, 1, 2).unwrap();
         assert_eq!((exb.pages, exb.info_title.as_deref()), (ex.pages.clone(), Some("A Test Title")));
-        assert_eq!(info_title_bytes(&bytes).as_deref(), Some("A Test Title"));
+        assert_eq!(info_title_reparse(&bytes).as_deref(), Some("A Test Title"));
         assert_eq!(extract_all_bytes(&bytes, None).unwrap().pages.len(), 1);
         // /Title 無し → None
         let plain = minimal_pdf("no title here", None);

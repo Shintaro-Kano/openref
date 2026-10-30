@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use openref_core::{datadir, edit, ingest, model, pdffetch, pdfingest, resolver, search, tags, zotero, Db};
+use openref_core::{datadir, edit, ingest, model, pdffetch, pdfingest, resolver, search, zotero, Db};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -564,17 +564,67 @@ fn fetch_pdf_unlocked(st: &St, key: &str) -> openref_core::Result<pdffetch::Fetc
     pdffetch::fetch_pdf_attach(&db, &plan, dl)
 }
 
-/// PDF 取込（pdfingest の 3 段）: ① md5 照合と ③ 登録・添付だけロックを取り、② 冒頭 2 頁の抽出・resolver・題名検索は
-/// ロックの外（取込中も /capture/status・Word・他の保存を止めない）。戻り値の guard は ③ のロック = 呼び手は続けて
-/// 同じロックの中で要確認 stub を作る（③ の md5 再照合と stub 作成の間に同じ PDF の別の取込が割り込まない）
-fn ingest_pdf_unlocked<'a>(
-    st: &'a St,
-    bytes: &[u8],
-    src_name: &str,
-    opts: &pdfingest::IngestOpts,
-) -> (std::sync::MutexGuard<'a, Db>, openref_core::Result<pdfingest::IngestReport>) {
-    let Ok(r) = pdfingest::ingest_pdf_bytes_unlocked(|| Ok::<_, std::convert::Infallible>(st.db()), bytes, src_name, None, opts);
-    r
+/// `/capture/pdf` と saveStandaloneAttachment の PDF 取込の経路ごとの値（ログの文面は経路ごとに今のまま）
+struct PdfFrom<'a> {
+    /// タブ / ページの題名（元ファイル名と stub の題名の既定）・URL（stub の URL）
+    title: Option<&'a str>,
+    url: Option<&'a str>,
+    /// stub の custom.source（stub の行のログ接頭辞も）
+    source: &'static str,
+    /// 取込の行（警告・識別子を解決できなかった行）のログ接頭辞と、解決できなかった行の主語
+    log: &'static str,
+    fail_subject: &'static str,
+}
+
+/// `ingest_or_stub` の結果。status ∈ added | attached | attached_additional | duplicate | needs_review | stub
+/// （needs_review は stub_on_fail=false なので来ないが、網羅のため）。note = stub の import_note
+struct Ingested {
+    key: String,
+    status: &'static str,
+    note: Option<String>,
+}
+
+/// PDF 取込（pdfingest の 3 段）→ 識別子が無い / 解決できなければ要確認 stub（`/capture/pdf`・saveStandaloneAttachment で共通）。
+/// ① md5 照合と ③ 登録・添付だけロックを取り、② 冒頭 2 頁の抽出・resolver・題名検索はロックの外（取込中も /capture/status・
+/// Word・他の保存を止めない）。stub は ③ のロックの中で作る（③ の md5 再照合と stub 作成の間に同じ PDF の別の取込が割り込まない）。
+/// 戻り値の guard = そのロック（呼び手は続けて要約・フォルダ所属に使う）。Err = DB / 添付の失敗だけ（抽出できない・
+/// resolver の失敗は stub_on_fail=false なので `fail` に入って届き、stub になる）
+fn ingest_or_stub<'a>(st: &'a St, bytes: &[u8], from: &PdfFrom) -> Result<(std::sync::MutexGuard<'a, Db>, Ingested), String> {
+    use pdfingest::PdfIngestOutcome as O;
+    let opts = pdfingest::IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
+    // 元ファイル名はタブ / ページの題名から（csl_filename=true なので添付名には使われない）
+    let src_name = format!("{}.pdf", pdfingest::safe_filename_stem(&from.title.map(pdfingest::strip_pdf_suffix).unwrap_or_default()));
+    let Ok((mut db, res)) =
+        pdfingest::ingest_pdf_bytes_unlocked(|| Ok::<_, std::convert::Infallible>(st.db()), bytes, &src_name, None, &opts);
+    let pdfingest::IngestReport { outcome, warnings, reason, fail, info_title, md5 } = res.map_err(|e| e.to_string())?;
+    for w in &warnings {
+        eprintln!("{}: ⚠ {w}", from.log);
+    }
+    let (key, status) = match outcome {
+        O::Added { key } => (key, "added"),
+        O::AttachedToExisting { key } => (key, "attached"),
+        O::AttachedAdditional { key } => (key, "attached_additional"),
+        O::DuplicateFile { key } => (key, "duplicate"),
+        O::NeedsReview { key } => (key, "needs_review"),
+        O::NoIdentifier => {
+            // 識別子ゼロ、本文の識別子を解決できない（doi.org 404・NCBI 障害）、または題名ガードで不採用:
+            // 捏造せず、判明している情報だけで document を作って添付を保全する（PDF を失わない）
+            if let Some(e) = &fail {
+                eprintln!("{}: {}識別子を解決できず → 要確認 stub へ: {e}", from.log, from.fail_subject);
+            }
+            let note = stub_note(&fail, &reason);
+            let origin = pdfingest::StubOrigin::Page { title: from.title, url: from.url, source: from.source };
+            let mut stub_warnings = Vec::new();
+            let made = pdfingest::create_review_stub(&mut db, &origin, info_title.as_deref(), bytes, &md5, &note, &mut stub_warnings);
+            for w in &stub_warnings {
+                eprintln!("{}: ⚠ {w}", from.source);
+            }
+            let (key, title) = made.map_err(|e| e.to_string())?;
+            eprintln!("{}: 要確認 stub {key}「{}」（{note}）", from.source, model::truncate_chars(&title, 60));
+            return Ok((db, Ingested { key, status: "stub", note: Some(note) }));
+        }
+    };
+    Ok((db, Ingested { key, status, note: None }))
 }
 
 /// 誌面 PDF が取れなかった時に connector が問い合わせてくる: OA 経路の当てがあるか
@@ -639,35 +689,15 @@ async fn save_standalone_attachment(
     let st2 = st.clone();
     // body（axum の Bytes）をそのまま blocking 側へ渡す（複製もファイルへの書き出しもしない）
     let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        // /capture/pdf と同じ報告経路（理由・警告・要確認ラベル・import_note・Err のログ）
-        let opts = pdfingest::IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
-        let src_name = format!("{}.pdf", safe_filename_stem(&strip_pdf_suffix(&title)));
-        let (mut db, res) = ingest_pdf_unlocked(&st2, &body, &src_name, &opts);
-        let (outcome, warnings, stub_reason, fail, info_title, md5) =
-            match res {
-                Ok(r) => (Some(r.outcome), r.warnings, r.reason, None, r.info_title, Some(r.md5)),
-                Err(e) => (None, Vec::new(), None, Some(e.to_string()), None, None),
-            };
-        for w in &warnings {
-            eprintln!("saveStandaloneAttachment: ⚠ {w}");
-        }
-        match outcome {
-            Some(pdfingest::PdfIngestOutcome::Added { key })
-            | Some(pdfingest::PdfIngestOutcome::AttachedToExisting { key })
-            | Some(pdfingest::PdfIngestOutcome::AttachedAdditional { key })
-            | Some(pdfingest::PdfIngestOutcome::DuplicateFile { key })
-            | Some(pdfingest::PdfIngestOutcome::NeedsReview { key }) => Ok(key),
-            Some(pdfingest::PdfIngestOutcome::NoIdentifier) | None => {
-                if let Some(e) = &fail {
-                    eprintln!("saveStandaloneAttachment: 識別子を解決できず → 要確認 stub へ: {e}");
-                }
-                let note = stub_note(&fail, &stub_reason);
-                // 取込が Err（冒頭を解析できない等）で /Title・md5 を得ていないときだけ解析・計算する
-                let info_title = if fail.is_some() { openref_core::pdftools::info_title_bytes(&body) } else { info_title };
-                let md5 = md5.unwrap_or_else(|| pdffetch::md5_hex(&body));
-                capture_stub(&mut db, info_title.as_deref(), &body, &md5, Some(&title), Some(&url), "connector-standalone", &note)
-            }
-        }
+        // /capture/pdf と同じ取込 → 失敗なら要確認 stub（理由・警告・要確認ラベル・import_note・Err のログ）
+        let from = PdfFrom {
+            title: Some(&title),
+            url: Some(&url),
+            source: "connector-standalone",
+            log: "saveStandaloneAttachment",
+            fail_subject: "",
+        };
+        ingest_or_stub(&st2, &body, &from).map(|(_, got)| got.key)
     })
     .await;
     match res {
@@ -1030,7 +1060,7 @@ fn not_pdf(body: &[u8]) -> Value {
 
 /// body = PDF バイト列、query = collection_id / title / url（ヒント）。**PDF タブからの取込の本命経路**。
 /// 冒頭テキストの DOI/PMID → resolver → 新規登録 or 既存 item へ添付（GUI の一括取込と同じ
-/// pdfingest の 3 段 = `ingest_pdf_unlocked`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
+/// pdfingest の 3 段 = `ingest_or_stub`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
 /// 識別子が無い・本文の識別子を解決できない（doi.org 404 等）ときは、従来どおりの capture stub（type document・題名は
 /// Info /Title が妥当ならそれ、無ければタブ題名・URL・custom.source=capture）を作って添付し、ラベル「要確認」を付ける
 /// （PDF を失わない = save_standalone_attachment と同じ方針）。
@@ -1071,48 +1101,13 @@ fn capture_pdf_ingest(
     url_hint: Option<String>,
     collection_id: Option<i64>,
 ) -> Result<Value, String> {
-    use pdfingest::PdfIngestOutcome as O;
-    let opts = pdfingest::IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
-    // 元ファイル名はタブ題名から（csl_filename=true なので添付名には使われない。stub の題名は capture_stub が決める）
-    let src_name = format!("{}.pdf", safe_filename_stem(&title_hint.as_deref().map(strip_pdf_suffix).unwrap_or_default()));
-    let (mut db, res) = ingest_pdf_unlocked(st, bytes, &src_name, &opts);
-    let (outcome, warnings, stub_reason, fail, info_title, md5) =
-        match res {
-            Ok(r) => (Some(r.outcome), r.warnings, r.reason, None, r.info_title, Some(r.md5)),
-            Err(e) => (None, Vec::new(), None, Some(e.to_string()), None, None),
-        };
-    for w in &warnings {
-        eprintln!("capture: ⚠ {w}");
+    let from = PdfFrom { title: title_hint.as_deref(), url: url_hint.as_deref(), source: "capture", log: "capture", fail_subject: "pdf の" };
+    let (db, Ingested { key, status, note }) = ingest_or_stub(st, bytes, &from)?;
+    // 応答の reason: stub になった理由 / 解決失敗の理由（= stub の import_note）/ duplicate の相手が要確認 stub という案内
+    let mut reason = note;
+    if status == "duplicate" && pdfingest::is_review_stub(&db, &key) {
+        reason = Some("同一ファイルが要確認 stub に添付済み。その item の詳細 → 編集から DOI/PMID を引き直せます".into());
     }
-    // 応答の reason: stub になった理由 / 解決失敗の理由 / duplicate の相手が要確認 stub という案内
-    let mut reason: Option<String> = None;
-    let (status, key) = match outcome {
-        Some(O::Added { key }) => ("added", key),
-        Some(O::AttachedToExisting { key }) => ("attached", key),
-        Some(O::AttachedAdditional { key }) => ("attached_additional", key),
-        Some(O::DuplicateFile { key }) => {
-            if pdfingest::is_review_stub(&db, &key) {
-                reason = Some("同一ファイルが要確認 stub に添付済み。その item の詳細 → 編集から DOI/PMID を引き直せます".into());
-            }
-            ("duplicate", key)
-        }
-        // stub_on_fail=false なので到達しないが、網羅のため
-        Some(O::NeedsReview { key }) => ("needs_review", key),
-        Some(O::NoIdentifier) | None => {
-            // 識別子ゼロ、本文の識別子を解決できない（doi.org 404・NCBI 障害）、または題名ガードで不採用:
-            // 捏造せず、判明している情報だけで document を作って添付を保全する（PDF を失わない）
-            if let Some(e) = &fail {
-                eprintln!("capture: pdf の識別子を解決できず → 要確認 stub へ: {e}");
-            }
-            let note = stub_note(&fail, &stub_reason);
-            reason = Some(note.clone());
-            // 取込が Err（冒頭を解析できない等）で /Title・md5 を得ていないときだけ解析・計算する
-            let info_title = if fail.is_some() { openref_core::pdftools::info_title_bytes(bytes) } else { info_title };
-            let md5 = md5.unwrap_or_else(|| pdffetch::md5_hex(bytes));
-            let key = capture_stub(&mut db, info_title.as_deref(), bytes, &md5, title_hint.as_deref(), url_hint.as_deref(), "capture", &note)?;
-            ("stub", key)
-        }
-    };
     // ゴミ箱内の item（md5 重複の相手）には触らない: フォルダ所属もしない（撤回表示は summarize_item の trashed の最小形に無い）
     let live = search::get_by_key(&db, &key).map_err(|e| e.to_string())?;
     if let (Some(_), Some(cid)) = (&live, collection_id) {
@@ -1133,78 +1128,6 @@ fn stub_note(fail: &Option<String>, stub_reason: &Option<String>) -> String {
         (None, Some(r)) => r.clone(),
         (None, None) => "識別子なし（PDF 本文に DOI/PMID が無く、タイトル検索も未一致。DOI/PMID を入力して書誌を引き直してください）".to_string(),
     }
-}
-
-/// 識別子が無い / 解決できない PDF の stub（type document・捏造しない）を作って添付し、「要確認」ラベルを付ける。
-/// `/capture/pdf`（PDF タブ）と Zotero Connector の standalone 経路で共通。題名は Info /Title（取込の冒頭解析で得たもの =
-/// `info_title`。解析し直さない）が妥当ならそれ、無ければヒント（タブ題名）から .pdf を落としたもの。
-/// `md5` = `bytes` の 16 進 md5（取込で 1 度計算したもの）。戻り値は item key
-fn capture_stub(
-    db: &mut Db,
-    info_title: Option<&str>,
-    bytes: &[u8],
-    md5: &str,
-    title_hint: Option<&str>,
-    url_hint: Option<&str>,
-    source: &str,
-    note: &str,
-) -> Result<String, String> {
-    let title = info_title
-        .filter(|t| pdfingest::plausible_title(t))
-        .map(str::to_string)
-        .or_else(|| title_hint.map(strip_pdf_suffix).filter(|t| !t.is_empty()))
-        .unwrap_or_else(|| "Untitled PDF".into());
-    let csl = json!({
-        "type": "document",
-        "title": title,
-        "URL": url_hint.filter(|u| !u.is_empty()),
-        "custom": { "source": source, "import_note": note }
-    });
-    let resolved = resolver::Resolved { csl, retracted: None, source: "capture" };
-    let added = ingest::add_item(db, &resolved).map_err(|e| e.to_string())?;
-    let filename = format!("{}.pdf", safe_filename_stem(&title));
-    if let edit::Placement::ManagedFallback { reason, .. } =
-        edit::attach_auto_with_md5(db, &added.key, &filename, bytes, md5).map_err(|e| e.to_string())?.placement
-    {
-        eprintln!("{source}: ⚠ {reason}");
-    }
-    // 一覧から見つけられるよう「要確認」ラベル（GUI 一括取込の要確認 stub と同じ色・同じ名）
-    match tags::ensure_tag(db, pdfingest::REVIEW_TAG, Some(pdfingest::REVIEW_TAG_COLOR)) {
-        Ok(tid) => {
-            if let Err(e) = tags::attach_tag(db, &added.key, tid) {
-                eprintln!("{source}: ⚠ 要確認ラベル付与失敗 {e}");
-            }
-        }
-        Err(e) => eprintln!("{source}: ⚠ 要確認ラベル作成失敗 {e}"),
-    }
-    eprintln!("{source}: 要確認 stub {}「{}」（{note}）", added.key, model::truncate_chars(&title, 60));
-    Ok(added.key)
-}
-
-/// タブ題名のヒントから拡張子を落とす（Chrome の PDF タブ題名はファイル名のことが多い）
-fn strip_pdf_suffix(t: &str) -> String {
-    let t = t.trim();
-    let l = t.to_lowercase();
-    if l.ends_with(".pdf") {
-        t[..t.len() - 4].trim().to_string()
-    } else {
-        t.to_string()
-    }
-}
-
-/// managed 添付のファイル名用（Drive モードでは drive_layout が CSL から命名するので使われない）
-fn safe_filename_stem(title: &str) -> String {
-    let s: String = title
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
-            c => c,
-        })
-        .collect();
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = model::truncate_chars(&s, 140);
-    let s = s.trim_end_matches('.').trim().to_string();
-    if s.is_empty() { "attachment".into() } else { s }
 }
 
 /// {key} → サーバ側の連鎖（PMC → Unpaywall → Crossref link[] → doi.org 着地ページ）で取得を試みる（ページ内 fetch 不発時の fallback）。

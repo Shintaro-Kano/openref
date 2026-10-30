@@ -178,6 +178,15 @@ fn common_cli_preview_copy_resume_and_report_share_core_results() {
     assert_eq!(report["report"], second);
     let history = Scratch::decode(s.cli(&["import", "history"]));
     assert_eq!(history.as_array().unwrap().len(), 2);
+    let listed = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == second["run_id"])
+        .unwrap();
+    assert_eq!(listed["total"], second["total"]);
+    assert_eq!(listed["source_id"], second["source_id"]);
+    assert!(listed.get("report").is_none());
 }
 
 #[test]
@@ -237,7 +246,9 @@ fn old_arguments_block_crossed_identifiers_and_backup_failure() {
     let out = s.import(&["--mount", s.root.to_str().unwrap()]);
     assert!(out.status.success());
     let history = Scratch::decode(s.cli(&["import", "history"]));
-    assert_eq!(history[0]["report"]["results"][0]["status"], "blocked");
+    assert!(history[0].get("report").is_none(), "history は一覧の列だけ");
+    let report = Scratch::decode(s.cli(&["import", "report", history[0]["id"].as_str().unwrap()]));
+    assert_eq!(report["report"]["results"][0]["status"], "blocked");
     let db = Db::open(&s.db).unwrap();
     assert_eq!(
         db.conn
@@ -404,4 +415,94 @@ fn saved_cli_decision_rejects_changed_candidate_until_reselected() {
         Scratch::decode(s.import(&args))["results"][0]["status"],
         "merged"
     );
+}
+
+#[test]
+fn source_id_new_makes_a_source_and_explicit_blank_is_an_error() {
+    let s = Scratch::new();
+    let source = |args: &[&str]| -> String {
+        let mut argv = args.to_vec();
+        argv.push("--report-json");
+        let report = Scratch::decode(s.import(&argv));
+        report["source_id"].as_str().unwrap().to_string()
+    };
+    // `@new` asks for a new source; it is never a source literally named "@new".
+    let first = source(&["--source-id", "@new"]);
+    assert!(
+        first.starts_with("paperpile-") && first.len() == 18,
+        "{first}"
+    );
+    // An explicit blank (e.g. an empty "$VAR") must not silently pick the single
+    // existing source: that would mix another library into its provenance.
+    for blank in ["", "  "] {
+        for dry in [true, false] {
+            let mut argv = vec!["--source-id", blank];
+            if dry {
+                argv.push("--dry-run");
+            }
+            let out = s.import(&argv);
+            assert!(!out.status.success(), "{blank:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains("--source-id が空です"), "{err}");
+        }
+    }
+    // Omitted = not chosen = the single existing source of this format.
+    assert_eq!(source(&["--dry-run"]), first);
+    let second = source(&["--source-id", "@new"]);
+    assert_ne!(second, first);
+    let out = s.import(&["--dry-run"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("同じ形式の移行元が複数あります"), "{err}");
+    assert!(err.contains(&first) && err.contains(&second), "{err}");
+    let db = Db::open(&s.db).unwrap();
+    let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT count(*) FROM import_sources"), 2);
+    assert_eq!(
+        count("SELECT count(*) FROM import_runs"),
+        2,
+        "blank runs nothing"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM import_sources WHERE trim(id)='' OR id='@new'"),
+        0
+    );
+}
+
+#[test]
+fn resume_keeps_the_prior_source_and_refuses_a_literal_new_source() {
+    let s = Scratch::new();
+    let report = Scratch::decode(s.import(&["--source-id", "legacy", "--report-json"]));
+    let run = report["run_id"].as_str().unwrap().to_string();
+    // A resumed run stays in its own source.
+    let plan = Scratch::decode(s.import(&["--resume", &run, "--dry-run", "--report-json"]));
+    assert_eq!(plan["source_id"], "legacy");
+    // Older CLIs stored `--source-id @new` literally. Resuming such a run must
+    // not turn "@new" into a fresh source (the run's objects would be duplicated).
+    let db = Db::open(&s.db).unwrap();
+    db.conn
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             UPDATE import_sources SET id='@new';
+             UPDATE import_runs SET source_id='@new';
+             UPDATE import_objects SET source_id='@new';
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let objects = count("SELECT count(*) FROM import_objects");
+    assert!(objects > 0);
+    for dry in [true, false] {
+        let mut argv = vec!["--resume", run.as_str()];
+        if dry {
+            argv.push("--dry-run");
+        }
+        let out = s.import(&argv);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("再開する実行の移行元「@new」"), "{err}");
+    }
+    assert_eq!(count("SELECT count(*) FROM import_sources"), 1);
+    assert_eq!(count("SELECT count(*) FROM import_runs"), 1);
+    assert_eq!(count("SELECT count(*) FROM import_objects"), objects);
 }

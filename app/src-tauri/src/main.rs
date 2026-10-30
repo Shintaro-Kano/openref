@@ -69,8 +69,14 @@ async fn migration_select_report(
     run: String,
 ) -> Result<(), String> {
     let db = migration_db(&state)?;
+    let shared = state.db.clone();
     let jobs = jobs.inner().clone();
-    blocking(move || jobs.select_report(db, &run)).await
+    blocking(move || {
+        // 開いている接続で 1 run だけ読む（DB の写しを取らない）。ロックは読む間だけ
+        let report = migration::past_report(&*lock(&shared)?, &run)?;
+        jobs.select_report(db, report)
+    })
+    .await
 }
 #[tauri::command]
 async fn migration_save_report(
@@ -85,17 +91,13 @@ async fn migration_save_report(
 async fn migration_history(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let path = migration_db(&state)?;
+    let shared = state.db.clone();
     blocking(move || {
-        let history = openref_core::import::apply::history(&path).map_err(err)?;
-        Ok(history
-            .into_iter()
-            .take(50)
-            .map(|mut entry| {
-                entry.as_object_mut().unwrap().remove("report");
-                entry
-            })
-            .collect())
+        // 一覧の列だけを開いている接続で読む（DB の写し・全 run の report を作らない）
+        let mut history =
+            openref_core::import::apply::history_list(&lock(&shared)?.conn).map_err(err)?;
+        history.truncate(50);
+        Ok(history)
     })
     .await
 }

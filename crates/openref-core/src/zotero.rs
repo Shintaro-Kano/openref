@@ -42,9 +42,9 @@ pub fn zotero_to_csl(z: &Value) -> Option<ConnectorItem> {
         }
     }
     if let Some(d) = z.get("DOI").and_then(|v| v.as_str()) {
-        let d = d.trim().trim_start_matches("https://doi.org/");
+        let d = crate::model::normalize_doi_for_storage(d);
         if !d.is_empty() {
-            m.insert("DOI".into(), json!(d.to_lowercase()));
+            m.insert("DOI".into(), json!(d));
         }
     }
 
@@ -249,6 +249,14 @@ mod tests {
         assert_eq!(c["issued"]["date-parts"][0], json!([2023, 2, 18]));
         assert_eq!(ci.connector_id.as_deref(), Some("abc123"));
         assert_eq!(ci.pdf_urls, vec!["https://example.org/x.pdf"]);
+
+        // DOI の接頭辞は model::normalize_doi の表のとおり剥がす（以前は `https://doi.org/` だけ）
+        for raw in ["doi:10.1053/J.GASTRO.2023.02.012", " https://dx.doi.org/10.1053/j.gastro.2023.02.012 ", "https://doi.org/https://doi.org/10.1053/j.gastro.2023.02.012"] {
+            let ci = zotero_to_csl(&json!({"itemType": "journalArticle", "title": "T", "DOI": raw})).unwrap();
+            assert_eq!(ci.csl["DOI"], "10.1053/j.gastro.2023.02.012", "{raw:?}");
+        }
+        let ci = zotero_to_csl(&json!({"itemType": "journalArticle", "title": "T", "DOI": "doi:"})).unwrap();
+        assert!(ci.csl.get("DOI").is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
-use openref_core::{datadir, fulltext, ingest, model, pdffetch, resolver, search, sync, CoreError, Db};
+use openref_core::{datadir, fulltext, ingest, model, pdffetch, resolver, search, sync, tags, CoreError, Db};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -149,6 +149,7 @@ enum ImportSrc {
         files: Vec<PathBuf>,
         #[arg(long, value_enum)]
         attachments: Option<ImportAttachmentMode>,
+        /// 追加先の移行元 ID（@new = 新しい移行元。省略 = 自動選択 = 同じ形式の移行元が 1 つならそれ・無ければ既定の 1 つ。空・空白だけは誤り）
         #[arg(long)]
         source_id: Option<String>,
         #[arg(long)]
@@ -179,7 +180,7 @@ enum ImportSrc {
         /// 共通移行処理を使い、PDF をコピーまたはリンクする
         #[arg(long, value_enum)]
         attachments: Option<ImportAttachmentMode>,
-        /// 再エクスポートを以前の移行元に追加するときの ID
+        /// 追加先の移行元 ID（@new = 新しい移行元。省略 = 自動選択 = 同じ形式の移行元が 1 つならそれ・無ければ既定の 1 つ。空・空白だけは誤り）
         #[arg(long)]
         source_id: Option<String>,
         /// 完了分を再利用し、同一入力の未完了分を再処理する実行 ID
@@ -197,7 +198,7 @@ enum ImportSrc {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// ライブラリ移行の履歴（読取のみ・JSON）
+    /// ライブラリ移行の履歴（読取のみ・JSON・実行ごとの一覧の列だけ。結果は import report）
     History,
     /// 指定した移行実行の結果（読取のみ・JSON）
     Report { run: String },
@@ -247,17 +248,16 @@ fn main() -> anyhow::Result<()> {
             ImportSrc::History => {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&openref_core::import::apply::history(&path)?)?
+                    serde_json::to_string_pretty(
+                        &openref_core::import::apply::history_list_snapshot(&path)?
+                    )?
                 );
                 return Ok(());
             }
             ImportSrc::Report { run } => {
-                let history = openref_core::import::apply::history(&path)?;
-                let report = history
-                    .iter()
-                    .find(|r| r["id"].as_str() == Some(run))
+                let report = openref_core::import::apply::run_report_snapshot(&path, run)?
                     .context("移行実行が見つかりません")?;
-                println!("{}", serde_json::to_string_pretty(report)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
             }
             ImportSrc::Paperpile {
@@ -307,6 +307,14 @@ fn main() -> anyhow::Result<()> {
                     }
                     _ => (None, None),
                 };
+                // ラベルは名前（大小無視）から id に引く。綴り違いは「(なし)」にせずエラーで終える（MCP の list_items と同じ）
+                let tag_id = match label.as_deref().map(str::trim) {
+                    Some(name) => match tags::tag_by_name(&db.conn, name)? {
+                        Some((id, _)) => Some(id),
+                        None => bail!("ラベル '{name}' は見つかりません"),
+                    },
+                    None => None,
+                };
                 let rows = search::list_items(
                     &db,
                     &search::ListFilter {
@@ -314,7 +322,7 @@ fn main() -> anyhow::Result<()> {
                         journal,
                         author_family: family,
                         author_initial: initial,
-                        tag: label,
+                        tag_id,
                         ..Default::default()
                     },
                 )?;
@@ -888,64 +896,42 @@ fn cmd_library_import(
     report_json: bool,
     decisions: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    use openref_core::import::{self, apply, files::AttachmentRoots, AttachmentMode, ImportSource};
-    let source = ImportSource {
-        id: "pending".into(),
-        format: format.into(),
+    use openref_core::import::{self, apply, AttachmentMode};
+    // 明示した空は誤り（空の変数の展開で、既存の唯一の移行元へ黙って追加しない）
+    if source_id.is_some_and(|s| s.trim().is_empty()) {
+        bail!("--source-id が空です。新しい移行元は --source-id @new、自動選択は --source-id を付けずに実行してください");
+    }
+    // 再開: 移行元と添付の扱いは前回の実行から引き継ぐ（入力の同一性は読んだ後に確かめる）
+    let prior = match resume {
+        Some(run) => Some(
+            apply::history_list_snapshot(db_path)?
+                .into_iter()
+                .find(|r| r["id"].as_str() == Some(run))
+                .context("再開する移行実行が見つかりません")?,
+        ),
+        None => None,
     };
-    apply::reject_database_file(json_path, db_path)?;
-    let mut input = if format == "zotero" {
-        import::zotero_rdf::read_input(json_path, source)?
-    } else {
-        import::paperpile::read_input(json_path, source)?
-    };
-    input.adopt_legacy_paperpile_ids = adopt_legacy_ids;
-    let mut resumed_mode = None;
-    let prior = if let Some(run) = resume {
-        let history = apply::history(db_path)?;
-        let prior = history
-            .into_iter()
-            .find(|r| r["id"].as_str() == Some(run))
-            .context("再開する移行実行が見つかりません")?;
-        if prior["input_sha256"].as_str() != Some(input.input_sha256.as_str()) {
-            bail!(
-                "再開には同一の入力ファイルが必要です。別の書出しは --source-id で追加してください"
-            );
-        }
-        resumed_mode = Some(if prior["attachment_mode"].as_str() == Some("copy") {
-            ImportAttachmentMode::Copy
-        } else {
-            ImportAttachmentMode::Link
-        });
-        Some(
+    let prior_source = match &prior {
+        Some(prior) => Some(
             prior["source_id"]
                 .as_str()
                 .context("履歴の移行元 ID がありません")?
                 .to_string(),
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
-    if let (Some(source), Some(prior)) = (source_id, prior.as_deref()) {
+    if let (Some(source), Some(prior)) = (source_id, prior_source.as_deref()) {
         if source != prior {
             bail!("--source-id と再開する実行の移行元が一致しません");
         }
     }
-    input.source.id = source_id
-        .map(str::to_string)
-        .or(prior)
-        .map(Ok)
-        .unwrap_or_else(|| apply::default_source(db_path, format))?;
-    let mut paths: Vec<_> = files.iter().cloned().chain(mount.iter().cloned()).collect();
-    if format == "zotero" {
-        paths.push(
-            std::fs::canonicalize(json_path)?
-                .parent()
-                .context("RDF の親フォルダがありません")?
-                .into(),
-        );
-    }
-    let roots = AttachmentRoots::new(&paths)?;
+    let resumed_mode = prior.as_ref().map(|p| {
+        if p["attachment_mode"].as_str() == Some("copy") {
+            ImportAttachmentMode::Copy
+        } else {
+            ImportAttachmentMode::Link
+        }
+    });
     let mode = match mode.or(resumed_mode).unwrap_or(if format == "zotero" {
         ImportAttachmentMode::Copy
     } else {
@@ -954,20 +940,37 @@ fn cmd_library_import(
         ImportAttachmentMode::Copy => AttachmentMode::Copy,
         ImportAttachmentMode::Link => AttachmentMode::Link,
     };
+    let choices: Option<import::decisions::Decisions> = match decisions {
+        Some(path) => Some(serde_json::from_slice(&std::fs::read(path)?)?),
+        None => None,
+    };
+    let roots: Vec<PathBuf> = files.iter().cloned().chain(mount.iter().cloned()).collect();
     #[cfg(unix)]
     let _signals = ImportSignalGuard::install()?;
-    let mut plan =
-        apply::prepare_controlled(db_path, &input, &roots, mode, &IMPORT_CANCELLED, |_| {})?;
-    if let Some(path) = decisions {
-        let choices = serde_json::from_slice(&std::fs::read(path)?)?;
-        import::decisions::resolve(
-            db_path,
-            &input,
-            &roots,
-            &mut plan,
-            &choices,
-            &IMPORT_CANCELLED,
-        )?;
+    let import::Prepared { input, roots, plan } = import::prepare_request(
+        db_path,
+        &import::Request {
+            format,
+            path: json_path,
+            roots: &roots,
+            mode,
+            source_id: source_id.or(prior_source.as_deref()),
+            adopt_legacy_ids,
+            decisions: choices.as_ref(),
+        },
+        &IMPORT_CANCELLED,
+        |_| {},
+    )?;
+    if let Some(prior) = &prior {
+        if prior["input_sha256"].as_str() != Some(input.input_sha256.as_str()) {
+            bail!(
+                "再開には同一の入力ファイルが必要です。別の書出しは --source-id で追加してください"
+            );
+        }
+    }
+    // 再開は前回と同じ移行元へ。旧版が文字どおり作った "@new" は新しい移行元の指定と区別できない
+    if let Some(prior) = prior_source.as_deref().filter(|p| *p != input.source.id) {
+        bail!("再開する実行の移行元「{prior}」は ID として指定できない名前のため、この実行は再開できません");
     }
     if dry_run {
         if report_json {
@@ -1001,7 +1004,7 @@ fn cmd_library_import(
                     plan.counts.copy_bytes_upper_bound
                 );
             }
-            for warning in &plan.warnings {
+            for warning in plan.notices.iter().chain(&plan.warnings) {
                 println!("注意: {warning}");
             }
         }
@@ -1043,7 +1046,7 @@ fn cmd_library_import(
                 }
             }
         }
-        for warning in &report.warnings {
+        for warning in report.notices.iter().chain(&report.warnings) {
             println!("注意: {warning}");
         }
         if report.fulltext_pending > 0 {
@@ -1087,9 +1090,9 @@ fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
     for (i, p) in paths.iter().enumerate() {
         let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         // 理由（要確認の根拠・Drive → managed 降格）も出す
-        let (res, warnings, reason) = match ingest_pdf_report(db, p, &IngestOpts::default()) {
-            Ok(r) => (Ok(r.outcome), r.warnings, r.reason),
-            Err(e) => (Err(e), Vec::new(), None),
+        let (res, warnings, reason, fail) = match ingest_pdf_report(db, p, &IngestOpts::default()) {
+            Ok(r) => (Ok(r.outcome), r.warnings, r.reason, r.fail),
+            Err(e) => (Err(e), Vec::new(), None, None),
         };
         let mut line = match res {
             Ok(PdfIngestOutcome::Added { key }) => {
@@ -1115,6 +1118,11 @@ fn cmd_import_pdf(db: &mut Db, paths: &[PathBuf]) -> anyhow::Result<()> {
                     "？ 要確認で登録（{}。ラベル「要確認」）  {key}",
                     reason.clone().unwrap_or_else(|| "識別子なし・タイトル検索未一致".into())
                 )
+            }
+            // ② の失敗（stub 無効設定の報告）は識別子なしではなく失敗
+            Ok(PdfIngestOutcome::NoIdentifier) if fail.is_some() => {
+                failed += 1;
+                format!("✗ 失敗: {}", fail.as_deref().unwrap_or_default())
             }
             Ok(PdfIngestOutcome::NoIdentifier) => {
                 review += 1;

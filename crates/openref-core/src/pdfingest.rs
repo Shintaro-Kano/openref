@@ -6,7 +6,8 @@
 //! 無ければ不採用 → stub（import_note に理由）。本文が文字化け / 和文が主（CJK 比率）なら照合できないので
 //! 従来どおり採用（lenient）。**後続候補を自動採用する経路は持たない**: 参考文献欄の DOI はその論文の題名も
 //! 文献リストに載っているのでガードを通ってしまい、自分の DOI の代わりに採用される（別論文の書誌を
-//! 付けるキメラレコードになる）。resolver の失敗（doi.org 404 等）も後続へ進まず Err（connectd は stub にする）。
+//! 付けるキメラレコードになる）。resolver の失敗（doi.org 404 等）も後続へ進まない（GUI / CLI は Err・
+//! connectd = `stub_on_fail=false` は `NoIdentifier` + `fail` で受けて stub にする）。
 //! 蔵書の実測（`title_guard_survey`・題名は Paperpile 由来）: 先頭 DOI = item の DOI、全文ガードの誤拒否 0
 //! （lenient は照合対象外。冒頭 3000 字に絞ると Springer 系で題名が 3000〜4800 字目にあり誤拒否するので全文に広げた）。
 //! この母集団では「別論文を登録する」退行は原理的に検出できないので、その系統は自作 PDF で確かめる。
@@ -35,14 +36,15 @@ pub enum PdfIngestOutcome {
     DuplicateFile { key: String },
     /// 識別子なし・タイトル検索も未一致 → 「要確認」ラベル付き stub として登録＋添付
     NeedsReview { key: String },
-    /// 識別子なしで stub を作らない設定（connectd は自前の stub を持つ）
+    /// 識別子なしで stub を作らない設定（connectd は ③ のロックの中で `create_review_stub`（`StubOrigin::Page`）を自分で呼ぶ）
     NoIdentifier,
 }
 
 pub struct IngestOpts {
     /// 識別子が無いときタイトル推定 → Crossref 検索を試みる
     pub title_search: bool,
-    /// それでも決まらないとき「要確認」stub を作る（false なら NoIdentifier を返す）
+    /// それでも決まらないとき「要確認」stub を作る。false なら NoIdentifier を返す（② の失敗 = 抽出できない・
+    /// resolver / 書誌検索の失敗も Err にせず NoIdentifier + `IngestReport::fail` で返す = 呼び手が `create_review_stub` を自分で呼ぶ）
     pub stub_on_fail: bool,
     /// 添付名を item の CSL から付ける（"Family et al. YYYY - Title.pdf"）。false なら元ファイル名
     /// （GUI/CLI の手元ファイルは元の名前を残す。connectd は一時ファイル名を添付名にしないため true）。
@@ -65,8 +67,11 @@ pub struct IngestReport {
     pub warnings: Vec<String>,
     /// NeedsReview / NoIdentifier になった理由（識別子なし・題名ガード不採用・テキスト層なし）
     pub reason: Option<String>,
-    /// 冒頭解析で得た PDF Info /Title（connectd が要確認 stub の題名に使う = 解析し直さない）。
-    /// md5 一致で早期 return したときは None
+    /// ② の失敗（抽出できない・resolver / 書誌検索の失敗）の文。`stub_on_fail=false` のときだけ入る（outcome = NoIdentifier・
+    /// reason = None）。true（GUI / CLI）では同じ失敗が Err になる
+    pub fail: Option<String>,
+    /// 冒頭解析で得た PDF Info /Title（connectd が要確認 stub の題名に使う = 解析し直さない。② の失敗でも
+    /// 文書を読めた範囲で入る）。md5 一致で早期 return したときは None
     pub info_title: Option<String>,
     /// 入力バイト列の 16 進 md5（1 度だけ計算したもの。connectd は要確認 stub の添付にそのまま渡す）
     pub md5: String,
@@ -149,10 +154,10 @@ struct IngestPlan {
     md5: String,
 }
 
-/// ② の結果（DB に触れずに決めたこと）: 確定した書誌（None = 要確認 / 識別子なし）・その理由・Info /Title
+/// ② の結果（DB に触れずに決めたこと）: 確定した書誌（None = 要確認 / 識別子なし）とその理由、または失敗
+/// （抽出できない・resolver / 書誌検索の失敗）。Info /Title は失敗でも文書を読めた範囲で入る
 struct Analyzed {
-    resolved: Option<Resolved>,
-    reason: Option<String>,
+    found: Result<(Option<Resolved>, Option<String>)>,
     info_title: Option<String>,
 }
 
@@ -167,15 +172,15 @@ fn ingest_pdf_prepare(db: &Db, md5: String) -> Result<Prepared> {
 }
 
 fn duplicate_file_report(key: String, md5: String) -> IngestReport {
-    IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings: Vec::new(), reason: None, info_title: None, md5 }
+    IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings: Vec::new(), reason: None, fail: None, info_title: None, md5 }
 }
 
 /// ③ 再ロックして登録・添付。② の間にロックを離していたので、まず md5 を取り直す（同じファイルが別経路で
-/// 入っていれば ① と同じ DuplicateFile）。② が Err ならその後で Err を返す
+/// 入っていれば ① と同じ DuplicateFile）。② が失敗ならその後で Err（`stub_on_fail=false` は NoIdentifier + fail）を返す
 fn ingest_pdf_commit(
     db: &mut Db,
     plan: IngestPlan,
-    analyzed: Result<Analyzed>,
+    analyzed: Analyzed,
     bytes: &[u8],
     src_name: &str,
     opts: &IngestOpts,
@@ -184,16 +189,28 @@ fn ingest_pdf_commit(
     if let Some(key) = find_item_by_md5(db, &file_md5)? {
         return Ok(duplicate_file_report(key, file_md5));
     }
-    let Analyzed { resolved, reason, info_title } = analyzed?;
+    let Analyzed { found, info_title } = analyzed;
+    let (resolved, reason) = match found {
+        Ok(found) => found,
+        // connectd は stub を自分で作る（題名の既定・URL・source が違う）ので、失敗の文・Info /Title・md5 を返す（呼び手が PDF を読み直さない）
+        Err(e) if !opts.stub_on_fail => {
+            let outcome = PdfIngestOutcome::NoIdentifier;
+            return Ok(IngestReport { outcome, warnings: Vec::new(), reason: None, fail: Some(e.to_string()), info_title, md5: file_md5 });
+        }
+        Err(e) => return Err(e),
+    };
     let mut warnings: Vec<String> = Vec::new();
     let Some(resolved) = resolved else {
         // ② は書誌が決まらないとき理由を必ず入れる
         let reason = reason.unwrap_or_default();
         if !opts.stub_on_fail {
-            return Ok(IngestReport { outcome: PdfIngestOutcome::NoIdentifier, warnings, reason: Some(reason), info_title, md5: file_md5 });
+            let outcome = PdfIngestOutcome::NoIdentifier;
+            return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5 });
         }
-        let outcome = create_review_stub(db, info_title.as_deref(), bytes, &file_md5, src_name, &reason, &mut warnings)?;
-        return Ok(IngestReport { outcome, warnings, reason: Some(reason), info_title, md5: file_md5 });
+        let origin = StubOrigin::File { name: src_name };
+        let (key, _) = create_review_stub(db, &origin, info_title.as_deref(), bytes, &file_md5, &reason, &mut warnings)?;
+        let outcome = PdfIngestOutcome::NeedsReview { key };
+        return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5 });
     };
     let outcome = match ingest::add_item(db, &resolved) {
         Ok(added) => {
@@ -211,7 +228,7 @@ fn ingest_pdf_commit(
         }
         Err(e) => return Err(e),
     };
-    Ok(IngestReport { outcome, warnings, reason: None, info_title, md5: file_md5 })
+    Ok(IngestReport { outcome, warnings, reason: None, fail: None, info_title, md5: file_md5 })
 }
 
 /// DB を Mutex で共有する呼び手（Tauri・connectd）向け: ①と③だけ `lock` でロックを取り、② はロックの外で行う。
@@ -295,9 +312,16 @@ impl Lookup for Net {
 }
 
 /// ② 冒頭 2 頁の抽出 → 識別子 → resolver（題名ガード）/ 題名検索。**DB に触らない**（ロックの外で呼ぶ）。
-/// Err（抽出できない・resolver の失敗）は `ingest_pdf_commit` へそのまま渡す（③ が md5 を取り直してから返す）
-fn analyze_with(net: &dyn Lookup, bytes: &[u8], file: Option<&Path>, opts: &IngestOpts) -> Result<Analyzed> {
-    let ex = pdftools::extract_pages_bytes(bytes, file, 1, 2)?;
+/// 失敗（抽出できない・resolver の失敗）も Info /Title と一緒に `ingest_pdf_commit` へ渡す（③ が md5 を取り直してから返す）
+fn analyze_with(net: &dyn Lookup, bytes: &[u8], file: Option<&Path>, opts: &IngestOpts) -> Analyzed {
+    match pdftools::extract_pages_bytes(bytes, file, 1, 2) {
+        Ok(ex) => Analyzed { found: identify(net, &ex, opts), info_title: ex.info_title },
+        Err(e) => Analyzed { found: Err(e.error), info_title: e.info_title },
+    }
+}
+
+/// ② の続き: 冒頭 2 頁の本文から書誌を決める（None = 要確認 / 識別子なし。そのときは理由を必ず入れる）
+fn identify(net: &dyn Lookup, ex: &pdftools::Extracted, opts: &IngestOpts) -> Result<(Option<Resolved>, Option<String>)> {
     let text = ex.pages.join("\n");
     let lenient = lenient_reason(&ex.pages, &text).is_some();
     // 先頭の識別子 1 件だけ（後続候補は見ない）。解決失敗は Err（connectd は stub にする）
@@ -336,7 +360,7 @@ fn analyze_with(net: &dyn Lookup, bytes: &[u8], file: Option<&Path>, opts: &Inge
             }
         })),
     };
-    Ok(Analyzed { resolved, reason, info_title: ex.info_title })
+    Ok((resolved, reason))
 }
 
 /// 題名ガードの判定（resolver 非依存＝単体テスト可能）。
@@ -449,9 +473,9 @@ where
 /// 取込 1 件の結果を 1 行の要約にする（duplicate の相手が要確認 stub かを DB で見る）
 fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
     use PdfIngestOutcome as O;
-    let (res, warnings, reason) = match res {
-        Ok(r) => (Ok(r.outcome), r.warnings, r.reason),
-        Err(e) => (Err(e), Vec::new(), None),
+    let (res, warnings, reason, fail) = match res {
+        Ok(r) => (Ok(r.outcome), r.warnings, r.reason, r.fail),
+        Err(e) => (Err(e), Vec::new(), None, None),
     };
     let mut r = match res {
         Ok(O::Added { key }) => ImportSummary {
@@ -489,10 +513,14 @@ fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
                 reason.clone().unwrap_or_else(|| "DOI/PMID なし・タイトル検索も未一致".into())
             ),
         },
-        Ok(O::NoIdentifier) => ImportSummary {
-            status: "no_id",
-            key: None,
-            message: reason.clone().unwrap_or_else(|| "冒頭 2 頁に DOI / PMID が見つからず登録を見送りました".into()),
+        Ok(O::NoIdentifier) => match fail {
+            // ② の失敗（stub_on_fail=false の報告）は識別子なしではなく失敗 = Err と同じ表示
+            Some(f) => ImportSummary { status: "error", key: None, message: f },
+            None => ImportSummary {
+                status: "no_id",
+                key: None,
+                message: reason.clone().unwrap_or_else(|| "冒頭 2 頁に DOI / PMID が見つからず登録を見送りました".into()),
+            },
         },
         Err(CoreError::Duplicate { existing_key, field }) => ImportSummary {
             status: "duplicate",
@@ -828,35 +856,99 @@ fn passing_candidates(cands: &[Candidate], text: &str) -> Vec<(TitleMatch, Optio
 
 // ---------- 要確認 stub ----------
 
-/// `info_title` = 冒頭解析で得た Info /Title、`md5` = `bytes` の 16 進 md5（どちらも取り直さない）
-fn create_review_stub(
+/// 要確認 stub の出どころ。型 document・ラベル「要確認」（色 peach）・custom.import_note は共通で、残りが経路で違う
+/// （GUI / CLI / MCP の stub と connectd の stub の差はそのまま残している）
+pub enum StubOrigin<'a> {
+    /// GUI / CLI / MCP の手元ファイル（`name` = 元ファイル名）: 題名の既定 = ファイル名から .pdf / .PDF を落としたもの
+    /// （空ならファイル名）・添付名 = 元ファイル名・custom.source = pdf-import-unresolved・custom.import_file = 元ファイル名・
+    /// URL の鍵なし・ラベルの作成 / 付与の失敗は Err
+    File { name: &'a str },
+    /// connectd（`/capture/pdf` = source capture・saveStandaloneAttachment = connector-standalone）: 題名の既定 =
+    /// タブ / ページの題名から .pdf を落としたもの（空なら "Untitled PDF"）・添付名 = 題名から・URL（空なら null）・
+    /// ラベルの作成 / 付与の失敗は warnings に入れて続ける（stub と添付は残る）
+    Page { title: Option<&'a str>, url: Option<&'a str>, source: &'a str },
+}
+
+/// 識別子が無い / 解決できない PDF の stub（捏造しない）を作って添付し、「要確認」ラベルを付ける。
+/// 題名は Info /Title（冒頭解析で得たもの = `info_title`。解析し直さない）が妥当ならそれ、無ければ `origin` の既定。
+/// `md5` = `bytes` の 16 進 md5（取り直さない）。Drive → managed 降格の理由は `warnings` へ。戻り値 = (item key, 題名)
+pub fn create_review_stub(
     db: &mut Db,
+    origin: &StubOrigin,
     info_title: Option<&str>,
     bytes: &[u8],
     md5: &str,
-    filename: &str,
     note: &str,
     warnings: &mut Vec<String>,
-) -> Result<PdfIngestOutcome> {
-    let stem = filename.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string();
-    // 題名は捏造しない: Info /Title が妥当ならそれ、無ければファイル名
-    let title = info_title
-        .filter(|t| plausible_title(t))
-        .map(str::to_string)
-        .unwrap_or_else(|| if stem.trim().is_empty() { filename.to_string() } else { stem });
-    // 型は document（connectd の capture_stub と同じ）。型カタログ（types.rs の 9 型）に無い型だと編集の sanitize が
-    // 「未知の参照タイプ」で弾き、ReferenceEditor も空のフォームになる = 要確認 stub を手で直せない
-    let csl = json!({
-        "type": "document",
-        "title": title,
-        "custom": { "source": "pdf-import-unresolved", "import_note": note, "import_file": filename }
-    });
+) -> Result<(String, String)> {
+    let info_title = info_title.filter(|t| plausible_title(t)).map(str::to_string);
+    // 型は document。型カタログ（types.rs の 9 型）に無い型だと編集の sanitize が「未知の参照タイプ」で弾き、
+    // ReferenceEditor も空のフォームになる = 要確認 stub を手で直せない
+    let (title, csl, filename) = match origin {
+        StubOrigin::File { name } => {
+            let stem = name.trim_end_matches(".pdf").trim_end_matches(".PDF");
+            let title = info_title.unwrap_or_else(|| if stem.trim().is_empty() { name.to_string() } else { stem.to_string() });
+            let csl = json!({
+                "type": "document",
+                "title": title,
+                "custom": { "source": "pdf-import-unresolved", "import_note": note, "import_file": name }
+            });
+            (title, csl, name.to_string())
+        }
+        StubOrigin::Page { title: hint, url, source } => {
+            let title = info_title
+                .or_else(|| hint.map(strip_pdf_suffix).filter(|t| !t.is_empty()))
+                .unwrap_or_else(|| "Untitled PDF".into());
+            let csl = json!({
+                "type": "document",
+                "title": title,
+                "URL": url.filter(|u| !u.is_empty()),
+                "custom": { "source": source, "import_note": note }
+            });
+            let filename = format!("{}.pdf", safe_filename_stem(&title));
+            (title, csl, filename)
+        }
+    };
+    // retracted: None なので source は使われない（撤回の印を書くときだけの値）
     let resolved = resolver::Resolved { csl, retracted: None, source: "pdf-import" };
     let added = ingest::add_item(db, &resolved)?;
-    note_placement(edit::attach_auto_with_md5(db, &added.key, filename, bytes, md5)?.placement, warnings);
-    let tid = tags::ensure_tag(db, REVIEW_TAG, Some(REVIEW_TAG_COLOR))?;
-    tags::attach_tag(db, &added.key, tid)?;
-    Ok(PdfIngestOutcome::NeedsReview { key: added.key })
+    note_placement(edit::attach_auto_with_md5(db, &added.key, &filename, bytes, md5)?.placement, warnings);
+    // 一覧から見つけられるよう「要確認」ラベル
+    let labeled = tags::ensure_tag(db, REVIEW_TAG, Some(REVIEW_TAG_COLOR))
+        .map_err(|e| ("要確認ラベル作成失敗", e))
+        .and_then(|tid| tags::attach_tag(db, &added.key, tid).map_err(|e| ("要確認ラベル付与失敗", e)));
+    match (labeled, origin) {
+        (Ok(_), _) => {}
+        (Err((_, e)), StubOrigin::File { .. }) => return Err(e),
+        (Err((what, e)), StubOrigin::Page { .. }) => warnings.push(format!("{what} {e}")),
+    }
+    Ok((added.key, title))
+}
+
+/// タブ題名のヒントから拡張子を落とす（Chrome の PDF タブ題名はファイル名のことが多い）
+pub fn strip_pdf_suffix(t: &str) -> String {
+    let t = t.trim();
+    let l = t.to_lowercase();
+    if l.ends_with(".pdf") {
+        t[..t.len() - 4].trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// managed 添付のファイル名用（Drive モードでは drive_layout が CSL から命名するので使われない）
+pub fn safe_filename_stem(title: &str) -> String {
+    let s: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
+            c => c,
+        })
+        .collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = model::truncate_chars(&s, 140);
+    let s = s.trim_end_matches('.').trim().to_string();
+    if s.is_empty() { "attachment".into() } else { s }
 }
 
 #[cfg(test)]
@@ -1085,7 +1177,15 @@ mod tests {
     /// 結果区分・理由・Info /Title・警告・md5（key は乱数なので除く）
     fn label(r: &Result<IngestReport>) -> String {
         match r {
-            Ok(r) => format!("{} reason={:?} info={:?} warn={:?} md5={}", kind(&r.outcome), r.reason, r.info_title, r.warnings, r.md5),
+            Ok(r) => format!(
+                "{} reason={:?} fail={:?} info={:?} warn={:?} md5={}",
+                kind(&r.outcome),
+                r.reason,
+                r.fail,
+                r.info_title,
+                r.warnings,
+                r.md5
+            ),
             Err(e) => format!("Err {e}"),
         }
     }
@@ -1196,7 +1296,8 @@ mod tests {
     }
 
     /// ① と ③ の間（② = ロックを離している間）に同じファイルが別経路で入ったら、③ は ① と同じ DuplicateFile を返す。
-    /// ② が Err（resolver 失敗）でも同じ（connectd が二重に stub を作らない）。入っていなければ Err はそのまま
+    /// ② が失敗（resolver 失敗）でも同じ（connectd が二重に stub を作らない）。入っていなければ失敗のまま
+    /// （stub_on_fail=false = NoIdentifier + fail）
     #[test]
     fn same_file_between_prepare_and_commit_is_duplicate() {
         let (dir, mut db) = temp_db("race");
@@ -1215,7 +1316,7 @@ mod tests {
         let n_att = |db: &Db| db.conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get::<_, i64>(0)).unwrap();
         assert_eq!(n_att(&db), 1);
 
-        // ② が Err: 同じファイルが入っていなければ Err のまま、入っていれば DuplicateFile（stub を作らせない）
+        // ② が失敗: 同じファイルが入っていなければ失敗のまま（NoIdentifier + fail）、入っていれば DuplicateFile（stub を作らせない）
         let err_bytes = &all[6].1;
         let md5e = crate::pdffetch::md5_hex(err_bytes);
         let fresh = |db: &Db| match ingest_pdf_prepare(db, md5e.clone()).unwrap() {
@@ -1223,13 +1324,72 @@ mod tests {
             Prepared::Duplicate(_) => panic!("まだ入っていない"),
         };
         let (plan_a, plan_b) = (fresh(&db), fresh(&db));
-        let r = ingest_pdf_commit(&mut db, plan_a, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts);
-        assert!(r.is_err(), "入っていなければ Err のまま");
+        let r = ingest_pdf_commit(&mut db, plan_a, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
+        assert!(matches!(r.outcome, PdfIngestOutcome::NoIdentifier), "{:?}", r.outcome);
+        assert!(r.fail.as_deref().is_some_and(|f| f.contains("404")), "入っていなければ失敗のまま: {:?}", r.fail);
+        assert_eq!(r.md5, md5e);
         let stub = ingest::add_item(&mut db, &Resolved { csl: json!({ "type": "document", "title": "stub" }), retracted: None, source: "test" }).unwrap();
         edit::attach_auto_with_md5(&db, &stub.key, "s.pdf", err_bytes, &md5e).unwrap();
         let r = ingest_pdf_commit(&mut db, plan_b, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
         assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == stub.key), "{:?}", r.outcome);
         assert_eq!(n_att(&db), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// connectd（stub_on_fail=false）は ② の失敗（resolver 失敗・抽出失敗）でも Err にせず NoIdentifier + fail で受け、
+    /// 要確認 stub の題名・添付に使う Info /Title と md5 を報告から取る（PDF を読み直さない）。報告の値は、文書を単独で
+    /// 読み直した /Title（`info_title_reparse`）と本文の md5 に一致する。GUI / CLI（stub_on_fail=true）は ② の失敗を Err で返す
+    #[test]
+    fn connectd_failure_report_carries_title_and_md5() {
+        let (dir, mut db) = temp_db("fail-report");
+        // pdftotext（poppler）の有無に依らず fallback も失敗させる: 別の壊れたファイルを「同じ内容のファイル」として渡す
+        let garbage = dir.join("garbage.pdf");
+        std::fs::write(&garbage, b"not a pdf").unwrap();
+        let pdf = crate::pdftools::minimal_pdf;
+        let titled = "Resolver Failure Paper Title For Stub";
+        // 頁の抽出で pdf-extract が panic する（フォントの参照先が無い）が、文書と /Info は読める PDF（置換は同じ長さ = xref は有効）
+        let font_panic: Vec<u8> = String::from_utf8(pdf("Body text of a paper whose font cannot be decoded", Some("Extraction Failure Title")))
+            .unwrap()
+            .replace("/Font << /F1 5 0 R >>", "/Font << /F1 9 0 R >>")
+            .into_bytes();
+        // 名前, 本文, pdftotext に渡すファイル, 期待する Info /Title, ② の失敗か
+        type Case<'a> = (&'a str, Vec<u8>, Option<&'a Path>, Option<&'a str>, bool);
+        let cases: Vec<Case> = vec![
+            ("resolver error", pdf("Some text long enough for the extractor doi 10.4040/missing here", Some(titled)), None, Some(titled), true),
+            ("extract panic", font_panic, Some(garbage.as_path()), Some("Extraction Failure Title"), true),
+            ("unparsable", b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n".to_vec(), Some(garbage.as_path()), None, true),
+            ("no text layer", pdf("", Some("Scanned Page Title")), None, Some("Scanned Page Title"), false),
+        ];
+        let connectd = IngestOpts { title_search: true, stub_on_fail: false, csl_filename: true };
+        for (name, bytes, file, want_title, failed) in &cases {
+            let r = bytes_report_with(&no_gate(), &mut db, bytes, "x.pdf", *file, &connectd).unwrap_or_else(|e| panic!("{name}: Err {e}"));
+            assert!(matches!(r.outcome, PdfIngestOutcome::NoIdentifier), "{name}: {:?}", r.outcome);
+            assert_eq!(r.info_title.as_deref(), *want_title, "{name}");
+            assert_eq!(r.info_title, crate::pdftools::info_title_reparse(bytes), "{name}: 文書を単独で読み直した題名と同じ");
+            assert_eq!(r.md5, crate::pdffetch::md5_hex(bytes), "{name}: 本文の md5");
+            if *failed {
+                assert!(r.fail.is_some() && r.reason.is_none(), "{name}: fail={:?} reason={:?}", r.fail, r.reason);
+            } else {
+                assert_eq!((r.fail.as_deref(), r.reason.as_deref()), (None, Some("テキスト層なし（スキャン PDF の可能性。OCR は未対応）")), "{name}");
+            }
+            if *name == "resolver error" {
+                assert!(r.fail.as_deref().is_some_and(|f| f.contains("10.4040/missing") && f.contains("404")), "{:?}", r.fail);
+            }
+            // GUI / CLI は ② の失敗を Err のまま返す（stub を作らない）
+            if *failed {
+                let gui = bytes_report_with(&no_gate(), &mut db, bytes, "x.pdf", *file, &IngestOpts::default());
+                assert!(gui.is_err(), "{name}: {}", label(&gui));
+            }
+            // 要約（GUI モーダル・MCP の import_summary の形）は ② の失敗を「識別子なし」ではなく失敗として出す
+            let fail = r.fail.clone();
+            let s = summarize_import(&db, Ok(r));
+            match fail {
+                Some(f) => assert_eq!((s.status, s.key.is_none(), s.message), ("error", true, f), "{name}"),
+                None => assert_eq!(s.status, "no_id", "{name}"),
+            }
+        }
+        // connectd の報告では DB に何も作らない（stub は connectd が create_review_stub で作る）。GUI は ② の失敗の 3 件だけ流した = Err で何も作らない
+        assert_eq!(db.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1293,7 +1453,8 @@ mod tests {
         std::fs::write(&dup, &dup_bytes).unwrap();
         for db in [&mut a, &mut *b.lock().unwrap()] {
             let mut w = Vec::new();
-            create_review_stub(db, None, &dup_bytes, &crate::pdffetch::md5_hex(&dup_bytes), "dup.pdf", "test", &mut w).unwrap();
+            let origin = StubOrigin::File { name: "dup.pdf" };
+            create_review_stub(db, &origin, None, &dup_bytes, &crate::pdffetch::md5_hex(&dup_bytes), "test", &mut w).unwrap();
         }
         let strip = |s: ImportSummary| (s.status, s.key.is_some(), s.message.replace(&dir_a.display().to_string(), "<A>").replace(&dir_b.display().to_string(), "<B>"));
         for (name, pa, pb) in [
@@ -1311,5 +1472,44 @@ mod tests {
         assert_eq!(strip(import_summary_unlocked(|| b.lock(), &dup).unwrap()).0, "duplicate");
         std::fs::remove_dir_all(&dir_a).ok();
         std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    /// 要確認 stub の中身は出どころで違う（GUI / CLI / MCP = File・connectd = Page）。CSL の全体・添付名・ラベルを固定する
+    #[test]
+    fn review_stub_shape_by_origin() {
+        let (dir, mut db) = temp_db("stub-shape");
+        let page = |title, url, source| StubOrigin::Page { title, url, source };
+        let cases: Vec<(StubOrigin, Option<&str>, &str, &str)> = vec![
+            // 題名: Info /Title が妥当ならそれ（どちらの出どころでも）
+            (StubOrigin::File { name: "scan 1.pdf" }, Some("A Plausible Title Of The Scanned Article"), r#"{"custom":{"import_file":"scan 1.pdf","import_note":"n","source":"pdf-import-unresolved"},"title":"A Plausible Title Of The Scanned Article","type":"document"}"#, "scan 1.pdf"),
+            // File: ファイル名から .pdf / .PDF を落とす・空ならファイル名
+            (StubOrigin::File { name: "scan 2.PDF" }, None, r#"{"custom":{"import_file":"scan 2.PDF","import_note":"n","source":"pdf-import-unresolved"},"title":"scan 2","type":"document"}"#, "scan 2.PDF"),
+            (StubOrigin::File { name: ".pdf" }, None, r#"{"custom":{"import_file":".pdf","import_note":"n","source":"pdf-import-unresolved"},"title":".pdf","type":"document"}"#, ".pdf"),
+            // Page: タブ題名から .pdf を落とす（大小無視）・添付名は題名から・URL は空なら null
+            (page(Some(" Tab: title.Pdf "), Some("https://example.org/a.pdf"), "capture"), Some("x"), r#"{"URL":"https://example.org/a.pdf","custom":{"import_note":"n","source":"capture"},"title":"Tab: title","type":"document"}"#, "Tab title.pdf"),
+            (page(Some(".pdf"), Some(""), "connector-standalone"), None, r#"{"URL":null,"custom":{"import_note":"n","source":"connector-standalone"},"title":"Untitled PDF","type":"document"}"#, "Untitled PDF.pdf"),
+            (page(None, None, "capture"), None, r#"{"URL":null,"custom":{"import_note":"n","source":"capture"},"title":"Untitled PDF","type":"document"}"#, "Untitled PDF.pdf"),
+        ];
+        for (i, (origin, info, csl, file)) in cases.iter().enumerate() {
+            let bytes = crate::pdftools::minimal_pdf(&format!("stub body {i}"), None);
+            let mut w = Vec::new();
+            let (key, title) = create_review_stub(&mut db, origin, *info, &bytes, &crate::pdffetch::md5_hex(&bytes), "n", &mut w).unwrap();
+            assert!(w.is_empty(), "{w:?}");
+            let (got_csl, path, tags): (String, String, String) = db
+                .conn
+                .query_row(
+                    "SELECT i.csl, a.path, (SELECT group_concat(t.name||'|'||t.color) FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id)
+                     FROM items i JOIN attachments a ON a.item_id = i.id WHERE i.key = ?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(got_csl, *csl, "case {i}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(csl).unwrap()["title"], title.as_str(), "case {i}");
+            assert_eq!(Path::new(&path).file_name().unwrap().to_str().unwrap(), *file, "case {i}");
+            assert_eq!(tags, "要確認|peach", "case {i}");
+            assert!(is_review_stub(&db, &key));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -312,6 +312,43 @@ fn manual_reference_create_and_edit() {
     let wd = search::item_detail(&db, &wk).unwrap().unwrap();
     assert_eq!(wd.item.csl["DOI"], "10.1000/abc");
     assert!(edit::create_manual(&mut db, &w).is_err(), "同一 DOI は拒否");
+    // 接頭辞・大小・空白が違っても同じ DOI（add_item の重複判定と同じ照合）
+    let dup = |db: &mut Db, csl: serde_json::Value| match edit::create_manual(db, &csl) {
+        Err(openref_core::CoreError::Duplicate { existing_key, field }) => Some((existing_key, field)),
+        Err(e) => panic!("{e}"),
+        Ok(k) => {
+            edit::trash(db, &k).unwrap();
+            None
+        }
+    };
+    for doi in ["doi:10.1000/abc", " DOI: 10.1000/ABC ", "HTTPS://DX.DOI.ORG/10.1000/abc", "http://doi.org/10.1000/abc"] {
+        let csl = json!({"type": "webpage", "title": "RSNA", "DOI": doi});
+        assert_eq!(dup(&mut db, csl), Some((wk.clone(), "DOI")), "{doi:?}");
+    }
+    assert_eq!(search::find_by_ids(&db, None, Some("doi:10.1000/ABC")).unwrap().map(|r| r.1), Some(wk.clone()));
+    // 保存も同じ正規化（編集でも）・接頭辞だけの DOI は空値と同じに落とす
+    let mut we = wd.item.csl.clone();
+    we["DOI"] = json!("doi: 10.1000/XYZ");
+    edit::update_csl(&mut db, &wk, &we).unwrap();
+    assert_eq!(search::item_detail(&db, &wk).unwrap().unwrap().item.csl["DOI"], "10.1000/xyz");
+    // 保存は接頭辞が重なっていても全部剥がす（BibTeX・Word に生で出るため）→ 同じ DOI として重複
+    for doi in ["https://doi.org/https://doi.org/10.1000/XYZ", "doi:https://doi.org/10.1000/xyz"] {
+        assert_eq!(dup(&mut db, json!({"type": "webpage", "title": "R", "DOI": doi})), Some((wk.clone(), "DOI")), "{doi:?}");
+    }
+    let only_prefix = edit::create_manual(&mut db, &json!({"type": "webpage", "title": "P", "DOI": "doi:"})).unwrap();
+    assert!(search::item_detail(&db, &only_prefix).unwrap().unwrap().item.csl.get("DOI").is_none());
+    // PMID は先頭の 0 を揃える・一致した方の欄を返す（PMID を持つ入力でも DOI で一致したら DOI）
+    let a = edit::create_manual(&mut db, &json!({"type": "article-journal", "title": "A", "PMID": "123"})).unwrap();
+    assert_eq!(dup(&mut db, json!({"type": "article-journal", "title": "A", "PMID": "0123"})), Some((a.clone(), "PMID")));
+    assert_eq!(search::find_by_ids(&db, Some("00123"), None).unwrap().map(|r| r.1), Some(a.clone()));
+    assert_eq!(
+        dup(&mut db, json!({"type": "article-journal", "title": "B", "PMID": "456", "DOI": "doi:10.1000/xyz"})),
+        Some((wk.clone(), "DOI"))
+    );
+    // ゴミ箱の文献とは重複にしない
+    edit::trash(&db, &a).unwrap();
+    assert_eq!(dup(&mut db, json!({"type": "article-journal", "title": "A", "PMID": "123"})), None);
+    assert!(search::find_by_ids(&db, Some("123"), None).unwrap().is_none());
 
     assert!(types::catalog().iter().any(|t| t.id == "chapter"));
 }
@@ -656,8 +693,11 @@ fn membership_counts_for_bulk_toolbar() {
     tags::rename_tag(&db, tid, "renamed").unwrap();
     assert_eq!(search::list_items(&db, &search::ListFilter { tag_id: Some(tid), ..Default::default() }).unwrap().len(), 2);
     assert_eq!(search::list_items(&db, &search::ListFilter { tag_id: Some(zeta), ..Default::default() }).unwrap().len(), 1);
-    // 名前での絞り込み（MCP / CLI）も従来どおり
-    assert_eq!(search::list_items(&db, &search::ListFilter { tag: Some("RENAMED".into()), ..Default::default() }).unwrap().len(), 2);
+    // 名前（大小無視）→ id → 絞り込み（MCP / CLI の経路）。綴り違いは None = 呼び出し側でエラーにできる
+    let rid = tags::tag_by_name(&db.conn, "RENAMED").unwrap().expect("大小無視で引ける").0;
+    assert_eq!(rid, tid);
+    assert_eq!(search::list_items(&db, &search::ListFilter { tag_id: Some(rid), ..Default::default() }).unwrap().len(), 2);
+    assert!(tags::tag_by_name(&db.conn, "renamd").unwrap().is_none());
 }
 
 #[test]

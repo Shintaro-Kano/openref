@@ -28,6 +28,7 @@
 //! 照合結果 → 採否（添付するか・`doi_check` の印は何か）は **`verdict` 1 関数**が全経路（connectd の `/capture/attachment`・
 //! connector の保険 DL を含む）の正で、`verdict_table` テストが全組合せを固定する。
 
+use crate::http::{fetch_agent as agent, fetch_agent_no_redirect, text};
 use crate::{edit, model, search, CoreError, Db, Result};
 use serde_json::Value;
 
@@ -188,13 +189,6 @@ pub enum OaLookup {
     Mismatch { reason: String },
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(60))
-        .user_agent(USER_AGENT)
-        .build()
-}
-
 pub const AWS_OA: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
 const AWS_BUCKET: &str = "pmc-oa-opendata";
 
@@ -220,14 +214,7 @@ pub fn pmc_oa_lookup(pmcid: &str, expect_doi: Option<&str>) -> std::result::Resu
     };
     let json_key = format!("{prefix}/{prefix}.json");
     let json = if keys.iter().any(|k| k == &json_key) {
-        Some(
-            agent()
-                .get(&format!("{AWS_OA}/{json_key}"))
-                .call()
-                .map_err(|e| format!("{json_key} 取得失敗: {e}"))?
-                .into_string()
-                .map_err(|e| e.to_string())?,
-        )
+        Some(text(agent().get(&format!("{AWS_OA}/{json_key}")).call(), |e| format!("{json_key} 取得失敗: {e}"))?)
     } else {
         None
     };
@@ -243,11 +230,7 @@ fn list_prefix(prefix: &str) -> std::result::Result<Vec<String>, String> {
         if let Some(t) = &token {
             req = req.query("continuation-token", t);
         }
-        let xml = req
-            .call()
-            .map_err(|e| format!("S3 一覧取得失敗: {e}"))?
-            .into_string()
-            .map_err(|e| e.to_string())?;
+        let xml = text(req.call(), |e| format!("S3 一覧取得失敗: {e}"))?;
         keys.extend(listing_keys(&xml));
         match listing_next_token(&xml) {
             Some(t) => token = Some(t),
@@ -311,19 +294,6 @@ pub fn s3_url_parts(url: &str) -> Option<(String, Option<String>)> {
     Some((key.to_string(), md5))
 }
 
-/// DOI 照合用: `https://doi.org/` / `doi:` 接頭辞を剥がし小文字化
-fn bare_doi(s: &str) -> String {
-    let t = s.trim().to_lowercase();
-    let t = t
-        .strip_prefix("https://doi.org/")
-        .or_else(|| t.strip_prefix("http://doi.org/"))
-        .or_else(|| t.strip_prefix("https://dx.doi.org/"))
-        .or_else(|| t.strip_prefix("http://dx.doi.org/"))
-        .or_else(|| t.strip_prefix("doi:"))
-        .unwrap_or(&t);
-    t.trim().to_string()
-}
-
 /// json（あれば）と一覧から OA 可否を決める（ネットワーク非依存＝テスト可能）。
 /// - json の `pmcid` / `doi` が item と食い違う → Mismatch（添付しない）
 /// - `is_pmc_openaccess` が明示的に false → NotOpenAccess（manuscript / TDM）
@@ -358,7 +328,7 @@ pub fn interpret_oa(
         }
     }
     if let (Some(want), Some(j)) = (expect_doi, v.get("doi").and_then(|x| x.as_str())) {
-        if bare_doi(j) != bare_doi(want) {
+        if model::normalize_doi(j) != model::normalize_doi(want) {
             return OaLookup::Mismatch { reason: format!("json doi {j} ≠ item DOI {want}") };
         }
     }
@@ -388,12 +358,11 @@ fn aws_fetch_pdf(key: &str, expect_md5: Option<&str>) -> std::result::Result<Vec
 }
 
 fn unpaywall_pdf_url(doi: &str, email: &str) -> std::result::Result<Option<String>, String> {
-    let resp = agent()
+    let sent = agent()
         .get(&format!("https://api.unpaywall.org/v2/{}", encode_doi_path(doi)))
         .query("email", email)
-        .call()
-        .map_err(|e| e.to_string())?;
-    let body = resp.into_string().map_err(|e| e.to_string())?;
+        .call();
+    let body = text(sent, |e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(v.pointer("/best_oa_location/url_for_pdf")
         .and_then(|u| u.as_str())
@@ -618,7 +587,7 @@ pub fn check_pdf_identity(bytes: &[u8], csl: &Value) -> IdentityCheck {
 /// - Mismatch: 目的 DOI が無く、**1 頁目**に別の DOI がある（参考文献が 2 頁目に始まる短報を誤って弾かないため 1 頁目に限る）
 /// - Unknown: それ以外。別 DOI と数えないもの = 表記ゆれ（同じ接頭辞で数字列が同じ）・目的 DOI の前方部分（行末で切れた自己候補）
 pub fn identity_from_pages(pages: &[String], target_doi: &str) -> IdentityCheck {
-    let target = normalize_doi(target_doi);
+    let target = printed_doi(target_doi);
     if target.is_empty() {
         return IdentityCheck::Unchecked { reason: "item に DOI なし".into() };
     }
@@ -703,7 +672,7 @@ fn contains_doi(page: &str, target: &str) -> bool {
 fn dois_in_text(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in crate::pdfingest::doi_re().captures_iter(text) {
-        let d = normalize_doi(&c[1]);
+        let d = printed_doi(&c[1]);
         let Some((_, suffix)) = d.split_once('/') else { continue };
         if suffix.len() < 2 || out.iter().any(|x| x == &d) {
             continue;
@@ -713,15 +682,9 @@ fn dois_in_text(text: &str) -> Vec<String> {
     out
 }
 
-/// 小文字化・`https://doi.org/` / `doi:` を剥がす・末尾の句読点を落とす
-pub fn normalize_doi(s: &str) -> String {
-    let mut d = s.trim().to_lowercase();
-    for p in ["https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi:"] {
-        if let Some(rest) = d.strip_prefix(p) {
-            d = rest.trim().to_string();
-        }
-    }
-    d.trim_end_matches(['.', ',', ';', ')', ']']).to_string()
+/// 本文に印字された DOI との比較形: `model::normalize_doi` + 末尾の句読点（文末の `.` 等）を落とす
+fn printed_doi(s: &str) -> String {
+    model::normalize_doi(s).trim_end_matches(['.', ',', ';', ')', ']']).to_string()
 }
 
 /// 候補 `d` を「別 DOI」と数えないか: 同一 / 表記ゆれ（同じ接頭辞で数字列が同じ。`10.5812/iranjradiol-138586` と
@@ -853,7 +816,7 @@ fn http_get(
     let mut url = start.to_string();
     for _ in 0..=MAX_REDIRECTS {
         url_allowed(&url, allow_http)?;
-        let mut req = agent_no_redirect().get(&url).set("Accept", accept);
+        let mut req = fetch_agent_no_redirect().get(&url).set("Accept", accept);
         if let Some(r) = referer {
             req = req.set("Referer", r);
         }
@@ -883,16 +846,6 @@ fn http_get(
     }
     Err(format!("リダイレクトが {MAX_REDIRECTS} 回を超えました（{}）", truncate_url(start)))
 }
-
-fn agent_no_redirect() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(60))
-        .redirects(0)
-        .user_agent(USER_AGENT)
-        .build()
-}
-
-const USER_AGENT: &str = "openref/0.1 (personal reference manager; +https://openref.unitedradiology.jp)";
 
 /// 外部 URL から PDF をダウンロードして `%PDF` を検証する（`http_get` = 手動リダイレクト・各ホップに SSRF ガード `url_allowed`・
 /// 本文 200 MB 上限）。`referer` は着地ページ（出版社ホストが要求することがある）。`allow_http` は Unpaywall（文書化 API が返す URL）だけ true。
@@ -927,11 +880,10 @@ fn crossref_pdf_links(doi: &str) -> std::result::Result<Vec<String>, String> {
     // 書誌検索・doi.org と同じ Crossref の門（同時 1 本 + 1.1 s 間隔）を通す。本文の受信まで門の中
     let body = crate::resolver::with_crossref_gate(|pace| {
         pace();
-        match agent().get(&format!("https://api.crossref.org/works/{}", encode_doi_path(doi))).call() {
-            Ok(r) => r.into_string().map_err(|e| e.to_string()),
-            Err(ureq::Error::Status(404, _)) => Err(format!("{doi} は Crossref 未登録")),
-            Err(e) => Err(e.to_string()),
-        }
+        text(agent().get(&format!("https://api.crossref.org/works/{}", encode_doi_path(doi))).call(), |e| match e {
+            ureq::Error::Status(404, _) => format!("{doi} は Crossref 未登録"),
+            e => e.to_string(),
+        })
     })?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(select_crossref_pdf_links(&v))
@@ -1815,7 +1767,7 @@ mod doi_tests {
         // temp_dir の同接頭辞を数える検査は並行テストと競合するのでやめた）
         assert!(matches!(check_pdf_identity(b"not a pdf at all", &json!({"DOI": "10.62713/aic.4729"})), IdentityCheck::Unchecked { .. }));
         // 正規化
-        assert_eq!(normalize_doi("https://doi.org/10.62713/AIC.4729."), "10.62713/aic.4729");
+        assert_eq!(printed_doi("https://doi.org/10.62713/AIC.4729."), "10.62713/aic.4729");
         // 境界: 直後が `,` / 末尾 / `.`+改行 は区切り、英数は不可
         assert!(contains_doi("DOI: 10.11152/mu-4292,", "10.11152/mu-4292"));
         assert!(contains_doi("DOI: 10.11152/mu-4292", "10.11152/mu-4292"));

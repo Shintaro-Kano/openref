@@ -204,7 +204,7 @@ pub fn resolve_collection(db: &Db, v: &Value) -> Result<i64> {
             return Ok(id);
         }
     }
-    let segs: Vec<&str> = s.split('/').map(str::trim).filter(|x| !x.is_empty()).collect();
+    let segs: Vec<&str> = collections::segments(s).collect();
     if segs.is_empty() {
         return Err(bad("フォルダの指定が空です"));
     }
@@ -219,36 +219,18 @@ pub fn resolve_collection(db: &Db, v: &Value) -> Result<i64> {
             _ => Err(bad(format!("フォルダ名 '{s}' が複数あります。'親/{s}' のパスか key で指定してください"))),
         };
     }
-    let mut parent: Option<i64> = None;
-    for seg in &segs {
-        match collections::child_id(&db.conn, parent, seg)? {
-            Some(id) => parent = Some(id),
-            None => {
-                return Err(CoreError::NotFound(format!(
-                    "フォルダパス '{s}' の '{seg}'（collections_tree で確認できます）"
-                )))
-            }
-        }
+    match collections::walk(&db.conn, None, s, false)? {
+        collections::Walked::At(Some(id), _) => Ok(id),
+        collections::Walked::At(None, _) => Err(bad("フォルダの指定が空です")),
+        collections::Walked::Missing(seg) => Err(CoreError::NotFound(format!(
+            "フォルダパス '{s}' の '{seg}'（collections_tree で確認できます）"
+        ))),
     }
-    parent.ok_or_else(|| bad("フォルダの指定が空です"))
 }
 
 /// 実表記のパス（'親/子'。NOCASE で解決したときも DB 上の表記を返す）
 fn collection_path(db: &Db, id: i64) -> Result<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = Some(id);
-    while let Some(c) = cur {
-        let (n, p): (String, Option<i64>) =
-            db.conn
-                .query_row("SELECT name, parent_id FROM collections WHERE id = ?1", [c], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        parts.push(n);
-        cur = p;
-        if parts.len() > 256 {
-            break; // 万一の循環で止まる
-        }
-    }
-    parts.reverse();
-    Ok(parts.join("/"))
+    collections::path_of(&db.conn, id)
 }
 
 fn collection_key(db: &Db, id: i64) -> Result<String> {
@@ -268,9 +250,7 @@ fn resolve_tag(db: &Db, v: &Value) -> Result<(i64, String)> {
         }
         _ => return Err(bad("ラベルは名前（文字列）で指定してください")),
     };
-    db.conn
-        .query_row("SELECT id, name FROM tags WHERE name = ?1", [name], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?
+    tags::tag_by_name(&db.conn, name)?
         .ok_or_else(|| CoreError::NotFound(format!("ラベル '{name}'（list_tags で確認できます）")))
 }
 
@@ -283,8 +263,9 @@ fn detail(db: &Db, key: &str) -> Result<search::ItemDetail> {
     search::item_detail(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))
 }
 
+/// 書き込み応答用のラベル名（詳細と同じ順）。詳細を丸ごと引き直さない（添付の stat まで走る）
 fn item_tags(db: &Db, key: &str) -> Result<Vec<String>> {
-    Ok(detail(db, key)?.tags.into_iter().map(|t| t.name).collect())
+    search::item_tag_names(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))
 }
 
 /// MCP の list_items / quick_add の 1 行。**ここは json! で書く snake_case が契約**（エージェント向けの応答形式）。core の行型に付いている
@@ -335,18 +316,17 @@ fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
         None => opt_str(a, "search")?,
     };
     let limit = opt_int(a, "limit")?.unwrap_or(50).max(1) as usize;
-    let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    // 空白だけの query / author / journal は core（search::list_items）が未指定として扱う
     let f = search::ListFilter {
-        search: nonempty(query),
+        search: query,
         collection_id,
-        tag: None,
         tag_id,
         starred_only: opt_bool(a, "starred_only")?.unwrap_or(false),
         trashed: opt_bool(a, "trashed")?.unwrap_or(false),
         limit,
-        author_family: nonempty(opt_str(a, "author")?),
-        author_initial: nonempty(opt_str(a, "author_initial")?),
-        journal: nonempty(opt_str(a, "journal")?),
+        author_family: opt_str(a, "author")?,
+        author_initial: opt_str(a, "author_initial")?,
+        journal: opt_str(a, "journal")?,
         metadata_only: opt_bool(a, "metadata_only")?.unwrap_or(false),
     };
     let rows = search::list_items(db, &f)?;
@@ -356,20 +336,19 @@ fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
 fn get_item(db: &mut Db, a: &Value) -> Result<Value> {
     let key = req_str(a, "key")?;
     let d = detail(db, &key)?;
-    let (deleted_at, date_modified): (Option<String>, String) = db.conn.query_row(
-        "SELECT deleted_at, date_modified FROM items WHERE id = ?1",
+    let annotation_count: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM annotations an JOIN attachments a ON a.id = an.attachment_id WHERE a.item_id = ?1",
         [d.item.id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
-    let ann = annotate::list_annotations(db, &key)?;
     let notes = &d.notes;
     let cols: Vec<Value> = d.collections.iter().map(|c| collection_ref(db, c.id)).collect::<Result<_>>()?;
     Ok(json!({
         "key": d.item.key,
         "starred": d.item.starred,
-        "deleted_at": deleted_at,
+        "deleted_at": d.deleted_at,
         "date_added": d.item.date_added,
-        "date_modified": date_modified,
+        "date_modified": d.date_modified,
         "csl": d.item.csl,
         "collections": cols,
         "tags": d.tags.iter().map(|t| json!({"name": t.name, "color": t.color})).collect::<Vec<_>>(),
@@ -383,7 +362,7 @@ fn get_item(db: &mut Db, a: &Value) -> Result<Value> {
             "doi_check": x.doi_check
         })).collect::<Vec<_>>(),
         "retraction": d.retraction,
-        "annotation_count": ann.len(),
+        "annotation_count": annotation_count,
         "note_count": notes.len(),
         "notes": notes.iter().map(note_json).collect::<Vec<_>>()
     }))
@@ -462,16 +441,23 @@ fn view_counts(db: &mut Db, _a: &Value) -> Result<Value> {
 fn membership(db: &mut Db, a: &Value) -> Result<Value> {
     let keys = str_list(a, "keys")?;
     let m = search::membership(db, &keys)?;
+    let col_ids: Vec<i64> = m.collections.iter().map(|(id, _)| *id).collect();
+    let tag_ids: Vec<i64> = m.tags.iter().map(|(id, _)| *id).collect();
+    let col_info = search::collection_keys_and_paths(db, &col_ids)?;
+    let tag_names = search::tag_names_by_id(db, &tag_ids)?;
     let cols: Vec<Value> = m
         .collections
         .iter()
-        .map(|(id, n)| Ok(json!({"key": collection_key(db, *id)?, "path": collection_path(db, *id)?, "n": n})))
+        .map(|(id, n)| {
+            let (key, path) = col_info.get(id).ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            Ok(json!({"key": key, "path": path, "n": n}))
+        })
         .collect::<Result<_>>()?;
     let tags: Vec<Value> = m
         .tags
         .iter()
         .map(|(id, n)| {
-            let name: String = db.conn.query_row("SELECT name FROM tags WHERE id = ?1", [id], |r| r.get(0))?;
+            let name = tag_names.get(id).ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             Ok(json!({"name": name, "n": n}))
         })
         .collect::<Result<_>>()?;
@@ -746,8 +732,9 @@ fn col_arg(db: &Db, a: &Value, k: &str) -> Result<i64> {
     resolve_collection(db, a.get(k).filter(|v| !v.is_null()).ok_or_else(|| bad(format!("引数 {k} は必須です")))?)
 }
 
+/// 書き込み応答用の所属フォルダのパス（詳細と同じ順）。詳細を丸ごと引き直さない（添付の stat まで走る）
 fn item_collections(db: &Db, key: &str) -> Result<Vec<String>> {
-    detail(db, key)?.collections.iter().map(|c| collection_path(db, c.id)).collect()
+    search::item_collection_paths(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))
 }
 
 fn add_to_collection(db: &mut Db, a: &Value) -> Result<Value> {
@@ -777,14 +764,9 @@ fn move_to_collection(db: &mut Db, a: &Value) -> Result<Value> {
 
 fn create_collection(db: &mut Db, a: &Value) -> Result<Value> {
     let name = req_str(a, "name")?;
-    let path = match a.get("parent").filter(|v| !v.is_null()) {
-        Some(p) => {
-            let pid = resolve_collection(db, p)?;
-            format!("{}/{}", collection_path(db, pid)?, name)
-        }
-        None => name,
-    };
-    let (id, created) = edit::ensure_collection_path(db, &path)?;
+    // 親の下から辿る（親をパスに戻して root から辿り直さない = 祖先に大小違いの同名があっても親の下に着地する）
+    let parent = a.get("parent").filter(|v| !v.is_null()).map(|p| resolve_collection(db, p)).transpose()?;
+    let (id, created) = collections::ensure_path(&db.conn, parent, &name)?;
     Ok(json!({
         "key": collection_key(db, id)?,
         "path": collection_path(db, id)?,
@@ -1247,6 +1229,21 @@ mod tests {
         assert!(call(&mut db, "view_counts", &Value::Null).is_ok());
     }
 
+    /// 空白だけの query / author / author_initial / journal は未指定として扱う（判定は core に 1 本・登録表では二重にしない）
+    #[test]
+    fn list_items_blank_args_mean_unspecified() {
+        let (mut db, _key) = seeded_db();
+        let count = |db: &mut Db, args: Value| call_ok(db, "list_items", args)["count"].as_u64().unwrap();
+        let all = count(&mut db, json!({}));
+        assert!(all >= 1);
+        for args in [json!({"query": "  "}), json!({"search": "\t"}), json!({"author": "   "}), json!({"journal": "  "})] {
+            assert_eq!(count(&mut db, args.clone()), all, "{args}");
+        }
+        // 頭文字だけが空白 = 姓だけで絞る
+        let by_family = count(&mut db, json!({"author": "Kano"}));
+        assert_eq!(count(&mut db, json!({"author": "Kano", "author_initial": " "})), by_family);
+    }
+
     /// 旧 MCP の tool_roundtrip（旧名・旧引数の形のまま call から通る）
     #[test]
     fn tool_roundtrip() {
@@ -1329,6 +1326,47 @@ mod tests {
         assert_eq!(v["collections"], json!(["Seed Folder"]));
 
         assert!(call(&mut db, "create_collection", &json!({"name": " / "})).is_err());
+    }
+
+    /// create_collection の parent = 親の下から辿る（親をパスに戻して root から辿り直さない）。
+    /// 旧データの形（祖先に大小違いの兄弟・`/` や前後空白を含む名前）でも指定した親の下に着地する
+    #[test]
+    fn create_collection_under_parent_walks_from_parent() {
+        let (mut db, _) = seeded_db();
+        db.conn
+            .execute_batch(
+                "INSERT INTO collections (key, name) VALUES ('TEACH001', 'Teach');
+                 INSERT INTO collections (key, name) VALUES ('TEACH002', 'teach');
+                 INSERT INTO collections (key, name, parent_id) VALUES ('XUNDER02', 'X', (SELECT id FROM collections WHERE key = 'TEACH002'));
+                 INSERT INTO collections (key, name) VALUES ('SLASH001', 'A/B');
+                 INSERT INTO collections (key, name) VALUES ('SPACE001', ' Pad ');",
+            )
+            .unwrap();
+        let parent_key = |db: &Db, key: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT p.key FROM collections c LEFT JOIN collections p ON p.id = c.parent_id WHERE c.key = ?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        for parent in ["XUNDER02", "SLASH001", "SPACE001"] {
+            let before: i64 = db.conn.query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0)).unwrap();
+            let v = call_ok(&mut db, "create_collection", json!({"name": "Y/z", "parent": parent}));
+            assert_eq!(v["created_segments"], json!(["Y", "z"]), "{parent}");
+            let after: i64 = db.conn.query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0)).unwrap();
+            assert_eq!(after - before, 2, "祖先を作り直さない: {parent}");
+            let y = parent_key(&db, v["key"].as_str().unwrap()).unwrap();
+            assert_eq!(parent_key(&db, &y).as_deref(), Some(parent), "指定した親の下: {parent}");
+            // 冪等（2 回目は作らない）
+            let v2 = call_ok(&mut db, "create_collection", json!({"name": "y/Z", "parent": parent}));
+            assert_eq!((v2["created"].clone(), v2["key"].clone()), (json!(false), v["key"].clone()));
+        }
+        // 名前が段を持たないときは親そのもの（従来どおり）
+        let v = call_ok(&mut db, "create_collection", json!({"name": " / ", "parent": "XUNDER02"}));
+        assert_eq!((v["key"].clone(), v["created"].clone()), (json!("XUNDER02"), json!(false)));
+        assert_eq!(v["path"], "teach/X");
     }
 
     /// 書込コマンドの往復（in-memory。添付・取込は一時ファイル DB）
@@ -1471,6 +1509,102 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 書き込み応答のラベル・フォルダは詳細（item_detail）を引き直さず、membership は N+1 にしない。
+    /// 旧（詳細 → 名前・パスを 1 件ずつ）と同じ結果で、クエリ数が減ることを示す
+    #[test]
+    fn write_responses_match_detail_and_use_fewer_queries() {
+        use std::cell::Cell;
+        thread_local!(static QUERIES: Cell<usize> = const { Cell::new(0) });
+        fn tick(_: &str, _: std::time::Duration) {
+            QUERIES.with(|c| c.set(c.get() + 1));
+        }
+        fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            QUERIES.with(|c| c.set(0));
+            let v = f();
+            (v, QUERIES.with(|c| c.get()))
+        }
+
+        let (mut db, key) = seeded_db();
+        // ラベル: 大小混在・日本語（大小無視の名前順で返る）
+        for t in ["beta", "Alpha", "gamma", "膵臓", "Delta"] {
+            call_ok(&mut db, "add_tag", json!({"key": key, "tag": t}));
+        }
+        // フォルダ: 入れ子 3 段・別の親の下の同名・soft-delete 済みの祖先の下
+        let a = collections::create_collection(&db, "Zeta", None).unwrap();
+        let b = collections::create_collection(&db, "Mid", Some(a)).unwrap();
+        let c = collections::create_collection(&db, "Leaf", Some(b)).unwrap();
+        let top = collections::create_collection(&db, "Leaf", None).unwrap();
+        let old_root = collections::create_collection(&db, "Old", None).unwrap();
+        let under_old = collections::create_collection(&db, "Under", Some(old_root)).unwrap();
+        let gone = collections::create_collection(&db, "Gone", None).unwrap();
+        // 同名（Leaf）は id の逆順（top → c）で所属に加える = 順は id 順ではなく所属に加えた順
+        for id in [top, c, under_old, gone] {
+            edit::add_to_collection(&db, &key, id).unwrap();
+        }
+        db.conn.execute("UPDATE collections SET deleted_at = '2026-01-01' WHERE id IN (?1, ?2)", [old_root, gone]).unwrap();
+        // 添付（実在しないパス = 詳細だと stat が走る）
+        let item_id: i64 = db.conn.query_row("SELECT id FROM items WHERE key = ?1", [&key], |r| r.get(0)).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO attachments (key, item_id, mode, path) VALUES ('ATT00001', ?1, 'linked', '/nonexistent/x.pdf')",
+                [item_id],
+            )
+            .unwrap();
+        db.conn.profile(Some(tick));
+
+        // 旧: 詳細を引き直して名前・パスを作る
+        let old_tags = |db: &Db| -> Vec<String> { detail(db, &key).unwrap().tags.into_iter().map(|t| t.name).collect() };
+        let old_cols = |db: &Db| -> Vec<String> {
+            detail(db, &key).unwrap().collections.iter().map(|c| collection_path(db, c.id).unwrap()).collect()
+        };
+        let (want_tags, q_old_tags) = count(|| old_tags(&db));
+        let (got_tags, q_new_tags) = count(|| item_tags(&db, &key).unwrap());
+        assert_eq!(got_tags, want_tags);
+        assert_eq!(got_tags, ["Alpha", "beta", "Delta", "gamma", "膵臓"]);
+        let (want_cols, q_old_cols) = count(|| old_cols(&db));
+        let (got_cols, q_new_cols) = count(|| item_collections(&db, &key).unwrap());
+        assert_eq!(got_cols, want_cols);
+        assert_eq!(
+            got_cols,
+            ["Leaf", "Zeta/Mid/Leaf", "Old/Under"],
+            "名前順（同名は所属に加えた順）・soft-delete 済みのフォルダ自身は出ず、soft-delete 済みの祖先の下は名前だけ出る"
+        );
+        assert!(q_new_tags <= 1 && q_new_cols <= 2, "新 {q_new_tags} / {q_new_cols}");
+        assert!(q_old_tags >= 5 && q_old_cols > 5, "旧 {q_old_tags} / {q_old_cols}");
+        eprintln!("クエリ数 ラベル 旧 {q_old_tags} → 新 {q_new_tags} / フォルダ 旧 {q_old_cols} → 新 {q_new_cols}");
+        assert!(matches!(item_tags(&db, "NOSUCHKEY"), Err(CoreError::NotFound(_))));
+        assert!(matches!(item_collections(&db, "NOSUCHKEY"), Err(CoreError::NotFound(_))));
+
+        // membership: 旧の写し（id ごとに key・パス・名前を問い合わせる）と同じ値
+        let keys = vec![key.clone()];
+        let m = search::membership(&db, &keys).unwrap();
+        let want_m = json!({
+            "collections": m.collections.iter().map(|(id, n)| json!({"key": collection_key(&db, *id).unwrap(), "path": collection_path(&db, *id).unwrap(), "n": n})).collect::<Vec<_>>(),
+            "tags": m.tags.iter().map(|(id, n)| json!({"name": db.conn.query_row("SELECT name FROM tags WHERE id = ?1", [id], |r| r.get::<_, String>(0)).unwrap(), "n": n})).collect::<Vec<_>>(),
+        });
+        let (got_m, q_new_m) = count(|| call_ok(&mut db, "membership", json!({"keys": keys})));
+        let (_, q_old_m) = count(|| {
+            let m = search::membership(&db, &keys).unwrap();
+            for (id, _) in &m.collections {
+                collection_key(&db, *id).unwrap();
+                collection_path(&db, *id).unwrap();
+            }
+            for (id, _) in &m.tags {
+                db.conn.query_row("SELECT name FROM tags WHERE id = ?1", [id], |r| r.get::<_, String>(0)).unwrap();
+            }
+        });
+        assert_eq!(got_m, want_m);
+        assert_eq!(got_m["collections"].as_array().unwrap().len(), 4, "membership は soft-delete 済みのフォルダも数える（旧と同じ）");
+        assert!(got_m["collections"].as_array().unwrap().iter().any(|c| c["path"] == "Old/Under"), "soft-delete 済みの祖先の下も数える（旧と同じ）");
+        assert!(q_new_m <= 4 && q_old_m > q_new_m, "membership のクエリは固定数（新 {q_new_m} / 旧 {q_old_m}）");
+        eprintln!("membership クエリ数 旧 {q_old_m} → 新 {q_new_m}");
+
+        // ゴミ箱の item も引ける
+        call_ok(&mut db, "trash_item", json!({"key": key}));
+        assert_eq!(item_tags(&db, &key).unwrap(), want_tags);
+        assert!(call_ok(&mut db, "get_item", json!({"key": key}))["deleted_at"].is_string());
     }
 
     const MINI_CSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>

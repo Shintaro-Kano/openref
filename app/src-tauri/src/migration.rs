@@ -1,8 +1,8 @@
 //! Desktop migration jobs use dedicated DB connections. The shared library
-//! mutex is only used by the command wrapper to obtain its file path.
+//! mutex is only used by the command wrappers to obtain its file path and to
+//! read the history (the run list and one past report) on the open connection.
 use openref_core::import::{
     self, apply, files::AttachmentRoots, plan::ImportPlan, AttachmentMode, ImportInput,
-    ImportSource,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -88,8 +88,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        drop(library);
-        jobs.select_report(db.clone(), &report.run_id).unwrap();
+        jobs.select_report(db.clone(), past_report(&library, &report.run_id).unwrap())
+            .unwrap();
         let historical = jobs.status().unwrap().unwrap();
         assert_eq!(historical.phase, "finished");
         let historical_report = historical.report.unwrap();
@@ -101,7 +101,8 @@ mod tests {
         // Reading an interrupted report does not create a phantom active job.
         jobs.index(&report.run_id).unwrap();
         assert_eq!(wait(&jobs, "finished").report.unwrap().fulltext_pending, 0);
-        jobs.select_report(db.clone(), &report.run_id).unwrap();
+        jobs.select_report(db.clone(), past_report(&library, &report.run_id).unwrap())
+            .unwrap();
         assert_eq!(
             jobs.status()
                 .unwrap()
@@ -131,6 +132,60 @@ mod tests {
             "omitted source reuses the single existing source"
         );
         jobs.cancel(&id).unwrap();
+        drop(jobs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn desktop_preview_uses_the_core_request_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "openref-desktop-request-{}",
+            openref_core::keys::new_key()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.json");
+        std::fs::write(&path, r#"[{"_id":"one","title":"Desktop request"}]"#).unwrap();
+        let db = dir.join("app/openref.sqlite");
+        let jobs = Jobs::default();
+        let config = |format: &str, source_id: Option<&str>| Config {
+            format: format.into(),
+            path: path.clone(),
+            roots: vec![],
+            mode: AttachmentMode::Copy,
+            source_id: source_id.map(str::to_string),
+            adopt_legacy_ids: false,
+            decisions: None,
+        };
+        let settle = |id: String| loop {
+            let status = jobs.status().unwrap().unwrap();
+            assert_eq!(status.id, id);
+            if status.phase != "preparing" {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let status = settle(
+            jobs.preview(db.clone(), config("paperpile", Some("@new")))
+                .unwrap(),
+        );
+        let source = status.plan.unwrap().source_id;
+        assert!(
+            source.starts_with("paperpile-") && source != "paperpile-@new",
+            "{source}"
+        );
+        let status = settle(
+            jobs.preview(db.clone(), config("paperpile", Some(" ")))
+                .unwrap(),
+        );
+        assert_eq!(status.plan.unwrap().source_id, "paperpile-default");
+        let status = settle(jobs.preview(db.clone(), config("endnote", None)).unwrap());
+        assert_eq!(status.phase, "error");
+        assert!(
+            status
+                .error
+                .unwrap()
+                .contains("対応していない移行元の形式です"),
+            "an unknown format is the core's one error"
+        );
         drop(jobs);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -213,6 +268,15 @@ struct Job {
     report: Option<apply::ImportReport>,
     error: Option<String>,
 }
+
+/// 過去の 1 run の結果（core の run_report = 索引待ちの数え直し・中断した実行の欠けた欄の補完も core）
+pub fn past_report(db: &openref_core::Db, run: &str) -> Result<apply::ImportReport, String> {
+    let entry = apply::run_report(&db.conn, run)
+        .map_err(super::err)?
+        .ok_or("移行実行が見つかりません")?;
+    serde_json::from_value(entry["report"].clone()).map_err(super::err)
+}
+
 #[derive(Clone, Default)]
 pub struct Jobs(Arc<Mutex<Option<Job>>>);
 #[derive(Serialize)]
@@ -250,9 +314,6 @@ impl Jobs {
         }
     }
     pub fn preview(&self, db: PathBuf, config: Config) -> Result<String, String> {
-        if !matches!(config.format.as_str(), "paperpile" | "zotero") {
-            return Err("対応する移行元を選択してください".into());
-        }
         let id = openref_core::keys::new_key();
         let cancel = Arc::new(AtomicBool::new(false));
         {
@@ -279,55 +340,21 @@ impl Jobs {
         tauri::async_runtime::spawn_blocking(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> Result<Approved, String> {
-                    apply::reject_database_file(&config.path, &db).map_err(super::err)?;
-                    let source = ImportSource {
-                        id: "pending".into(),
-                        format: config.format.clone(),
-                    };
-                    let mut input = if config.format == "paperpile" {
-                        import::paperpile::read_input(&config.path, source)
-                    } else {
-                        import::zotero_rdf::read_input(&config.path, source)
-                    }
+                    let import::Prepared { input, roots, plan } = import::prepare_request(
+                        &db,
+                        &import::Request {
+                            format: &config.format,
+                            path: &config.path,
+                            roots: &config.roots,
+                            mode: config.mode,
+                            source_id: config.source_id.as_deref(),
+                            adopt_legacy_ids: config.adopt_legacy_ids,
+                            decisions: config.decisions.as_ref(),
+                        },
+                        &cancel,
+                        |p| jobs.progress(&worker_id, p),
+                    )
                     .map_err(super::err)?;
-                    input.source.id = config
-                        .source_id
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| {
-                            if s == "@new" {
-                                format!("{}-{}", config.format, openref_core::keys::new_key())
-                            } else {
-                                s
-                            }
-                        })
-                        .map(Ok)
-                        .unwrap_or_else(|| apply::default_source(&db, &config.format))
-                        .map_err(super::err)?;
-                    input.adopt_legacy_paperpile_ids =
-                        config.format == "paperpile" && config.adopt_legacy_ids;
-                    let mut paths = config.roots.clone();
-                    if config.format == "zotero" {
-                        paths.push(
-                            std::fs::canonicalize(&config.path)
-                                .map_err(super::err)?
-                                .parent()
-                                .ok_or("RDF の親フォルダがありません")?
-                                .into(),
-                        );
-                    }
-                    let roots = AttachmentRoots::new(&paths).map_err(super::err)?;
-                    let mut plan =
-                        apply::prepare_controlled(&db, &input, &roots, config.mode, &cancel, |p| {
-                            jobs.progress(&worker_id, p)
-                        })
-                        .map_err(super::err)?;
-                    if let Some(choices) = &config.decisions {
-                        import::decisions::resolve(
-                            &db, &input, &roots, &mut plan, choices, &cancel,
-                        )
-                        .map_err(super::err)?;
-                    }
                     Ok(Approved {
                         config,
                         input,
@@ -436,25 +463,8 @@ impl Jobs {
         };
         std::fs::write(path, contents).map_err(super::err)
     }
-    pub fn select_report(&self, db: PathBuf, run: &str) -> Result<(), String> {
-        let history = apply::history(&db).map_err(super::err)?;
-        let entry = history
-            .into_iter()
-            .find(|h| h["id"].as_str() == Some(run))
-            .ok_or("移行実行が見つかりません")?;
-        let mut value = entry["report"].clone();
-        // Older interrupted runs only have committed per-item results.
-        for (field, fallback) in [
-            ("source_id", entry["source_id"].clone()),
-            ("total", entry["total"].clone()),
-            ("backup_path", entry["backup_path"].clone()),
-            ("fulltext_pending", serde_json::json!(0)),
-        ] {
-            if value.get(field).is_none() {
-                value[field] = fallback;
-            }
-        }
-        let report: apply::ImportReport = serde_json::from_value(value).map_err(super::err)?;
+    /// 過去の結果（past_report）を完了済みの job として開く（全文索引の再試行・保存ができる）
+    pub fn select_report(&self, db: PathBuf, report: apply::ImportReport) -> Result<(), String> {
         let mut slot = self.0.lock().map_err(super::err)?;
         if slot
             .as_ref()
@@ -463,7 +473,7 @@ impl Jobs {
             return Err("別の移行処理が進行中です".into());
         }
         *slot = Some(Job {
-            id: run.into(),
+            id: report.run_id.clone(),
             db,
             phase: "finished".into(),
             cancel: Arc::new(AtomicBool::new(false)),

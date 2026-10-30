@@ -2,7 +2,7 @@
 //! フォルダが 1 論文 1 所属の分類軸なのに対し、タグは多対多の横断軸。
 
 use crate::{CoreError, Db, Result};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 /// ラベルの色 = Paperpile の 25 スタイル（背景 + 文字色の組。5×5 グリッドの並び順）。
 /// DB の tags.color にはこの id を入れる。見た目（背景・文字・枠の色とダークモード）は UI 側
@@ -15,9 +15,6 @@ pub const LABEL_COLORS: [&str; 25] = [
     "cream", "lime", "mint", "orange", "brown", //
     "mustard", "olive", "green", "forest", "steel",
 ];
-
-/// 新規ラベルの既定色（Paperpile と同じ灰）
-pub const DEFAULT_LABEL_COLOR: &str = "gray";
 
 /// 受け付ける色: パレット id か `#rrggbb`
 pub fn valid_color(c: &str) -> bool {
@@ -38,7 +35,6 @@ pub struct TagRow {
     pub id: i64,
     pub name: String,
     pub color: Option<String>,
-    pub sort_order: i64,
     pub n_items: i64,
 }
 
@@ -55,7 +51,7 @@ pub fn list_tags(db: &Db, sort: TagSort) -> Result<Vec<TagRow>> {
         TagSort::Count => "n_items DESC, t.name COLLATE NOCASE, t.id",
     };
     let sql = format!(
-        "SELECT t.id, t.name, t.color, t.sort_order,
+        "SELECT t.id, t.name, t.color,
                 (SELECT COUNT(*) FROM item_tags it
                  JOIN items i ON i.id = it.item_id
                  WHERE it.tag_id = t.id AND i.deleted_at IS NULL) AS n_items
@@ -67,54 +63,59 @@ pub fn list_tags(db: &Db, sort: TagSort) -> Result<Vec<TagRow>> {
             id: r.get(0)?,
             name: r.get(1)?,
             color: r.get(2)?,
-            sort_order: r.get(3)?,
-            n_items: r.get(4)?,
+            n_items: r.get(3)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-pub fn create_tag(db: &Db, name: &str, color: Option<&str>) -> Result<i64> {
+/// ラベル名の検査: 前後の空白を落とし、空は拒否する
+fn tag_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
         return Err(CoreError::BadInput("タグ名が空です".into()));
     }
-    check_color(color)?;
-    if let Some(id) = tag_id_by_name(db, name)? {
-        // 既存なら色だけ更新して返す（冪等）
-        if let Some(c) = color {
-            db.conn
-                .execute("UPDATE tags SET color = ?1 WHERE id = ?2", rusqlite::params![c, id])?;
-        }
-        return Ok(id);
-    }
-    let next_order: i64 = db
-        .conn
-        .query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tags", [], |r| r.get(0))?;
-    db.conn.execute(
-        "INSERT INTO tags (name, color, sort_order) VALUES (?1, ?2, ?3)",
-        rusqlite::params![name, color, next_order],
-    )?;
-    Ok(db.conn.last_insert_rowid())
+    Ok(name)
 }
 
+/// 名前（大小無視 = 列の COLLATE NOCASE）でラベルを引く → (id, DB 上の名前)。名前で引く問い合わせはここだけ
+pub fn tag_by_name(conn: &Connection, name: &str) -> Result<Option<(i64, String)>> {
+    Ok(conn
+        .query_row("SELECT id, name FROM tags WHERE name = ?1 COLLATE NOCASE", [name], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?)
+}
+
+/// ラベルを作る唯一の経路: 名前のラベルが無ければ color で作り、あれば既存の id を返す（色は変えない）。
+/// 検査はしない（name は trim 済みで空でないもの・color は検査済みを渡す）。Connection で受けるのは移行（import::apply の
+/// トランザクション）から呼ぶため。tags.sort_order（migration v3）は書かない = 既定の 0（並べ替えの UI は無く、どこからも読まない）
+pub(crate) fn ensure_tag_conn(conn: &Connection, name: &str, color_if_new: Option<&str>) -> Result<i64> {
+    // 別の接続（app・connectd・他のセッションの MCP）が同じ名前を同時に作っても UNIQUE で落ちないよう、衝突は黙って既存へ合流する
+    // （旧 edit::add_tag の INSERT OR IGNORE と同じ。既存の色は変えない）
+    conn.execute(
+        "INSERT INTO tags (name, color) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
+        rusqlite::params![name, color_if_new],
+    )?;
+    tag_by_name(conn, name)?
+        .map(|(id, _)| id)
+        .ok_or_else(|| CoreError::NotFound(format!("ラベル '{name}'（作成直後に見つからない）")))
+}
+
+/// 名前のラベルを作る。既存なら色だけ更新して返す（冪等）
+pub fn create_tag(db: &Db, name: &str, color: Option<&str>) -> Result<i64> {
+    let name = tag_name(name)?;
+    check_color(color)?;
+    let id = ensure_tag_conn(&db.conn, name, color)?;
+    if let Some(c) = color {
+        db.conn.execute("UPDATE tags SET color = ?1 WHERE id = ?2", rusqlite::params![c, id])?;
+    }
+    Ok(id)
+}
+
+/// 改名だけ（検査は update_tag と同じ）
 pub fn rename_tag(db: &Db, id: i64, new_name: &str) -> Result<()> {
-    let new_name = new_name.trim();
-    if new_name.is_empty() {
-        return Err(CoreError::BadInput("タグ名が空です".into()));
-    }
-    if let Some(other) = tag_id_by_name(db, new_name)? {
-        if other != id {
-            return Err(CoreError::BadInput(format!("タグ '{new_name}' は既に存在します")));
-        }
-    }
-    let n = db
-        .conn
-        .execute("UPDATE tags SET name = ?1 WHERE id = ?2", rusqlite::params![new_name, id])?;
-    if n == 0 {
-        return Err(CoreError::NotFound(format!("tag {id}")));
-    }
-    Ok(())
+    update_tag(db, id, Some(new_name), None)
 }
 
 pub fn set_tag_color(db: &Db, id: i64, color: Option<&str>) -> Result<()> {
@@ -137,11 +138,8 @@ pub fn update_tag(db: &Db, id: i64, new_name: Option<&str>, color: Option<&str>)
     }
     let new_name = match new_name {
         Some(n) => {
-            let n = n.trim();
-            if n.is_empty() {
-                return Err(CoreError::BadInput("タグ名が空です".into()));
-            }
-            if let Some(other) = tag_id_by_name(db, n)? {
+            let n = tag_name(n)?;
+            if let Some((other, _)) = tag_by_name(&db.conn, n)? {
                 if other != id {
                     return Err(CoreError::BadInput(format!("タグ '{n}' は既に存在します")));
                 }
@@ -207,12 +205,12 @@ pub fn merge_tags(db: &Db, sources: &[i64], target: i64) -> Result<i64> {
 }
 
 /// 名前のラベルが無ければ color で作り、あれば既存をそのまま返す（色は変えない）。
-/// 取込の「要確認」など、システムが付けるラベル用（user が Manage labels で変えた色を毎回戻さない）
+/// 取込の「要確認」など、システムが付けるラベル用（user が Manage labels で変えた色を毎回戻さない）と、
+/// 名前で付ける `edit::add_tag`（MCP / CLI。色は None = 表示は UI の既定の灰）
 pub fn ensure_tag(db: &Db, name: &str, color_if_new: Option<&str>) -> Result<i64> {
-    match tag_id_by_name(db, name.trim())? {
-        Some(id) => Ok(id),
-        None => create_tag(db, name, color_if_new),
-    }
+    let name = tag_name(name)?;
+    check_color(color_if_new)?;
+    ensure_tag_conn(&db.conn, name, color_if_new)
 }
 
 /// Find and replace の 1 件分の結果
@@ -307,17 +305,6 @@ pub fn detach_tag(db: &Db, item_key: &str, tag_id: i64) -> Result<()> {
         rusqlite::params![item_id, tag_id],
     )?;
     Ok(())
-}
-
-fn tag_id_by_name(db: &Db, name: &str) -> Result<Option<i64>> {
-    Ok(db
-        .conn
-        .query_row(
-            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
-            [name],
-            |r| r.get(0),
-        )
-        .optional()?)
 }
 
 #[cfg(test)]

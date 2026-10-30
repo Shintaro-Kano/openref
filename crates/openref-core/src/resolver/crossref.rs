@@ -1,15 +1,16 @@
 //! doi.org content negotiation（Accept: CSL-JSON）。
 //! Crossref / DataCite 両 agency をこの 1 経路でカバーする（PubMed 非収載 DOI の fallback）。
 
-use super::pubmed::{call_with_retry_paced, Throttle};
+use super::pubmed::Throttle;
 use super::Resolved;
+use crate::http::{agent, call_with_retry_paced};
 use crate::Result;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 /// Crossref への要求どうしの最小間隔。匿名（mailto なし）の公開プールは応答ヘッダで `x-rate-limit-limit: 1`・
 /// `x-rate-limit-interval: 1s`・`x-concurrency-limit: 1` を返す → 同時 1 本（前の応答を受け取るまで次を送らない）・
-/// 前の送信から間隔を空ける。間隔は 1 s ちょうどにしない: 要求ごとに agent を作り直すので TLS / DNS の揺らぎで Crossref 側の
+/// 前の送信から間隔を空ける。間隔は 1 s ちょうどにしない: 要求ごとに接続を張り直すので TLS / DNS の揺らぎで Crossref 側の
 /// 到着間隔は送信間隔より縮みうる（EUTILS_INTERVAL の 333 → 400 ms と同じ理由）→ 余裕を取って 1.1 s
 const CROSSREF_INTERVAL: Duration = Duration::from_millis(1100);
 
@@ -26,7 +27,7 @@ pub(crate) fn with_crossref_gate<T>(f: impl FnOnce(&dyn Fn()) -> T) -> T {
 
 pub fn fetch_by_doi(doi: &str) -> Result<Resolved> {
     let url = format!("https://doi.org/{doi}");
-    let req = super::pubmed::agent()
+    let req = agent()
         .get(&url)
         .set("Accept", "application/vnd.citationstyles.csl+json");
     let what = format!("doi.org negotiation ({doi})");
@@ -52,7 +53,7 @@ pub struct Candidate {
 
 /// Crossref `works?query.bibliographic=` でタイトル推定文字列から候補を引く（識別子なし PDF 用）。
 pub fn search_bibliographic(q: &str, rows: usize) -> Result<Vec<Candidate>> {
-    let req = super::pubmed::agent()
+    let req = agent()
         .get("https://api.crossref.org/works")
         .query("query.bibliographic", q)
         .query("rows", &rows.to_string())

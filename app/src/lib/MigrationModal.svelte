@@ -143,13 +143,13 @@
           </div>
           {#if config.mode==="copy"}<p class="mg-path">{t("コピー先")}: {plan.managed_storage}<br/>{t("コピー予定容量（上限）")}: {(plan.counts.copy_bytes_upper_bound/1048576).toFixed(2)} MiB</p>{/if}
           {#if plan.counts.review+plan.counts.blocked>0}<p class="mg-help">{t("確認候補の文献・PDFを選び、選択内容で再確認してください。未選択の候補と削除済み・識別子矛盾の文献は保留します。")}</p>{/if}
-          {#each plan.warnings as w}<p class="mg-help">{w}</p>{/each}
+          {#each [...plan.notices, ...plan.warnings] as w}<p class="mg-help">{w}</p>{/each}
         {/if}
         {#if report}
           <p>{labels[report.state] ?? report.state} · {report.results.length} / {report.total} · {report.complete?t("移行完了"):t("処理結果と不足・注意事項を確認してください")}</p>
           {#if report.fulltext_pending}<p class="mg-help">{t("全文索引の未処理")}: {report.fulltext_pending}</p><button disabled={active||pending} onclick={index}>{t("全文索引を作成・再試行")}</button>{/if}
           {#if report.backup_path}<p class="mg-path">{t("開始前バックアップ")}: {report.backup_path}</p>{/if}
-          {#each report.warnings as w}<p class="mg-help">{w}</p>{/each}
+          {#each [...report.notices, ...report.warnings] as w}<p class="mg-help">{w}</p>{/each}
         {/if}
         {#each entries.slice(page*50,(page+1)*50) as entry}
           <details class="mg-result"><summary>{"title" in entry && entry.title ? String(entry.title) : entry.object_id} · {"action" in entry ? labels[entry.action.action] ?? entry.action.action : labels[entry.status] ?? entry.status}</summary>

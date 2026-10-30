@@ -188,6 +188,9 @@ pub struct ImportPlan {
     pub items: Vec<PlannedItem>,
     pub counts: PlanCounts,
     pub warnings: Vec<String>,
+    /// 対応の要らない注意（ImportInput.notices）
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 #[derive(Default)]
@@ -198,25 +201,14 @@ struct IdentityIndex {
 }
 
 pub(crate) fn doi(csl: &Value) -> Option<String> {
-    let raw = model::s(csl, "DOI")?.trim().to_lowercase();
-    let d = [
-        "https://doi.org/",
-        "http://doi.org/",
-        "https://dx.doi.org/",
-        "http://dx.doi.org/",
-        "doi:",
-    ]
-    .iter()
-    .find_map(|prefix| raw.strip_prefix(prefix))
-    .unwrap_or(&raw)
-    .trim();
+    let d = model::normalize_doi(model::s(csl, "DOI")?);
     let (prefix, suffix) = d.split_once('/')?;
     let registrant = prefix.strip_prefix("10.")?;
-    (registrant.len() >= 4
+    let valid = registrant.len() >= 4
         && registrant.bytes().all(|c| c.is_ascii_digit())
         && !suffix.is_empty()
-        && !d.chars().any(char::is_whitespace))
-    .then(|| d.to_string())
+        && !d.chars().any(char::is_whitespace);
+    valid.then_some(d)
 }
 
 pub(crate) fn pmid(csl: &Value) -> Option<String> {
@@ -239,13 +231,7 @@ pub(crate) fn identifier_sql() -> (String, String) {
     let whitespace = "char(9)||char(10)||char(11)||char(12)||char(13)||char(32)";
     let raw = format!("lower(trim(doi,{whitespace}))");
     let mut expression = "CASE".to_string();
-    for prefix in [
-        "https://doi.org/",
-        "http://doi.org/",
-        "https://dx.doi.org/",
-        "http://dx.doi.org/",
-        "doi:",
-    ] {
+    for prefix in model::DOI_PREFIXES {
         expression.push_str(&format!(
             " WHEN {raw} LIKE '{prefix}%' THEN trim(substr({raw},{}),{whitespace})",
             prefix.len() + 1
@@ -673,6 +659,7 @@ pub fn preview_controlled(
         items,
         counts,
         warnings: input.warnings.clone(),
+        notices: input.notices.clone(),
     })
 }
 
@@ -721,4 +708,39 @@ pub(crate) fn identifier_candidates(
         }
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQL の索引の式（items.doi = 生成列で小文字済み）と Rust の正規化が同じ値を出す
+    #[test]
+    fn identifier_sql_matches_rust_normalizer() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (doi_sql, pmid_sql) = identifier_sql();
+        for raw in [
+            "10.1148/rg.230216",
+            " 10.1148/RG.230216 ",
+            "https://doi.org/10.1148/rg.230216",
+            "HTTP://DOI.ORG/10.1148/rg.230216",
+            "https://dx.doi.org/ 10.1148/rg.230216",
+            "http://dx.doi.org/10.1148/rg.230216",
+            "doi: 10.1148/rg.230216",
+            "https://doi.org/doi:10.1/x",
+            "https://www.doi.org/10.1/x",
+        ] {
+            let sql: String = conn
+                .query_row(&format!("SELECT {doi_sql} FROM (SELECT lower(?1) AS doi)"), [raw], |r| r.get(0))
+                .unwrap();
+            assert_eq!(sql, model::normalize_doi(raw), "{raw:?}");
+        }
+        for (raw, want) in [("00123", "123"), (" 123 ", "123")] {
+            let sql: String = conn
+                .query_row(&format!("SELECT {pmid_sql} FROM (SELECT ?1 AS pmid)"), [raw], |r| r.get(0))
+                .unwrap();
+            assert_eq!(sql, want);
+            assert_eq!(pmid(&serde_json::json!({ "PMID": raw })).as_deref(), Some(want));
+        }
+    }
 }

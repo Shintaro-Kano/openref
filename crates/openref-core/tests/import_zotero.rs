@@ -149,6 +149,13 @@ fn zotero_copy_apply_and_repeat_preserve_all_counts_and_bytes() {
         .unwrap();
         assert_eq!(report.state, "finished");
         assert!(!report.complete);
+        // 登録日時を保持できないことは形式の固定の注意（notices）に 1 回だけ。文献ごとには繰り返さない
+        assert!(report.notices.iter().any(|w| w.contains("登録・更新日時")));
+        assert!(!report
+            .warnings
+            .iter()
+            .chain(report.results.iter().flat_map(|r| r.warnings.iter()))
+            .any(|w| w.contains("登録日時")));
     }
     let db = Db::open(&db_path).unwrap();
     let (key, csl): (String, String) = db

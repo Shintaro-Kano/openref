@@ -16,6 +16,42 @@ pub fn s<'a>(csl: &'a Value, key: &str) -> Option<&'a str> {
     csl.get(key).and_then(|v| v.as_str())
 }
 
+/// DOI の前に付きうる接頭辞（URL 形と `doi:`）。照合用の SQL 索引（`import::plan::identifier_sql`）も
+/// この表から式を作る = 足すと既存 DB の索引の式とずれる（索引が使われなくなる）。
+pub const DOI_PREFIXES: [&str; 5] = [
+    "https://doi.org/",
+    "http://doi.org/",
+    "https://dx.doi.org/",
+    "http://dx.doi.org/",
+    "doi:",
+];
+
+/// DOI の表記を揃える（保存・照合の共通形）: 前後の空白を除いて小文字にし、`DOI_PREFIXES` を 1 つだけ剥がし、
+/// もう一度空白を除く。妥当性は見ない（`10.` で始まるか等は `import::plan::doi`）。`%` の URL エンコードは
+/// 復号しない（SQL 側の索引の式と同じ結果にするため）。
+pub fn normalize_doi(s: &str) -> String {
+    let raw = s.trim().to_lowercase();
+    DOI_PREFIXES
+        .iter()
+        .find_map(|prefix| raw.strip_prefix(prefix))
+        .unwrap_or(&raw)
+        .trim()
+        .to_string()
+}
+
+/// 保存する DOI の形: `normalize_doi` を変わらなくなるまで繰り返す（`https://doi.org/https://doi.org/10.x` → `10.x`）。
+/// 保存値は BibTeX・Word の引用にそのまま出るので接頭辞を残さない。照合（SQL の索引と同じ式）は `normalize_doi` の 1 回のまま。
+pub fn normalize_doi_for_storage(s: &str) -> String {
+    let mut d = normalize_doi(s);
+    loop {
+        let next = normalize_doi(&d);
+        if next == d {
+            return d;
+        }
+        d = next;
+    }
+}
+
 /// 題名に混じる JATS/HTML マークアップ（Crossref は `<scp>`・`<sup>`・`<sub>`・`<i>` を生で返す）を剥がし、
 /// 実体参照（名前付き・数値 `&#8211;` `&#x2013;`）を戻し、空白を畳む。**比較・表示用**（pdfingest の題名ガード、
 /// popup の表示）。保存する CSL 題名には掛けない（`<i>` `<sup>` `<sub>` は citeproc が書式として使う = Crossref の文字列をそのまま保存する）。
@@ -285,5 +321,51 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
     } else {
         let t: String = text.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_doi_strips_one_prefix_case_and_whitespace() {
+        // 接頭辞の全種・大小・前後の空白（接頭辞の後ろの空白も）
+        for raw in [
+            "10.1148/RG.230216",
+            " 10.1148/rg.230216\n",
+            "https://doi.org/10.1148/rg.230216",
+            "HTTPS://DOI.ORG/10.1148/RG.230216",
+            "http://doi.org/10.1148/rg.230216",
+            "https://dx.doi.org/10.1148/rg.230216",
+            "http://dx.doi.org/10.1148/rg.230216",
+            "doi:10.1148/rg.230216",
+            "DOI: 10.1148/rg.230216",
+            "\tdoi:  10.1148/rg.230216 ",
+        ] {
+            assert_eq!(normalize_doi(raw), "10.1148/rg.230216", "{raw:?}");
+        }
+        // 剥がすのは 1 つだけ（SQL の索引の式と同じ）・URL エンコードは復号しない・表に無い接頭辞は残す・妥当性は見ない
+        assert_eq!(normalize_doi("https://doi.org/doi:10.1/x"), "doi:10.1/x");
+        assert_eq!(normalize_doi("https://doi.org/10.1002%2FABC"), "10.1002%2fabc");
+        assert_eq!(normalize_doi("https://www.doi.org/10.1/x"), "https://www.doi.org/10.1/x");
+        assert_eq!(normalize_doi("doi:"), "");
+        assert_eq!(normalize_doi("not a doi"), "not a doi");
+    }
+
+    #[test]
+    fn normalize_doi_for_storage_strips_until_fixed_point() {
+        for raw in [
+            "https://doi.org/https://doi.org/10.1148/RG.230216",
+            "https://doi.org/http://dx.doi.org/doi: 10.1148/rg.230216",
+            "doi:https://doi.org/10.1148/rg.230216",
+            " DOI: doi:10.1148/rg.230216 ",
+            "10.1148/rg.230216",
+        ] {
+            assert_eq!(normalize_doi_for_storage(raw), "10.1148/rg.230216", "{raw:?}");
+        }
+        assert_eq!(normalize_doi_for_storage("doi:doi:"), "");
+        // 照合用は 1 回だけ（SQL の索引の式と同じ）
+        assert_eq!(normalize_doi("doi:https://doi.org/10.1/x"), "https://doi.org/10.1/x");
     }
 }

@@ -297,11 +297,12 @@ pub fn read_input(path: &Path, source: ImportSource) -> Result<ImportInput> {
         .collect();
     let mut parents: BTreeMap<String, String> = BTreeMap::new();
     let mut memberships: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut warnings=vec![
+    let notices = vec![
         "Zotero RDF の登録・更新日時は保持できないため、OpenRef の取込日時を使います".into(),
         "RDF の resource ID は同一入力内で照合します。別の書出しやライブラリでの安定 ID とは扱いません".into(),
         "公式 RDF 出力処理と公開テスト形式を根拠に実装しています。Zotero アプリでの書出し操作と PDF 注釈表示は未検証です".into(),
     ];
+    let mut warnings = Vec::new();
     for id in &collection_ids {
         for child in graph.refs(id, "dcterms:hasPart") {
             if collection_ids.contains(&child) {
@@ -481,6 +482,7 @@ pub fn read_input(path: &Path, source: ImportSource) -> Result<ImportInput> {
         items,
         folders,
         warnings,
+        notices,
     })
 }
 

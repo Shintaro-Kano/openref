@@ -51,7 +51,7 @@ pub(crate) fn fingerprint_reader(reader: &mut impl Read) -> Result<FileFingerpri
     fingerprint_reader_controlled(reader, &AtomicBool::new(false), &mut |_| {})
 }
 
-fn fingerprint_reader_controlled(
+pub(crate) fn fingerprint_reader_controlled(
     reader: &mut impl Read,
     cancel: &AtomicBool,
     progress: &mut impl FnMut(u64),

@@ -43,19 +43,11 @@ pub fn styles_dir(db: &Db) -> PathBuf {
         .join("styles")
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .user_agent("openref/0.1 (personal reference manager)")
-        .build()
-}
-
 fn get_text(url: &str) -> std::result::Result<String, String> {
-    match agent().get(url).call() {
-        Ok(r) => r.into_string().map_err(|e| e.to_string()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(e.to_string()),
-    }
+    crate::http::text(crate::http::agent().get(url).call(), |e| match e {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        e => e.to_string(),
+    })
 }
 
 /// style id = リポジトリのファイル名（小文字英数とハイフン）。それ以外は拒否

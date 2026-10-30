@@ -25,3 +25,7 @@ html5ever = "0.38"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# 登録表の応答のクエリ数を数えるテスト用（rusqlite の profile）
+rusqlite = { workspace = true, features = ["trace"] }

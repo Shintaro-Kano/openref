@@ -20,10 +20,11 @@ export interface MigrationPlan {
   managed_storage: string | null;
   counts: Record<"new_items" | "existing_items" | "review" | "blocked" | "folders" | "notes" | "tags" | "available_pdfs" | "existing_pdfs" | "missing_pdfs" | "ambiguous_pdfs" | "unsupported_attachments" | "failed_pdfs" | "copy_bytes_upper_bound", number>;
   warnings: string[];
+  notices: string[];
   items: {object_id:string; title:string; allow_new:boolean; candidate_details:{key:string;csl_sha256:string;title:string;doi:string|null;pmid:string|null}[]; file_options:{object_id:string;attachment_id:string;path:string}[]; selection:{item_key:string}|null; selected_files:string[]; action:{action:string; item_key?:string; candidates?:string[]; reason?:string}; warnings:string[]; attachments:{id:string; status:string; path?:string; candidates?:string[]; reason?:string}[]}[];
 }
 export interface MigrationReport {
-  run_id:string; source_id:string; state:string; total:number; complete:boolean; fulltext_pending:number; backup_path:string|null; warnings:string[];
+  run_id:string; source_id:string; state:string; total:number; complete:boolean; fulltext_pending:number; backup_path:string|null; warnings:string[]; notices:string[];
   results:{object_id:string; status:string; item_key:string|null; warnings:string[]; attachments:{id:string;status:string;detail:string|null}[]}[];
 }
 export interface MigrationStatus {
@@ -119,7 +120,6 @@ export interface TagRow {
   id: number;
   name: string;
   color: string | null;
-  sortOrder: number;
   nItems: number;
 }
 
@@ -179,8 +179,6 @@ export interface ImportSummary {
 export interface ListFilter {
   search?: string | null;
   collectionId?: number | null;
-  /** ラベル名で絞る（MCP / CLI 用・大小無視）。GUI は tagId を使う */
-  tag?: string | null;
   /** ラベルビュー: id で絞る（名前だと改名した瞬間に空になる） */
   tagId?: number | null;
   starredOnly?: boolean;

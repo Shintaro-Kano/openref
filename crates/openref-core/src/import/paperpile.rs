@@ -24,6 +24,12 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
         .ok_or_else(|| CoreError::Parse("Paperpile JSON: 配列ではありません".into()))?;
     let mut folders = BTreeMap::new();
     let mut items = Vec::with_capacity(records.len());
+    // 元レコードに保持しただけのもの（情報）は文献ごとの warnings にせず、件数を notices にまとめる
+    let mut unmapped_fields: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unmapped_records = 0;
+    let mut multi_url = 0;
+    let mut created_missing = 0;
+    let mut created_invalid = 0;
     for (position, rec) in records.iter().enumerate() {
         if !rec.is_object() {
             return Err(CoreError::Parse(format!(
@@ -155,17 +161,17 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
             .map(|(key, _)| key.as_str())
             .collect();
         if !unmapped.is_empty() {
-            warnings.push(format!(
-                "UI/引用に未反映のフィールドを元レコードに保持: {}",
-                unmapped.join(", ")
-            ));
+            unmapped_records += 1;
+            for key in unmapped {
+                *unmapped_fields.entry(key.to_string()).or_default() += 1;
+            }
         }
         if rec
             .get("url")
             .and_then(Value::as_array)
             .is_some_and(|urls| urls.len() > 1)
         {
-            warnings.push("URL は先頭を引用用に採用し、残りを元レコードに保持します".into());
+            multi_url += 1;
         }
         if !matches!(
             rec.get("pubtype").and_then(Value::as_str),
@@ -204,6 +210,17 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
                 });
             }
         }
+        let date_added = rec
+            .get("created")
+            .and_then(Value::as_f64)
+            .and_then(unix_to_sqlite);
+        if date_added.is_none() {
+            if rec.get("created").is_none_or(Value::is_null) {
+                created_missing += 1;
+            } else {
+                created_invalid += 1;
+            }
+        }
         items.push(super::ImportItem {
             id: rec
                 .get("_id")
@@ -214,10 +231,7 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
             // A single export proves presence, not stability across re-exports.
             stable_id: false,
             csl,
-            date_added: rec
-                .get("created")
-                .and_then(Value::as_f64)
-                .and_then(unix_to_sqlite),
+            date_added,
             raw: rec.clone(),
             folder_ids,
             tags,
@@ -230,17 +244,43 @@ pub fn read_input(json_path: &Path, source: super::ImportSource) -> Result<super
     let mut input=super::ImportInput {
         source, adopt_legacy_paperpile_ids:false, input_sha256: super::files::digest(&bytes), adapter_version: "paperpile-array-v1".into(),
         items, folders: folders.into_values().collect(),
-        warnings: vec![
+        warnings: Vec::new(),
+        notices: vec![
             "Paperpile の現行配列形式と labelsNamed のタグ名を確認済み。フォルダ階層・ノート・空フォルダ・独立添付は未検証です".into(),
-            "元レコードと内部 CSL は別々に保持します。この事前確認では DB への保存は行いません".into(),
+            "元レコードと内部 CSL は別々に保持します".into(),
             "内容変更後の再書出しにおける元 ID の安定性は未検証です。同一入力ダイジェスト内だけで照合します".into(),
         ],
     };
     if has_tags {
-        input.warnings.push(
+        input.notices.push(
             "元のタグ色は JSON に含まれないため、OpenRef 側の既定色または既存の色を使用します"
                 .into(),
         );
+    }
+    if unmapped_records > 0 {
+        let fields: Vec<_> = unmapped_fields
+            .iter()
+            .map(|(field, n)| format!("{field} {n} 件"))
+            .collect();
+        input.notices.push(format!(
+            "{unmapped_records} 件で UI/引用に未反映のフィールドを元レコードに保持しました（{}）",
+            fields.join("・")
+        ));
+    }
+    if multi_url > 0 {
+        input.notices.push(format!(
+            "{multi_url} 件は URL が複数あるため、先頭を引用用に採用し、残りを元レコードに保持しました"
+        ));
+    }
+    for (n, why) in [
+        (created_missing, "元の登録日時（created）が無い"),
+        (created_invalid, "元の登録日時（created）が数値でないか範囲外の"),
+    ] {
+        if n > 0 {
+            input.notices.push(format!(
+                "{n} 件は{why}ため、新しく登録する文献には OpenRef の取込日時を使います（既存の文献への追加では既存の登録日時のまま）"
+            ));
+        }
     }
     Ok(input)
 }

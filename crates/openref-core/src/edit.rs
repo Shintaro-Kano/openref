@@ -37,12 +37,10 @@ fn sanitize_with(csl: &Value, carried: &[String]) -> Result<Value> {
             continue;
         }
         let v = match (k.as_str(), v) {
-            ("DOI", Value::String(s)) => Value::String(
-                s.trim()
-                    .trim_start_matches("https://doi.org/")
-                    .trim_start_matches("http://dx.doi.org/")
-                    .to_lowercase(),
-            ),
+            ("DOI", Value::String(s)) => match model::normalize_doi_for_storage(s) {
+                d if d.is_empty() => continue, // 接頭辞だけ（`doi:` 等）は空値と同じ
+                d => Value::String(d),
+            },
             (_, Value::String(s)) => Value::String(s.trim().to_string()),
             _ => v.clone(),
         };
@@ -58,13 +56,8 @@ fn sanitize_with(csl: &Value, carried: &[String]) -> Result<Value> {
 /// 手動作成（Create new reference）。DOI/PMID が既存と衝突する場合は拒否。
 pub fn create_manual(db: &mut Db, csl: &Value) -> Result<String> {
     let csl = sanitize(csl)?;
-    let pmid = model::s(&csl, "PMID").map(str::to_string);
-    let doi = model::s(&csl, "DOI").map(str::to_string);
-    if let Some((_, existing)) = crate::search::find_by_ids(db, pmid.as_deref(), doi.as_deref())? {
-        return Err(CoreError::Duplicate {
-            existing_key: existing,
-            field: if pmid.is_some() { "PMID" } else { "DOI" },
-        });
+    if let Some((existing_key, field)) = ingest::find_duplicate(&db.conn, &csl)? {
+        return Err(CoreError::Duplicate { existing_key, field });
     }
     let key = keys::new_key();
     let tx = db.conn.transaction()?;
@@ -250,17 +243,9 @@ pub fn add_tag(db: &Db, key: &str, tag: &str) -> Result<()> {
     if tag.is_empty() {
         return Err(CoreError::BadInput("空のタグ".into()));
     }
-    let id = item_id(db, key)?;
-    db.conn
-        .execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])?;
-    let tag_id: i64 = db
-        .conn
-        .query_row("SELECT id FROM tags WHERE name = ?1", [tag], |r| r.get(0))?;
-    db.conn.execute(
-        "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
-        rusqlite::params![id, tag_id],
-    )?;
-    Ok(())
+    item_id(db, key)?; // 無い key ならラベルを作らずに NotFound
+    let tag_id = crate::tags::ensure_tag(db, tag, None)?;
+    crate::tags::attach_tag(db, key, tag_id)
 }
 
 /// 名前は add_tag と同じく前後の空白を落とし、空なら同じ BadInput。
@@ -270,12 +255,11 @@ pub fn remove_tag(db: &Db, key: &str, tag: &str) -> Result<()> {
     if tag.is_empty() {
         return Err(CoreError::BadInput("空のタグ".into()));
     }
-    let id = item_id(db, key)?;
-    db.conn.execute(
-        "DELETE FROM item_tags WHERE item_id = ?1 AND tag_id IN (SELECT id FROM tags WHERE name = ?2)",
-        rusqlite::params![id, tag],
-    )?;
-    Ok(())
+    item_id(db, key)?; // 無い key は NotFound（無い名前は no-op）
+    match crate::tags::tag_by_name(&db.conn, tag)? {
+        Some((tag_id, _)) => crate::tags::detach_tag(db, key, tag_id),
+        None => Ok(()),
+    }
 }
 
 pub fn add_to_collection(db: &Db, key: &str, collection_id: i64) -> Result<()> {
@@ -308,25 +292,10 @@ pub fn remove_from_collection(db: &Db, key: &str, collection_id: i64) -> Result<
 }
 
 /// フォルダをパスで確保する（冪等）。'Parent/Child' 可・途中の親も無ければ作る。
-/// 既存判定は NOCASE（MCP resolve_collection と同基準。大小文字違いの重複を作らない）。
+/// 段の照合は `collections::walk`（MCP のフォルダ指定と同じ基準 = 大小無視。大小文字違いの重複を作らない）。
 /// 返り値 = (最終セグメントの collection id, 新規作成したセグメント名の列)。
 pub fn ensure_collection_path(db: &Db, path: &str) -> Result<(i64, Vec<String>)> {
-    let mut parent: Option<i64> = None;
-    let mut created = Vec::new();
-    for seg in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        let id = match crate::collections::child_id(&db.conn, parent, seg)? {
-            Some(id) => id,
-            None => {
-                let id = crate::collections::insert_child(&db.conn, parent, seg)?;
-                created.push(seg.to_string());
-                id
-            }
-        };
-        parent = Some(id);
-    }
-    parent
-        .map(|id| (id, created))
-        .ok_or_else(|| CoreError::BadInput("フォルダ名が空です".into()))
+    crate::collections::ensure_path(&db.conn, None, path)
 }
 
 /// 添付書込の実際の置き場所（attach_auto の戻り値。呼び手はログ・診断表示に使う）

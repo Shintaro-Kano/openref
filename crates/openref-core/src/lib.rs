@@ -10,6 +10,7 @@ pub mod drive_layout;
 pub mod edit;
 pub mod error;
 pub mod fulltext;
+mod http;
 pub mod import;
 pub mod ingest;
 pub mod kbmanifest;

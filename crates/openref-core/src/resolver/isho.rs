@@ -17,12 +17,10 @@ pub(super) fn canonical_doi(doi: &str) -> Option<String> {
 pub(super) fn fetch(doi: &str) -> Result<Resolved> {
     let doi = canonical_doi(doi)
         .ok_or_else(|| CoreError::BadInput("医書.jp の対象 DOI ではありません".into()))?;
-    let body = super::pubmed::agent()
+    let sent = crate::http::agent()
         .post("https://webview.isho.jp/bib/download")
-        .send_form(&[("doi", doi.as_str()), ("format", "0")])
-        .map_err(|e| CoreError::Http(format!("医書.jp RIS: {e}")))?
-        .into_string()
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+        .send_form(&[("doi", doi.as_str()), ("format", "0")]);
+    let body = crate::http::text(sent, |e| format!("医書.jp RIS: {e}")).map_err(CoreError::Http)?;
     parse(&body, &doi)
 }
 

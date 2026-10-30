@@ -7,10 +7,12 @@ pub mod inventory;
 mod note_html;
 pub mod paperpile;
 pub mod plan;
+mod prepare;
 mod provenance;
 mod storage;
 pub mod zotero_rdf;
 
+pub use prepare::{prepare_request, read_input, Prepared, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,7 +43,12 @@ pub struct ImportInput {
     pub items: Vec<ImportItem>,
     /// A graph, not slash-delimited paths. Includes empty folders.
     pub folders: Vec<ImportFolder>,
+    /// この入力に固有の注意（入力の中身による）。最終報告の warnings に入り、complete を false にする
     pub warnings: Vec<String>,
+    /// 対応の要らない注意: 形式（adapter の版）の固定の注意と、元レコードに保持しただけのものの件数の集計。
+    /// 事前確認・最終報告に notices として出し、complete には数えない。対応が要るもの（取り込めない・曖昧・不一致）は warnings
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -41,23 +41,20 @@ pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<ItemRow>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// PMID → DOI の順で既存 item を探す（connector 側 dedup 用）
+/// PMID → DOI の順で既存 item（ゴミ箱を除く）を探す（connector 側 dedup 用）。照合は add_item の重複判定と同じ
+/// （`ingest::find_duplicate` = DOI は接頭辞・大小・空白を、PMID は先頭の 0 を揃えて比べる）
 pub fn find_by_ids(db: &Db, pmid: Option<&str>, doi: Option<&str>) -> Result<Option<(i64, String)>> {
-    for (val, sql) in [
-        (pmid, "SELECT id, key FROM items WHERE deleted_at IS NULL AND pmid = ?1"),
-        (doi, "SELECT id, key FROM items WHERE deleted_at IS NULL AND doi = ?1"),
-    ] {
-        if let Some(v) = val {
-            let row = db
-                .conn
-                .query_row(sql, [v], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-                .optional()?;
-            if row.is_some() {
-                return Ok(row);
-            }
+    let mut ids = serde_json::Map::new();
+    for (field, value) in [("PMID", pmid), ("DOI", doi)] {
+        if let Some(v) = value {
+            ids.insert(field.into(), v.into());
         }
     }
-    Ok(None)
+    let Some((key, _)) = crate::ingest::find_duplicate(&db.conn, &serde_json::Value::Object(ids))? else {
+        return Ok(None);
+    };
+    let id = db.conn.query_row("SELECT id FROM items WHERE key = ?1", [&key], |r| r.get(0))?;
+    Ok(Some((id, key)))
 }
 
 pub fn get_by_key(db: &Db, key: &str) -> Result<Option<ItemRow>> {
@@ -89,9 +86,8 @@ pub fn retraction_of(db: &Db, item_id: i64) -> Result<Option<String>> {
 pub struct ListFilter {
     pub search: Option<String>,
     pub collection_id: Option<i64>,
-    /// ラベル名で絞る（MCP / CLI 用・大小無視）
-    pub tag: Option<String>,
-    /// ラベル id で絞る（GUI のラベルビュー。名前だと改名した瞬間に一覧が空になるため id で引く）
+    /// ラベル id で絞る（GUI のラベルビュー。名前だと改名した瞬間に一覧が空になるため id で引く。MCP / CLI は名前から
+    /// `tags::tag_by_name` で id に引いてから渡す = 綴り違いは呼び出し側でエラーにでき、「0 件」と見分けられる）
     pub tag_id: Option<i64>,
     pub starred_only: bool,
     pub trashed: bool,
@@ -105,7 +101,7 @@ pub struct ListFilter {
     /// journal_keys を推移的に辿って同一誌の全 item を返す（表記ゆれ・print/electronic ISSN・short の有無を吸収）
     pub journal: Option<String>,
     /// true = PDF 本文（fulltext_fts）を検索対象にしない（Word アドインの引用検索用: 著者名で「その著者を引用している
-    /// だけの論文」が混ざると誤引用のもとになる）。GUI / CLI / MCP は false = 本文も検索
+    /// だけの論文」が混ざると誤引用のもとになる）。GUI / CLI は false = 本文も検索。MCP は metadata_only 引数で選べる
     pub metadata_only: bool,
 }
 
@@ -211,8 +207,7 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
         EXISTS(SELECT 1 FROM notes n WHERE n.item_id = i.id) AS has_note";
     let common = "AND (?2 IS NULL OR i.id IN (SELECT item_id FROM collection_items WHERE collection_id = ?2))
         AND (?3 = 0 OR i.starred = 1)
-        AND (?6 IS NULL OR i.id IN (SELECT it.item_id FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name = ?6 COLLATE NOCASE))
-        AND (?11 IS NULL OR i.id IN (SELECT item_id FROM item_tags WHERE tag_id = ?11))
+        AND (?6 IS NULL OR i.id IN (SELECT item_id FROM item_tags WHERE tag_id = ?6))
         AND (?7 IS NULL OR i.id IN (SELECT ci.item_id FROM creators_index ci
              WHERE (ci.family = ?7 COLLATE NOCASE OR ci.literal = ?7 COLLATE NOCASE)
                AND (?8 IS NULL OR upper(substr(ci.given, 1, 1)) = upper(?8))))
@@ -269,13 +264,12 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
             f.starred_only as i64,
             f.trashed as i64,
             limit,
-            f.tag,
-            // 空白だけは未指定扱い（GUI のチップ。MCP は渡す前に同じ判定をしている）
+            f.tag_id,
+            // 空白だけは未指定扱い（GUI のチップ・MCP / CLI の引数もここで一本に判定する）
             f.author_family.as_deref().filter(|s| !s.trim().is_empty()),
             f.author_initial.as_deref().filter(|s| !s.trim().is_empty()),
             journal_key,
-            f.metadata_only as i64,
-            f.tag_id
+            f.metadata_only as i64
         ],
         |row| {
             let item = row_to_item(row)?;
@@ -355,9 +349,14 @@ pub struct ItemDetail {
     pub item: ItemRow,
     /// ゴミ箱にある（items.deleted_at IS NOT NULL）
     pub deleted: bool,
+    /// MCP の get_item が返す生の値（GUI の JSON には出さない = 契約不変）
+    #[serde(skip)]
+    pub deleted_at: Option<String>,
+    #[serde(skip)]
+    pub date_modified: String,
     pub attachments: Vec<AttachmentRow>,
     pub collections: Vec<CollectionRef>,
-    /// sort_order → 名前順
+    /// 名前順（大小無視・同名は id 順 = 行のバッジ・list_tags の名前順と同じ）
     pub tags: Vec<TagRef>,
     pub retraction: Option<String>,
     /// item 単位のメモ（user が UI で書くもの + MCP 経由で Claude が残すもの）
@@ -368,12 +367,12 @@ pub fn item_detail(db: &Db, key: &str) -> Result<Option<ItemDetail>> {
     let row = db
         .conn
         .query_row(
-            "SELECT id, key, csl, starred, date_added, deleted_at IS NOT NULL FROM items WHERE key = ?1",
+            "SELECT id, key, csl, starred, date_added, deleted_at, date_modified FROM items WHERE key = ?1",
             [key],
-            |r| Ok((row_to_item(r)?, r.get::<_, i64>(5)? != 0)),
+            |r| Ok((row_to_item(r)?, r.get::<_, Option<String>>(5)?, r.get::<_, String>(6)?)),
         )
         .optional()?;
-    let Some((item, deleted)) = row else { return Ok(None) };
+    let Some((item, deleted_at, date_modified)) = row else { return Ok(None) };
     let mut stmt = db
         .conn
         .prepare("SELECT id, key, mode, path, page_count, doi_check FROM attachments WHERE item_id = ?1 ORDER BY id")?;
@@ -393,14 +392,14 @@ pub fn item_detail(db: &Db, key: &str) -> Result<Option<ItemDetail>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut stmt = db.conn.prepare(
         "SELECT c.id, c.name FROM collections c JOIN collection_items ci ON ci.collection_id = c.id
-         WHERE ci.item_id = ?1 AND c.deleted_at IS NULL ORDER BY c.name",
+         WHERE ci.item_id = ?1 AND c.deleted_at IS NULL ORDER BY c.name, ci.rowid",
     )?;
     let collections = stmt
         .query_map([item.id], |r| Ok(CollectionRef { id: r.get(0)?, name: r.get(1)? }))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut stmt = db.conn.prepare(
         "SELECT t.id, t.name, t.color FROM tags t JOIN item_tags it ON it.tag_id = t.id
-         WHERE it.item_id = ?1 ORDER BY t.sort_order, t.name COLLATE NOCASE",
+         WHERE it.item_id = ?1 ORDER BY t.name COLLATE NOCASE, t.id",
     )?;
     let tags = stmt
         .query_map([item.id], |r| Ok(TagRef { id: r.get(0)?, name: r.get(1)?, color: r.get(2)? }))?
@@ -409,13 +408,62 @@ pub fn item_detail(db: &Db, key: &str) -> Result<Option<ItemDetail>> {
     let notes = crate::annotate::list_notes(db, key)?;
     Ok(Some(ItemDetail {
         item,
-        deleted,
+        deleted: deleted_at.is_some(),
+        deleted_at,
+        date_modified,
         attachments,
         collections,
         tags,
         retraction,
         notes,
     }))
+}
+
+/// 登録表（MCP）の書き込み応答用: item のラベル名だけを詳細（`item_detail`）と同じ順（大小無視・同名は id 順）で返す。
+/// 詳細を引き直すと添付の stat（`Path::exists`）まで走るため、要る列だけの SELECT 1 本にした。item が無ければ None（ゴミ箱の item は引ける）
+pub fn item_tag_names(db: &Db, key: &str) -> Result<Option<Vec<String>>> {
+    let mut stmt = db.conn.prepare_cached(
+        "SELECT t.name FROM items i
+         LEFT JOIN item_tags it ON it.item_id = i.id
+         LEFT JOIN tags t ON t.id = it.tag_id
+         WHERE i.key = ?1 ORDER BY t.name COLLATE NOCASE, t.id",
+    )?;
+    let rows = stmt.query_map([key], |r| r.get::<_, Option<String>>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(if rows.is_empty() { None } else { Some(rows.into_iter().flatten().collect()) })
+}
+
+/// 登録表（MCP）の書き込み応答用: item の所属フォルダを実表記のパス（'親/子'）で、詳細と同じ順（フォルダ名順・同名は所属に加えた順 = collection_items の rowid 順）で返す。
+/// パスは再帰 CTE 1 本で辿る（soft-delete 済みの祖先も名前を出す・257 段で打ち切る = `collections::path_of` と同じ）。
+/// item が無ければ None（ゴミ箱の item は引ける）。soft-delete 済みのフォルダ自身は出さない
+pub fn item_collection_paths(db: &Db, key: &str) -> Result<Option<Vec<String>>> {
+    let exists: bool =
+        db.conn.query_row("SELECT EXISTS (SELECT 1 FROM items WHERE key = ?1)", [key], |r| r.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut stmt = db.conn.prepare_cached(
+        "WITH RECURSIVE up(root, root_name, ord, name, parent_id, depth) AS (
+           SELECT c.id, c.name, ci.rowid, c.name, c.parent_id, 0
+           FROM items i JOIN collection_items ci ON ci.item_id = i.id
+           JOIN collections c ON c.id = ci.collection_id AND c.deleted_at IS NULL
+           WHERE i.key = ?1
+           UNION ALL
+           SELECT up.root, up.root_name, up.ord, c.name, c.parent_id, up.depth + 1
+           FROM collections c JOIN up ON c.id = up.parent_id WHERE up.depth < 256
+         )
+         SELECT root, name FROM up ORDER BY root_name, ord, depth DESC",
+    )?;
+    let rows = stmt
+        .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out: Vec<(i64, Vec<String>)> = Vec::new();
+    for (root, name) in rows {
+        match out.last_mut() {
+            Some((id, parts)) if *id == root => parts.push(name),
+            _ => out.push((root, vec![name])),
+        }
+    }
+    Ok(Some(out.into_iter().map(|(_, parts)| parts.join("/")).collect()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -520,6 +568,37 @@ pub fn membership(db: &Db, keys: &[String]) -> Result<Membership> {
     })
 }
 
+/// 登録表（MCP）の membership 用: フォルダ id 群 → (key, 実表記のパス)。祖先の鎖は再帰 CTE 1 本で辿る
+/// （`collections::path_of` と同じ: soft-delete 済みの祖先も名前を出す・257 段で打ち切る）。表に無い id は結果に含まれない
+pub fn collection_keys_and_paths(db: &Db, ids: &[i64]) -> Result<std::collections::HashMap<i64, (String, String)>> {
+    let json = serde_json::to_string(ids).map_err(|e| CoreError::BadInput(e.to_string()))?;
+    let mut stmt = db.conn.prepare(
+        "WITH RECURSIVE up(root, key, name, parent_id, depth) AS (
+           SELECT id, key, name, parent_id, 0 FROM collections WHERE id IN (SELECT value FROM json_each(?1))
+           UNION ALL
+           SELECT up.root, up.key, c.name, c.parent_id, up.depth + 1
+           FROM collections c JOIN up ON c.id = up.parent_id WHERE up.depth < 256
+         )
+         SELECT root, key, name FROM up ORDER BY root, depth DESC",
+    )?;
+    let rows = stmt
+        .query_map([&json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut parts: std::collections::HashMap<i64, (String, Vec<String>)> = std::collections::HashMap::new();
+    for (root, key, name) in rows {
+        parts.entry(root).or_insert_with(|| (key, Vec::new())).1.push(name);
+    }
+    Ok(parts.into_iter().map(|(id, (key, p))| (id, (key, p.join("/")))).collect())
+}
+
+/// 登録表（MCP）の membership 用: ラベル id 群 → 名前（1 本）
+pub fn tag_names_by_id(db: &Db, ids: &[i64]) -> Result<std::collections::HashMap<i64, String>> {
+    let json = serde_json::to_string(ids).map_err(|e| CoreError::BadInput(e.to_string()))?;
+    let mut stmt = db.conn.prepare("SELECT id, name FROM tags WHERE id IN (SELECT value FROM json_each(?1))")?;
+    let rows = stmt.query_map([&json], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 pub struct Counts {
     pub items: i64,
     pub attachments: i64,
@@ -593,7 +672,7 @@ mod tests {
         // 他の行型の鍵も camelCase: TagRow / CollectionRow / AttachmentRow / Purged（GUI がそのまま返す）
         let keys_of = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         let t = serde_json::to_value(&crate::tags::list_tags(&db, crate::tags::TagSort::Alphabetical).unwrap()[0]).unwrap();
-        assert_eq!(keys_of(&t), ["color", "id", "nItems", "name", "sortOrder"]);
+        assert_eq!(keys_of(&t), ["color", "id", "nItems", "name"]);
         crate::collections::create_collection(&db, "Liver", None).unwrap();
         let c = serde_json::to_value(&collections(&db).unwrap()[0]).unwrap();
         assert_eq!(keys_of(&c), ["id", "key", "nItems", "name", "parentId"]);
@@ -613,5 +692,25 @@ mod tests {
         let f: ListFilter = serde_json::from_value(serde_json::json!({"tagId": 3, "starredOnly": true, "authorFamily": "  "})).unwrap();
         assert_eq!((f.tag_id, f.starred_only, f.limit, f.metadata_only, f.trashed), (Some(3), true, 0, false, false));
         assert_eq!(list_items(&db, &ListFilter { trashed: true, author_family: Some("  ".into()), ..Default::default() }).unwrap().len(), 1);
+    }
+
+    /// 詳細のラベルと行のバッジは同じ順（名前順・大小無視）。作成の経路（Manage labels の create_tag・
+    /// MCP / CLI の add_tag）で並びが変わらない
+    #[test]
+    fn detail_and_row_tags_share_name_order() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch("INSERT INTO items (key, csl) VALUES ('ITEM0001', '{\"title\":\"T\",\"type\":\"article-journal\"}')")
+            .unwrap();
+        let z = crate::tags::create_tag(&db, "zeta", None).unwrap();
+        let b = crate::tags::create_tag(&db, "Beta", Some("sky")).unwrap();
+        crate::tags::attach_tag(&db, "ITEM0001", z).unwrap();
+        crate::tags::attach_tag(&db, "ITEM0001", b).unwrap();
+        crate::edit::add_tag(&db, "ITEM0001", "omega").unwrap();
+        crate::edit::add_tag(&db, "ITEM0001", "alpha").unwrap();
+        let names = |v: &[TagRef]| v.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        let detail = names(&item_detail(&db, "ITEM0001").unwrap().unwrap().tags);
+        assert_eq!(detail, ["alpha", "Beta", "omega", "zeta"]);
+        assert_eq!(names(&list_items(&db, &ListFilter::default()).unwrap()[0].tags), detail);
     }
 }

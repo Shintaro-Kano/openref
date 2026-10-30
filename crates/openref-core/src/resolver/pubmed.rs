@@ -2,6 +2,7 @@
 //! esearch: DOI → PMID / efetch: PMID → PubmedArticle XML → CSL-JSON。
 
 use super::Resolved;
+use crate::http::{agent, call_with_retry_paced};
 use crate::{CoreError, Result};
 use roxmltree::{Document, Node};
 use serde_json::{json, Map, Value};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const EUTILS: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 
-/// E-utilities の要求どうしの最小間隔（NCBI の上限 3 req/s = 333.3 ms）。要求ごとに agent を作り直すので
+/// E-utilities の要求どうしの最小間隔（NCBI の上限 3 req/s = 333.3 ms）。要求ごとに接続を張り直すので
 /// TLS / DNS の揺らぎで NCBI 側の到着間隔は送信間隔より縮みうる → 余裕を取って 400 ms。
 /// 1 件の DOI 解決 = esearch + efetch の 2 要求で、その間も空ける。
 /// Crossref（api.crossref.org・doi.org の content negotiation）は別の門 `crossref::CROSSREF_GATE`（同時 1 本 + 1.1 s 間隔）。
@@ -64,32 +65,6 @@ impl Throttle {
             }
         }
         *last = Some(Instant::now());
-    }
-}
-
-/// resolver 共通の HTTP agent（timeout 30s・UA 固定。crossref.rs も使う）
-pub(super) fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("openref/0.1 (personal reference manager)")
-        .build()
-}
-
-/// 429（E-utilities は 3 req/s 超・Crossref も混雑時）なら 1s, 2s 待って最大 2 回再試行。成功したら本文を文字列で返す。
-/// PDF 一括取込では 1 件あたり esearch+efetch の 2 連打になり、素のままでは実測で 429 が出た（今は EUTILS_THROTTLE が要求ごとに空ける）。
-/// `pace` = 各送信（再試行を含む）の直前に呼ぶ待ち（E-utilities は `EUTILS_THROTTLE`・Crossref は `CROSSREF_GATE` が渡す）。
-pub(super) fn call_with_retry_paced(req: ureq::Request, what: &str, pace: impl Fn()) -> Result<String> {
-    let mut attempt: u64 = 0;
-    loop {
-        pace();
-        match req.clone().call() {
-            Ok(r) => return r.into_string().map_err(|e| CoreError::Http(e.to_string())),
-            Err(ureq::Error::Status(429, _)) if attempt < 2 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1000 * attempt));
-            }
-            Err(e) => return Err(CoreError::Http(format!("{what}: {e}"))),
-        }
     }
 }
 

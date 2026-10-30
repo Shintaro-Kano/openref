@@ -449,6 +449,21 @@ fn attachment_failures_are_reported_without_discarding_bibliography() {
     ));
 }
 
+/// created が無い / 数値でない（範囲外）は区別した件数の notices。文献ごとの warnings にはしない
+#[test]
+fn missing_and_invalid_created_are_counted_separately() {
+    let s = Scratch::new();
+    let i = input(
+        &s,
+        json!([{"_id":"a","title":"A"},{"_id":"b","title":"B","created":"yesterday"},
+               {"_id":"c","title":"C","created":-1.0},{"_id":"d","title":"D","created":1750000000.0}]),
+    );
+    assert!(i.items.iter().all(|i| i.warnings.is_empty()));
+    assert!(i.items[3].date_added.is_some());
+    assert!(i.notices.iter().any(|w| w.starts_with("1 件は元の登録日時（created）が無いため、新しく登録する文献には")), "{:?}", i.notices);
+    assert!(i.notices.iter().any(|w| w.starts_with("2 件は元の登録日時（created）が数値でないか範囲外のため")), "{:?}", i.notices);
+}
+
 #[test]
 fn unreadable_shapes_and_cyclic_folder_graphs_do_not_silently_drop_data() {
     let s = Scratch::new();
@@ -458,7 +473,12 @@ fn unreadable_shapes_and_cyclic_folder_graphs_do_not_silently_drop_data() {
     );
     assert_eq!(i.items.len(), 1);
     assert_eq!(i.items[0].csl["type"], "document");
+    // 題名・folders・notes・labels の 4 件。created が無いことは対応の要らない注意（notices の件数）
     assert_eq!(i.items[0].warnings.len(), 4);
+    assert!(i
+        .notices
+        .iter()
+        .any(|w| w.starts_with("1 件は元の登録日時（created）が無い")));
     i.folders = vec![import::ImportFolder {
         id: "a".into(),
         stable_id: false,

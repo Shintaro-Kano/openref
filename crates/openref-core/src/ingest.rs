@@ -379,7 +379,7 @@ pub fn merge_enrichment(db: &mut Db, id: i64, resolved: &Resolved) -> Result<boo
     Ok(changed)
 }
 
-fn find_duplicate(
+pub(crate) fn find_duplicate(
     conn: &rusqlite::Connection,
     csl: &serde_json::Value,
 ) -> Result<Option<(String, &'static str)>> {

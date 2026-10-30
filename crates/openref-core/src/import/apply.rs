@@ -10,7 +10,6 @@ use crate::{CoreError, Db, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -245,7 +244,12 @@ pub struct ImportReport {
     pub backup_path: Option<PathBuf>,
     pub total: usize,
     pub results: Vec<ItemResult>,
+    /// この実行の注意（入力固有・フォルダ・清掃・索引など）。空でなければ complete = false
     pub warnings: Vec<String>,
+    /// 対応の要らない注意（ImportInput.notices）。complete には数えない
+    #[serde(default)]
+    pub notices: Vec<String>,
+    /// 全文献が登録・追加済み・添付が全部取り込み済み・索引待ちなし・注意なし（notices は除く）
     pub complete: bool,
     pub fulltext_pending: usize,
 }
@@ -345,8 +349,6 @@ fn remember(
 /// caller holds IMMEDIATE. The transaction never reads attachment file bytes.
 fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Result<ItemAction> {
     let mapped = object(conn, input, "item", scope(input, item.stable_id), &item.id)?.map(|v| v.0);
-    let doi = plan::doi(&item.csl);
-    let pmid = plan::pmid(&item.csl);
     let mut candidates = plan::identifier_candidates(conn, &item.csl, mapped.as_deref())?;
     if input.adopt_legacy_paperpile_ids && input.source.format == "paperpile" {
         if let Some(id) = item
@@ -385,10 +387,7 @@ fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Resu
         });
     }
     if let Some((key, csl, deleted)) = candidates.first() {
-        let conflict = [(doi, plan::doi(csl)), (pmid, plan::pmid(csl))]
-            .into_iter()
-            .any(|(a, b)| matches!((a,b),(Some(a),Some(b)) if a!=b));
-        return Ok(if *deleted || conflict {
+        return Ok(if *deleted || plan::conflicts(&item.csl, csl) {
             ItemAction::Blocked {
                 candidates: vec![key.clone()],
                 reason: "書込直前に識別子の矛盾またはゴミ箱の文献を検出しました".into(),
@@ -562,6 +561,19 @@ struct PreparedPdf {
     identity: Option<(String, String)>,
 }
 
+/// 読んだ分をそのまま dst へ書く Read（copy_pdf の読取・ハッシュ・書込を 1 回の読みで）
+struct Tee<'a, R: Read, W: Write> {
+    src: &'a mut R,
+    dst: &'a mut W,
+}
+impl<R: Read, W: Write> Read for Tee<'_, R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.src.read(buf)?;
+        self.dst.write_all(&buf[..n])?;
+        Ok(n)
+    }
+}
+
 fn copy_pdf(
     db: &Db,
     run: &str,
@@ -607,30 +619,22 @@ fn copy_pdf(
             params![m.dev().to_string(), m.ino().to_string(), key],
         )?;
     }
-    let mut sha = Sha256::new();
-    let mut md5 = md5::Context::new();
-    let mut bytes = 0;
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(CoreError::Conflict("移行が中止されました".into()));
-        }
-        let n = src.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        dst.write_all(&buffer[..n])?;
-        sha.update(&buffer[..n]);
-        md5.consume(&buffer[..n]);
-        bytes += n as u64;
-        progress(&Progress {
-            phase: "copy",
-            completed,
-            total,
-            bytes,
-        });
-    }
-    let sha256 = format!("{:x}", sha.finalize());
+    // 読みながら staging へ書く（読取・ハッシュのループは files と共用）
+    let FileFingerprint { bytes, sha256, md5 } = super::files::fingerprint_reader_controlled(
+        &mut Tee {
+            src: &mut src,
+            dst: &mut dst,
+        },
+        cancel,
+        &mut |bytes| {
+            progress(&Progress {
+                phase: "copy",
+                completed,
+                total,
+                bytes,
+            })
+        },
+    )?;
     if bytes != expected.bytes || sha256 != expected.sha256 {
         return Err(CoreError::Conflict(
             "事前確認後に PDF が変更されました。コピーを採用しません".into(),
@@ -667,7 +671,7 @@ fn copy_pdf(
         key,
         path: dest,
         sha256,
-        md5: format!("{:x}", md5.compute()),
+        md5,
         copied: true,
         bytes,
         parent: Some(dest_dir),
@@ -811,7 +815,6 @@ struct AttachmentHash {
 type AttachmentHashes = HashMap<String, AttachmentHash>;
 fn attachment_hashes(
     db: &Db,
-    _roots: &AttachmentRoots,
     storage: &Path,
     key: Option<&str>,
     db_path: &Path,
@@ -843,7 +846,6 @@ fn attachment_hashes(
             managed.as_ref().map(|r| r.inspect_pdf(&path))
         } else {
             Some((|| {
-                reject_database_file(Path::new(&path), db_path)?;
                 let path = Path::new(&path);
                 let owned = AttachmentRoots::new(&[path
                     .parent()
@@ -1055,6 +1057,38 @@ fn verify_source(
     Ok(())
 }
 
+/// 再利用する保存済み PDF（Existing）の再検証: 元ファイルの対応（verify_source）と managed の写しの指紋。
+/// 写しが事前確認の指紋と違えば Ok(false)（文言は呼び手 = 実行前検証と文献ごとの再検証で違う）
+fn verify_existing(
+    roots: &AttachmentRoots,
+    managed: &AttachmentRoots,
+    source: &super::ImportAttachment,
+    planned: &AttachmentPlan,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(u64),
+) -> Result<bool> {
+    let AttachmentPlan::Existing {
+        id,
+        path,
+        fingerprint,
+        source_file,
+        ..
+    } = planned
+    else {
+        unreachable!();
+    };
+    verify_source(
+        roots,
+        source,
+        id,
+        source_file.as_ref().map(|(p, f)| (p.as_path(), f)),
+        false,
+        cancel,
+        progress,
+    )?;
+    Ok(managed.inspect_controlled(path, cancel, progress)?.1 == *fingerprint)
+}
+
 fn apply_existing(
     conn: &Connection,
     input: &ImportInput,
@@ -1202,29 +1236,15 @@ pub fn execute(
                     cancel,
                     &mut notify,
                 )?,
-                AttachmentPlan::Existing {
-                    id,
-                    path,
-                    fingerprint,
-                    source_file,
-                    ..
-                } => {
-                    verify_source(
+                AttachmentPlan::Existing { .. } => {
+                    if !verify_existing(
                         roots,
+                        managed.as_ref().unwrap(),
                         source,
-                        id,
-                        source_file.as_ref().map(|(p, f)| (p.as_path(), f)),
-                        false,
+                        att,
                         cancel,
                         &mut notify,
-                    )?;
-                    if managed
-                        .as_ref()
-                        .unwrap()
-                        .inspect_controlled(path, cancel, &mut notify)?
-                        .1
-                        != *fingerprint
-                    {
+                    )? {
                         return Err(CoreError::Conflict(
                             "保存済み PDF が事前確認後に変更されました".into(),
                         ));
@@ -1246,7 +1266,11 @@ pub fn execute(
     let mut db = Db::open(&resolved)?;
     let legacy_keys = legacy_bibliography(&db.conn)?;
     let run = format!("{}{}", crate::keys::new_key(), crate::keys::new_key());
-    let backup = crate::backup::snapshot(&db, &format!("pre-import-{run}-"), 1)?;
+    let backup = crate::backup::snapshot(
+        &db,
+        crate::backup::IMPORT_PREFIX,
+        crate::backup::IMPORT_KEEP,
+    )?;
     db.conn.execute("UPDATE import_runs SET state='interrupted',date_finished=datetime('now') WHERE state='running'",[])?;
     let mut warnings = cleanup(&mut db, &storage)?;
     let existing_format: Option<String> = db
@@ -1279,6 +1303,7 @@ pub fn execute(
         total: input.items.len(),
         results: Vec::new(),
         warnings,
+        notices: input.notices.clone(),
         complete: false,
         fulltext_pending: 0,
     };
@@ -1289,6 +1314,9 @@ pub fn execute(
         .query_map([&input.source.id], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     let work = (|| -> Result<()> {
+        // 誤りは run の failed として記録する（run の行は既に running で作ってある）
+        let mut citekeys = Citekeys::default();
+        citekeys.read_all(&db.conn)?;
         let folders = prepare_folders(&mut db, input, &prior, cancel, &mut report.warnings)?;
         for (ordinal, (item, planned)) in input.items.iter().zip(&approved.items).enumerate() {
             progress(&Progress {
@@ -1307,25 +1335,6 @@ pub fn execute(
                 attachments: Vec::new(),
                 warnings: planned.warnings.clone(),
             };
-            let before = planned
-                .selection
-                .as_ref()
-                .map(|s| ItemAction::AddMissing {
-                    item_key: s.item_key.clone(),
-                })
-                .unwrap_or(match_item(&db.conn, input, item)?);
-            let hashes = attachment_hashes(
-                &db,
-                roots,
-                &storage,
-                if let ItemAction::AddMissing { item_key } = &before {
-                    Some(item_key)
-                } else {
-                    None
-                },
-                &resolved,
-                cancel,
-            )?;
             let mut pdfs = Vec::new();
             let mut reuse = Vec::new();
             if matches!(
@@ -1334,37 +1343,23 @@ pub fn execute(
             ) {
                 for att in &planned.attachments {
                     match att {
-                        AttachmentPlan::Existing {
-                            id,
-                            path,
-                            fingerprint,
-                            source_file,
-                            ..
-                        } => {
+                        AttachmentPlan::Existing { id, .. } => {
                             let source = item.attachments.iter().find(|a| &a.id == id).unwrap();
-                            let inspected = (|| -> Result<()> {
-                                verify_source(
-                                    roots,
-                                    source,
-                                    id,
-                                    source_file.as_ref().map(|(p, f)| (p.as_path(), f)),
-                                    false,
-                                    cancel,
-                                    &mut |_| {},
-                                )?;
-                                if managed
-                                    .as_ref()
-                                    .unwrap()
-                                    .inspect_controlled(path, cancel, &mut |_| {})?
-                                    .1
-                                    != *fingerprint
-                                {
-                                    return Err(CoreError::Conflict(
-                                        "保存済み PDF が変更されました".into(),
-                                    ));
+                            let inspected = verify_existing(
+                                roots,
+                                managed.as_ref().unwrap(),
+                                source,
+                                att,
+                                cancel,
+                                &mut |_| {},
+                            )
+                            .and_then(|same| {
+                                if same {
+                                    Ok(())
+                                } else {
+                                    Err(CoreError::Conflict("保存済み PDF が変更されました".into()))
                                 }
-                                Ok(())
-                            })();
+                            });
                             match inspected {
                                 Ok(()) => reuse.push(att),
                                 Err(e) => result.attachments.push(AttachmentResult {
@@ -1396,52 +1391,27 @@ pub fn execute(
                                     input.items.len(),
                                 )
                             } else {
-                                (|| -> Result<PreparedPdf> {
-                                    let (_, fresh) = roots.inspect_resolved_pdf(path)?;
-                                    if &fresh != fingerprint {
-                                        Err(CoreError::Conflict(
-                                            "事前確認後に PDF が変更されました".into(),
-                                        ))
-                                    } else {
-                                        let mut reader = roots.open_selected_file(path)?;
-                                        let mut md5 = md5::Context::new();
-                                        let mut sha = Sha256::new();
-                                        let mut bytes = 0;
-                                        let mut b = [0; 64 * 1024];
-                                        loop {
-                                            if cancel.load(Ordering::Relaxed) {
-                                                return Err(CoreError::Conflict(
-                                                    "移行が中止されました".into(),
-                                                ));
-                                            }
-                                            let n = reader.read(&mut b)?;
-                                            if n == 0 {
-                                                break;
-                                            }
-                                            md5.consume(&b[..n]);
-                                            sha.update(&b[..n]);
-                                            bytes += n as u64;
-                                        }
-                                        if format!("{:x}", sha.finalize()) != fingerprint.sha256
-                                            || bytes != fingerprint.bytes
-                                        {
+                                // リンク元を 1 回だけ読む（中止が効く）。md5 も同じ読みの値を使う
+                                roots
+                                    .inspect_controlled(path, cancel, &mut |_| {})
+                                    .and_then(|(_, fresh)| {
+                                        if &fresh != fingerprint {
                                             return Err(CoreError::Conflict(
-                                                "リンク元 PDF が変更されました".into(),
+                                                "事前確認後に PDF が変更されました".into(),
                                             ));
                                         }
                                         Ok(PreparedPdf {
                                             id: id.clone(),
                                             key: crate::keys::new_key(),
                                             path: path.clone(),
-                                            sha256: fingerprint.sha256.clone(),
-                                            md5: format!("{:x}", md5.compute()),
+                                            sha256: fresh.sha256,
+                                            md5: fresh.md5,
                                             copied: false,
-                                            bytes,
+                                            bytes: fresh.bytes,
                                             parent: None,
                                             identity: None,
                                         })
-                                    }
-                                })()
+                                    })
                             };
                             match prepared {
                                 Ok(pdf) => pdfs.push(pdf),
@@ -1478,6 +1448,29 @@ pub fn execute(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
+            // 既存添付のハッシュは新しく登録する PDF との照合（apply_pdfs）にだけ使う。
+            // 再実行で PDF が全部 Existing（再利用）なら読まない
+            let hashes = if pdfs.is_empty() {
+                AttachmentHashes::new()
+            } else {
+                let before = match &planned.selection {
+                    Some(s) => ItemAction::AddMissing {
+                        item_key: s.item_key.clone(),
+                    },
+                    None => match_item(&db.conn, input, item)?,
+                };
+                attachment_hashes(
+                    &db,
+                    &storage,
+                    if let ItemAction::AddMissing { item_key } = &before {
+                        Some(item_key)
+                    } else {
+                        None
+                    },
+                    &resolved,
+                    cancel,
+                )?
+            };
             let applied = (|| -> Result<()> {
                 let tx = db
                     .conn
@@ -1612,6 +1605,7 @@ pub fn execute(
                                 previously_imported,
                                 &prior,
                                 &folders,
+                                &citekeys,
                                 &mut result.warnings,
                             )?;
                         }
@@ -1649,6 +1643,10 @@ pub fn execute(
                 tx.commit()?;
                 Ok(())
             })();
+            if let (Ok(()), Some(key)) = (&applied, &result.item_key) {
+                // 書き込んだ文献の引用キーを後続の文献の衝突検査へ（取り込み・不足分の補完で増えうる）
+                citekeys.read_item(&db.conn, key)?;
+            }
             if let Err(e) = applied {
                 result.status = "failed".into();
                 result.item_key = None;
@@ -1791,8 +1789,7 @@ fn mapped_folder(
     } else {
         base
     };
-    let same:Option<(String,String)>=conn.query_row("SELECT key,name FROM collections WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE AND deleted_at IS NULL ORDER BY id LIMIT 1",params![parent,base],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((key, existing)) = same {
+    if let Some((_, key, existing)) = crate::collections::child(conn, parent, &base)? {
         // 1.1.0 までの移行が作った移行元名の親フォルダ（source_root）にも合流させない
         let taken:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM import_objects WHERE target_key=?4 AND ((source_id=?1 AND kind=?2 AND scope=?3 AND object_id!=?5) OR kind='source_root'))",params![input.source.id,kind,scope,key,id],|r|r.get(0))?;
         if !taken {
@@ -1809,8 +1806,7 @@ fn mapped_folder(
     let suffix = &digest(json!([input.source.id, scope, id]).to_string().as_bytes())[..8];
     let mut n = 0;
     loop {
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM collections WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE AND deleted_at IS NULL)",params![parent,display],|r|r.get(0))?;
-        if !exists {
+        if !crate::collections::sibling_taken(conn, &display, parent, None)? {
             break;
         }
         n += 1;
@@ -1823,11 +1819,7 @@ fn mapped_folder(
     if display != name {
         warnings.push(format!("フォルダ表示名を変更: {name} → {display}"));
     }
-    let key = crate::keys::new_key();
-    conn.execute(
-        "INSERT INTO collections(key,name,parent_id) VALUES(?1,?2,?3)",
-        params![key, display, parent],
-    )?;
+    let (_, key) = crate::collections::insert_child_keyed(conn, parent, &display)?;
     remember(conn, input, kind, scope, id, &key, raw, "")?;
     Ok(Some(key))
 }
@@ -1953,6 +1945,7 @@ fn apply_metadata(
     previously_imported: bool,
     prior: &super::provenance::CrossExport,
     folders: &FolderMap,
+    citekeys: &Citekeys,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     for (id, folder) in item
@@ -2038,17 +2031,53 @@ fn apply_metadata(
                 "既存の引用キーを保持し、元の引用キーは原情報に保存しました: {citekey}"
             ));
         }
-        let collision:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE id!=?1 AND (json_extract(csl,'$.custom.paperpile.citekey')=?2 OR json_extract(csl,'$.\"citation-key\"')=?2))",params![item_id,citekey],|r|r.get(0))?;
-        if collision {
+        if citekeys.collides(citekey, item_id) {
             warnings.push(format!(
                 "引用キーが衝突しています。既存キーは変更していません: {citekey}"
             ));
         }
     }
-    if item.date_added.is_none() {
-        warnings.push("元の登録日時を取得できないため、OpenRef の取込日時を使用しました".into());
-    }
     Ok(())
+}
+
+/// 引用キー → それを持つ文献 id。run の開始時に items を 1 回だけ走査し、run 中に書いた文献の分を足す
+/// （文献ごとに items 全表を json_extract で走査していた = 書込 tx 内で O(N²)）。
+/// 照合は旧 SQL `json_extract(..)=?` と同じ: json_extract が文字列（TEXT）を返す値だけを、そのまま比べる
+#[derive(Default)]
+struct Citekeys(HashMap<String, std::collections::BTreeSet<i64>>);
+impl Citekeys {
+    const SELECT: &str = "SELECT id,json_extract(csl,'$.custom.paperpile.citekey'),json_extract(csl,'$.\"citation-key\"') FROM items";
+    /// run の開始時: 全文献
+    fn read_all(&mut self, conn: &Connection) -> Result<()> {
+        self.add(conn.prepare(Self::SELECT)?.query([])?)
+    }
+    /// run 中に書いた文献 1 件を読み足す（key の一意索引で引く）
+    fn read_item(&mut self, conn: &Connection, key: &str) -> Result<()> {
+        self.add(
+            conn.prepare(&format!("{} WHERE key=?1", Self::SELECT))?
+                .query([key])?,
+        )
+    }
+    fn add(&mut self, mut rows: rusqlite::Rows<'_>) -> Result<()> {
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            for n in [1, 2] {
+                if let rusqlite::types::ValueRef::Text(text) = row.get_ref(n)? {
+                    self.0
+                        .entry(String::from_utf8_lossy(text).into_owned())
+                        .or_default()
+                        .insert(id);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// item_id 以外にこのキーを持つ文献があるか
+    fn collides(&self, citekey: &str, item_id: i64) -> bool {
+        self.0
+            .get(citekey)
+            .is_some_and(|ids| ids.iter().any(|id| *id != item_id))
+    }
 }
 
 fn apply_tag(
@@ -2081,15 +2110,10 @@ fn apply_tag(
         }
         target
     } else {
-        conn.execute(
-            "INSERT OR IGNORE INTO tags(name,color) VALUES(?1,?2)",
-            params![name, tag.color],
-        )?;
-        let (id, key): (i64, Option<String>) = conn.query_row(
-            "SELECT id,import_key FROM tags WHERE name=?1 COLLATE NOCASE",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        // 名前で既存のラベルへ合流する（色は変えない）・無ければ作る = 手作りのラベルと同じ経路（sort_order も同じ既定の 0）
+        let id = crate::tags::ensure_tag_conn(conn, name, tag.color.as_deref())?;
+        let key: Option<String> =
+            conn.query_row("SELECT import_key FROM tags WHERE id=?1", [id], |r| r.get(0))?;
         let key = match key {
             Some(key) => key,
             None => {
@@ -2263,39 +2287,103 @@ pub fn default_source(db_path: &Path, format: &str) -> Result<String> {
     match sources.unwrap_or_default().as_slice() {
         [] => Ok(format!("{format}-default")),
         [source] => Ok(source.clone()),
-        _ => Err(CoreError::BadInput("同じ形式の移行元が複数あります。以前の移行元を選択するか --source-id を指定してください".into())),
+        many => Err(CoreError::BadInput(format!(
+            "同じ形式の移行元が複数あります（{}）。追加先の移行元を指定してください",
+            many.join("・")
+        ))),
     }
 }
 
-pub fn history(db_path: &Path) -> Result<Vec<Value>> {
-    inventory::with_snapshot(db_path, |conn| {
-        let has:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='import_runs')",[],|r|r.get(0))?;
-        if !has{return Ok(Vec::new());}
-        let mut stmt=conn.prepare("SELECT json_object('id',id,'format',(SELECT format FROM import_sources WHERE import_sources.id=import_runs.source_id),'source_id',source_id,'input_sha256',input_sha256,'state',state,'attachment_mode',attachment_mode,'date_added',date_added,'backup_path',backup_path,'total',json_array_length(input_json,'$.items'),'report',json(report_json)) FROM import_runs ORDER BY date_added DESC,id DESC")?;
-        let rows=stmt.query_map([],|r|r.get::<_,String>(0))?;
-        let mut history=Vec::new();
-        for row in rows {
-            let mut entry:Value=serde_json::from_str(&row?)?;
-            if entry["report"].is_null() {
-                let mut results=conn.prepare("SELECT result_json FROM import_results WHERE run_id=?1 ORDER BY ordinal")?;
-                let committed=results.query_map([entry["id"].as_str().unwrap()],|r|r.get::<_,String>(0))?
-                    .map(|r|Ok(serde_json::from_str::<Value>(&r?)?)).collect::<Result<Vec<_>>>()?;
-                entry["report"]=json!({"run_id":entry["id"],"state":entry["state"],"results":committed,"complete":false,"warnings":["実行は完了していません。保存済みの文献単位の結果を表示しています"]});
-            }
-            let mut pending = std::collections::BTreeSet::new();
-            if let Some(results) = entry["report"]["results"].as_array() {
-                for result in results {
-                    for att in result["attachments"].as_array().into_iter().flatten() {
-                        if let Some(key) = att["target_key"].as_str() {
-                            if fulltext_pending(conn, key)? { pending.insert(key.to_string()); }
-                        }
+/// 履歴の 1 行の列（一覧と run_report で共通）。total は report の値（= 入力の件数）を使い、
+/// report の無い中断した実行だけ入力 JSON の件数を数える（入力全量の解析は一覧では避ける）
+const HISTORY_COLUMNS: &str = "'id',id,'format',(SELECT format FROM import_sources WHERE import_sources.id=import_runs.source_id),\
+'source_id',source_id,'input_sha256',input_sha256,'state',state,'attachment_mode',attachment_mode,'date_added',date_added,\
+'backup_path',backup_path,'total',COALESCE(json_extract(report_json,'$.total'),json_array_length(input_json,'$.items'))";
+
+fn has_import_runs(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='import_runs')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// 移行の実行の一覧（新しい順）。一覧に要る列だけで、report は組み立てない（1 run の結果は run_report）
+pub fn history_list(conn: &Connection) -> Result<Vec<Value>> {
+    if !has_import_runs(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT json_object({HISTORY_COLUMNS}) FROM import_runs ORDER BY date_added DESC,id DESC"
+    ))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+/// 1 run の一覧の列 + "report"。索引待ちは今の DB で数え直す（execute 末・index_report と同じ定義）。
+/// report の無い中断した実行は保存済みの文献単位の結果で組み立て、欠けた source_id / total / backup_path を一覧の列で補う
+pub fn run_report(conn: &Connection, run: &str) -> Result<Option<Value>> {
+    if !has_import_runs(conn)? {
+        return Ok(None);
+    }
+    // 行・文献単位の結果・索引待ちを同じ時点で読む（開いている GUI の接続で読んでも途中の書込が混ざらない）
+    let tx = conn.unchecked_transaction()?;
+    let Some(row) = tx
+        .query_row(
+            &format!("SELECT json_object({HISTORY_COLUMNS},'report',json(report_json)) FROM import_runs WHERE id=?1"),
+            [run],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut entry: Value = serde_json::from_str(&row)?;
+    // 壊れた report_json（object でない JSON）は Err にする（IndexMut の panic は GUI の DB ロックを poison する）
+    if !entry["report"].is_null() && !entry["report"].is_object() {
+        return Err(CoreError::Parse(format!(
+            "移行実行 {run} の保存済みの結果が壊れています（object ではありません）"
+        )));
+    }
+    if entry["report"].is_null() {
+        let mut results =
+            tx.prepare("SELECT result_json FROM import_results WHERE run_id=?1 ORDER BY ordinal")?;
+        let committed = results
+            .query_map([run], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
+            .collect::<Result<Vec<_>>>()?;
+        entry["report"] = json!({"run_id":entry["id"],"state":entry["state"],"results":committed,"complete":false,"warnings":["実行は完了していません。保存済みの文献単位の結果を表示しています"]});
+    }
+    let mut pending = std::collections::BTreeSet::new();
+    if let Some(results) = entry["report"]["results"].as_array() {
+        for result in results {
+            for att in result["attachments"].as_array().into_iter().flatten() {
+                if let Some(key) = att["target_key"].as_str() {
+                    if fulltext_pending(&tx, key)? {
+                        pending.insert(key.to_string());
                     }
                 }
             }
-            entry["report"]["fulltext_pending"] = json!(pending.len());
-            if !pending.is_empty() { entry["report"]["complete"] = json!(false); }
-            history.push(entry);
         }
-        Ok(history)
-    }).map(Option::unwrap_or_default)
+    }
+    entry["report"]["fulltext_pending"] = json!(pending.len());
+    if !pending.is_empty() {
+        entry["report"]["complete"] = json!(false);
+    }
+    for field in ["source_id", "total", "backup_path"] {
+        if entry["report"].get(field).is_none() {
+            entry["report"][field] = entry[field].clone();
+        }
+    }
+    Ok(Some(entry))
+}
+
+/// CLI 用の history_list: DB の私用コピーで読む（元 DB へ SQLite 接続しない = 作らない・migration しない・WAL を触らない）
+pub fn history_list_snapshot(db_path: &Path) -> Result<Vec<Value>> {
+    inventory::with_snapshot(db_path, history_list).map(Option::unwrap_or_default)
+}
+
+/// CLI 用の run_report（私用コピーで読む）
+pub fn run_report_snapshot(db_path: &Path, run: &str) -> Result<Option<Value>> {
+    Ok(inventory::with_snapshot(db_path, |conn| run_report(conn, run))?.flatten())
 }

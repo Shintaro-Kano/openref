@@ -76,14 +76,16 @@ impl Fixture {
             .unwrap()
     }
 }
-/// history の中で run_id の実行が持つ索引待ち（history は date_added 秒単位 + 乱数 id の順なので [0] で引かない）
+/// 履歴の run_report が数える run_id の索引待ち。CLI（私用コピー）と GUI（開いている接続）の 2 経路が同じ値を返すことも確かめる
 fn history_pending(db: &std::path::Path, run_id: &str) -> Value {
-    apply::history(db)
+    let snapshot = apply::run_report_snapshot(db, run_id)
         .unwrap()
-        .into_iter()
-        .find(|h| h["id"] == run_id)
-        .expect("run in history")["report"]["fulltext_pending"]
-        .clone()
+        .expect("run in history");
+    let live = apply::run_report(&Db::open(db).unwrap().conn, run_id)
+        .unwrap()
+        .expect("run in history");
+    assert_eq!(snapshot, live);
+    snapshot["report"]["fulltext_pending"].clone()
 }
 
 impl Drop for Fixture {
@@ -504,6 +506,43 @@ fn backup_failure_prevents_items_sources_and_run_creation() {
     assert_eq!(f.count("import_sources"), 0);
 }
 
+/// 移行前のスナップショットは pre-import- 固定の接頭辞で新しい 3 本だけ残る（同じ秒に続いても上書きしない）。
+/// 旧版の run id 入りの名前（pre-import-<run>-<日時>.sqlite）は数えも消しもしない
+#[test]
+fn pre_import_backups_keep_newest_three() {
+    let f = Fixture::new(json!([{"_id":"one","title":"Backup","created":1750000000.0}]));
+    let backups = f.db.parent().unwrap().join("backup");
+    std::fs::create_dir_all(&backups).unwrap();
+    let legacy = backups.join("pre-import-ABCDEFGH23456789-20261029-101010.sqlite");
+    std::fs::write(&legacy, b"legacy").unwrap();
+    let input = f.input();
+    let mut paths = Vec::new();
+    for _ in 0..5 {
+        paths.push(f.run(&input, AttachmentMode::Copy).backup_path.unwrap());
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&backups)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("pre-import-"))
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 4, "新しい 3 本 + 旧名 1 本: {names:?}");
+    assert!(legacy.exists());
+    for (n, path) in paths.iter().enumerate() {
+        assert_eq!(path.exists(), n >= 2, "{n}: {}", path.display());
+    }
+    let recorded: String = Db::open(&f.db)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT backup_path FROM import_runs ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(PathBuf::from(recorded), paths[4]);
+}
+
 #[test]
 fn job_lock_covers_aliases_and_is_released_on_drop() {
     let f = Fixture::new(json!([]));
@@ -643,8 +682,8 @@ fn interrupted_results_are_readable_and_previous_unreferenced_files_are_recovere
         .unwrap();
     db.conn.execute("INSERT INTO import_files(run_id,key,path,staging_path,sha256,state,file_device,file_inode) VALUES(?1,'ORPHAN23',?2,?3,'test','ready',?4,?5)",rusqlite::params![run,orphan.to_string_lossy(),part.to_string_lossy(),{use std::os::unix::fs::MetadataExt;std::fs::metadata(&orphan).unwrap().dev().to_string()},{use std::os::unix::fs::MetadataExt;std::fs::metadata(&orphan).unwrap().ino().to_string()}]).unwrap();
     drop(db);
-    let history = apply::history(&f.db).unwrap();
-    assert_eq!(history[0]["report"]["results"].as_array().unwrap().len(), 1);
+    let history = apply::run_report_snapshot(&f.db, &run).unwrap().unwrap();
+    assert_eq!(history["report"]["results"].as_array().unwrap().len(), 1);
     let untouched = f.file("unrelated.pdf", b"%PDF-keep");
     f.run(&input, AttachmentMode::Copy);
     assert!(!orphan.exists());
@@ -935,7 +974,7 @@ fn tag_renames_are_preserved_and_deleted_tag_ids_are_not_rebound() {
 #[test]
 #[ignore = "10,000-record / 1,000-PDF scale measurement in an isolated scratch DB"]
 fn scale_10000_records_1000_pdfs() {
-    let records:Vec<_>=(0..10000).map(|n|{let mut rec=json!({"_id":format!("scale-{n}"),"title":format!("Scale article {n}"),"doi":format!("10.5555/scale-{n}"),"created":1750000000.0,"author":[{"last":format!("Author{n}")}],"published":{"year":"2026"}});if n<1000{rec["attachments"]=json!([{"_id":format!("pdf-{n}"),"filename":format!("pdfs/{n}.pdf")}]);}rec}).collect();
+    let records:Vec<_>=(0..10000).map(|n|{let mut rec=json!({"_id":format!("scale-{n}"),"title":format!("Scale article {n}"),"doi":format!("10.5555/scale-{n}"),"citekey":format!("Scale{n}"),"created":1750000000.0,"author":[{"last":format!("Author{n}")}],"published":{"year":"2026"}});if n<1000{rec["attachments"]=json!([{"_id":format!("pdf-{n}"),"filename":format!("pdfs/{n}.pdf")}]);}rec}).collect();
     let f = Fixture::new(json!(records));
     let pdf = openref_core::pdftools::minimal_pdf("Generated scale fixture", None);
     for n in 0..1000 {
@@ -1056,8 +1095,7 @@ fn fulltext_is_independent_cancellable_and_reports_failures_without_losing_items
     assert_eq!(f.count("items"), 1);
     assert_eq!(f.count("attachments"), 2);
     assert_eq!(report.state, "finished");
-    let history = apply::history(&f.db).unwrap();
-    assert_eq!(history[0]["report"]["fulltext_pending"], 1);
+    assert_eq!(history_pending(&f.db, &report.run_id), 1);
     assert!(report.warnings.iter().any(|w| w.contains("全文索引")));
 }
 
@@ -1343,6 +1381,129 @@ fn review_citation_key_is_preserved_across_formats_in_both_directions() {
     }
 }
 
+/// 形式の固定の注意は notices に分かれ、complete を妨げない。注意の無い実行は complete = true
+/// （PDF があれば全文索引の後に true）。事前確認専用の文言は最終報告に出ない
+#[test]
+fn clean_run_is_complete_and_fixed_caveats_are_notices() {
+    let f = Fixture::new(json!([
+        {"_id":"one","title":"Clean","doi":"10.1234/clean","created":1750000000.0},
+        {"_id":"two","title":"With PDF","doi":"10.1234/pdf","created":1750000000.0,
+         "attachments":[{"_id":"pdf","filename":"pdfs/two.pdf"}]}
+    ]));
+    f.file(
+        "pdfs/two.pdf",
+        &openref_core::pdftools::minimal_pdf("Complete fixture text", None),
+    );
+    let input = f.input();
+    assert!(input.warnings.is_empty());
+    assert!(!input.notices.is_empty());
+    let roots = f.roots();
+    let plan = apply::prepare(&f.db, &input, &roots, AttachmentMode::Copy).unwrap();
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(plan.notices, input.notices);
+    let mut report = apply::execute(
+        &f.db,
+        &f.json,
+        &input,
+        &plan,
+        &roots,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.notices, input.notices);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.results.iter().all(|r| r.warnings.is_empty()));
+    assert!(!report
+        .notices
+        .iter()
+        .chain(&report.warnings)
+        .any(|w| w.contains("事前確認")));
+    // 索引待ちの PDF が 1 本 → まだ完了ではない
+    assert_eq!(report.fulltext_pending, 1);
+    assert!(!report.complete);
+    apply::index_report(&f.db, &mut report, &AtomicBool::new(false), |_| {}).unwrap();
+    assert_eq!(report.fulltext_pending, 0);
+    assert!(report.complete, "{:?}", report.warnings);
+    // PDF の無い実行は終わった時点で完了
+    let g = Fixture::new(json!([{"_id":"one","title":"Clean","doi":"10.1234/clean","created":1750000000.0}]));
+    let report = g.run(&g.input(), AttachmentMode::Copy);
+    assert!(report.complete);
+}
+
+/// 実 Paperpile 書出しの構造（tests/fixtures/paperpile-2026-10-27）で、元レコードに保持しただけの情報
+/// （未反映のフィールド・複数 URL）は文献ごとの warnings にならず notices の件数になる → 索引の後 complete = true
+#[test]
+fn actual_paperpile_export_completes() {
+    let records: Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/paperpile-2026-10-27/library.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let f = Fixture::new(records);
+    for n in 0..2 {
+        f.file(
+            &format!("All Papers/F/Fixture{n} - Article.pdf"),
+            &openref_core::pdftools::minimal_pdf(&format!("Fixture article {n} text"), None),
+        );
+    }
+    let input = f.input();
+    assert!(input.items.iter().all(|i| i.warnings.is_empty()), "{:?}", input.items.iter().map(|i| &i.warnings).collect::<Vec<_>>());
+    assert!(input.notices.iter().any(|w| w.starts_with("3 件で UI/引用に未反映のフィールドを元レコードに保持しました（")), "{:?}", input.notices);
+    assert!(input.notices.iter().any(|w| w.starts_with("3 件は URL が複数ある")), "{:?}", input.notices);
+    let mut report = f.run(&input, AttachmentMode::Copy);
+    assert!(report.results.iter().all(|r| r.status == "inserted" && r.warnings.is_empty()), "{:?}", report.results);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.fulltext_pending, 2);
+    assert!(!report.complete);
+    apply::index_report(&f.db, &mut report, &AtomicBool::new(false), |_| {}).unwrap();
+    assert_eq!(report.fulltext_pending, 0, "{:?}", report.warnings);
+    assert!(report.complete, "{:?}", report.warnings);
+}
+
+/// 引用キーの衝突は既存の文献と、同じ run で先に書いた文献の両方と照合する。
+/// 照合は文字列だけ（数値の citation-key 42 は "42" と衝突しない）・自分自身とは衝突しない
+#[test]
+fn citekey_collision_checks_existing_and_earlier_items_in_the_run() {
+    let f = Fixture::new(json!([
+        {"_id":"a","title":"A","doi":"10.1234/a","citekey":"Shared"},
+        {"_id":"b","title":"B","doi":"10.1234/b","citekey":"Fresh"},
+        {"_id":"c","title":"C","doi":"10.1234/c","citekey":"Fresh"},
+        {"_id":"d","title":"D","doi":"10.1234/d","citekey":"42"},
+        {"_id":"e","title":"E","doi":"10.1234/e","citekey":"Own"}
+    ]));
+    let db = Db::open(&f.db).unwrap();
+    for (key, csl) in [
+        ("OTHER", json!({"title":"Other","citation-key":"Shared"})),
+        ("NUMBER", json!({"title":"Number","citation-key":42})),
+        ("OWN", json!({"title":"E","DOI":"10.1234/e","custom":{"paperpile":{"citekey":"Own"}}})),
+    ] {
+        db.conn
+            .execute("INSERT INTO items(key,csl) VALUES(?1,?2)", [key, &csl.to_string()])
+            .unwrap();
+    }
+    drop(db);
+    let report = f.run(&f.input(), AttachmentMode::Copy);
+    let collided: Vec<_> = report
+        .results
+        .iter()
+        .map(|r| r.warnings.iter().any(|w| w.contains("引用キーが衝突しています")))
+        .collect();
+    assert_eq!(collided, [true, false, true, false, false]);
+    assert_eq!(report.results[4].status, "merged");
+    // 再実行: 全部が自分の書いた文献へ merged。a・b/c は互いに / 既存 OTHER と衝突し続ける
+    let again = f.run(&f.input(), AttachmentMode::Copy);
+    let collided: Vec<_> = again
+        .results
+        .iter()
+        .map(|r| r.warnings.iter().any(|w| w.contains("引用キーが衝突しています")))
+        .collect();
+    assert_eq!(collided, [true, true, true, false, false]);
+}
+
 #[cfg(unix)]
 #[test]
 fn review_replaced_staging_and_unknown_ownership_are_preserved() {
@@ -1575,10 +1736,16 @@ fn choices_allow_cross_export_pdf_complement_without_restoring_metadata() {
     assert_eq!(repeated.results[0].status, "merged");
     assert_eq!(f.count("notes"), 0);
     assert_eq!(f.count("item_tags"), 0);
-    assert!(apply::history(&f.db)
+    assert!(apply::history_list_snapshot(&f.db)
         .unwrap()
         .iter()
-        .any(|h| h.to_string().contains("利用者が確認した対応")));
+        .any(
+            |h| apply::run_report_snapshot(&f.db, h["id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .to_string()
+                .contains("利用者が確認した対応")
+        ));
 }
 
 #[test]
@@ -2379,4 +2546,26 @@ fn removed_membership_of_joined_user_folder_is_not_restored() {
         .warnings
         .iter()
         .any(|w| w.contains("解除済み")));
+}
+
+/// report_json が object でない JSON（壊れた保存結果）でも run_report は panic せず Err・一覧は読める
+/// （GUI は DB のロックを持ったまま読むので、panic すると AppState の DB が poison される）
+#[test]
+fn run_report_rejects_non_object_report_json_without_panic() {
+    let f = Fixture::new(json!([{"_id":"one","title":"Broken report fixture"}]));
+    let input = f.input();
+    let report = f.run(&input, AttachmentMode::Copy);
+    let db = Db::open(&f.db).unwrap();
+    db.conn
+        .execute(
+            "UPDATE import_runs SET report_json='[]' WHERE id=?1",
+            [&report.run_id],
+        )
+        .unwrap();
+    assert!(apply::run_report(&db.conn, &report.run_id).is_err());
+    drop(db);
+    assert!(apply::run_report_snapshot(&f.db, &report.run_id).is_err());
+    let list = apply::history_list_snapshot(&f.db).unwrap();
+    assert_eq!(list[0]["id"], report.run_id.as_str());
+    assert_eq!(list[0]["total"], 1);
 }
