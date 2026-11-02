@@ -26,6 +26,15 @@ export const DEFAULT_FAKES = {
   "@tauri-apps/plugin-dialog": "export const open = async (...a) => (globalThis.__dialogOpen ? globalThis.__dialogOpen(...a) : null);",
 };
 
+/** svelte の exports を browser 条件で自分で解く(node の条件解決に頼らない)。無い subpath は null */
+const SVELTE_PKG = JSON.parse(readFileSync(fileURLToPath(new URL("node_modules/svelte/package.json", APP)), "utf8"));
+export function resolveSvelteBrowser(spec) {
+  const sub = spec === "svelte" ? "." : "./" + spec.slice("svelte/".length);
+  let e = SVELTE_PKG.exports[sub];
+  while (e && typeof e === "object") e = e.browser ?? e.default ?? e.import;
+  return typeof e === "string" ? new URL("node_modules/svelte/" + e.replace(/^\.\//, ""), APP).href : null;
+}
+
 let installed = null; // 登録済みの fakes（1 プロセスに 1 組。違う fakes で 2 度目に呼ばれたら throw = 黙って前の物が効くのを防ぐ）
 
 /** loader を登録する（1 プロセスに 1 回。setupHarness が呼ぶ） */
@@ -40,7 +49,10 @@ export function installLoader(fakes = DEFAULT_FAKES) {
     resolve(spec, ctx, next) {
       if (Object.hasOwn(fakes, spec)) return { url: "data:text/javascript," + encodeURIComponent(fakes[spec]), shortCircuit: true };
       if (spec === "svelte" || spec.startsWith("svelte/")) {
-        return next(spec, { ...ctx, parentURL: APP, conditions: [...ctx.conditions, "browser"] });
+        // browser 側(index-client.js 等)に自分で解く。next に conditions を足して渡す方式は Node 22(CI)の registerHooks が
+        // 無視して server 側(index-server.js = mount が無い)に解いていた(2.0.0 の CI 失敗・Node 26 では効いていた)
+        const url = resolveSvelteBrowser(spec);
+        if (url) return { url, shortCircuit: true };
       }
       if ((spec.startsWith("./") || spec.startsWith("../")) && ctx.parentURL?.startsWith("file:")) {
         const f = fileURLToPath(new URL(spec, ctx.parentURL));
