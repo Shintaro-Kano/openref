@@ -70,7 +70,9 @@ export function installLoader(fakes = DEFAULT_FAKES) {
 
 /** jsdom を作り、window / document と DOM の型を globalThis に載せる */
 export function installDom() {
-  const dom = new JSDOM("<!doctype html><body></body>", { pretendToBeVisual: true });
+  // url を与える = origin を opaque にしない。無いと下の総なめで window.localStorage の getter が SecurityError を投げる
+  // (Node 22 = CI には localStorage の global が無く define が呼ばれる・Node 25+ は global があるので素通り = 手元だけ通っていた 2.0.0 の CI 失敗)
+  const dom = new JSDOM("<!doctype html><body></body>", { pretendToBeVisual: true, url: "http://localhost/" });
   const define = (k) => {
     const v = dom.window[k];
     Object.defineProperty(globalThis, k, { value: typeof v === "function" && k[0] === k[0].toLowerCase() ? v.bind(dom.window) : v, configurable: true, writable: true });
