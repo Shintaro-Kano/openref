@@ -1,16 +1,19 @@
 //! OpenRef MCP server — stdio JSON-RPC 2.0 手実装。
 //! tool は 3 つだけ: `schema`（スキーマ + 注記 + コマンド一覧）/ `sql`（読み取り専用 SQL）/ `call`（core の登録表
 //! = GUI と同じ動詞）。用途はコードに書かない（何をするかはその場の指示とエージェント向け手引きの文章で決まる）。
-//! 安全網は 1 つ: このプロセスで最初の書込コマンドの前に DB のスナップショット（core::backup・失敗したら書かない）。
+//! 安全網は 1 つ: このプロセスで最初の（DB を変える）書込コマンドの前に DB のスナップショット（core::backup・失敗したら書かない）。
+//! env `OPENREF_MCP_ALLOW`（分類 read / wiki とコマンド名のカンマ区切り）で起動すると、許可外のコマンドは一覧に出さず呼べない。
+//! 無い・空なら全部。env `OPENREF_MCP_CHAT=1`（OpenNote のチャットが付ける）は写しの接頭辞を `pre-chat-` にするだけ。
 //! 依存は serde_json + rusqlite + openref-core のみ（SDK 非依存）。stdout = プロトコル専用（改行区切り JSON-RPC）、stderr = ログ。
 
-use openref_core::{backup, commands, datadir, Db};
+use openref_core::{backup, commands, datadir, wiki, Db};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SQL_ROWS_DEFAULT: u64 = 200;
@@ -36,9 +39,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let mut allow = Allow::parse(std::env::var("OPENREF_MCP_ALLOW").ok().as_deref());
+    allow.chat = std::env::var("OPENREF_MCP_CHAT").is_ok_and(|v| v.trim() == "1");
+    for w in &allow.warnings {
+        eprintln!("openref-mcp: OPENREF_MCP_ALLOW: {w}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--schema") {
-        print!("{}", schema_text(&db));
+        print!("{}", schema_text(&db, &allow));
         return;
     }
     if args.iter().any(|a| a == "--commands") {
@@ -47,7 +55,11 @@ fn main() {
         return;
     }
     eprintln!("openref-mcp: ready ({})", db_path.display());
+    if let Some(n) = &allow.names {
+        eprintln!("openref-mcp: 許可一覧で起動（{} コマンド）", n.len());
+    }
     let mut srv = Server::new(db);
+    srv.allow = allow;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -67,8 +79,69 @@ fn main() {
     }
 }
 
+/// 許可一覧（env `OPENREF_MCP_ALLOW`）。分類 `read` = 登録表の読みのコマンド全部・`wiki` = `wiki_*` 全部・他はコマンド名（別名可）。
+/// 新しい分類は作らない。`sql` は読み取り専用なので対象外（いつも使える）
+#[derive(Default)]
+struct Allow {
+    /// None = 全部許す（env が無い・空）
+    names: Option<BTreeSet<&'static str>>,
+    /// 未知の分類・コマンド名（起動時に stderr へ出す・落とさない）
+    warnings: Vec<String>,
+    /// env `OPENREF_MCP_CHAT=1` = OpenRef のチャットのセッション（写しの接頭辞だけ変える・コマンドは絞らない）
+    chat: bool,
+}
+
+/// 許可一覧で起動したとき、ホストのファイルのパス（引数 path）は vault の中だけ受けるコマンド
+const HOST_PATH_COMMANDS: [&str; 3] = ["import_pdf", "attach_pdf", "cite_install_file"];
+
+impl Allow {
+    fn parse(env: Option<&str>) -> Allow {
+        let mut out = Allow::default();
+        let words: Vec<&str> = env.unwrap_or("").split(',').map(str::trim).filter(|w| !w.is_empty()).collect();
+        if words.is_empty() {
+            // 値が設定されているのに空白・区切りだけ = 起動側の不具合の可能性（全部許すのは env が無いときと同じ）
+            if env.is_some_and(|e| !e.is_empty()) {
+                out.warnings.push(format!("値 {:?} にコマンド名がありません。全部のコマンドを許します", env.unwrap_or_default()));
+            }
+            return out;
+        }
+        let mut names = BTreeSet::new();
+        for w in words {
+            let hit: Vec<&'static str> = match w {
+                "read" => commands::registry().iter().filter(|c| !c.writes).map(|c| c.name).collect(),
+                "wiki" => commands::registry().iter().filter(|c| commands::is_wiki(c)).map(|c| c.name).collect(),
+                other => commands::find(other).map(|c| vec![c.name]).unwrap_or_default(),
+            };
+            if hit.is_empty() {
+                out.warnings.push(format!("未知の分類・コマンド名 {w} は無視します（分類は read / wiki・他は schema の一覧のコマンド名）"));
+            }
+            names.extend(hit);
+        }
+        out.names = Some(names);
+        out
+    }
+
+    fn restricted(&self) -> bool {
+        self.names.is_some()
+    }
+
+    fn allows(&self, c: &commands::Command) -> bool {
+        self.names.as_ref().is_none_or(|n| n.contains(c.name))
+    }
+
+    /// DB の写しの接頭辞: OpenRef のチャット（OPENREF_MCP_CHAT=1）と許可一覧のセッションは `pre-chat-`・他は `pre-agent-`（新しい 5 個は接頭辞ごと）
+    fn snapshot_prefix(&self) -> &'static str {
+        if self.chat || self.restricted() {
+            backup::CHAT_PREFIX
+        } else {
+            backup::AGENT_PREFIX
+        }
+    }
+}
+
 struct Server {
     db: Db,
+    allow: Allow,
     /// `sql` 用の読み取り専用の別接続（初回に遅延で開く）
     ro: Option<Connection>,
     /// このプロセスで書込の前のスナップショットを済ませたか
@@ -97,7 +170,7 @@ fn check_tool_args(tool: &str, args: &Value, accepted: &[&str]) -> Result<(), St
 
 impl Server {
     fn new(db: Db) -> Self {
-        Server { db, ro: None, snapshotted: false, sql_budget: SQL_TIME_BUDGET }
+        Server { db, allow: Allow::default(), ro: None, snapshotted: false, sql_budget: SQL_TIME_BUDGET }
     }
 
     fn handle_message(&mut self, msg: &Value) -> Option<Value> {
@@ -121,10 +194,7 @@ impl Server {
                 let default_args = json!({});
                 let args = msg.pointer("/params/arguments").unwrap_or(&default_args);
                 match self.call_tool(name, args) {
-                    Ok(texts) => Some(ok(id, json!({
-                        "content": texts.into_iter().map(|t| json!({"type": "text", "text": t})).collect::<Vec<_>>(),
-                        "isError": false
-                    }))),
+                    Ok(content) => Some(ok(id, json!({ "content": content, "isError": false }))),
                     Err(e) => Some(ok(id, json!({
                         "content": [{ "type": "text", "text": e }],
                         "isError": true
@@ -136,12 +206,13 @@ impl Server {
         }
     }
 
-    fn call_tool(&mut self, name: &str, args: &Value) -> Result<Vec<String>, String> {
+    /// 戻り値 = MCP の content（text / image）の並び
+    fn call_tool(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
         match name {
-            "schema" => Ok(vec![schema_text(&self.db)]),
+            "schema" => Ok(vec![text_content(schema_text(&self.db, &self.allow))]),
             "sql" => {
                 check_tool_args("sql", args, &["sql", "params", "max_rows"])?;
-                self.run_sql(args).map(|v| vec![serde_json::to_string_pretty(&v).unwrap()])
+                self.run_sql(args).map(|v| vec![text_content(serde_json::to_string_pretty(&v).unwrap())])
             }
             "call" => {
                 check_tool_args("call", args, &["name", "args"])?;
@@ -150,18 +221,31 @@ impl Server {
                 self.run_command(cmd, &cargs)
             }
             // 登録表の名前（旧 15 tool の名前を含む）で直接呼ばれたとき（古い tool 一覧を持ったままのクライアント）は call と同じに扱う
+            // （許可一覧の検査も run_command の中 = 同じ）
             other if commands::find(other).is_some() => self.run_command(other, args),
             other => Err(format!("unknown tool: {other}（tool は schema / sql / call）")),
         }
     }
 
-    /// 登録表のコマンドを実行する。writes のコマンドはこのプロセスで最初の 1 回だけ、先に DB のスナップショットを取る
-    /// （取れなければ実行しない = fail-closed）。結果の JSON の後ろにスナップショットの場所を添える
-    fn run_command(&mut self, name: &str, args: &Value) -> Result<Vec<String>, String> {
+    /// 登録表のコマンドを実行する（call と旧 tool 名の直接呼出しの両方がここを通る = 許可一覧の検査はここだけ）。
+    /// DB を変える書込（commands::writes_db）はこのプロセスで最初の 1 回だけ、先に DB のスナップショットを取る
+    /// （取れなければ実行しない = fail-closed）。結果の JSON の後ろにスナップショットの場所を添える。
+    /// 結果の予約キー `_mcp_images` は抜いて image content にする（text に base64 を流さない）
+    fn run_command(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
         let cmd = commands::find(name).ok_or_else(|| format!("未知のコマンド: {name}（schema の一覧を参照）"))?;
+        if !self.allow.allows(cmd) {
+            return Err(format!("{name} はこのセッションでは許可されていません（使えるのは schema の一覧のコマンドだけ）"));
+        }
+        let vaulted;
+        let args = if self.allow.restricted() && HOST_PATH_COMMANDS.contains(&cmd.name) {
+            vaulted = self.vault_path_arg(args)?;
+            &vaulted
+        } else {
+            args
+        };
         let mut note = None;
-        if cmd.writes && !self.snapshotted {
-            match backup::snapshot(&self.db, backup::AGENT_PREFIX, backup::AGENT_KEEP) {
+        if commands::writes_db(cmd) && !self.snapshotted {
+            match backup::snapshot(&self.db, self.allow.snapshot_prefix(), backup::AGENT_KEEP) {
                 Ok(p) => {
                     self.snapshotted = true;
                     note = p.map(|p| {
@@ -174,12 +258,31 @@ impl Server {
             }
         }
         match commands::call(&mut self.db, name, args) {
-            Ok(v) => Ok(std::iter::once(serde_json::to_string_pretty(&v).unwrap()).chain(note).collect()),
+            Ok(v) => Ok(to_content(v, note)),
             Err(e) => Err(match note {
                 Some(n) => format!("{e}\n{n}"),
                 None => e.to_string(),
             }),
         }
+    }
+
+    /// 許可一覧のセッションでホストのファイルを読むコマンドの path を、vault の中の canonical なパスに替える
+    /// （vault の外・vault の中の symlink で外を指すもの・Wiki が無効 / 未設定は拒否。検査したパスそのものを渡す）
+    fn vault_path_arg(&self, args: &Value) -> Result<Value, String> {
+        let mut a = args.clone();
+        if let Some(p) = args.get("path").and_then(Value::as_str) {
+            // 文言は core のものを 1 度だけ（BadInput の「入力を解釈できません」を重ねない）
+            let msg = |e: openref_core::CoreError| match e {
+                openref_core::CoreError::BadInput(m) => m,
+                e => e.to_string(),
+            };
+            let ctx = wiki::Ctx::from_db(&self.db).map_err(msg)?;
+            let canon = ctx
+                .host_path_in_vault(Path::new(p))
+                .map_err(|e| format!("このセッションでは path にワークスペースの中のファイル（絶対パスかワークスペース相対）だけ渡せます（{}）", msg(e)))?;
+            a["path"] = json!(canon.to_string_lossy());
+        }
+        Ok(a)
     }
 
     /// `sql` の接続: db.path から別の接続を READ_ONLY で開き、query_only + authorizer（読み以外を拒否）を掛ける
@@ -345,6 +448,21 @@ fn collect_rows(
     Ok(out)
 }
 
+/// コマンドの結果 → MCP の content: 予約キー `_mcp_images` を抜いて image に・残りの JSON を text に・最後に安全網の知らせ
+fn to_content(mut v: Value, note: Option<String>) -> Vec<Value> {
+    let images = v.as_object_mut().and_then(|o| o.remove(wiki::commands::MCP_IMAGES));
+    let mut out = vec![text_content(serde_json::to_string_pretty(&v).unwrap())];
+    for img in images.as_ref().and_then(Value::as_array).into_iter().flatten() {
+        out.push(json!({"type": "image", "data": img["data"], "mimeType": img["mimeType"]}));
+    }
+    out.extend(note.map(text_content));
+    out
+}
+
+fn text_content(t: String) -> Value {
+    json!({"type": "text", "text": t})
+}
+
 fn ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -371,7 +489,7 @@ fn tools_json() -> Value {
         },
         {
             "name": "call",
-            "description": "コマンドを実行する（書込はすべてここ・GUI と同じ動詞）。name と args は schema の一覧のとおり。item は key（8 桁）・フォルダは key かパス（'親/子'）・ラベルは名前で指す（数値 id は受けない）。注釈・ノートの author は 'claude:<model>' 推奨。このプロセスで最初の書込の前に DB のスナップショットを backup/ に作る。",
+            "description": "コマンドを実行する（書込はすべてここ・GUI と同じ動詞）。name と args は schema の一覧のとおり。item は key（8 桁）・フォルダは key かパス（'親/子'）・ラベルは名前で指す（数値 id は受けない）。注釈・ノートの author は 'claude:<model>' 推奨。このプロセスで最初の（DB を変える）書込の前に DB のスナップショットを backup/ に作る。",
             "inputSchema": { "type": "object", "properties": {
                 "name": { "type": "string", "description": "コマンド名（例 list_items / add_tag）" },
                 "args": { "type": "object", "description": "コマンドの引数" }
@@ -396,20 +514,22 @@ const SCHEMA_NOTES: &str = "\
 - `import_sources` / `import_runs` / `import_objects` / `import_results` / `import_files` はライブラリ移行の由来・履歴・対応表・結果・コピー台帳。元レコードは引用用 CSL や全文索引とは別のローカル資料。削除済み対象の対応も残すので、履歴を削除して再作成・復元する操作はしない。
 - `PRAGMA data_version` は他の接続の書込で増える（app はこれを 2 秒ごとに見て一覧を読み直す = call の書込はすぐ画面に出る）。
 - sql の PRAGMA は値なしの読み（`PRAGMA user_version` 等）と表の情報（table_info・table_xinfo・table_list・index_list・index_info・index_xinfo・foreign_key_list・integrity_check・quick_check）だけ。表の情報は `SELECT * FROM pragma_table_info('items')` の形でも読める（JOIN・WHERE に使える）。
+- OpenNote（OpenRef のページ機能・任意・既定は無効。コマンドは `wiki_*`）: ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。正はディスクのファイルで、索引 `<app_dir>/wiki-index.sqlite` は再生成できるキャッシュ（sql からは見えない）。読むのは call の `wiki_status` / `wiki_list` / `wiki_read`（画像は画像そのもの・PDF は抽出テキスト）/ `wiki_backlinks` / `wiki_search`（題名 + 本文の全文検索・和文可・tag の AND 絞込）/ `wiki_tags` / `wiki_inbox`（`ingest/` に置かれた素材の一覧）、書くのは `wiki_write`（md / html）/ `wiki_move`（パスはワークスペース相対）。`wiki_write` で既存を上書きすると上書き前を `<app_dir>/wiki-history/<16 桁>/<unix 秒>.<拡張子>` に退避して応答の `backup` に返す（ファイルごとに新しい 10 世代・同じフォルダの `path.txt` が元のファイルの絶対パス）= 戻すときはその中身を `wiki_write` で書き戻す。有効化は GUI だけ（Settings › OpenNote・フォルダは左の木のワークスペース名のメニュー）。settings の `wiki_enabled`（\"1\" = 有効）`wiki_root`（ワークスペースの絶対パス）。ページから item へのリンクは `[題名](openref://open?key=KEY)`（KEY は実在の key だけ・`wiki_backlinks` の key で逆に引ける）。
+- OpenNote の用例（雛形。何を書くかはその場の指示で決める）: (1) ingest/ の素材を記事に = `wiki_inbox` → `wiki_read`（素材）→ 関係する論文を `list_items` で探す → `wiki_write`（記事。frontmatter の `sources` に素材のパス・`items` に key・`tags`）→ `wiki_move`（素材を ingest/ の外の置き場へ）。(2) 選んだ論文の要約ページを作る = `get_item` と `get_fulltext` で読む → `wiki_write`（`[題名](openref://open?key=KEY)` 付き）→ `wiki_backlinks {key}` で載ったかを確かめる。書誌は get_item の値だけを使う（作らない）。
 ";
 
 /// スナップショットからの戻し方（`schema` の §4 の末尾・手引き文書と同文 = drift test）
 const RESTORE_TEXT: &str = "\
 - 戻し方（スナップショット → DB）: **cp / mv で openref.sqlite を置き換えない**（`-wal` が残っているうちに本体ファイルを置き換えると壊れる。connectd・app・他のセッションの MCP が DB を開いている間は `-wal` が残るのが常態）。
   1. 書き手を止める: OpenRef.app を終了する・connectd は `launchctl bootout gui/$(id -u)/dev.openref.connectd`（再開は `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.openref.connectd.plist`）・openref を使っている他の Claude セッションは書込をしない状態にする
-  2. `sqlite3 \"<DB>\" \".restore '<backup>/pre-agent-<日時>.sqlite'\"`（SQLite の backup API = `-wal` があっても・DB を開いたままの読み手がいても整合する）
+  2. `sqlite3 \"<DB>\" \".restore '<backup>/pre-agent-<日時>.sqlite'\"`（SQLite の backup API = `-wal` があっても・DB を開いたままの読み手がいても整合する。OpenRef のチャットのセッション（OPENREF_MCP_CHAT=1）と許可一覧で起動したセッションの写しは `pre-chat-<日時>.sqlite`）
   3. `sqlite3 \"<DB>\" \"pragma integrity_check\"` が ok を返すことを確かめてから書き手を戻す
 ";
 
 /// FTS5 の内部表（shadow table）の接尾辞。DDL の一覧では 1 行にまとめる
 const FTS_SHADOW: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
 
-fn schema_text(db: &Db) -> String {
+fn schema_text(db: &Db, allow: &Allow) -> String {
     let mut out = String::from("# OpenRef スキーマ\n\n読むのは `sql`（読み取り専用・単文）、書くのは `call`（下の §3 のコマンド）。\n\n## 1. テーブル（sqlite_master から生成）\n\n```sql\n");
     let rows: Vec<(String, String, String)> = db
         .conn
@@ -441,8 +561,11 @@ fn schema_text(db: &Db) -> String {
     out.push_str("\n## 2. 注記\n\n");
     out.push_str(SCHEMA_NOTES);
     out.push_str("\n## 3. call のコマンド一覧\n\n");
-    out.push_str("`call(name, args)`。item は key・フォルダは key かパス・ラベルは名前。書込のコマンドはこのプロセスで最初の 1 回の前に DB のスナップショットを取る。\n\n");
-    out.push_str(&commands::markdown());
+    out.push_str("`call(name, args)`。item は key・フォルダは key かパス・ラベルは名前。DB を変える書込のコマンドはこのプロセスで最初の 1 回の前に DB のスナップショットを取る（`wiki_*` の書込は DB を変えない = 上書き前のファイルを wiki-history/ に退避）。\n\n");
+    if allow.restricted() {
+        out.push_str("**このセッションで使えるのは下の一覧のコマンドだけ**（許可一覧 = 起動時の OPENREF_MCP_ALLOW）。ホストのファイルのパスを受けるコマンドはワークスペースの中のファイルだけ受ける。\n\n");
+    }
+    out.push_str(&commands::markdown_where(|c| allow.allows(c)));
     out.push_str("\n## 4. 環境\n\n");
     // どれも整数を返す問い合わせ（user_version・件数）
     let q = |sql: &str| -> String { db.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).map(|n| n.to_string()).unwrap_or_else(|e| format!("?（{e}）")) };
@@ -463,8 +586,8 @@ fn schema_text(db: &Db) -> String {
         q("SELECT count(*) FROM tags"),
     ));
     out.push_str(&format!(
-        "- スナップショット: このプロセスで最初の書込コマンドの前に `{bdir}/{}<日時>.sqlite` を 1 個作る（新しい {} 個を残す・DB だけ = purge_item で消えた managed の PDF は戻らない）\n",
-        backup::AGENT_PREFIX,
+        "- スナップショット: このプロセスで最初の DB を変える書込コマンドの前に `{bdir}/{}<日時>.sqlite` を 1 個作る（新しい {} 個を残す・DB だけ = purge_item で消えた managed の PDF は戻らない）\n",
+        allow.snapshot_prefix(),
         backup::AGENT_KEEP
     ));
     out.push_str(RESTORE_TEXT);
@@ -691,6 +814,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// OPENREF_MCP_CHAT=1（チャット）は写しの接頭辞だけ変える（コマンドは絞らない）。許可一覧も pre-chat-
+    #[test]
+    fn chat_flag_changes_prefix_only() {
+        let mut a = Allow::parse(None);
+        assert_eq!(a.snapshot_prefix(), backup::AGENT_PREFIX);
+        a.chat = true;
+        assert_eq!(a.snapshot_prefix(), backup::CHAT_PREFIX);
+        assert!(!a.restricted() && commands::registry().iter().all(|c| a.allows(c)), "コマンドは全部");
+        assert_eq!(Allow::parse(Some("read")).snapshot_prefix(), backup::CHAT_PREFIX);
+        let (mut srv, dir) = file_server("chatflag");
+        srv.allow.chat = true;
+        let s = text(&tool(&mut srv, "schema", json!({})));
+        assert!(s.contains("/pre-chat-<日時>.sqlite") && !s.contains("このセッションで使えるのは下の一覧のコマンドだけ"), "{s}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 許可一覧のセッション（チャット）の写しは pre-chat-。新しい 5 個は接頭辞ごと = pre-agent- を押し出さない
+    #[test]
+    fn chat_snapshot_prefix_keeps_agent_snapshots() {
+        let (mut srv, dir) = file_server("chatsnap");
+        let key: String = srv.db.conn.query_row("SELECT key FROM items", [], |r| r.get(0)).unwrap();
+        let bdir = dir.join("backup");
+        std::fs::create_dir_all(&bdir).unwrap();
+        for i in 0..5 {
+            std::fs::write(bdir.join(format!("pre-agent-2000010{i}-000000.sqlite")), b"old").unwrap();
+            std::fs::write(bdir.join(format!("pre-chat-2000010{i}-000000.sqlite")), b"old").unwrap();
+        }
+        srv.allow = Allow::parse(Some("read,wiki,quick_add,import_pdf,set_star"));
+        assert!(text(&tool(&mut srv, "schema", json!({}))).contains("/pre-chat-<日時>.sqlite"));
+        let r = tool(&mut srv, "call", json!({"name": "set_star", "args": {"key": key, "starred": true}}));
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(text(&json!({"content": [r["content"][1]]})).contains("pre-chat-"), "{r}");
+        let names = |p: &str| -> usize {
+            std::fs::read_dir(&bdir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with(p)).count()
+        };
+        assert_eq!(names("pre-chat-"), 5, "チャットの写しは 5 個");
+        assert!(!bdir.join("pre-chat-20000100-000000.sqlite").exists(), "チャットの最古が消える");
+        assert_eq!(names("pre-agent-"), 5, "pre-agent- は押し出さない");
+        assert!(bdir.join("pre-agent-20000100-000000.sqlite").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// スナップショットを取れなければ書込を実行しない（fail-closed）
     #[test]
     fn snapshot_failure_blocks_write() {
@@ -725,6 +890,91 @@ mod tests {
         let c = Connection::open(dir.join("openref.sqlite")).unwrap();
         assert_eq!(c.query_row("SELECT count(*) FROM tags WHERE name = 'wal'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 結果の _mcp_images は image content になり、text には base64 が残らない（安全網の知らせは最後）
+    #[test]
+    fn images_become_image_content() {
+        let v = json!({"path": "ingest/a.png", "size": 3, "_mcp_images": [{"mimeType": "image/png", "data": "QUJD"}]});
+        let c = to_content(v, Some("note".into()));
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[1], json!({"type": "image", "data": "QUJD", "mimeType": "image/png"}));
+        let t = c[0]["text"].as_str().unwrap();
+        assert!(!t.contains("QUJD") && !t.contains("_mcp_images") && t.contains("ingest/a.png"), "{t}");
+        assert_eq!(c[2]["text"], "note");
+        assert_eq!(to_content(json!([1]), None).len(), 1);
+    }
+
+    /// 許可一覧: 分類 read / wiki と名前（別名可）・未知は警告・空なら全部
+    #[test]
+    fn allow_list_parse() {
+        assert!(!Allow::parse(None).restricted() && Allow::parse(None).warnings.is_empty());
+        // 設定されているのに実質空 = 全部許すが警告
+        let blank = Allow::parse(Some(" , "));
+        assert!(!blank.restricted() && blank.warnings.len() == 1, "{:?}", blank.warnings);
+        assert!(Allow::parse(Some("")).warnings.is_empty());
+        let a = Allow::parse(Some("read, wiki,create_item,import_pdf,nope,writes"));
+        let n = a.names.as_ref().unwrap();
+        for ok in ["list_items", "get_fulltext", "wiki_read", "wiki_write", "wiki_move", "quick_add", "import_pdf"] {
+            assert!(n.contains(ok), "{ok}");
+        }
+        for no in ["purge_item", "add_tag", "update_item", "fetch_pdf", "cite_set_prefs", "attach_pdf", "delete_collection"] {
+            assert!(!n.contains(no), "{no}");
+        }
+        assert_eq!(a.warnings.len(), 2, "{:?}", a.warnings);
+        assert!(a.warnings[0].contains("nope") && a.warnings[1].contains("writes"));
+    }
+
+    /// 許可一覧で起動: schema に許可外が出ない・call も旧 tool 名の直呼びも拒否・sql と読みは通る・
+    /// import_pdf は vault の外を拒否（Wiki 無効も拒否）・env 無しは今どおり
+    #[test]
+    fn allow_list_enforced() {
+        let (mut srv, dir) = file_server("allow");
+        let key: String = srv.db.conn.query_row("SELECT key FROM items", [], |r| r.get(0)).unwrap();
+        srv.allow = Allow::parse(Some("read,wiki,quick_add,import_pdf"));
+        let s = text(&tool(&mut srv, "schema", json!({})));
+        assert!(s.contains("`list_items`") && s.contains("`wiki_write`") && s.contains("`import_pdf`") && s.contains("このセッションで使えるのは"));
+        assert!(!s.contains("`purge_item`") && !s.contains("`add_tag`") && !s.contains("`fetch_pdf`"));
+        for r in [
+            tool(&mut srv, "call", json!({"name": "purge_item", "args": {"key": key}})),
+            tool(&mut srv, "purge_item", json!({"key": key})),
+            tool(&mut srv, "set_tags", json!({"key": key, "add": ["x"]})),
+            tool(&mut srv, "call", json!({"name": "trash_item", "args": {"key": key}})),
+        ] {
+            assert_eq!(r["isError"], true);
+            assert!(text(&r).contains("このセッションでは許可されていません"), "{}", text(&r));
+        }
+        assert_eq!(tool(&mut srv, "call", json!({"name": "get_item", "args": {"key": key}}))["isError"], false);
+        assert_eq!(tool(&mut srv, "get_item", json!({"key": key}))["isError"], false);
+        assert!(sql(&mut srv, "SELECT count(*) FROM items").is_ok());
+        let pdf = dir.join("x.pdf");
+        std::fs::write(&pdf, openref_core::pdftools::minimal_pdf("x", None)).unwrap();
+        let r = tool(&mut srv, "call", json!({"name": "import_pdf", "args": {"path": pdf.to_string_lossy()}}));
+        assert_eq!(r["isError"], true);
+        assert!(text(&r).contains("ワークスペースの中のファイル") && text(&r).contains("無効") && !text(&r).contains("入力を解釈できません"), "{}", text(&r));
+        // wiki の書込は DB を変えない = 失敗しても成功しても DB のスナップショットを作らない。拒否も作らない
+        assert!(!dir.join("backup").exists());
+        let n: i64 = srv.db.conn.query_row("SELECT count(*) FROM items WHERE deleted_at IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        // env 無し = 全部（今どおり）
+        srv.allow = Allow::parse(None);
+        let s = text(&tool(&mut srv, "schema", json!({})));
+        assert!(s.contains("`purge_item`") && !s.contains("このセッションで使えるのは"));
+        assert_eq!(tool(&mut srv, "call", json!({"name": "trash_item", "args": {"key": key}}))["isError"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wiki_* の書込は DB のスナップショットを作らない（vault のファイルだけ・上書き前は wiki-history）
+    #[test]
+    fn wiki_writes_take_no_db_snapshot() {
+        let (mut srv, dir) = file_server("wikisnap");
+        let r = tool(&mut srv, "call", json!({"name": "wiki_write", "args": {"path": "a.md", "content": "x"}}));
+        assert_eq!(r["isError"], true, "Wiki は無効");
+        let r = tool(&mut srv, "wiki_move", json!({"from": "a.md", "to": "b.md"}));
+        assert_eq!(r["isError"], true);
+        assert!(!dir.join("backup").exists(), "DB の写しを作らない");
+        assert!(!srv.snapshotted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

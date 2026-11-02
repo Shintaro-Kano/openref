@@ -10,7 +10,8 @@
      class は tabs- 接頭辞（tb- は viewer のツールバーが使用中） */
   import { tick } from "svelte";
   import LabelBadge from "./LabelBadge.svelte";
-  import { app, activateTab, closeTab, moveTab, openTab, tabView, viewTitle, type Tab, type View } from "./state.svelte";
+  import { app, activateTab, closeTab, moveTab, openTabInMode, tabView, viewTitle, type Tab, type View } from "./state.svelte";
+  import { wikiTabTitle } from "./wiki/wiki.svelte";
 
   let listEl = $state<HTMLDivElement | null>(null);
   /** 並べ替えで掴んでいるタブの id と、見た目のずれ（配列上の枠の左端から px。transform で指に追わせる） */
@@ -187,7 +188,7 @@
       （tabindex を付けると空きのクリックで検索欄からフォーカスが外れる）= リスナーは action で付ける */
   function dblclickNew(node: HTMLElement) {
     const f = (e: MouseEvent) => {
-      if (e.target === node || e.target === listEl) void openTab();
+      if (e.target === node || e.target === listEl) void openTabInMode();
     };
     node.addEventListener("dblclick", f);
     return { destroy: () => node.removeEventListener("dblclick", f) };
@@ -219,7 +220,7 @@
           role="tab"
           tabindex={front ? 0 : -1}
           aria-selected={front}
-          title={tab.viewer ? tab.viewer.title : tip(tab, v)}
+          title={tab.viewer ? tab.viewer.title : tab.wiki && app.wikiOn ? (tab.wiki.path ?? wikiTabTitle(tab.wiki)) : tip(tab, v)}
           onpointerdown={(e) => onTabDown(e, tab.id)}
           onclick={(e) => {
             if (e.button === 0) void activateTab(tab.id);
@@ -238,6 +239,19 @@
                   stroke-linejoin="round" /></svg>
             </span>
             <span class="tabs-title">{tab.viewer.title || "PDF"}</span>
+          {:else if tab.wiki && app.wikiOn}
+            <!-- Wiki タブ（OpenNote）= ページの題名・ホームは OpenNote -->
+            <span class="tabs-ico" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="13" height="13"
+                ><path
+                  d="M3 2.2h7.6l2.4 2.4v9.2H3zM5.4 6h5.2M5.4 8.4h5.2M5.4 10.8h3.4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round" /></svg>
+            </span>
+            <span class="tabs-title">{wikiTabTitle(tab.wiki)}</span>
           {:else if v.kind === "tag"}
             {@const tv = v}
             <LabelBadge name={viewTitle(tv)} color={app.tags.find((x) => x.id === tv.id)?.color ?? null} />
@@ -274,7 +288,7 @@
             <span class="tabs-title">{viewTitle(v)}</span>
           {/if}
         </div>
-        {#if app.tabs.length > 1 || tab.viewer}
+        {#if app.tabs.length > 1 || tab.viewer || (tab.wiki && app.wikiOn)}
           <button
             class="tabs-x"
             tabindex="-1"
@@ -288,5 +302,5 @@
       </div>
     {/each}
   </div>
-  <button class="tabs-new" title={t("新しいタブ（⌘T）")} aria-label={t("新しいタブ")} onclick={() => void openTab()}>{t("＋")}</button>
+  <button class="tabs-new" title={t("新しいタブ（⌘T）")} aria-label={t("新しいタブ")} onclick={() => void openTabInMode()}>{t("＋")}</button>
 </div>

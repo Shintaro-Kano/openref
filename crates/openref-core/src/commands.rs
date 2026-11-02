@@ -7,7 +7,7 @@
 
 use crate::{
     annotate, bibtex, citestyle, collections, edit, fulltext, kbmanifest, model, pdffetch, pdfingest, resolver,
-    search, tags, types, CoreError, Db, Result,
+    search, tags, types, wiki, CoreError, Db, Result,
 };
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
@@ -39,17 +39,39 @@ pub fn find(name: &str) -> Option<&'static Command> {
 
 /// コマンドを実行する。args は object（null は {}）。未知の引数・必須の欠落はここで弾く（綴り違いを黙って無視しない）
 pub fn call(db: &mut Db, name: &str, args: &Value) -> Result<Value> {
-    let cmd = find(name).ok_or_else(|| bad(format!("未知のコマンド: {name}（schema の一覧を参照）")))?;
     let empty = json!({});
     let args = if args.is_null() { &empty } else { args };
-    check_args(cmd, args)?;
+    let cmd = validate(name, args)?;
     (cmd.run)(db, args)
+}
+
+/// 引数を登録表の定義で検査してエントリを返す（`call` と GUI の Tauri 包みが同じ検査を使う）
+pub fn validate(name: &str, args: &Value) -> Result<&'static Command> {
+    let cmd = find(name).ok_or_else(|| bad(format!("未知のコマンド: {name}（schema の一覧を参照）")))?;
+    check_args(cmd, args)?;
+    Ok(cmd)
+}
+
+/// 書込のうち DB を変えるもの（MCP の安全網 = DB のスナップショットはこれの前だけ）。
+/// `wiki_*` の書込は vault のファイルを書くだけで、上書き前は wiki-history に退避する（DB の写しは要らない）
+pub fn writes_db(c: &Command) -> bool {
+    c.writes && !is_wiki(c)
+}
+
+/// OpenNote のコマンド（名前が `wiki_` で始まる）か。writes_db と MCP の許可一覧の分類 `wiki` が使う
+pub fn is_wiki(c: &Command) -> bool {
+    c.name.starts_with("wiki_")
 }
 
 /// 一覧の Markdown（`schema` tool の「コマンド一覧」節と、手引き文書の commands ブロック = 同じ文字列）
 pub fn markdown() -> String {
+    markdown_where(|_| true)
+}
+
+/// 一覧の Markdown を keep が true のコマンドだけで（MCP の許可一覧 = OPENREF_MCP_ALLOW で起動したセッション）
+pub fn markdown_where(keep: impl Fn(&Command) -> bool) -> String {
     let mut out = String::new();
-    for c in registry() {
+    for c in registry().iter().filter(|c| keep(c)) {
         let mut head = format!("- `{}`（{}", c.name, if c.writes { "書込" } else { "読み" });
         if !c.aliases.is_empty() {
             let a: Vec<String> = c.aliases.iter().map(|a| format!("`{a}`")).collect();
@@ -889,6 +911,48 @@ fn cite_install_file(db: &mut Db, a: &Value) -> Result<Value> {
     citestyle::install_file(&citestyle::styles_dir(db), Path::new(&req_str(a, "path")?))
 }
 
+// ---------------- 読み: OpenNote（コマンドは wiki_*） ----------------
+// 設定と app_dir を読んだら Db を使わず core::wiki の索引を呼ぶ
+
+fn wiki_status(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::status(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_list(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::list(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_read(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::read_agent(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_backlinks(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::backlinks(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_search(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::search(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_tags(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::tags(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_inbox(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::commands::inbox(&wiki::Ctx::from_db(db)?, a)
+}
+
+// ---------------- 書込: OpenNote（ワークスペースのファイルを書く・DB は変えない） ----------------
+
+/// 上書きは if_sha256 の有無によらず必ず退避（GUI の自動保存の包みは退避しない edit::write = 別の関数）
+fn wiki_write(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::edit::write_agent(&wiki::Ctx::from_db(db)?, a)
+}
+
+fn wiki_move(db: &mut Db, a: &Value) -> Result<Value> {
+    wiki::edit::move_(&wiki::Ctx::from_db(db)?, a)
+}
+
 // ---------------- 表 ----------------
 
 const KEY: (&str, &str, &str) = ("key", "string", "item の key（8 桁）");
@@ -988,6 +1052,62 @@ fn build() -> Vec<Command> {
         c("cite_locale_xml", false, &[],
           "citeproc の言語ファイル（locales-xx-XX.xml）の XML",
           schema(&[("lang", "string", "例 en-US / ja-JP")], &["lang"]), cite_locale_xml),
+        // ---- 読み: OpenNote（コマンドは wiki_*。ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。有効化とフォルダの指定は GUI だけ） ----
+        c("wiki_status", false, &[],
+          "OpenNote（コマンドは wiki_*）の状態: 有効か・ワークスペースの root・件数（ページ・種類別・リンク・未解決・同名で曖昧・ingest/ の件数・frontmatter）・最終走査（unix 秒）。無効でもエラーにしない（他の wiki_* は無効ならエラー）",
+          schema(&[], &[]), wiki_status),
+        c("wiki_list", false, &[],
+          "ワークスペースのページの一覧（パス順）: path（ワークスペース相対）・title・kind（md / html / media = 画像・動画・音声・pdf / other）・tags・items（参照している item の key）・mtime（unix 秒）・size。total が count より大きければ limit で切れている",
+          schema(&[
+              ("prefix", "string", "ワークスペース相対のパスの前方一致（例 'notes/'）"),
+              ("kind", "string", "md / html / media / other"),
+              ("tag", "string", "tag（大小無視・# は付けても付けなくてもよい）"),
+              ("tags", "string[]", "複数の tag（AND。tag と併用可）"),
+              ("limit", "integer", "既定 1000"),
+          ], &[]), wiki_list),
+        c("wiki_read", false, &[],
+          "ワークスペースのファイルを 1 つ読む。md / html = content（本文）・title・tags・items・frontmatter（[{key, value}]・解けなかった項目は raw: true で原文）・links（kind・target・解決先 path・ambiguous）・sha256（wiki_write の if_sha256 に渡す）。画像（中身が png / jpeg / gif / webp・base64 で 5 MB = 生データ 3,932,160 バイトまで）= 画像そのもの（MCP の image content）・pdf = content に抽出テキスト（頁区切り \\f・pages = 総頁数・from_page / to_page = 実際に切り出した範囲・範囲外は空で out_of_range・抽出できなければ text_error）・それ以外の画像（svg / avif / heic・上限超）と動画・音声・other = path・abs_path・size・種類だけ。ワークスペースの外・`..`・`.` 始まりの区画・ワークスペースの外を指す symlink は拒否",
+          schema(&[
+              ("path", "string", "ワークスペース相対のパス（ワークスペースの中の絶対パスも可）"),
+              ("max_chars", "integer", "content の上限（既定 200000・truncated で切れたかを示す）"),
+              ("from_page", "integer", "pdf: 1 始まり"),
+              ("to_page", "integer", "pdf: この頁まで（含む）"),
+          ], &["path"]), wiki_read),
+        c("wiki_backlinks", false, &[],
+          "そのページ（path）か item（key）を参照しているページの一覧（path・title・kind・link_kinds・excerpt = 一致した行）。path と key はどちらか 1 つ",
+          schema(&[
+              ("path", "string", "ワークスペース相対のパス"),
+              KEY,
+              ("limit", "integer", "既定 200"),
+          ], &[]), wiki_backlinks),
+        c("wiki_search", false, &[],
+          "ワークスペースのページを探す: 題名の部分一致（完全一致 → 前方一致 → 全語を含む）を上に、続いて md / html の本文の全文検索（和文可・語は空白区切りで AND・最後の語は前方一致）。pages = path・title・kind・tags・mtime・size・match（title / body / title+body）・snippet（一致箇所を U+E000 … U+E001 で囲んだ抜粋）。tag / tags は AND の絞込（query を省けば tag を全部持つページを題名順）",
+          schema(&[
+              ("query", "string", "検索語（空白区切り・AND）"),
+              ("tag", "string", "tag で絞る（大小無視）"),
+              ("tags", "string[]", "複数の tag（AND。tag と併用可）"),
+              ("limit", "integer", "既定 50・最大 1000（total が絞込後の総数）"),
+          ], &[]), wiki_search),
+        c("wiki_tags", false, &[],
+          "ワークスペースの tag の一覧と件数（ページ数の多い順。大小だけ違う表記は 1 つに束ねる）",
+          schema(&[("limit", "integer", "既定 500（total が tag の総数）")], &[]), wiki_tags),
+        c("wiki_inbox", false, &[],
+          "inbox = ワークスペースの ingest/（未処理の素材）にあるファイル（下位フォルダも・`.` 始まりは除く）: path（ワークスペース相対）・name・kind・media（image / video / audio / pdf）・size・mtime。フォルダが無ければ空。OpenRef は素材を動かさない（記事にしたら skill が sources/ へ移す）。dir = chat-log でチャットの記録（chat-log/・新しい順）の一覧",
+          schema(&[("limit", "integer", "既定 1000"), ("dir", "string", "ingest（既定）か chat-log")], &[]), wiki_inbox),
+        // ---- 書込: OpenNote（ワークスペースのファイルだけ・DB は変えない = DB のスナップショットは取らない） ----
+        c("wiki_write", true, &[],
+          "ワークスペースに md / html のページを書く（新規はフォルダも作る・戻り値 created）。既存を上書きするときは必ず上書き前を <app_dir>/wiki-history/ に退避して backup（退避先のパス）を返す。sha256 = 書いた後の内容。if_sha256（wiki_read の sha256）が今のファイルと違えば書かずに {ok: false, conflict: true, sha256: 今の値} = 読み直してから書き直す。ワークスペースの外・`..`・`.` 始まり・symlink・md / html 以外の拡張子・新しく作る名前の `[ ] | # ^ \\ :` は拒否。item へのリンクは `[題名](openref://open?key=KEY)`（KEY は get_item / list_items で確かめた実在の key だけ）。frontmatter の items / sources / tags は任意。用例: 「ingest/ の素材を記事に」= wiki_inbox → wiki_read（素材）→ wiki_write（記事）→ wiki_move（素材を ingest/ の外へ）・「選んだ論文の要約ページを作る」= get_item・get_fulltext → wiki_write（openref:// のリンク付き）→ wiki_backlinks {key} で確かめる",
+          schema(&[
+              ("path", "string", "ワークスペース相対のパス（.md / .html）"),
+              ("content", "string", "ファイルの中身の全体"),
+              ("if_sha256", "string", "この sha256 のときだけ上書き（競合保護・省略 = 照合しないで上書き）"),
+          ], &["path", "content"]), wiki_write),
+        c("wiki_move", true, &[],
+          "ワークスペースの中のファイルの移動 / 改名（例: ingest/ の素材を記事にした後に別のフォルダへ）。移動先が既にあれば拒否（上書きしない）・拡張子（大小無視）を変える移動も拒否。戻り値 from / to（逆の move で戻せる）。リンクは書き換えない（参照しているページは呼び手が直す）",
+          schema(&[
+              ("from", "string", "ワークスペース相対のパス（今の場所）"),
+              ("to", "string", "ワークスペース相対のパス（移動先・途中のフォルダは作る）"),
+          ], &["from", "to"]), wiki_move),
         // ---- 書込: item ----
         c("set_star", true, &[],
           "★ を付ける / 外す",
@@ -1011,11 +1131,11 @@ fn build() -> Vec<Command> {
           "PMID / DOI / PubMed URL / doi.org URL から書誌を機械確定して登録（ネットワーク・重複は既存 key を示してエラー。戻り値の source = 書誌の取得元 pubmed / doi.org / isho-ris・warnings = PubMed の照合に失敗して doi.org で代用した等の警告。普段は空）",
           schema(&[("input", "string", "PMID・DOI・URL")], &["input"]), quick_add),
         c("import_pdf", true, &[],
-          "手元の PDF を取り込む（本文の DOI/PMID → 書誌確定 → 登録 + 添付。決まらなければラベル「要確認」で登録）",
-          schema(&[("path", "string", "PDF の絶対パス")], &["path"]), import_pdf),
+          "手元の PDF を取り込む（本文の DOI/PMID → 書誌確定 → 登録 + 添付。決まらなければラベル「要確認」で登録）。MCP を許可一覧（OPENREF_MCP_ALLOW）で起動したセッションではワークスペースの中のファイルだけ（絶対パスかワークスペース相対）",
+          schema(&[("path", "string", "PDF の絶対パス（許可一覧のセッションはワークスペース相対も可）")], &["path"]), import_pdf),
         c("attach_pdf", true, &[],
-          "手元の PDF を既存の item に添付する（設定に従い Drive か storage/ へ置く。戻り値の fulltext = 本文の索引の結果）",
-          schema(&[KEY, ("path", "string", "PDF の絶対パス")], &["key", "path"]), attach_pdf),
+          "手元の PDF を既存の item に添付する（設定に従い Drive か storage/ へ置く。戻り値の fulltext = 本文の索引の結果）。MCP を許可一覧（OPENREF_MCP_ALLOW）で起動したセッションではワークスペースの中のファイルだけ（絶対パスかワークスペース相対）",
+          schema(&[KEY, ("path", "string", "PDF の絶対パス（許可一覧のセッションはワークスペース相対も可）")], &["key", "path"]), attach_pdf),
         c("fetch_pdf", true, &[],
           "PDF の無い item に OA の PDF を自動取得して添付する（PMC → Unpaywall → Crossref → 着地ページ。冒頭の DOI で同一性を照合・paywall は取らない）",
           schema(&[KEY], &["key"]), fetch_pdf),
@@ -1134,8 +1254,8 @@ fn build() -> Vec<Command> {
               ("doi_always", "boolean", ""),
           ], &[]), cite_set_prefs),
         c("cite_install_file", true, &[],
-          "手元の .csl ファイルを導入する（id は custom- 付き）",
-          schema(&[("path", "string", ".csl の絶対パス")], &["path"]), cite_install_file),
+          "手元の .csl ファイルを導入する（id は custom- 付き）。MCP を許可一覧（OPENREF_MCP_ALLOW）で起動したセッションではワークスペースの中のファイルだけ（絶対パスかワークスペース相対）",
+          schema(&[("path", "string", ".csl の絶対パス（許可一覧のセッションはワークスペース相対も可）")], &["path"]), cite_install_file),
     ]
 }
 
@@ -1143,6 +1263,30 @@ fn build() -> Vec<Command> {
 mod tests {
     use super::*;
     use crate::resolver::Resolved;
+
+    /// 索引と退避の置き場の名前は契約（既存の利用者の app_dir に実物があり、登録表 / MCP の説明文が `<app_dir>/wiki-history/` と教え、
+    /// チャットの undo は退避の置き場の中かで判定する）= const の値を固定する
+    #[test]
+    fn wiki_file_names_are_fixed() {
+        use crate::wiki::{edit, index};
+        assert_eq!(index::INDEX_FILE, "wiki-index.sqlite");
+        assert_eq!(edit::HISTORY_DIR, "wiki-history");
+        let doc = find("wiki_write").unwrap().doc;
+        assert!(doc.contains(&format!("<app_dir>/{}/", edit::HISTORY_DIR)), "{doc}");
+    }
+
+    /// OpenNote の分類 = 名前が `wiki_` で始まるものだけ（`wiki` で始まるだけ・途中に `wiki_` は外）。writes_db はそれを写しから外す
+    #[test]
+    fn is_wiki_is_the_wiki_underscore_prefix() {
+        let cmd = |name: &'static str| Command { name, doc: "", args: json!({}), writes: true, aliases: &[], run: |_, _| Ok(json!(null)) };
+        for (name, want) in [("wiki_write", true), ("wiki_", true), ("wikiwrite", false), ("wiki", false), ("x_wiki_y", false), ("Wiki_x", false), ("set_star", false)] {
+            assert_eq!(is_wiki(&cmd(name)), want, "{name}");
+            assert_eq!(writes_db(&cmd(name)), !want, "{name}");
+        }
+        let wiki: Vec<&str> = registry().iter().filter(|c| is_wiki(c)).map(|c| c.name).collect();
+        assert!(wiki.len() >= 9 && wiki.iter().all(|n| n.starts_with("wiki_")), "{wiki:?}");
+        assert!(registry().iter().filter(|c| c.writes && is_wiki(c)).all(|c| !writes_db(c)));
+    }
 
     fn seeded_db() -> (Db, String) {
         let mut db = Db::open_in_memory().unwrap();
@@ -1218,6 +1362,38 @@ mod tests {
             assert!(find(f).is_some_and(|c| c.writes), "{f}");
         }
         assert!(markdown().contains("`search_library`"));
+    }
+
+    /// wiki_*: 無効なら status は状態を返し他はエラー・in-memory の Db は明示のエラー・引数は登録表の定義で検査
+    #[test]
+    fn wiki_commands_disabled_and_in_memory() {
+        let mut db = Db::open_in_memory().unwrap();
+        assert_eq!(call_ok(&mut db, "wiki_status", json!({}))["enabled"], false);
+        for (name, args) in [
+            ("wiki_list", json!({})),
+            ("wiki_read", json!({"path": "a.md"})),
+            ("wiki_backlinks", json!({"path": "a.md"})),
+            ("wiki_search", json!({"query": "x"})),
+            ("wiki_tags", json!({})),
+            ("wiki_inbox", json!({})),
+            ("wiki_write", json!({"path": "a.md", "content": "x"})),
+            ("wiki_move", json!({"from": "a.md", "to": "b.md"})),
+        ] {
+            assert_eq!(call_err(&mut db, name, args), wiki::commands::DISABLED, "{name}");
+        }
+        db.set_setting("wiki_enabled", "1").unwrap();
+        db.set_setting("wiki_root", "/tmp").unwrap();
+        assert!(call_err(&mut db, "wiki_list", json!({})).contains("in-memory"));
+        assert!(call_ok(&mut db, "wiki_status", json!({}))["error"].as_str().unwrap().contains("in-memory"));
+        assert!(call_err(&mut db, "wiki_read", json!({})).contains("path は必須"));
+        assert!(call_err(&mut db, "wiki_list", json!({"pth": "x"})).contains("未知の引数 pth"));
+        assert!(!find("wiki_read").unwrap().writes);
+        // wiki の書込は書込だが DB は変えない（MCP は DB のスナップショットを取らない）・GUI の force は登録表に出さない
+        for n in ["wiki_write", "wiki_move"] {
+            assert!(find(n).unwrap().writes && !writes_db(find(n).unwrap()), "{n}");
+        }
+        assert!(writes_db(find("import_pdf").unwrap()) && !writes_db(find("list_items").unwrap()));
+        assert!(call_err(&mut db, "wiki_write", json!({"path": "a.md", "content": "x", "force": true})).contains("未知の引数 force"));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod sync;
 pub mod tags;
 pub mod types;
 pub mod update;
+pub mod wiki;
 pub mod zotero;
 
 pub use db::Db;

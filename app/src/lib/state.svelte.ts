@@ -52,6 +52,14 @@ export interface TabViewer {
   title: string;
 }
 
+/** Wiki タブ（OpenNote）。path = vault 相対（null = ホーム = 木だけ・中央は空）。
+    viewer と同じく前面も含めて常にここが正（snapshot / restore しない）。永続するのは path だけ */
+export interface TabWiki {
+  path: string | null;
+  scrollTop: number;
+  editing: boolean;
+}
+
 /** タブ 1 枚 = 一覧の状態一式。不活性のタブはここに snapshot（値の複製）で眠る。
     前面のタブの中身は app.view / search / filters / items / checked / checkAnchor / selected / detail が正で、
     ここは切替の時に書く（前面の view は tabView() で読む）。
@@ -69,11 +77,13 @@ export interface Tab {
   detail: ItemDetail | null;
   scrollTop: number;
   viewer: TabViewer | null;
+  /** Wiki タブ（一覧の状態は下に持ったまま = 一覧に戻すと見える） */
+  wiki: TabWiki | null;
 }
 
 let nextTabId = 1;
 function blankTab(view: View = { kind: "all" }, search = "", filters: Filters = { author: null, journal: null }): Tab {
-  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null };
+  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null, wiki: null };
 }
 const firstTab = blankTab();
 
@@ -88,6 +98,8 @@ export const app = $state({
   tab: firstTab.id,
   /** ui_tabs の復元が済んだ（済むまで保存しない = マウント直後の既定の 1 枚で保存済みを上書きしない） */
   tabsRestored: false,
+  /** OpenNote が有効（settings.wiki_enabled。wiki/wiki.svelte.ts の loadWikiStatus が書く）。false の間は Wiki の UI を描かない */
+  wikiOn: false,
   items: [] as ItemSummary[],
   /** 詳細パネルに出している 1 件（クリック選択） */
   selected: null as string | null,
@@ -278,10 +290,10 @@ export async function reveal(key: string) {
 }
 
 async function revealNow(key: string) {
-  if (frontViewer()) {
+  if (frontViewer() || frontWiki()) {
     await openTab();
-    if (frontViewer()) {
-      toast(t("✗ 一覧に表示できませんでした（PDF のタブから新しいタブを開けません。処理中・取込の実行中は後で開いてください）"));
+    if (frontViewer() || frontWiki()) {
+      toast(t("✗ 一覧に表示できませんでした（新しいタブを開けません。処理中・取込の実行中は後で開いてください）"));
       return;
     }
   }
@@ -378,15 +390,48 @@ export function frontViewer(): TabViewer | null {
   return app.tabs.find((t) => t.id === app.tab)?.viewer ?? null;
 }
 
+/** 前面のタブの Wiki（無ければ・Wiki が無効なら null = 一覧か PDF が見えている） */
+export function frontWiki(): TabWiki | null {
+  return app.wikiOn ? (app.tabs.find((t) => t.id === app.tab)?.wiki ?? null) : null;
+}
+
+/** ⌘T・TabStrip の ＋ = 今のモードで新しいタブ（前面が Wiki なら Wiki のホーム・それ以外は一覧の「すべて」） */
+export function openTabInMode() {
+  return openTab({ kind: "all" }, frontWiki() ? { path: null, scrollTop: 0, editing: false } : null);
+}
+
 /** タブの操作（切替・開く・閉じる）を受け付けるか。処理中（busy）・エディタ・モーダル・取込中は受け付けない
     （一括操作などの後処理 = clearChecks / closeDetail / reloadDetail が別のタブに効く事故を 1 つの規則で防ぐ。
-    purge モーダル中に切り替わると PurgeModal が新しいタブの一覧から題名を引けない等）。PDF ビューアの中では受け付ける */
+    purge モーダル中に切り替わると PurgeModal が新しいタブの一覧から題名を引けない等）。PDF ビューアの中では受け付ける。
+    モーダルは本体の app.modal と Wiki のダイアログ（modalOpen）の両方 */
 export function tabOpsAllowed(): boolean {
-  return !app.busy && !app.editorOpen && !app.modal && !app.importJob;
+  return !app.busy && !app.editorOpen && !modalOpen() && !app.importJob;
+}
+
+/** モーダルが開いているか = 本体の app.modal か、Wiki のダイアログ（wiki.svelte が登録する guard）。タブの操作と ⌘⌥I が見る */
+export function modalOpen(): boolean {
+  return !!app.modal || !!modalGuard?.();
+}
+
+/** Wiki のモーダル（新規・改名・ゴミ箱・破棄の確認・conflict・チャットの説明・救出）が開いているか（wiki.svelte が登録）。
+    開いている間はタブの切替・開く・閉じるを受け付けない（ダイアログは Wiki のタブの中に居る = 外れると消え、戻ると蘇る） */
+let modalGuard: (() => boolean) | null = null;
+export function setModalGuard(f: (() => boolean) | null) {
+  modalGuard = f;
 }
 
 /** 切替の世代。各 await の後で比べ、追い越された（連打・切替の途中の切替）切替はそこで降りる */
 let tabGen = 0;
+
+/** 前面のタブを離れる・中身を外す前の確認（OpenNote の編集 = 未保存の変更を保存する。wiki.svelte が登録）。
+    true = 離れてよい（保存の要らないときは同期で true = Wiki を使っていなければ待ちを足さない）・false = 離れない */
+let leaveGuard: (() => true | Promise<boolean>) | null = null;
+export function setLeaveGuard(f: (() => true | Promise<boolean>) | null) {
+  leaveGuard = f;
+}
+function frontLeave(): true | Promise<boolean> {
+  return leaveGuard ? leaveGuard() : true;
+}
 
 function rowsEl(): HTMLElement | null {
   return document.querySelector<HTMLElement>(".list > .rows");
@@ -437,6 +482,10 @@ async function switchTab(id: number, closeFront: boolean): Promise<boolean> {
   // 保存の後に一括操作やモーダルが始まった（busy・modal）なら切り替えない
   await autoSaveAndCloseNote();
   if (gen !== tabGen || app.noteEditor || !app.tabs.some((t) => t.id === id) || !tabOpsAllowed()) return false;
+  // Wiki の編集中なら保存してから（保存できなければ切り替えない = 未保存を他のタブに置き去りにしない）
+  const lv = frontLeave();
+  if (lv !== true && !(await lv)) return false;
+  if (gen !== tabGen || !app.tabs.some((t) => t.id === id) || !tabOpsAllowed()) return false;
   // メニューは閉じる（ツールバーのメニューは前のタブのチェックが対象）
   app.listMenu = null;
   app.folderMenu = null;
@@ -465,8 +514,8 @@ async function switchTab(id: number, closeFront: boolean): Promise<boolean> {
 }
 
 /** 新しいタブを末尾に足して前面で開く（⌘T・＋・⌘クリック / 中クリック・フォルダの「新しいタブで開く」）。
-    中身は v（既定 = すべて）だけ = 検索語・チップ・チェックなし */
-export async function openTab(v: View = { kind: "all" }) {
+    中身は v（既定 = すべて）だけ = 検索語・チップ・チェックなし。wiki を渡すと Wiki タブ（下の一覧は v） */
+export async function openTab(v: View = { kind: "all" }, wiki: TabWiki | null = null) {
   if (!tabOpsAllowed()) return;
   const live = viewLive(v);
   // 開いているメモは先に保存して閉じる（保存に失敗したらタブを作らない = 切り替えられない空のタブを残さない）。
@@ -474,8 +523,13 @@ export async function openTab(v: View = { kind: "all" }) {
   await autoSaveAndCloseNote();
   if (app.noteEditor || !tabOpsAllowed() || (live && !viewLive(v))) return;
   const t = blankTab($state.snapshot(v) as View);
+  t.wiki = wiki;
   app.tabs.push(t);
-  await switchTab(t.id, false);
+  // 切り替えられなかった（Wiki の編集を保存できない等）= 作ったタブを残さない（空のタブを置き去りにしない）
+  if (!(await switchTab(t.id, false)) && app.tab !== t.id) {
+    const i = app.tabs.findIndex((x) => x.id === t.id);
+    if (i >= 0) app.tabs.splice(i, 1);
+  }
 }
 
 /** タブを閉じる（× / 中クリック / ⌘W・PDF タブはビューアの × / Esc も）。最後の 1 枚は閉じない（PDF タブならビューアだけ
@@ -486,7 +540,12 @@ export async function closeTab(id: number) {
   const i = app.tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
   if (app.tabs.length <= 1) {
-    app.tabs[i].viewer = null;
+    const lv = frontLeave(); // Wiki の編集中 = 保存できなければ中身を外さない
+    if (lv !== true && !(await lv)) return;
+    const only = app.tabs.find((t) => t.id === id);
+    if (!only) return;
+    only.viewer = null;
+    only.wiki = null; // Wiki タブも中身を外して一覧に戻す
     return;
   }
   if (id !== app.tab) {
@@ -644,6 +703,8 @@ export function tabsPref(): string {
         filters: front ? app.filters : t.filters,
         // PDF タブ = item key + 添付 id（照合用）+ 題名（ビューアの見出し・タブの題名）
         ...(t.viewer ? { viewer: { key: t.viewer.itemKey, attachment: t.viewer.attachmentId, title: t.viewer.title } } : {}),
+        // Wiki タブ = vault 相対の path（null = ホーム）
+        ...(t.wiki ? { wiki: { path: t.wiki.path } } : {}),
       };
     }),
   });
@@ -694,6 +755,12 @@ function parseViewer(v: any): TabViewer | null {
     : null;
 }
 
+/** ui_tabs の Wiki タブの値（Wiki が無効なら null = 一覧のタブとして戻す） */
+function parseWiki(w: any): TabWiki | null {
+  if (!app.wikiOn || !w || !(w.path === null || (typeof w.path === "string" && w.path))) return null;
+  return { path: w.path, scrollTop: 0, editing: false };
+}
+
 /** 戻す PDF タブの item を引き、添付 id がその item の添付にあるか確かめる（id は削除後に再利用されうる・item が消えていることも
     ある = MCP / CLI）。あれば今の題名で返し、無ければ viewer = null（一覧のタブとして戻す）。引けない（IPC の失敗）は確かめずに
     そのまま戻して err を返す（保存済みの PDF タブを消さない。添付が本当に無ければビューアの読込のエラーが見える） */
@@ -741,15 +808,17 @@ export async function restoreTabs() {
   }
   const list: any[] = Array.isArray(saved?.tabs) ? saved.tabs : [];
   const activeAt = Number.isInteger(saved?.active) ? (saved.active as number) : 0;
-  const found: { at: number; tab: Tab; viewer: TabViewer | null; orphan: boolean }[] = [];
+  const found: { at: number; tab: Tab; viewer: TabViewer | null; wiki: TabWiki | null; orphan: boolean }[] = [];
   let lost = 0; // 開けない PDF タブ（値が壊れている・item / 添付が無い）
   list.forEach((s, at) => {
     const view = parseView(s?.view);
     const viewer = parseViewer(s?.viewer);
     if (s?.viewer != null && !viewer) lost++;
-    if (!view && !viewer) return;
+    const wiki = viewer ? null : parseWiki(s?.wiki);
+    if (!view && !viewer && !wiki) return;
     const tab = blankTab(view ?? { kind: "all" }, typeof s.search === "string" ? s.search : "", parseFilters(s.filters));
-    found.push({ at, tab, viewer, orphan: !view });
+    tab.wiki = wiki;
+    found.push({ at, tab, viewer, wiki, orphan: !view });
   });
   const checked = await Promise.all(found.map((f) => (f.viewer ? checkViewer(f.viewer) : null)));
   const tabs: Tab[] = [];
@@ -765,7 +834,7 @@ export async function restoreTabs() {
     }
     const v = c?.viewer ?? null;
     if (f.viewer && !v) lost++;
-    if (f.orphan && !v) return;
+    if (f.orphan && !v && !f.wiki) return;
     if (v) {
       const id = `${v.itemKey}\u0000${v.attachmentId}`;
       if (seen.has(id)) return;

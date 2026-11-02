@@ -42,6 +42,8 @@
   import OutlineTab from "./viewer/OutlineTab.svelte";
   import ThumbnailsTab from "./viewer/ThumbnailsTab.svelte";
   import AnnotationCard from "./viewer/AnnotationCard.svelte";
+  import WikiChat from "./wiki/WikiChat.svelte";
+  import { chat, chatShown, setFloat, setViewerSelection } from "./wiki/chat.svelte";
   import { embeddedComments, inertMarkup, type EmbeddedComment } from "./viewer/embedded";
   import {
     normText,
@@ -111,7 +113,18 @@
   let editColor = $state("yellow");
   let editComment = $state("");
 
-  let sideTab = $state<"search" | "annotations" | "outline" | "pages">("annotations");
+  // chat = OpenNote のチャット（OpenNote とチャットが有効なときだけ）。右ペインの WikiChat と同じ会話で、文脈はこの文献（+ 選択）
+  let sideTab = $state<"search" | "annotations" | "outline" | "pages" | "chat">("annotations");
+  const chatTab = $derived(chatShown());
+  $effect(() => {
+    if (!chatTab && sideTab === "chat") sideTab = "annotations";
+  });
+  // 本文の選択（selInfo = 4 字以上・mouseup で確定）をチャットの文脈に（前面のタブだけ）。selInfo はスクロール / Esc / 注釈の保存でも
+  // 消えるので、消えても文脈は残す（外すのは × か送信か別の元へ移ったとき = ページの選択と同じ寿命）
+  $effect(() => {
+    const text = selInfo?.text ?? null;
+    if (front && chatTab && text) untrack(() => setViewerSelection(itemKey, text));
+  });
   let sideDoc = $state<any>(null); // load 後の doc をタブ（目次/ページ）へ橋渡し（反応駆動用）
   let pagesWrap = $state<HTMLDivElement | null>(null); // ポップオーバー配置の基準
 
@@ -1833,6 +1846,11 @@
           <button class:active={sideTab === "pages"} onclick={() => (sideTab = "pages")}>
             {t("ページ::thumbnails")}
           </button>
+          {#if chatTab}
+            <button class:active={sideTab === "chat"} onclick={() => ((sideTab = "chat"), (chat.focusPending = true))}>
+              {t("チャット")}{#if chat.status?.state === "busy"} <span class="dim">●</span>{/if}
+            </button>
+          {/if}
         </div>
 
         {#if sideTab === "search"}
@@ -1900,6 +1918,15 @@
           </div>
         {:else if sideTab === "outline"}
           <OutlineTab doc={sideDoc} onJump={gotoPage} />
+        {:else if sideTab === "chat" && chatTab}
+          {#if chat.float}
+            <div class="wk-floated">
+              <p>{t("チャットは浮かせたパネルに表示中です")}</p>
+              <button class="wk-floated-btn" onclick={() => setFloat(null)}>{t("ここに戻す")}</button>
+            </div>
+          {:else}
+            <WikiChat />
+          {/if}
         {:else}
           <ThumbnailsTab doc={sideDoc} {pageCount} {currentPage} {baseSizes} onJump={gotoPage} />
         {/if}

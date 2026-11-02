@@ -8,11 +8,17 @@ license.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 serde.workspace = true
 serde_json.workspace = true
 openref-core = { path = "../../crates/openref-core" }
+notify = "8"
+notify-debouncer-mini = "0.7"
+trash = "5"
+libc = "0.2"
+percent-encoding = "2"
+http-range = "0.1"
 
 [[bin]]
 name = "openref-app"

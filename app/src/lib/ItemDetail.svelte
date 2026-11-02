@@ -2,6 +2,7 @@
   import { t } from "./i18n.svelte";
   import { api } from "./api";
   import LabelBadge from "./LabelBadge.svelte";
+  import WikiItemSection from "./wiki/WikiItemSection.svelte";
   import {
     app,
     askPurgeSelected,
@@ -180,6 +181,8 @@
         </p>
       {/each}
     </div>
+
+    <WikiItemSection itemKey={d.key} />
 
     <p class="footer dim">
       {d.key} {t("· 追加")} {d.dateAdded} · source: {c.custom?.source ?? "?"}

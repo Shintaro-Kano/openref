@@ -71,6 +71,11 @@ pub fn extract_all_bytes(bytes: &[u8], file: Option<&Path>) -> Result<Extracted>
     Ok(extract(bytes, file, None)?)
 }
 
+/// 総頁数だけ（内蔵の解析で文書を読むだけ・本文は抽出しない）。読めない・panic なら None
+pub fn page_count(bytes: &[u8]) -> Option<usize> {
+    std::panic::catch_unwind(|| pdf_extract::Document::load_mem(bytes).ok().map(|d| d.get_pages().len())).ok().flatten()
+}
+
 fn read_file(pdf: &Path) -> Result<Vec<u8>> {
     if !pdf.exists() {
         return Err(CoreError::NotFound(format!("file {}", pdf.display())));

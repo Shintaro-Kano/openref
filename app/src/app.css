@@ -9,6 +9,8 @@
   --star: #f5a623;
   --danger: #c0392b;
   --banner: #fdecea;
+  /* OpenNote: md ページの見出しの色分け（h1〜h6・shadow root へ継承される。控えめ = 本文色寄りの青〜緑青〜藍） */
+  --wk-h1: #1957b0; --wk-h2: #1d6390; --wk-h3: #1b6e64; --wk-h4: #4b4f9e; --wk-h5: #55687b; --wk-h6: var(--dim);
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Helvetica Neue", sans-serif;
   font-size: 13px;
   color-scheme: light dark;
@@ -23,6 +25,7 @@
     --accent: #6ab0ff;
     --accent-soft: #223650;
     --banner: #4a2320;
+    --wk-h1: #8cc0ff; --wk-h2: #80c4e6; --wk-h3: #7fd0c0; --wk-h4: #b0b4f0; --wk-h5: #a9b6c3;
   }
 }
 
@@ -124,6 +127,7 @@ header {
 .tabs-page { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
 main { display: grid; grid-template-columns: 230px minmax(360px, 1fr) 380px; flex: 1; min-height: 0; }
+main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* OpenNote の右ペインを隠したとき */
 
 /* ---------- sidebar ---------- */
 .sidebar {
@@ -1009,3 +1013,9 @@ body.dragging { user-select: none; -webkit-user-select: none; cursor: grabbing; 
   display: flex; align-items: center; justify-content: center;
   font-size: 18px; color: var(--accent); font-weight: 600; pointer-events: none;
 }
+
+/* OpenNote のチャットを浮かせている間の案内（右ペイン WikiRight と PDF viewer の右バーの両方で使う = ここに置く） */
+.wk-floated { padding: 16px 12px; font-size: 12.5px; color: var(--dim); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.wk-floated p { margin: 0; }
+.wk-floated-btn { border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; background: var(--bg); font-size: 11.5px; cursor: pointer; color: var(--text); }
+.wk-floated-btn:hover { border-color: var(--accent); }

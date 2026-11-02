@@ -30,6 +30,29 @@ OpenRef 本体のソースコード（`crates/*`, `app/src/*`, `app/src-tauri/*`
   - `svelte` (5.x): MIT License — Copyright (c) 2016–2026 Rich Harris and contributors
   - `@tauri-apps/api`, `@tauri-apps/plugin-dialog` (2.x): Apache-2.0 OR MIT — Copyright (c) 2019–2026 Tauri Programme within The Commons Conservancy
 
+### 1.5 OpenRef / OpenNote の描画（Markdown・HTML の掃除）
+- **所在**: `app/` フロントエンドバンドル（`app/src/lib/wiki/render/`）
+- **パッケージ**:
+  - `markdown-it` (15.x): MIT License — Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin
+  - `markdown-it-footnote` (4.x): MIT License — Copyright (c) 2014-2015 Vitaly Puzrin, Alex Kocharin
+  - `markdown-it-task-lists` (2.x): ISC License — Copyright (c) 2016, Revin Guillen
+  - `linkify-it` (6.x): MIT License — Copyright (c) 2015 Vitaly Puzrin
+  - `mdurl` (2.x): MIT License — Copyright (c) 2015 Vitaly Puzrin, Alex Kocharin
+  - `uc.micro` (3.x): MIT License — Copyright Mathias Bynens
+  - `punycode.js` (2.x): MIT License — Copyright Mathias Bynens
+  - `entities` (8.x): BSD-2-Clause — Copyright (c) Felix Böhm
+  - `dompurify` (3.x): MPL-2.0 OR Apache-2.0（本プロジェクトは **Apache-2.0** を選択）— Copyright Dr.-Ing. Mario Heiderich, Cure53 and contributors（<https://github.com/cure53/DOMPurify>）
+- `markdown-it` の依存 `argparse` はコマンドライン用（`bin/`）で、バンドルには入りません。
+
+### 1.6 OpenRef / OpenNote のエディタ（CodeMirror 6）
+- **所在**: `app/` フロントエンドバンドル（`app/src/lib/wiki/editor/`・編集を開いたときに読む別の chunk）
+- **パッケージ**（いずれも MIT License — Copyright (C) 2018–2026 by Marijn Haverbeke <marijn@haverbeke.berlin> and others、<https://github.com/codemirror>・<https://github.com/lezer-parser>）:
+  - `@codemirror/state`, `@codemirror/view`, `@codemirror/commands`, `@codemirror/language`, `@codemirror/search`, `@codemirror/autocomplete` (6.x)
+  - `@codemirror/lang-markdown`, `@codemirror/lang-html`, `@codemirror/lang-css`, `@codemirror/lang-javascript` (6.x)
+  - `@lezer/common`, `@lezer/highlight`, `@lezer/lr`, `@lezer/markdown`, `@lezer/html`, `@lezer/css`, `@lezer/javascript` (1.x)
+  - `style-mod` (4.x), `w3c-keyname` (2.x), `crelt` (1.x), `@marijn/find-cluster-break` (1.x)
+- `@codemirror/lint` と `@codemirror/streamparser` は依存として入りますが、バンドルには入りません。
+
 ---
 
 ## 2. Rust クレート依存関係（ビルド時リンク）

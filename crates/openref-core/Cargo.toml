@@ -22,6 +22,7 @@ md5 = "0.7"
 sha2 = "0.10"
 percent-encoding = "2"
 html5ever = "0.38"
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -96,6 +96,86 @@ enum Cmd {
         #[command(subcommand)]
         action: StyleAction,
     },
+    /// OpenNote のワークスペースを読み書きする（MCP の call の wiki_* と同じ core・結果は JSON。有効化とフォルダの指定は GUI だけ）
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiAction {
+    /// 有効か・ワークスペースの root・件数
+    Status,
+    /// ページの一覧
+    List {
+        /// ワークスペース相対のパスの前方一致
+        #[arg(long)]
+        prefix: Option<String>,
+        /// md / html / media / other
+        #[arg(long)]
+        kind: Option<String>,
+        /// tag（繰り返し指定 = AND）
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(short = 'n', long)]
+        limit: Option<i64>,
+    },
+    /// 1 ファイルを読む（md / html = 本文とメタ・PDF = 抽出テキスト・画像は「<画像 N バイト・path>」の 1 行）
+    Read {
+        path: String,
+        #[arg(long)]
+        max_chars: Option<i64>,
+        /// PDF: 1 始まり
+        #[arg(long)]
+        from_page: Option<i64>,
+        /// PDF: この頁まで（含む）
+        #[arg(long)]
+        to_page: Option<i64>,
+    },
+    /// 題名 + 本文の検索（語は AND）
+    Search {
+        query: Vec<String>,
+        /// tag で絞る（繰り返し指定 = AND）
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(short = 'n', long)]
+        limit: Option<i64>,
+    },
+    /// そのページ（--path）か item（--key）を参照しているページ
+    Backlinks {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(short = 'n', long)]
+        limit: Option<i64>,
+    },
+    /// tag の一覧と件数（ページ数の多い順）
+    Tags {
+        #[arg(short = 'n', long)]
+        limit: Option<i64>,
+    },
+    /// ingest/ の素材の一覧（--dir chat-log = チャットの記録・新しい順）
+    Inbox {
+        /// ingest（既定）/ chat-log
+        #[arg(long)]
+        dir: Option<String>,
+        #[arg(short = 'n', long)]
+        limit: Option<i64>,
+    },
+    /// md / html を書く（中身は --file か標準入力）。既存の上書きは上書き前を wiki-history/ に退避して backup に返す
+    Write {
+        path: String,
+        /// 中身のファイル（省略 = 標準入力）
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// この sha256 のときだけ上書き（競合保護）
+        #[arg(long)]
+        if_sha256: Option<String>,
+    },
+    /// ワークスペースの中の移動 / 改名（移動先が既にあれば拒否・拡張子は変えられない）
+    Move { from: String, to: String },
 }
 
 #[derive(Subcommand)]
@@ -414,6 +494,84 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Cutover { action } => cmd_cutover(&db, action)?,
         Cmd::Style { action } => cmd_style(&db, action)?,
+        Cmd::Wiki { action } => cmd_wiki(&mut db, action)?,
+    }
+    Ok(())
+}
+
+/// 登録表の wiki_* を呼んで JSON を出す（MCP の call と同じ検査・同じ関数）。
+/// 予約キー `_mcp_images`（画像の base64）は端末に出さず「<画像 N バイト・path>」の 1 行にする
+fn cmd_wiki(db: &mut Db, action: WikiAction) -> anyhow::Result<()> {
+    use serde_json::{json, Map, Value};
+    let mut a = Map::new();
+    let mut put = |k: &str, v: Value| {
+        if !v.is_null() {
+            a.insert(k.to_string(), v);
+        }
+    };
+    let tags = |t: Vec<String>| if t.is_empty() { Value::Null } else { json!(t) };
+    let name = match action {
+        WikiAction::Status => "wiki_status",
+        WikiAction::List { prefix, kind, tag, limit } => {
+            put("prefix", json!(prefix));
+            put("kind", json!(kind));
+            put("tags", tags(tag));
+            put("limit", json!(limit));
+            "wiki_list"
+        }
+        WikiAction::Read { path, max_chars, from_page, to_page } => {
+            put("path", json!(path));
+            put("max_chars", json!(max_chars));
+            put("from_page", json!(from_page));
+            put("to_page", json!(to_page));
+            "wiki_read"
+        }
+        WikiAction::Search { query, tag, limit } => {
+            put("query", if query.is_empty() { Value::Null } else { json!(query.join(" ")) });
+            put("tags", tags(tag));
+            put("limit", json!(limit));
+            "wiki_search"
+        }
+        WikiAction::Backlinks { path, key, limit } => {
+            put("path", json!(path));
+            put("key", json!(key));
+            put("limit", json!(limit));
+            "wiki_backlinks"
+        }
+        WikiAction::Tags { limit } => {
+            put("limit", json!(limit));
+            "wiki_tags"
+        }
+        WikiAction::Inbox { dir, limit } => {
+            put("dir", json!(dir));
+            put("limit", json!(limit));
+            "wiki_inbox"
+        }
+        WikiAction::Write { path, file, if_sha256 } => {
+            let content = match &file {
+                Some(f) => std::fs::read_to_string(f).with_context(|| format!("{} を読めません（UTF-8 のテキスト）", f.display()))?,
+                None => std::io::read_to_string(std::io::stdin()).context("標準入力を読めません（UTF-8 のテキスト）")?,
+            };
+            put("path", json!(path));
+            put("content", json!(content));
+            put("if_sha256", json!(if_sha256));
+            "wiki_write"
+        }
+        WikiAction::Move { from, to } => {
+            put("from", json!(from));
+            put("to", json!(to));
+            "wiki_move"
+        }
+    };
+    let mut v = openref_core::commands::call(db, name, &Value::Object(a))?;
+    let images = v.as_object_mut().and_then(|o| o.remove(openref_core::wiki::commands::MCP_IMAGES));
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    for _ in images.as_ref().and_then(Value::as_array).into_iter().flatten() {
+        println!("<画像 {} バイト・{}>", v["size"], v["path"].as_str().unwrap_or_default());
+    }
+    // write の競合（if_sha256 が今のファイルと違う）は書いていない = 終了コードで知らせる
+    if v["conflict"] == true {
+        bail!("書きませんでした（ファイルが --if-sha256 の内容から変わっています。今の sha256 は上のとおり）");
     }
     Ok(())
 }

@@ -16,6 +16,7 @@
     type View,
   } from "./state.svelte";
   import { composing } from "./input";
+  import WikiSegment from "./wiki/WikiSegment.svelte";
 
   function isActive(kind: string, id?: number): boolean {
     const v = app.view as any;
@@ -138,6 +139,7 @@
   oncontextmenu={() => (app.folderMenu = null)} />
 
 <nav class="sidebar">
+  <WikiSegment />
   <div class="sep sec-head">
     <span>MY LIBRARY</span>
     <span class="head-actions">

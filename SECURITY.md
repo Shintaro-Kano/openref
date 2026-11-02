@@ -43,6 +43,8 @@ OpenRef がインターネットへ HTTP(S) リクエストを送るのは、ユ
 | **CSL Styles Repository** (GitHub `citation-style-language`) | 同梱 4 種以外の引用スタイル・言語ファイルを新規導入したとき | スタイル ID / ロケール名（取得後はローカルにキャッシュ） |
 | **配布サイト** (`openref.unitedradiology.jp`) | アプリ起動時・前回から 24 時間以上経っていたときだけ（Settings › 起動時に新版を確認 で無効化可） | 動いている版番号のみ（`dl/VERSION` の GET 1 回。User-Agent `openref/X.Y.Z`） |
 
+OpenRef / OpenNote のチャット（既定 OFF・§6 の 4）を有効にしたときの Anthropic への通信は、OpenRef ではなく利用者の Claude Code が行います。
+
 ---
 
 ## 4. インストーラ (`install.sh`) が行うこと・行わないこと
@@ -93,13 +95,24 @@ AI エージェントに蔵書操作を委譲する `openref-mcp` は、誤操�
    - さらに **SQLite Authorizer (`rusqlite::hooks::Authorization`)** を登録し、`SELECT`・読み取り専用 `PRAGMA`・関数呼び出し以外のすべての操作（`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH` 等）をコンパイル段階で拒否します。
    - 単文のみ許可（複数文は拒否）し、行数上限（既定 200・最大 2,000 行）、文字数上限（100,000 字）、実行時間上限（10 秒で `Interrupt`）を設けています。
 2. **書込コマンド実行前の自動スナップショット**:
-   - エージェントが `call` ツールで書込コマンドを初めて実行する直前に、DB 全体のオンラインバックアップを `~/Library/Application Support/OpenRef/backup/pre-agent-<日時>.sqlite` に自動作成します（最新 5 個を保持。バックアップ作成に失敗した場合は書込自体を中止します）。
+   - エージェントが `call` ツールで書込コマンドを初めて実行する直前に、DB 全体のオンラインバックアップを `~/Library/Application Support/OpenRef/backup/pre-agent-<日時>.sqlite` に自動作成します（最新 5 個を保持。バックアップ作成に失敗した場合は書込自体を中止します）。OpenRef / OpenNote のチャット（下の 4・環境変数 `OPENREF_MCP_CHAT=1` で起動）と許可一覧（`OPENREF_MCP_ALLOW`）で起動したセッションでは `pre-chat-<日時>.sqlite` に作り、こちらも最新 5 個を別に保持します（`pre-agent-` を押し出しません）。
 3. **安全な復元手順（`.restore`）**:
    - 万一エージェントの書込を巻き戻したい場合は、WAL（`-wal`）との不整合を防ぐため `cp` / `mv` ではなく SQLite の `.restore` コマンドを使用します:
      ```bash
      sqlite3 "$HOME/Library/Application Support/OpenRef/openref.sqlite" \
        ".restore '$HOME/Library/Application Support/OpenRef/backup/pre-agent-<日時>.sqlite'"
      ```
+     チャットや許可一覧で起動したセッションの書込を巻き戻すときは `pre-chat-<日時>.sqlite` を同じ手順で指定します。
+4. **OpenRef / OpenNote のチャット（既定 OFF）**:
+   - 利用者が自分でインストールした Claude Code CLI を子プロセスとして起動します（shell を通さない）。ログインは利用者の Claude Code のもので、チャットの [ログイン] は Terminal.app に `claude auth login` を開くだけ・[ログアウト] は `claude auth logout` を実行します。OpenRef は認証情報・API キーを保持しません。発言と Claude が読んだ内容（ワークスペースのページ・添付・蔵書の情報・Claude が読みに行ったその他のファイル）は Claude Code から Anthropic へ送られ、会話記録は Claude Code が `~/.claude/projects/` に保存します（チャットを無効にしても残ります）。
+   - **ふるまいは Claude Code をターミナルで普通に使うときと同じです**: 組み込みの道具（Read / Edit / Write / Bash / Web…）を確認なしで使い（`--permission-mode bypassPermissions`）、利用者の Claude Code の設定（`~/.claude/` の settings・hooks・plugins・memory）と `CLAUDE.md`（ワークスペースの root と、その親・利用者のもの）を読みます。ワークスペースの中に限る制限はありません。MCP だけは `--strict-mcp-config` で `openref-mcp`（アプリと同じ DB・蔵書と OpenNote の全コマンド）に限ります。ページや PDF の中の指示の文に従わないことは ワークスペースの `CLAUDE.md` の規則に委ねます（無ければ OpenRef が既定の文を置き、利用者が編集します）。
+   - `openref-mcp` の `call` で書くときは、初回の書込の前に DB の写し（`backup/pre-chat-<日時>.sqlite`・上の 2）を作ります。`wiki_write` / `wiki_move` で書いたページは上書き前の内容が `wiki-history/` に退避され、チャットの [元に戻す] で戻せます（その後に利用者が編集したファイル・Edit / Write / Bash で直接変えたファイルは戻しません）。
+   - **会話のログ（既定 ON・Settings › OpenNote › チャットのログを chat-log/ に残す で OFF）**: 発言・Claude の応答・使った道具の要点・変えたファイルの一覧を ワークスペースの `chat-log/<日時> <最初の発言>.md` に追記します（発言に添えた選択範囲の本文も含みます）。ワークスペースの中なので OpenNote の索引に入り、以後のチャットで Claude が読めます。原本は Claude Code の `~/.claude/projects/` で、OFF にしても既に書いたファイルは残ります（不要なら削除してください）。
+   - 内蔵の PDF ビューアの [チャット] タブは同じ会話で、開いている文献の key と題名・選択した本文を発言に添えます。
+5. **OpenRef / OpenNote の参照フォルダと URL の窓（任意）**:
+   - 参照フォルダ（右ペインの home で追加・読み取り専用）の下の pdf / html / 画像 / 動画 / 音声は、ワークスペースと同じく asset protocol の配信範囲に加えて内蔵の表示で開きます（md と他の種類は OS の既定アプリ）。配信範囲の追加は OpenRef の再起動まで取り消せません（外した直後は内蔵で開くのだけ止まります）。索引・検索・MCP・編集の範囲は広がりません。
+   - 「リンク（URL）を OpenRef の窓で開く」（既定 OFF）を ON にすると、OpenNote のページの http(s) リンクを OpenRef の別窓（WKWebView）で開きます。この窓には OpenRef の API（Tauri の capabilities）を与えず、http(s) 以外への遷移とダウンロードを拒否します。ワークスペースと参照フォルダを配信する `asset://` は OpenRef 自身が配信し、要求元がメインの窓でなければ 403 を返します（別窓に読み込んだ外部ページからは読めません）。Cookie はブラウザと別で、ページの内容は通常のブラウザと同じくそのサイトへ送られます。
+   - この窓のページから**カメラ / マイクは使えません**: 利用者の Mac で実測したところ、ページの `navigator.mediaDevices` は未定義で `getUserMedia` は呼べず、OS の許可ダイアログも出ません（OpenRef はカメラ / マイクの利用目的を Info.plist に宣言していません）。将来この窓でカメラ / マイクを使えるようにする予定はなく、WebView 側で明示的に拒否する実装（Tauri 2.12 以降の許可ハンドラ）は公開後の課題として記録しています。
 
 ---
 

@@ -68,7 +68,19 @@ curl -fsSL https://openref.unitedradiology.jp/uninstall.sh | bash
 |---|---|
 | `schema` | DB スキーマ（DDL）・利用規約・全コマンド一覧・DB 統計を返す |
 | `sql` | 読み取り専用 SQL（`PRAGMA query_only` + SQLite Authorizer により `SELECT` 系のみ許可・10 秒上限） |
-| `call` | GUI と同一の書込・読取コマンド群を実行（初回書込前に `backup/pre-agent-*.sqlite` へ自動スナップショットを作成） |
+| `call` | GUI と同一の書込・読取コマンド群を実行（初回書込前に `backup/pre-agent-*.sqlite` へ自動スナップショットを作成。OpenRef / OpenNote のチャットと、許可一覧（`OPENREF_MCP_ALLOW`）で起動したセッションは `backup/pre-chat-*.sqlite`） |
+
+OpenRef / OpenNote（OpenRef のページ機能。Settings › OpenNote で有効にしたとき）のワークスペース（ページを置くフォルダ）も `call` の `wiki_*` で読み書きできます（`wiki_write` の上書きは上書き前を `wiki-history/` に退避）。環境変数 `OPENREF_MCP_ALLOW`（例 `read,wiki`）で起動すると、使えるコマンドをその一覧に絞れます。
+
+### OpenRef / OpenNote のチャット（任意・既定 OFF）
+
+Settings › OpenNote › チャット を有効にすると、OpenNote の右ペインと内蔵の PDF ビューアの [チャット] タブで Claude と対話しながらワークスペースを編集できます（PDF のタブでは開いている文献と選択した本文が発言に添えられます）。
+
+- **利用者が自分でインストールした Claude Code CLI（`claude` コマンド）** を子プロセスとして起動します。ログインはご自身の Claude Code のものを使います（チャットの [ログイン] はターミナルに `claude auth login` を開くだけ・[ログアウト] は `claude auth logout`）。OpenRef は認証情報・API キーを保持しません。利用量はご自身の Claude のプランに計上されます（Claude Code に API キーや Bedrock / Vertex を設定している場合はその課金）。モデルはチャットの欄で選べます（`--model`）。
+- 発言と、Claude が読んだページ・添付ファイル・蔵書の情報は、Claude Code を通じて **Anthropic に送信されます**。会話記録は Claude Code が `~/.claude/projects/` に保存します（チャットを無効にしても残ります。OpenRef が持つのは会話の id だけです）。
+- Claude のふるまいは **Claude Code をターミナルで普通に使うときと同じ**です: 組み込みの道具（Read / Edit / Write / Bash / Web…）を確認なしで使え（`--permission-mode bypassPermissions`）、ご自身の Claude Code の設定（`~/.claude/`）と ワークスペースの `CLAUDE.md` を読みます。MCP は `openref-mcp`（蔵書と OpenNote の全コマンド）だけを読み込みます。ふるまいの規則は ワークスペースの **`CLAUDE.md`** に書きます（無ければ初回に既定の文を置きます。自由に編集でき、OpenRef は上書きしません）。`wiki_write` / `wiki_move` で書いたページは上書き前の内容が `wiki-history/` に退避され、チャットの [元に戻す] で 1 件ずつ戻せます（Edit / Write / Bash で直接変えたファイルは追跡しません）。
+- **会話のログ**（既定 ON・Settings › OpenNote › チャットのログを chat-log/ に残す で OFF）: 発言・応答・使った道具・変えたファイルの一覧を ワークスペースの `chat-log/<日時> <最初の発言>.md` に追記します。ワークスペースの中なので検索と以後のチャットから参照できます（原本は Claude Code の `~/.claude/projects/`）。
+- **参照フォルダと URL**: OpenNote のページからワークスペースの外のファイルを指すリンクは、右ペインの home の「参照フォルダ」に親フォルダを追加すると、その下の PDF / html / 画像を内蔵の表示で開けます（読み取り専用。追加した範囲は再起動まで外せません）。http(s) のリンクは既定で OS のブラウザに開きます。Settings › OpenNote › リンク（URL）を OpenRef の窓で開く で OpenRef の別窓に切り替えられます（Cookie はブラウザと別なので、ログインが要るサイトは既定のままを推奨）。
 
 ---
 
@@ -87,6 +99,7 @@ openref show <KEY>                                       # --json で CSL-JSON
 openref collections                                      # フォルダツリー
 openref fetch-pdf --missing                              # OA 論文の PDF を自動取得（PMC AWS Open Data 等）
 openref info
+openref wiki status                                      # OpenRef / OpenNote のワークスペース（read / search / write / move 等も）
 
 # Paperpile JSON エクスポートからの一括インポート（同じ入力から再実行可能）
 openref import paperpile "/path/to/Paperpile-Export.json" [--dry-run]
@@ -148,7 +161,7 @@ CLI の候補確定は `--decisions /path/choices.json` を使います。まず
 
 ## プライバシーと外部通信先
 
-OpenRef はテレメトリ・アナリティクスを一切行いません。また、LLM の API キーをアプリ内に保持しません。バックグラウンドの通信は、アプリ起動時の新版確認（配布サイトの版番号ファイルを 24 時間に 1 回まで取得・識別子なし・Settings で無効化可）だけで、それ以外の外部への HTTP(S) 通信は以下の機能を実行した際に限定されます（詳細は [SECURITY.md](SECURITY.md)）:
+OpenRef はテレメトリ・アナリティクスを一切行いません。また、LLM の API キーをアプリ内に保持しません（OpenRef / OpenNote のチャットを有効にしたときの送信は、利用者の Claude Code が Anthropic へ行います = 上の「OpenRef / OpenNote のチャット」）。バックグラウンドの通信は、アプリ起動時の新版確認（配布サイトの版番号ファイルを 24 時間に 1 回まで取得・識別子なし・Settings で無効化可）だけで、それ以外の外部への HTTP(S) 通信は以下の機能を実行した際に限定されます（詳細は [SECURITY.md](SECURITY.md)）:
 
 - **DOI / PubMed 書誌解決**: `eutils.ncbi.nlm.nih.gov`, `api.crossref.org`, `doi.org`（医書.jp の DOI がまだ doi.org で解決できないときだけ `webview.isho.jp`）
 - **OA PDF 自動取得**: `pmc-oa-opendata.s3.amazonaws.com`（PMC AWS Open Data）、出版社のサイト（DOI の着地ページ・Crossref が示す PDF の URL・ページが宣言する `citation_pdf_url` へ通常の GET。Cookie なし・プライベート IP は拒否）、および環境変数 `OPENREF_EMAIL` をユーザーが明示設定した場合のみ `api.unpaywall.org`（Unpaywall・opt-in）
@@ -166,6 +179,7 @@ OpenRef はテレメトリ・アナリティクスを一切行いません。ま
 - **終了直前（⌘Q の 300ms 以内）のタブ操作**: アプリ終了直前の 300ms 以内に行ったタブ開閉はデバウンスにより次回起動時のタブ復元に含まれない場合があります。
 - **Chrome 拡張・Word アドインの導入方式**: Chrome 拡張は `chrome://extensions` からのパッケージ化されていない拡張機能の読み込み（load unpacked）、Word 連携は Word の Startup フォルダに置くテンプレート（`OpenRef.dotm`）方式です。
 - **Unpaywall 経路**: デフォルトでは無効（opt-in）です。利用する場合はユーザー自身のメールアドレスを環境変数 `OPENREF_EMAIL` に設定してください。
+- **OpenNote の「リンク（URL）を OpenRef の窓で開く」**: 開いたページからカメラ / マイクは使えません（`navigator.mediaDevices` が無く `getUserMedia` は呼べません）。ログインが要るサイトは Cookie がブラウザと別なので、既定（OS のブラウザで開く）のままを推奨します。
 - **`openref sync`（Google Drive 等との差分スキャン）**: macOS の「システム設定 > プライバシーとセキュリティ > ファイルとフォルダ」でターミナルへのアクセス許可が必要です。
 
 ---

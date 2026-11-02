@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 /// エージェント（MCP）の書込の前のスナップショット
 pub const AGENT_PREFIX: &str = "pre-agent-";
+/// OpenRef のチャット（MCP を env OPENREF_MCP_CHAT=1 で起動したセッション）と許可一覧 OPENREF_MCP_ALLOW のセッションの書込の前のスナップショット。
+/// 接頭辞ごとに新しい AGENT_KEEP 個を残す = チャットの起こし直しが Claude Code / Desktop の `pre-agent-` を押し出さない
+pub const CHAT_PREFIX: &str = "pre-chat-";
 /// 残す個数（新しい順）
 pub const AGENT_KEEP: usize = 5;
 /// ライブラリ移行の開始前のスナップショット（実行との対応は import_runs.backup_path が持つ）

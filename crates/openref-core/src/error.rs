@@ -23,8 +23,18 @@ pub enum CoreError {
     /// データディレクトリの解決・移行（datadir.rs）。前置きを付けずそのまま表示する
     #[error("{0}")]
     DataDir(String),
+    /// OpenNote の状態（無効・未設定・索引の作り直し中）など。前置きを付けずそのまま表示する（msg）。
+    /// code = 機械可読の印（`crate::wiki::codes`）。画面は code で分岐し、msg（人と agent が読む文）を照合しない
+    #[error("{msg}")]
+    Wiki { code: &'static str, msg: String },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl CoreError {
+    pub fn wiki(code: &'static str, msg: impl Into<String>) -> Self {
+        CoreError::Wiki { code, msg: msg.into() }
+    }
 }

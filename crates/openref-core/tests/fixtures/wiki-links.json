@@ -1,0 +1,63 @@
+{
+  "about": "OpenRef for Wiki のリンク抽出・解決の規則。cargo test（crates/openref-core/tests/wiki_links_fixture.rs）と描画側の node test が同じこの 1 枚を読む。links は出現順。kind = wiki（[[…]]）/ embed（![[…]]）/ md（md の相対）/ html（html の相対）/ openref / file / external。target は書かれたまま（wiki / embed は alias を除いた name#heading）。字下げ 4 の code block は CommonMark の近似 = 段落の続きでもリストの中でもない字下げ 4 以上の行（tab は 4 列）を code とみなす。完全一致しない境界: リストの終わり（空行の後の字下げ 0 の行か見出しで終わるとみなす）・引用（>）の中の字下げ・表や HTML ブロックの直後の字下げ・インラインコードの行またぎ・括弧の入れ子を含む dest が行末まで閉じない行の後続のリンク",
+  "md": [
+    {"name": "wikilink の基本・alias・見出し", "md": "[[a]] [[b|別名]] [[c#見出し]] [[d#h|x]]", "links": [{"kind": "wiki", "target": "a"}, {"kind": "wiki", "target": "b"}, {"kind": "wiki", "target": "c#見出し"}, {"kind": "wiki", "target": "d#h"}]},
+    {"name": "埋め込み（サイズ指定も alias と同じく除く）", "md": "![[img.jpg]] ![[notion-cases/attachments/x/case3_08.jpg|560]] ![[page]]", "links": [{"kind": "embed", "target": "img.jpg"}, {"kind": "embed", "target": "notion-cases/attachments/x/case3_08.jpg"}, {"kind": "embed", "target": "page"}]},
+    {"name": "表の中の \\| は | と同じ", "md": "| [[categories/general\\|general]] | x |", "links": [{"kind": "wiki", "target": "categories/general"}]},
+    {"name": "同じページの見出し", "md": "[[#参照資料|REF]]", "links": [{"kind": "wiki", "target": "#参照資料"}]},
+    {"name": "空の [[]] と閉じない [[ は無視", "md": "[[]] と [[x]] と [[閉じない", "links": [{"kind": "wiki", "target": "x"}]},
+    {"name": "md の相対リンク・画像・title 付き・<…> 付き", "md": "[t](sub/a.md) ![alt](img/b.png \"title\") [s](<with space.md>) [p](a%20b.md#h)", "links": [{"kind": "md", "target": "sub/a.md"}, {"kind": "md", "target": "img/b.png"}, {"kind": "md", "target": "with space.md"}, {"kind": "md", "target": "a%20b.md#h"}]},
+    {"name": "openref・file・外部", "md": "[論文](openref://open?key=ABCD2345&page=3) [pdf](file:///Users/x/a%20b.pdf) [web](https://example.org/a_(b)) [m](mailto:a@example.org)", "links": [{"kind": "openref", "target": "openref://open?key=ABCD2345&page=3"}, {"kind": "file", "target": "file:///Users/x/a%20b.pdf"}, {"kind": "external", "target": "https://example.org/a_(b)"}, {"kind": "external", "target": "mailto:a@example.org"}]},
+    {"name": "autolink と参照の定義（使う側 [x][r] は数えない）", "md": "<https://example.org> と [x][r]\n\n[r]: ../up.md \"t\"\n[^1]: 脚注は除く", "links": [{"kind": "external", "target": "https://example.org"}, {"kind": "md", "target": "../up.md"}]},
+    {"name": "同じページの #… と空は無視", "md": "[top](#見出し) [empty]()", "links": []},
+    {"name": "入れ子の画像リンクは外 → 内", "md": "[![cap](thumb.png)](big.png)", "links": [{"kind": "md", "target": "big.png"}, {"kind": "md", "target": "thumb.png"}]},
+    {"name": "インラインコードの中は抽出しない（同じ長さの backtick の対）", "md": "`[[no]]` ``a ` [[no2]]`` [[yes]] `[x](no.md)`", "links": [{"kind": "wiki", "target": "yes"}]},
+    {"name": "fence の中は抽出しない（``` と ~~~・長い fence は短い閉じで閉じない）", "md": "```\n[[no]]\n```\n[[a]]\n~~~md\n[x](no.md)\n~~~\n````\n```\n[[no2]]\n````\n[[b]]", "links": [{"kind": "wiki", "target": "a"}, {"kind": "wiki", "target": "b"}]},
+    {"name": "引用・リストの中の fence", "md": "> ```\n> [[no]]\n> ```\n- ```\n  [[no2]]\n  ```\n[[yes]]", "links": [{"kind": "wiki", "target": "yes"}]},
+    {"name": "HTML コメントの中は抽出しない（複数行も）", "md": "<!-- [[no]] --> [[a]] <!--\n[[no2]]\n--> [[b]]", "links": [{"kind": "wiki", "target": "a"}, {"kind": "wiki", "target": "b"}]},
+    {"name": "frontmatter は文字列の値の [[…]] だけ（配列・入れ子も・先に数える）。md リンクは取らない", "md": "---\nrelated: [\"[[r1]]\", \"[[r2|x]]\"]\nnote: \"see [[r3]] and [x](no.md)\"\nmeta:\n  up: \"[[r4]]\"\n---\n[[yes]]", "links": [{"kind": "wiki", "target": "r1"}, {"kind": "wiki", "target": "r2"}, {"kind": "wiki", "target": "r3"}, {"kind": "wiki", "target": "r4"}, {"kind": "wiki", "target": "yes"}]},
+    {"name": "callout・HTML の中の wikilink", "md": "> [!info] [[a]]\n<details><summary>[[b]]</summary></details>", "links": [{"kind": "wiki", "target": "a"}, {"kind": "wiki", "target": "b"}]},
+    {"name": "字下げ 4 の code block（空行の後・段落の続きでもリストの中でもない）は抽出しない", "md": "段落\n\n    [[no]]\n    [x](no.md)\n[[yes]]", "links": [{"kind": "wiki", "target": "yes"}]},
+    {"name": "リストの中の字下げ 4 の続きと段落の続きはリンクとして残す", "md": "- 項目\n\n    [[kept]]\n\n段落\n    [[kept2]]", "links": [{"kind": "wiki", "target": "kept"}, {"kind": "wiki", "target": "kept2"}]},
+    {"name": "エスケープした [ はリンクにしない", "md": "\\[x](no.md) [y](yes.md)", "links": [{"kind": "md", "target": "yes.md"}]}
+  ],
+  "html": [
+    {"name": "title・meta・リンク", "html": "<html><head><title> 題 名 </title><meta name=\"wiki:tags\" content=\"a, #b ,\"><meta name=\"wiki:items\" content=\"KEY22222, KEY33333\"></head><body><a href=\"page.md\">p</a><img src=\"img/x.png\"><video src=\"v.mp4\"><source src=\"v.webm\"></video><audio src=\"s.mp3\"></audio><a href=\"openref://open?key=KEY44444\">r</a><a href=\"https://example.org\">e</a><a href=\"#top\">t</a></body></html>", "title": "題 名", "tags": ["a", "b"], "items": ["KEY22222", "KEY33333", "KEY44444"], "links": [{"kind": "html", "target": "page.md"}, {"kind": "html", "target": "img/x.png"}, {"kind": "html", "target": "v.mp4"}, {"kind": "html", "target": "v.webm"}, {"kind": "html", "target": "s.mp3"}, {"kind": "openref", "target": "openref://open?key=KEY44444"}, {"kind": "external", "target": "https://example.org"}]},
+    {"name": "script・style・template の中は見ない", "html": "<script>var s = '<a href=\"no.md\">';</script><style>a{background:url(no.png)}</style><template><a href=\"no2.md\"></a></template><a href=\"yes.md\">y</a>", "title": null, "tags": [], "items": [], "links": [{"kind": "html", "target": "yes.md"}]}
+  ],
+  "resolve": {
+    "about": "Obsidian の規則: basename 一致（拡張子省略可 = .md を補う・大小無視・NFC）。同名が複数なら ambiguous = true（同じフォルダの物・無ければ最短のパスを選ぶ）。/ を含む指定は vault 相対 → 書いたファイルからの相対 → 末尾一致。md の相対リンクは書いたファイルからの相対 → wikilink と同じ規則。html の相対は相対だけ。file:// は vault の中なら解決",
+    "root": "/vault",
+    "files": ["index.md", "notes/Alpha.md", "notes/sub/beta.md", "other/beta.md", "other/gamma.md", "img/pic.JPG", "notes/dup.md", "misc/dup.md", "deep/a/dup.md", "page.html", "café.md", "x.md", "x.html"],
+    "cases": [
+      {"src": "index.md", "kind": "wiki", "target": "alpha", "path": "notes/Alpha.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "Alpha.md", "path": "notes/Alpha.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "ALPHA#h", "path": "notes/Alpha.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "#h", "path": "index.md", "ambiguous": false},
+      {"src": "index.md", "kind": "embed", "target": "pic.jpg", "path": "img/pic.JPG", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "beta", "path": "other/beta.md", "ambiguous": true},
+      {"src": "notes/sub/x.md", "kind": "wiki", "target": "beta", "path": "notes/sub/beta.md", "ambiguous": true},
+      {"src": "index.md", "kind": "wiki", "target": "sub/beta", "path": "notes/sub/beta.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "notes/sub/beta", "path": "notes/sub/beta.md", "ambiguous": false},
+      {"src": "other/gamma.md", "kind": "wiki", "target": "../notes/Alpha", "path": "notes/Alpha.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "dup", "path": "misc/dup.md", "ambiguous": true},
+      {"src": "index.md", "kind": "wiki", "target": "a/dup", "path": "deep/a/dup.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "page", "path": "page.html", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "x", "path": "x.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "x.html", "path": "x.html", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "café", "path": "café.md", "ambiguous": false},
+      {"src": "index.md", "kind": "wiki", "target": "missing", "path": null, "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "sub/beta.md", "path": "notes/sub/beta.md", "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "../other/gamma.md#h", "path": "other/gamma.md", "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "/img/pic.JPG", "path": "img/pic.JPG", "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "gamma.md", "path": "other/gamma.md", "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "caf%C3%A9.md", "path": "café.md", "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "md", "target": "../../outside.md", "path": null, "ambiguous": false},
+      {"src": "notes/Alpha.md", "kind": "html", "target": "gamma.md", "path": null, "ambiguous": false},
+      {"src": "page.html", "kind": "html", "target": "notes/Alpha.md", "path": "notes/Alpha.md", "ambiguous": false},
+      {"src": "index.md", "kind": "file", "target": "file:///vault/other/gamma.md", "path": "other/gamma.md", "ambiguous": false},
+      {"src": "index.md", "kind": "file", "target": "file:///elsewhere/a.pdf", "path": null, "ambiguous": false},
+      {"src": "index.md", "kind": "external", "target": "https://example.org", "path": null, "ambiguous": false}
+    ]
+  }
+}

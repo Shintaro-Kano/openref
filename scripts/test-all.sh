@@ -33,6 +33,19 @@ run "sort" node app/src/lib/sort.test.mjs
 run "folders" node app/src/lib/folders.test.mjs
 # 参照エディタの CSL ⇄ フォーム変換(cslForm.ts)
 run "editor csl" node app/src/lib/cslForm.test.mjs
+# OpenNote の描画: DOMPurify の許可リストと URL 規則・<style> の掃除・asset URL・表の分割(jsdom)・作者の data-wk-* が遷移の印にならない・contain の文字列 / リンク抽出の fixture が core と一致
+run "wiki render" node app/src/lib/wiki/render.test.mjs
+run "wiki links" node app/src/lib/wiki/links.test.mjs
+# 実部品(Svelte 5 + jsdom)の 5 本は土台 app/src/lib/wiki/test-harness.mjs(loader・jsdom の global 化・Tauri の偽物)を共有。MediaView: page の差し替えで確かめていない src の PDF iframe を作らない
+run "wiki mediaview" node app/src/lib/wiki/mediaview.test.mjs
+# OpenNote の編集(実部品 + 実 CodeMirror + jsdom・invoke は差し替え): 自動保存の debounce・conflict の分岐・外部の書換え・caret への挿入・保存に失敗したまま閉じない・PICK_EXT = core の media_kind
+run "wiki edit" node app/src/lib/wiki/edit.test.mjs
+# OpenNote のチャット(実部品 + jsdom・invoke と event "wiki-chat" は差し替え): stream-json の reducer・送信と文脈・変更の一覧と元に戻す・診断と異常終了・OFF でタブなし
+run "wiki chat" node app/src/lib/wiki/chat.test.mjs
+# IME ガード(実部品 + jsdom): かなの確定 Enter・取消 Esc(isComposing / keyCode 229)をページ内検索・検索欄・window の Esc・モーダルが拾わない
+run "wiki ime" node app/src/lib/wiki/ime.test.mjs
+# エラーの契約(実部品 wiki.svelte.ts + jsdom): wiki_run の {"code","message"} を ipc.ts が解き、画面は code(rebuilding / bad_query)で分岐・欄と toast は message
+run "wiki ipc" node app/src/lib/wiki/ipc.test.mjs
 # Word: citeproc 実整形(同梱スタイル・型・誌名スタイル)・OpenRef.dotm の整形とダイアログ・dotm の生成器
 run "word cite" node word/test-cite.cjs
 run "word types" node word/test-types.cjs

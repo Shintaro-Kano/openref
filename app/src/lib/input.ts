@@ -1,8 +1,8 @@
 /* 入力欄の共通処理（IME の判定・Enter・開いた欄へのフォーカス）。モーダル・ピッカー・Manage の表の入力欄で共用 */
 
 /** IME の変換中（確定の Enter・取消の Esc・候補を選ぶ ↑↓ を含む）。WebKit は確定の Enter を compositionend の後に
-    isComposing=false・keyCode=229 で送る = word/cite-dialog.js と同じ判定 */
-export const composing = (e: KeyboardEvent) => e.isComposing || e.keyCode === 229;
+    isComposing=false・keyCode=229 で送る = word/cite-dialog.js と同じ判定。InputEvent（oninput）は keyCode を持たない = isComposing だけ */
+export const composing = (e: KeyboardEvent | InputEvent) => e.isComposing || (e as KeyboardEvent).keyCode === 229;
 
 /** Enter（IME の確定を除く）で fn を呼ぶ */
 export function onEnter(e: KeyboardEvent, fn: () => unknown) {
