@@ -4,8 +4,8 @@
 
 import { invoke as tauriInvoke, type InvokeArgs } from "@tauri-apps/api/core";
 
-/** core の wiki::codes のうち画面が分岐に使う物 */
-export const WIKI_CODES = { rebuilding: "rebuilding", badQuery: "bad_query" } as const;
+/** core の wiki::codes のうち画面が分岐に使う物。unknown_root = args.root が履歴（wiki_workspaces）に無い */
+export const WIKI_CODES = { rebuilding: "rebuilding", badQuery: "bad_query", unknownRoot: "unknown_root" } as const;
 
 export class WikiError extends Error {
   code: string;

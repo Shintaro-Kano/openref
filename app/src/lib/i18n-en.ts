@@ -835,7 +835,19 @@ export const en: Record<string, string> = {
   "この文献を添えない": "Don't attach this reference",
   // ワークスペース名のメニュー
   "ホーム（参照フォルダ・ページ情報）": "Home (reference folders, page info)",
-  "OpenNote のフォルダを選び直す…": "Change the OpenNote folder…",
+  "最近のワークスペース": "Recent workspaces",
+  "別のフォルダを選ぶ…": "Choose another folder…",
+  // 右ペインのホームのワークスペースの節
+  "ワークスペース": "Workspaces",
+  "このワークスペースを履歴から外す": "Remove this workspace from the history",
+  // タブごとのワークスペース
+  "この会話は {name} のワークスペースのものです。ここで送ると新しい会話になります": "This conversation belongs to the {name} workspace. Sending here starts a new conversation",
+  "履歴に無いワークスペースのタブを {name} のホームに戻しました": "Tabs of workspaces no longer in the history were returned to the {name} home",
+  "ワークスペースを切り替えられません": "Could not switch the workspace",
+  "⚠ ワークスペースを切り替えられません": "⚠ Could not switch the workspace",
+  "編集中のページを離れたので、残りのファイルを取り込みませんでした": "You left the page being edited, so the remaining files were not imported",
+  "編集中のページを離れたので、取り込んだファイルを本文に入れませんでした": "You left the page being edited, so the imported files were not inserted into it",
+  "見つかりません": "Not found",
   "参照フォルダ（読み取り専用）を追加…": "Add a read-only reference folder…",
   "チャットを浮かせる（アプリの窓の中で動かせます）": "Float the chat (movable inside the app window)",
   "掴んで移動・右下の角で大きさ": "Drag to move · resize at the bottom-right corner",

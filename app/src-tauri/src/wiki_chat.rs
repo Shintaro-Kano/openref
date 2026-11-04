@@ -518,7 +518,8 @@ fn mcp_candidates_in(
     v
 }
 
-/// チャットに使える版か: `--schema` の出力に wiki_write があり、OPENREF_MCP_CHAT=1 で写しが `pre-chat-` になる版。`--schema` も DB を
+/// チャットに使える版か: `--schema` の出力に wiki_write があり（引数 root = OPENREF_WIKI_ROOT で子の root に固定できる版）、
+/// OPENREF_MCP_CHAT=1 で写しが `pre-chat-` になる版。`--schema` も DB を
 /// 開くので、アプリと同じ DB を OPENREF_DB で渡す（渡さないと既定 = 本番の DB を開く）。成功だけを (パス, mtime) ごとに覚える（失敗・タイムアウトは次の status で確かめ直す）
 fn mcp_usable(p: &Path, db: &Path) -> bool {
     static OK: Mutex<Vec<(PathBuf, std::time::SystemTime)>> = Mutex::new(Vec::new());
@@ -546,9 +547,18 @@ fn mcp_usable(p: &Path, db: &Path) -> bool {
     ok
 }
 
-/// `pre-chat-<日時>.sqlite` のパス（スナップショットの行 = 接頭辞が env で変わる）があれば OPENREF_MCP_CHAT を知る版（戻し方の定型文は版を問わず pre-chat- を含むので見ない）
+/// `pre-chat-<日時>.sqlite` のパス（スナップショットの行 = 接頭辞が env で変わる）があれば OPENREF_MCP_CHAT を知る版（戻し方の定型文は版を問わず pre-chat- を含むので見ない）。
+/// コマンド一覧の `wiki_write` の引数の行に `root` があれば OPENREF_WIKI_ROOT を知る版（無い版の子はタブの行き来で前面のワークスペースへ書く）
 fn schema_is_chat_ready(code: Option<i32>, out: &str) -> bool {
-    code == Some(0) && out.contains("`wiki_write`") && out.contains("/pre-chat-<日時>.sqlite")
+    code == Some(0) && wiki_write_takes_root(out) && out.contains("/pre-chat-<日時>.sqlite")
+}
+
+/// `--schema` の §3（コマンド一覧 = 1 コマンドが「- `名前`（読み / 書込）— 説明」の行と「  - 引数: …」の行）の wiki_write の引数に `root` がある
+fn wiki_write_takes_root(out: &str) -> bool {
+    out.split("\n- `wiki_write`（")
+        .nth(1)
+        .and_then(|s| s.lines().nth(1))
+        .is_some_and(|l| l.trim_start().starts_with("- 引数:") && l.contains("`root` "))
 }
 
 /// 使う openref-mcp（候補の順に、実行でき wiki_write を持つ最初のもの）
@@ -578,13 +588,15 @@ pub struct Launch {
 
 /// claude の引数（shell を通さない・可変長のフラグは `--flag=値` の 1 引数）。resume = 続きの会話（`--resume`）・でなければ `--session-id`。
 /// ふるまいは Claude Code を普通に使うときと同じ（全部の道具・確認なし = bypassPermissions・user / project の設定と CLAUDE.md を読む）。
-/// MCP だけは `--strict-mcp-config` でこの openref-mcp（アプリと同じ DB・OPENREF_MCP_CHAT=1 = DB の写しは `pre-chat-`）に限る（user の登録の openref と二重にしない）
+/// MCP だけは `--strict-mcp-config` でこの openref-mcp（アプリと同じ DB・OPENREF_MCP_CHAT=1 = DB の写しは `pre-chat-`・
+/// OPENREF_WIKI_ROOT = 子の root = root を省いた wiki_* と許可一覧の path の検査をこの root に固定 = 「始めた root に縛る」）に限る
+/// （user の登録の openref と二重にしない）
 pub fn args(l: &Launch, session_id: &str, resume: bool) -> Vec<String> {
     let mcp = json!({"mcpServers": {"openref": {
         "type": "stdio",
         "command": l.mcp.to_string_lossy(),
         "args": [],
-        "env": {"OPENREF_DB": l.db.to_string_lossy(), "OPENREF_MCP_CHAT": "1"},
+        "env": {"OPENREF_DB": l.db.to_string_lossy(), "OPENREF_MCP_CHAT": "1", "OPENREF_WIKI_ROOT": l.root.to_string_lossy()},
     }}});
     let mut a: Vec<String> = [
         "-p",
@@ -1969,9 +1981,24 @@ impl Chat {
         self.send_with(text, path, selection, None, en)
     }
 
-    /// send + item（PDF のタブで開いている文献 (key, 題名)）
+    /// send + item（PDF のタブで開いている文献 (key, 題名)）。root の照合なし（画面の command は send_to）
+    #[cfg(test)]
     pub fn send_with(
         &self,
+        text: &str,
+        path: Option<&str>,
+        selection: Option<&str>,
+        item: Option<(&str, &str)>,
+        en: bool,
+    ) -> Result<u64, String> {
+        self.send_to(None, text, path, selection, item, en)
+    }
+
+    /// send_with + root（画面の前面のタブの root）: Some なら子の root と同じときだけ送る（違えば Err = 送らない。
+    /// 画面は先に止めて前面の root で起こし直す）。照合は Inner の lock の中 = 照合と書込の間に子が替わらない
+    pub fn send_to(
+        &self,
+        root: Option<&Path>,
         text: &str,
         path: Option<&str>,
         selection: Option<&str>,
@@ -1986,6 +2013,13 @@ impl Chat {
                 "The chat is not running (open it again)",
             ));
         };
+        if root.is_some_and(|r| st.root.as_deref() != Some(r)) {
+            return Err(tr(
+                en,
+                "この会話は別のワークスペースのものです（送っていません）",
+                "This conversation belongs to another workspace (not sent)",
+            ));
+        }
         match st.state {
             State::Idle => {}
             State::Busy => {
@@ -2427,6 +2461,10 @@ mod tests {
             mcp["mcpServers"]["openref"]["env"]["OPENREF_MCP_CHAT"], "1",
             "DB の写しは pre-chat-"
         );
+        assert_eq!(
+            mcp["mcpServers"]["openref"]["env"]["OPENREF_WIKI_ROOT"], "/v",
+            "子の root に固定（タブの行き来で設定 wiki_root が動いても子は始めた root に書く）"
+        );
         // Claude Code を普通に使うときと同じ: 道具・設定・CLAUDE.md を絞らない・確認なし
         assert!(a.contains(&"--permission-mode=bypassPermissions".to_string()));
         assert!(a.contains(&"--strict-mcp-config".to_string()));
@@ -2485,18 +2523,29 @@ mod tests {
 
     #[test]
     fn schema_ready_needs_wiki_write_and_chat_prefix() {
+        // コマンド一覧の wiki_write の 2 行（引数に root がある版）
+        let w8 = "\n- `wiki_write`（書込）— ワークスペースに md / html のページを書く\n  - 引数: `path` string（必須）: p / `content` string（必須）: c / `root` string: r\n- `wiki_move`（書込）— m\n";
+        let w7 = "\n- `wiki_write`（書込）— ワークスペースに md / html のページを書く（`root` は使わない）\n  - 引数: `path` string（必須）: p / `content` string（必須）: c\n- `wiki_move`（書込）— m\n  - 引数: `root` string: r\n";
         assert!(schema_is_chat_ready(
             Some(0),
-            "… `wiki_write` … backup/pre-chat-<日時>.sqlite を 1 個作る"
+            &format!("… backup/pre-chat-<日時>.sqlite を 1 個作る{w8}")
         ));
-        assert!(!schema_is_chat_ready(Some(0), "… `wiki_write` … backup/pre-agent-<日時>.sqlite を 1 個作る … の写しは `pre-chat-<日時>.sqlite`）"), "OPENREF_MCP_CHAT を知らない版（戻し方の定型文の pre-chat- では通さない）");
+        assert!(!schema_is_chat_ready(Some(0), &format!("… backup/pre-agent-<日時>.sqlite を 1 個作る … の写しは `pre-chat-<日時>.sqlite`）{w8}")), "OPENREF_MCP_CHAT を知らない版（戻し方の定型文の pre-chat- では通さない）");
         assert!(
             !schema_is_chat_ready(Some(0), "/pre-chat-<日時>.sqlite"),
             "wiki_write の無い版"
         );
+        assert!(
+            !schema_is_chat_ready(Some(0), &format!("/pre-chat-<日時>.sqlite{w7}")),
+            "wiki_write に root の無い版（OPENREF_WIKI_ROOT を知らない = 子が前面のワークスペースへ書く）= 説明文や他のコマンドの root では通さない"
+        );
+        assert!(
+            !schema_is_chat_ready(Some(0), "… `wiki_write`（md / html）… `root` … /pre-chat-<日時>.sqlite"),
+            "注記の中の `wiki_write` では通さない"
+        );
         assert!(!schema_is_chat_ready(
             Some(1),
-            "`wiki_write` /pre-chat-<日時>.sqlite"
+            &format!("/pre-chat-<日時>.sqlite{w8}")
         ));
     }
 
@@ -2921,7 +2970,9 @@ done
     }
 
     fn wait_for(events: &Arc<Mutex<Vec<Value>>>, f: impl Fn(&[Value]) -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // 待つ上限は長くてよい（成功すれば待たない）: 偽の子は毎回新しいスクリプトで、macOS は新しいファイルの初回の exec を評価する。
+        // 同時に走ると評価が順番待ちになり、子の最初の行まで 5 秒を超える
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if f(&events.lock().unwrap()) {
                 return true;
@@ -3014,7 +3065,7 @@ done
             .unwrap();
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
         // 追記は書き手スレッド（A-15）= 書き終えるのを待ってから読む
-        assert!(r.chat.flush(Duration::from_secs(10)));
+        assert!(r.chat.flush(Duration::from_secs(30)));
         let files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -3049,7 +3100,7 @@ done
         assert_eq!(s2.session_id, s.session_id);
         r.chat.send("huge", None, None, false).unwrap();
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
-        assert!(r.chat.flush(Duration::from_secs(10)));
+        assert!(r.chat.flush(Duration::from_secs(30)));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let text = std::fs::read_to_string(&files[0]).unwrap();
         assert!(
@@ -3063,7 +3114,7 @@ done
             .unwrap();
         r.chat.send("書かない", None, None, false).unwrap();
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
-        assert!(r.chat.flush(Duration::from_secs(10)));
+        assert!(r.chat.flush(Duration::from_secs(30)));
         assert!(!std::fs::read_to_string(&files[0])
             .unwrap()
             .contains("書かない"));
@@ -3071,8 +3122,49 @@ done
         r.chat.start(&l, None, true, false).unwrap();
         r.chat.send("別の会話", None, None, false).unwrap();
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
-        assert!(r.chat.flush(Duration::from_secs(10)));
+        assert!(r.chat.flush(Duration::from_secs(30)));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        r.chat.stop(Duration::from_secs(5), Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    /// send_to の root が子の root と違えば送らない（ターンも状態も進まない）・同じなら送る・None は照合しない・子が無ければ「動いていません」
+    #[test]
+    fn fake_child_send_to_checks_root() {
+        let r = rig("sendroot");
+        let other = r.dir.join("other");
+        let e = r
+            .chat
+            .send_to(Some(&r.launch.root), "x", None, None, None, false)
+            .unwrap_err();
+        assert!(e.contains("動いていません"), "{e}");
+        r.chat.start(&r.launch, None, false, false).unwrap();
+        assert_eq!(r.chat.root().as_deref(), Some(r.launch.root.as_path()));
+        for en in [false, true] {
+            let e = r
+                .chat
+                .send_to(Some(&other), "hello", None, None, None, en)
+                .unwrap_err();
+            assert!(
+                e.contains(if en { "another workspace" } else { "別のワークスペース" }),
+                "{e}"
+            );
+        }
+        assert_eq!(r.chat.state(), State::Idle, "送っていない");
+        assert_eq!(
+            r.chat
+                .send_to(Some(&r.launch.root), "hello", None, None, None, false)
+                .unwrap(),
+            1,
+            "照合に落ちた分はターンを進めない"
+        );
+        assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
+        assert_eq!(
+            r.chat.send_to(None, "hello", None, None, None, false).unwrap(),
+            2,
+            "None は照合しない"
+        );
+        assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
         r.chat.stop(Duration::from_secs(5), Duration::from_secs(1));
         let _ = std::fs::remove_dir_all(&r.dir);
     }
@@ -3500,14 +3592,14 @@ sleep 30
         String::from_utf8_lossy(&out.stdout).lines().count()
     }
 
-    /// M1: 起動の確認を待つ間の stop は「resume の失敗」ではない = Err を返し、新しい会話を起こさない
+    /// 起動の確認を待つ間の stop は「resume の失敗」ではない = Err を返し、新しい会話を起こさない
     #[test]
     fn qa_m1_stop_during_start_is_not_a_resume_failure() {
         let r = rig_with("m1", SLOW);
         let (c, l) = (r.chat.clone(), r.launch.clone());
         let h = std::thread::spawn(move || c.start(&l, Some("saved-id".into()), false, false));
-        // 子が起きて initialize を待たせている間（応答は 1 秒後）に stop
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // 子が起きて initialize を待たせている間（応答は 1 秒後）に stop。待つ上限は wait_for と同じ理由で長い
+        let deadline = Instant::now() + Duration::from_secs(30);
         while spawns(&r.dir) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -3526,7 +3618,7 @@ sleep 30
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
-    /// M2: 同時の start は直列 = 子は 1 つ・保存済みの会話を捨てない・両方が同じ id を返す。new の二度押しも 1 回
+    /// 同時の start は直列 = 子は 1 つ・保存済みの会話を捨てない・両方が同じ id を返す。new の二度押しも 1 回
     #[test]
     fn qa_m2_concurrent_starts_make_one_child() {
         let r = rig_with("m2", SLOW);
@@ -3866,7 +3958,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         assert_ne!(a.session_id, b.session_id);
         assert_eq!(r.chat.send("many", None, None, false).unwrap(), 1);
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
-        assert!(r.chat.flush(Duration::from_secs(10)));
+        assert!(r.chat.flush(Duration::from_secs(30)));
         let ev = r.events.lock().unwrap().clone();
         let sid = |e: &Value| e["session_id"].as_str().unwrap_or("").to_string();
         let n = |e: &Value| {
@@ -3971,7 +4063,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         r.chat.send("pend", None, None, false).unwrap();
         assert!(wait_for(&r.events, |_| pending(&r) == 1));
         r.chat.stop(Duration::from_secs(3), Duration::from_secs(1));
-        // 捨てるのは stdout の読み手が終わりを読んだ時（QA M1）
+        // 捨てるのは stdout の読み手が終わりを読んだ時
         assert!(
             wait_for(&r.events, |_| pending(&r) == 0),
             "止めたターンの pending が残った"
@@ -4012,7 +4104,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         false
     }
 
-    /// QA M1: stop（stdin を閉じる）の後に子が出すそのターンの tool_result は、読み手が背圧で遅れていても記録する
+    /// stop（stdin を閉じる）の後に子が出すそのターンの tool_result は、読み手が背圧で遅れていても記録する
     /// （子の終了 = on_exit で pending を捨てると、ファイルは変わったのに changes・[元に戻す]・ログの変更が欠ける）
     #[test]
     fn qa_a44_result_after_stop_under_backpressure_is_recorded() {
@@ -4058,7 +4150,7 @@ exit 0
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
-    /// QA L1: 読み手が背圧で待つ間に stop → start(new) しても、古い子の残りの行（gen が古い）は新しい会話に流れない
+    /// 読み手が背圧で待つ間に stop → start(new) しても、古い子の残りの行（gen が古い）は新しい会話に流れない
     #[test]
     fn qa_a15_old_gen_lines_after_restart_are_dropped() {
         use std::sync::atomic::Ordering;
@@ -4116,6 +4208,7 @@ done
             app_dir: Some(app),
             home: Some(d.clone()),
             watched: false,
+            ..Default::default()
         };
         (d, ctx)
     }

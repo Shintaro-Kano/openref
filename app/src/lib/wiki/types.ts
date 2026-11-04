@@ -85,6 +85,29 @@ export interface WikiStatus {
   recovered?: { at: number; moved_to: string } | null;
   /** 画面側: wiki_status の呼び出し自体が失敗した（有効 / 無効は wiki_settings で決め、これはヘッダーの警告に出すだけ） */
   statusError?: string;
+  /** 画面側: この root へ設定を揃えられない（wiki_front_root の失敗 = core の文。揃い終えるまでヘッダーの警告に残す） */
+  frontError?: string;
+  /** 最近のワークスペース（新しい順・有効のときだけ）。切替は wiki_switch_root・履歴から外すのは wiki_forget_root */
+  workspaces?: WikiWorkspace[];
+}
+
+/** wiki_status.workspaces の 1 件（設定 wiki_workspaces = Rust だけが読み書きする） */
+export interface WikiWorkspace {
+  /** canonical な絶対パス */
+  root: string;
+  /** 最後に GUI で使った時刻（unix 秒） */
+  last_used: number;
+  /** フォルダが今あるか（無い = 未接続のディスク等。履歴には残して灰色） */
+  exists: boolean;
+  /** 現在のワークスペース（設定 wiki_root = 前面の OpenNote タブの root に追従する）。画面の ✓ はタブの root で決める（workspaceList） */
+  current: boolean;
+}
+
+/** wiki_switch_root {args:{root}} / wiki_pick_root（取り消し = null）/ wiki_front_root {args:{root}} の戻り値（契約）。
+    画面は switch / pick の root で前面のタブの root を替える（status の root から切替を推測しない） */
+export interface WikiRootResult {
+  root: string;
+  restart?: boolean;
 }
 
 /** wiki_tags の 1 件 */
@@ -114,6 +137,8 @@ export interface WikiChanged {
   added: string[];
   removed: string[];
   modified: string[];
+  /** 監視中のワークスペース（canonical）。画面は前面の root と違う通知を捨てる（無い = 旧い形 = 今どおり受ける） */
+  root?: string;
 }
 
 /** 見出し（目次・`[[name#heading]]` の着地）。id は描画側が shadow root 内で付けたもの */
@@ -223,6 +248,8 @@ export interface WikiChatStatus {
   state: WikiChatState;
   /** 今の会話(vault の root と組で wiki-chat.json に保存されているもの) */
   session_id: string | null;
+  /** 子プロセスのワークスペース(cwd = 起こした root)。子がいなければ null */
+  root?: string | null;
 }
 
 export type WikiChatState = "off" | "starting" | "idle" | "busy" | "stopping";
@@ -240,7 +267,7 @@ export interface WikiChatAuth { logged_in: boolean; method: string | null; email
  *  有効 / 無効が変わったら(メニュー・command・Wiki の ON/OFF・vault の切替のどれでも・子の有無によらず)Rust は wiki-chat {type: "enabled"} を出す
  *  (画面は wiki_chat_status を読み直す)。{type: "state"} はターンの busy / idle 等の子の状態だけ(画面は status を読み直さない = claude --version 等を毎ターン起こさない) */
 
-/** wiki_chat_start {new?: boolean} → 子プロセスを起こす。new なら新しい会話(--session-id)、でなければ保存済みの会話を --resume。
+/** wiki_chat_start {new?: boolean, root?: string} → 子プロセスを起こす(root = そのワークスペースで = 画面は前面の root を渡す)。new なら新しい会話(--session-id)、でなければ保存済みの会話を --resume。
  *  resume に失敗したら新しい会話にして notice で知らせる */
 export interface WikiChatStartResult { session_id: string; resumed: boolean; notice?: string }
 
@@ -250,7 +277,7 @@ export interface WikiChatContext { path?: string; selection?: string; item?: str
 
 /** wiki_chat_start は返る前に session_id を wiki-chat.json に保存し(以後の wiki_chat_status は必ずそれを返す)、state(idle か、失敗なら off)を出す。画面も返った後に wiki_chat_status を読み直す */
 
-/** wiki_chat_send {text, context?}(文脈が無ければ context を付けない)→ { turn }。turn = この会話で 1 から数えるターン番号(changes・undo の鍵)。**アプリの起動中は同じ会話の中で増え続ける**(子プロセスを --resume で起こし直しても 1 に戻さない) */
+/** wiki_chat_send {text, context?, root?}(文脈が無ければ context を付けない・root = 前面の root。子の root と違えば Err = 画面が先に wiki_chat_stop → wiki_chat_start する)→ { turn }。turn = この会話で 1 から数えるターン番号(changes・undo の鍵)。**アプリの起動中は同じ会話の中で増え続ける**(子プロセスを --resume で起こし直しても 1 に戻さない) */
 export interface WikiChatSendResult { turn: number }
 
 /** wiki_chat_interrupt {} = ターンだけ止める(会話は続く)/ wiki_chat_stop {} = 子プロセスを終える(stdin を閉じる → 猶予 → SIGTERM) */

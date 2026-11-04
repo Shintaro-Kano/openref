@@ -1,12 +1,13 @@
 // OpenNote のファイル操作 = 新規ページ / 新規フォルダ / 改名 / ゴミ箱と、そのメニュー・ダイアログ（WikiDialogs）の流れ。
-// wiki.svelte.ts から移しただけ（B-33）。状態（wk）と骨組みの動詞は wiki.svelte.ts を読む一方向（wiki.svelte.ts はここを読まない = 循環しない）
+// wiki.svelte.ts から移しただけ（B-33）。状態（wk）と骨組みの動詞は wiki.svelte.ts を読む一方向（wiki.svelte.ts はここを読まない = 循環しない）。
+// 操作は画面の root（wikiArgs が args.root を足す）= 追随させるタブも画面の root のタブだけ（onShown = 別のワークスペースの同じ相対パスは別のファイル）
 
 import { t } from "../i18n.svelte";
 import { app, closeTab, frontWiki, toast } from "../state.svelte";
 import { dirOf } from "./render/asset.ts";
 import type { WikiCreateResult, WikiMkdirResult, WikiRenamePreview, WikiRenameResult, WikiTrashResult } from "./types";
 import { dirty, discardEdit, ed, holdAutosave, renamed, resumeAutosave } from "./edit.svelte";
-import { canLeave, isRefPath, loadAll, openWikiPage, wikiArgs, wk } from "./wiki.svelte";
+import { canLeave, isRefPath, loadAll, onShown, openWikiPage, shownRoot, wikiArgs, wk } from "./wiki.svelte";
 
 /** 今のフォルダ（前面のページのフォルダ・ホームなら vault の直下 = ""・参照フォルダのページを見ているときも vault の直下） */
 export function currentDir(): string {
@@ -159,8 +160,8 @@ export async function doRename(from: string, to: string, rewrite: boolean) {
   try {
     const r = await wikiArgs("wiki_rename", { from, to, rewrite }) as WikiRenameResult;
     wk.dialog = null;
-    renamed(from, r.path);
-    for (const tab of app.tabs) if (tab.wiki?.path === from) tab.wiki.path = r.path;
+    renamed(from, r.path, shownRoot());
+    for (const tab of app.tabs) if (onShown(tab.wiki) && tab.wiki.path === from) tab.wiki.path = r.path;
     // skipped = 確認の後に書き換わったので触らなかったファイル（core の任意の欄）
     const skipped = r.skipped ?? [];
     if (skipped.length) {
@@ -216,14 +217,14 @@ export async function doTrash(path: string, dir = false) {
   if (r.index_error) toast(`${t("ゴミ箱に移しましたが、索引を更新できませんでした")}: ${r.index_error.slice(0, 160)}`, 8000);
   else toast(t("ゴミ箱に移しました（Finder の「戻す」で戻せます）"));
   try {
-    const hit = app.tabs.filter((x) => underPath(x.wiki?.path, path, dir));
+    const hit = app.tabs.filter((x) => onShown(x.wiki) && underPath(x.wiki.path, path, dir));
     for (const tab of hit) {
       if (app.tabs.length > 1 && tab.id !== app.tab) await closeTab(tab.id);
     }
     const front = app.tabs.find((x) => x.id === app.tab);
-    if (front && underPath(front.wiki?.path, path, dir)) {
+    if (front && onShown(front.wiki) && underPath(front.wiki.path, path, dir)) {
       if (app.tabs.length > 1) await closeTab(front.id);
-      else front.wiki = { path: null, scrollTop: 0, editing: false };
+      else front.wiki = { path: null, root: front.wiki.root ?? null, scrollTop: 0, editing: false };
     }
   } catch (e) {
     toast(`✗ ${t("タブを閉じられません")}: ${String(e).slice(0, 200)}`);

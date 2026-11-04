@@ -1,9 +1,10 @@
 <script lang="ts">
   /* OpenNote の小さなダイアログ: 新規ページの名前と形式（md / html）/ 新規フォルダの名前 / 名前の変更（[[旧名]] の書換えの確認）/ ゴミ箱へ。
-     木の右クリック・ツールバーの「…」・ヘッダーの [＋ 新規] のメニューもここ（wk.menu）。状態は wiki.svelte.ts・動詞は files.svelte.ts（参照フォルダの追加は refdirs.svelte.ts） */
+     木の右クリック・ツールバーの「…」・ヘッダーの [＋ 新規]・ワークスペース名（最近のワークスペースの切替）のメニューもここ（wk.menu）。
+     状態は wiki.svelte.ts・動詞は files.svelte.ts（参照フォルダの追加は refdirs.svelte.ts） */
   import { t } from "../i18n.svelte";
   import { composing, focusMe, onEnter } from "../input";
-  import { answerDiscard, openWikiPage, pickRoot, wk } from "./wiki.svelte";
+  import { answerDiscard, openWikiPage, pickRoot, switchWorkspace, wk, workspaceList, workspaceName } from "./wiki.svelte";
   import { askNewFolder, askNewPage, askRename, askTrash, createFolder, createPage, doRename, doTrash, editingUnder, folderNameProblem, nameProblem, pageExt, pagesUnder, previewRename, type PageExt } from "./files.svelte";
   import { addRefDir } from "./refdirs.svelte";
   import { editText } from "./edit.svelte";
@@ -72,7 +73,7 @@
     }
   }
 
-  /** 開いたダイアログの既定のボタンへフォーカス（WKWebView はクリックでフォーカスを移さない・CLAUDE.md §6） */
+  /** 開いたダイアログの既定のボタンへフォーカス（WKWebView はクリックでフォーカスを移さない） */
   function focusBtn(node: HTMLButtonElement) {
     queueMicrotask(() => node.focus());
   }
@@ -96,7 +97,21 @@
       <!-- 長い絶対パスは先頭側を省略して末尾（ワークスペース名）を残す（rtl の型。両端の &lrm; で頭の / や末尾の ) . - _ が反対側へ回らないようにする） -->
       <div class="wk-menu-head wk-menu-head-path" title={m.path}>&lrm;{m.path}&lrm;</div>
       <button role="menuitem" onclick={() => ((wk.menu = null), void openWikiPage(null))}>{t("ホーム（参照フォルダ・ページ情報）")}</button>
-      <button role="menuitem" onclick={() => ((wk.menu = null), void pickRoot())}>{t("OpenNote のフォルダを選び直す…")}</button>
+      <!-- 最近のワークスペース = 1 クリックで切替。現在は ✓ で押せない・無いフォルダは灰色で押せない（[外す] は右ペインのホーム） -->
+      <div class="wk-menu-head">{t("最近のワークスペース")}</div>
+      {#each workspaceList() as w (w.root)}
+        <button
+          role="menuitem"
+          class="wk-menu-ws"
+          class:wk-menu-gone={!w.exists && !w.current}
+          disabled={w.current || !w.exists}
+          title={w.exists || w.current ? w.root : `${w.root}\n${t("見つかりません")}`}
+          onclick={() => ((wk.menu = null), void switchWorkspace(w.root))}>
+          <span class="wk-menu-check" aria-hidden="true">{w.current ? "✓" : ""}</span><span class="wk-menu-name">{workspaceName(w.root) || w.root}</span>
+        </button>
+      {/each}
+      <div class="wk-menu-sep" role="separator"></div>
+      <button role="menuitem" onclick={() => ((wk.menu = null), void pickRoot())}>{t("別のフォルダを選ぶ…")}</button>
       <button role="menuitem" onclick={() => ((wk.menu = null), void addRefDir())}>{t("参照フォルダ（読み取り専用）を追加…")}</button>
     {:else if m.kind === "file"}
       <button role="menuitem" onclick={() => askRename(m.path)}>{t("名前を変更…")}</button>
@@ -241,6 +256,14 @@
   .wk-menu-danger { color: var(--danger); }
   .wk-menu-head { padding: 4px 10px 6px; font-size: 11.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
   .wk-menu-head-path { direction: rtl; text-align: left; }
+  /* 押せない行（現在・無いフォルダ）は .wk-menu button:hover の背景を出さない（同じ形の selector で後に書く = 勝つ） */
+  .wk-menu-ws { display: flex; align-items: center; max-width: 260px; }
+  .wk-menu button.wk-menu-ws:disabled { color: var(--text); cursor: default; }
+  .wk-menu button.wk-menu-ws:disabled:hover { background: transparent; }
+  .wk-menu button.wk-menu-ws.wk-menu-gone { color: var(--dim); opacity: 0.6; }
+  .wk-menu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wk-menu-check { flex: none; width: 16px; color: var(--accent); }
+  .wk-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
   .wk-dlg-ext { display: flex; gap: 14px; font-size: 12.5px; }
   .wk-dlg-ext label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; color: var(--dim); }
   .wk-dlg-ext label.wk-dlg-ext-on { color: var(--text); }

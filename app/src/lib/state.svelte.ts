@@ -53,9 +53,12 @@ export interface TabViewer {
 }
 
 /** Wiki タブ（OpenNote）。path = vault 相対（null = ホーム = 木だけ・中央は空）。
-    viewer と同じく前面も含めて常にここが正（snapshot / restore しない）。永続するのは path だけ */
+    root = このタブのワークスペース（canonical な絶対パス = wiki_status.workspaces[].root の文字列）。
+    null = まだ分からない（旧 ui_tabs・状態が届く前に開いた）= 最初の状態の root を採る（wiki.svelte の loadWikiStatus）。
+    viewer と同じく前面も含めて常にここが正（snapshot / restore しない）。永続するのは path と root だけ */
 export interface TabWiki {
   path: string | null;
+  root: string | null;
   scrollTop: number;
   editing: boolean;
 }
@@ -395,9 +398,10 @@ export function frontWiki(): TabWiki | null {
   return app.wikiOn ? (app.tabs.find((t) => t.id === app.tab)?.wiki ?? null) : null;
 }
 
-/** ⌘T・TabStrip の ＋ = 今のモードで新しいタブ（前面が Wiki なら Wiki のホーム・それ以外は一覧の「すべて」） */
+/** ⌘T・TabStrip の ＋ = 今のモードで新しいタブ（前面が Wiki なら Wiki のホーム = 前面のタブのワークスペースを継ぐ・それ以外は一覧の「すべて」） */
 export function openTabInMode() {
-  return openTab({ kind: "all" }, frontWiki() ? { path: null, scrollTop: 0, editing: false } : null);
+  const w = frontWiki();
+  return openTab({ kind: "all" }, w ? { path: null, root: w.root ?? null, scrollTop: 0, editing: false } : null);
 }
 
 /** タブの操作（切替・開く・閉じる）を受け付けるか。処理中（busy）・エディタ・モーダル・取込中は受け付けない
@@ -431,6 +435,13 @@ export function setLeaveGuard(f: (() => true | Promise<boolean>) | null) {
 }
 function frontLeave(): true | Promise<boolean> {
   return leaveGuard ? leaveGuard() : true;
+}
+
+/** OpenNote のタブを前面にした（切替・開く） = 画面の状態をそのタブのワークスペースへ移す（wiki.svelte が登録 = leaveGuard と同じ型。
+    state は wiki を import できない = 循環）。同期で呼ぶ（行き先の木と箱を同じ描画で出す）。待ち（wiki_front_root）は wiki.svelte の側 */
+let rootGuard: ((w: TabWiki) => void) | null = null;
+export function setRootGuard(f: ((w: TabWiki) => void) | null) {
+  rootGuard = f;
 }
 
 function rowsEl(): HTMLElement | null {
@@ -501,6 +512,8 @@ async function switchTab(id: number, closeFront: boolean): Promise<boolean> {
   const top = target.scrollTop;
   restoreFrom(target);
   app.tab = id;
+  // OpenNote のタブ = そのワークスペースの写しへ（root が違えば。MY LIBRARY / PDF のタブでは変えない = 最後の OpenNote の root のまま）
+  if (target.wiki && app.wikiOn) rootGuard?.(target.wiki);
   app.searchReset++; // 検索欄の文字を戻したタブの検索語に（待ち中の検索は捨てる）
   // 戻した一覧の描画を待ってスクロール位置を戻す（tick は microtask なので、ここに別の切替は割り込めない）
   await tick();
@@ -703,8 +716,8 @@ export function tabsPref(): string {
         filters: front ? app.filters : t.filters,
         // PDF タブ = item key + 添付 id（照合用）+ 題名（ビューアの見出し・タブの題名）
         ...(t.viewer ? { viewer: { key: t.viewer.itemKey, attachment: t.viewer.attachmentId, title: t.viewer.title } } : {}),
-        // Wiki タブ = vault 相対の path（null = ホーム）
-        ...(t.wiki ? { wiki: { path: t.wiki.path } } : {}),
+        // Wiki タブ = vault 相対の path（null = ホーム）+ ワークスペース（まだ分からなければ書かない = 復元で設定の root）
+        ...(t.wiki ? { wiki: t.wiki.root ? { path: t.wiki.path, root: t.wiki.root } : { path: t.wiki.path } } : {}),
       };
     }),
   });
@@ -755,10 +768,11 @@ function parseViewer(v: any): TabViewer | null {
     : null;
 }
 
-/** ui_tabs の Wiki タブの値（Wiki が無効なら null = 一覧のタブとして戻す） */
+/** ui_tabs の Wiki タブの値（Wiki が無効なら null = 一覧のタブとして戻す）。root は文字列ならそのまま・無い / 壊れていれば null
+    （最初の状態で設定の root を採る。履歴に無い root は最初の状態で設定の root のホームへ戻す = wiki.svelte の loadWikiStatus） */
 function parseWiki(w: any): TabWiki | null {
   if (!app.wikiOn || !w || !(w.path === null || (typeof w.path === "string" && w.path))) return null;
-  return { path: w.path, scrollTop: 0, editing: false };
+  return { path: w.path, root: typeof w.root === "string" && w.root ? w.root : null, scrollTop: 0, editing: false };
 }
 
 /** 戻す PDF タブの item を引き、添付 id がその item の添付にあるか確かめる（id は削除後に再利用されうる・item が消えていることも

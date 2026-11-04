@@ -51,7 +51,7 @@
         placeholder: mode === "md" ? t("ここに書く（Markdown）") : "",
       });
       attach(h);
-      h.focus(); // WKWebView ではボタンのクリックでフォーカスが移らない = 明示（CLAUDE.md §6）
+      h.focus(); // WKWebView ではボタンのクリックでフォーカスが移らない = 明示
       onReady?.(h);
     } catch (e) {
       failed = String(e);

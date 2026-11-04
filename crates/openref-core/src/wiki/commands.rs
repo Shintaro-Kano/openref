@@ -1,10 +1,11 @@
 //! 読みの command: `wiki_status` `wiki_list` `wiki_read` `wiki_backlinks` `wiki_search` `wiki_tags` `wiki_inbox`。
-//! 登録表（crate::commands）の関数は `Ctx::from_db` で設定と app_dir を読んだら Db を手放し、ここの関数（Db を要しない）を呼ぶ。
-//! GUI の Tauri 包みも同じ: Db のロックは `Ctx::from_db` の間だけ。
+//! 登録表（crate::commands）の関数は `Ctx::from_db_pinned` で設定と app_dir を読んだら（引数 `root` があればその root に固定）
+//! Db を手放し、ここの関数（Db を要しない）を呼ぶ。GUI の Tauri 包みも同じ: Db のロックは `Ctx::from_db_pinned` の間だけ。
 
 use super::codes;
 use super::index::{self, default_title, sha256_hex, with_index, Fresh, Index, ListQuery, SearchQuery};
 use super::scan::{self, Kind};
+use super::workspaces;
 use crate::{CoreError, Db, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -24,10 +25,15 @@ pub struct Ctx {
     /// GUI が root を監視していて、監視を張った後の stat 走査も済んでいる（変更は監視が索引に取り込む）= 入口の鮮度規則
     /// （5 秒ごとの stat 走査）を省く（`freshen`）。登録表（MCP / CLI）は常に false = 今どおり
     pub watched: bool,
+    /// 設定 `wiki_workspaces`（最近のワークスペース）。壊れていれば空（退避は GUI の仕事 = 読みの入口を止めない）
+    pub workspaces: workspaces::Map,
+    /// `pin` で root を置き換えたときの、置き換える前の設定 `wiki_root`（None = pin していない = root が設定の値）。
+    /// `wiki_status` の `workspaces[].current` は固定した root ではなくこちら（= 利用者が前面で見ているワークスペース）
+    pub pinned_from: Option<Option<String>>,
 }
 
 impl Ctx {
-    /// 設定 `wiki_enabled`（"1" = 有効）・`wiki_root` と `db.app_dir()`・環境変数 HOME
+    /// 設定 `wiki_enabled`（"1" = 有効）・`wiki_root`・`wiki_workspaces` と `db.app_dir()`・環境変数 HOME
     pub fn from_db(db: &Db) -> Result<Ctx> {
         Ok(Ctx {
             enabled: db.setting("wiki_enabled")?.as_deref() == Some("1"),
@@ -35,10 +41,41 @@ impl Ctx {
             app_dir: db.app_dir(),
             home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
             watched: false,
+            workspaces: workspaces::parse(db.setting(workspaces::KEY)?.as_deref()).unwrap_or_default(),
+            pinned_from: None,
         })
     }
 
-    /// 使える状態なら (索引のパス, canonical な root)
+    /// from_db + 引数 `root` があればその root に固定する（`pin`）。登録表の wiki_* と GUI の wiki_* の入口
+    pub fn from_db_pinned(db: &Db, a: &Value) -> Result<Ctx> {
+        let mut ctx = Ctx::from_db(db)?;
+        if let Some(r) = pin_arg(a)? {
+            ctx.pin(&r)?;
+        }
+        Ok(ctx)
+    }
+
+    /// この呼び出しの root を置き換える。最近のワークスペースの履歴（`workspaces` の鍵 = canonical）と文字列で等しい root だけ
+    /// 受ける（canonicalize しない = symlink・末尾 `/` 等の生の綴りと空文字は拒否 = agent が任意のフォルダへ書き回らない）。
+    /// 置き換える前の設定 wiki_root は `pinned_from` に覚える（2 度目の pin でも最初の値のまま）
+    pub fn pin(&mut self, root: &str) -> Result<()> {
+        known_root(&self.workspaces, root)?;
+        if self.pinned_from.is_none() {
+            self.pinned_from = Some(self.root.take());
+        }
+        self.root = Some(root.to_string());
+        Ok(())
+    }
+
+    /// 設定 wiki_root（pin していれば置き換える前の値）
+    pub fn setting_root(&self) -> Option<&str> {
+        match &self.pinned_from {
+            Some(r) => r.as_deref(),
+            None => self.root.as_deref(),
+        }
+    }
+
+    /// 使える状態なら (索引のパス, canonical な root)。索引 = `<app_dir>/wiki-index/<root の hash>.sqlite`（`index::index_path`）
     pub fn ready(&self) -> Result<(PathBuf, PathBuf)> {
         if !self.enabled {
             return Err(CoreError::wiki(codes::UNAVAILABLE, DISABLED));
@@ -52,7 +89,7 @@ impl Ctx {
         })?;
         let home = self.home.as_deref().ok_or_else(|| CoreError::wiki(codes::UNAVAILABLE, "HOME が未設定のためワークスペースのフォルダを検査できません"))?;
         let root = super::check_root(Path::new(root), home, Some(app_dir))?;
-        Ok((app_dir.join(index::INDEX_FILE), root))
+        Ok((index::index_path(app_dir, &root), root))
     }
 
     /// ホストのファイルのパス p（絶対か vault 相対）がワークスペースの中の通常のファイルなら canonical なパスを返す（symlink を解いてから
@@ -84,6 +121,28 @@ pub(crate) fn opt_str(a: &Value, k: &str) -> Result<Option<String>> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone()).filter(|s| !s.trim().is_empty())),
         Some(_) => Err(bad(format!("{k} は文字列で渡してください"))),
+    }
+}
+
+/// 引数 `root`: 無い・null = None。文字列はそのまま（空・空白だけでも Some = pin が unknown_root で拒否する = opt_str の
+/// 「空白は無し」にしない）。他の型は BadInput
+pub fn pin_arg(a: &Value) -> Result<Option<String>> {
+    match a.get("root") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(bad("root は文字列で渡してください（wiki_status の workspaces の root）")),
+    }
+}
+
+/// root が最近のワークスペースの履歴（設定 wiki_workspaces の鍵）と文字列で等しいか。無ければ code unknown_root
+pub fn known_root(m: &workspaces::Map, root: &str) -> Result<()> {
+    if m.contains_key(root) {
+        Ok(())
+    } else {
+        Err(CoreError::wiki(
+            codes::UNKNOWN_ROOT,
+            format!("履歴に無いワークスペースです: {root}（root には wiki_status の workspaces の root をそのまま渡す）"),
+        ))
     }
 }
 
@@ -171,13 +230,27 @@ pub(crate) fn index_path_for(ix: &Index, rel: &str, abs: &Path) -> Result<Option
 
 // ---------------- command ----------------
 
-/// 状態: 有効か・root・件数（ページ・種類別・リンク・未解決・ambiguous・inbox・frontmatter）・最終走査。無効でもエラーにしない
+/// 状態: 有効か・root・件数（ページ・種類別・リンク・未解決・ambiguous・inbox・frontmatter）・最終走査・最近のワークスペース。
+/// 無効でもエラーにしない（無効なら `{enabled, root}` だけ）。root を固定（pin）していれば root・index_path・件数はその root の物で、
+/// workspaces[].current は設定 wiki_root のまま
 pub fn status(ctx: &Ctx, _a: &Value) -> Result<Value> {
     let mut out = json!({"enabled": ctx.enabled, "root": ctx.root});
     if !ctx.enabled {
         return Ok(out);
     }
-    let (ip, root) = match ctx.ready() {
+    // root が使えない（error の枝）・作り直し中の枝でも返す = 履歴が出口になる。current は設定 wiki_root が使えれば canonical と、
+    // 使えなければ設定の生の値と比べる（symlink・末尾 `/` の綴りで履歴の current が外れない）
+    let ready = ctx.ready();
+    let canon = |r: Option<&(PathBuf, PathBuf)>| r.map(|(_, r)| r.to_string_lossy().into_owned());
+    let current = match &ctx.pinned_from {
+        None => canon(ready.as_ref().ok()).or_else(|| ctx.root.clone()),
+        Some(set) => {
+            let unpinned = Ctx { root: set.clone(), pinned_from: None, ..ctx.clone() };
+            canon(unpinned.ready().ok().as_ref()).or_else(|| set.clone())
+        }
+    };
+    out["workspaces"] = workspaces_json(ctx, current.as_deref());
+    let (ip, root) = match ready {
         Ok(v) => v,
         Err(e) => {
             out["error"] = json!(e.to_string());
@@ -210,6 +283,20 @@ pub fn status(ctx: &Ctx, _a: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(out)
+}
+
+/// `wiki_status` の `workspaces` = 最近のワークスペース（新しい順）: root・last_used・exists（フォルダとして実在）・current（現在の root =
+/// canonical か、使えなければ設定 wiki_root の生の値と文字列が等しい）。
+fn workspaces_json(ctx: &Ctx, current_root: Option<&str>) -> Value {
+    Value::Array(
+        workspaces::order(&ctx.workspaces)
+            .into_iter()
+            .map(|(root, t)| {
+                let current = current_root == Some(root.as_str());
+                json!({"root": root, "last_used": t, "exists": Path::new(&root).is_dir(), "current": current})
+            })
+            .collect(),
+    )
 }
 
 /// ページの一覧（パス順）
@@ -930,7 +1017,7 @@ mod tests {
         let app = home.join("scratch-app");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&app).unwrap();
-        let ctx = Ctx { enabled: true, root: Some(root.to_string_lossy().into()), app_dir: Some(app), home: Some(home), watched: false };
+        let ctx = Ctx { enabled: true, root: Some(root.to_string_lossy().into()), app_dir: Some(app), home: Some(home), watched: false, ..Default::default() };
         Env { base, ctx, root, _serial }
     }
     fn put(root: &Path, rel: &str, body: &str) {
@@ -1077,11 +1164,212 @@ mod tests {
         for f in [list, read, backlinks] {
             assert_eq!(f(&off, &json!({"path": "a.md"})).unwrap_err().to_string(), DISABLED);
         }
-        let mem = Ctx { enabled: true, root: Some("/x".into()), app_dir: None, home: Some("/Users/x".into()), watched: false };
+        let mem = Ctx { enabled: true, root: Some("/x".into()), app_dir: None, home: Some("/Users/x".into()), watched: false, ..Default::default() };
         assert!(list(&mem, &json!({})).unwrap_err().to_string().contains("in-memory"));
         assert!(status(&mem, &json!({})).unwrap()["error"].as_str().unwrap().contains("in-memory"));
-        let unset = Ctx { enabled: true, root: None, app_dir: Some("/tmp/x".into()), home: Some("/Users/x".into()), watched: false };
+        let unset = Ctx { enabled: true, root: None, app_dir: Some("/tmp/x".into()), home: Some("/Users/x".into()), watched: false, ..Default::default() };
         assert!(list(&unset, &json!({})).unwrap_err().to_string().contains("未設定"));
+    }
+
+    /// 索引の置き場 = ワークスペースごと: ready() は index_path(app_dir, canonical な root)・status の index_path も同じ
+    #[test]
+    fn ready_index_is_per_workspace() {
+        let e = env("ready-ix");
+        let (ip, root) = e.ctx.ready().unwrap();
+        let app = e.ctx.app_dir.clone().unwrap();
+        assert_eq!(ip, index::index_path(&app, &root));
+        assert_eq!(ip.parent().unwrap(), app.join(index::INDEX_DIR));
+        assert_ne!(ip, app.join(index::INDEX_FILE), "旧の置き場は使わない");
+        let st = status(&e.ctx, &json!({})).unwrap();
+        assert_eq!(st["index_path"], json!(ip.to_string_lossy()));
+        assert!(ip.exists(), "status が索引を作った");
+        assert!(!app.join(index::INDEX_FILE).exists());
+        // 別の root = 別の索引
+        let other = e.base.join("home/Documents/blog");
+        std::fs::create_dir_all(&other).unwrap();
+        let o = Ctx { root: Some(other.to_string_lossy().into()), ..e.ctx.clone() };
+        assert_ne!(o.ready().unwrap().0, ip);
+    }
+
+    /// wiki_status の workspaces: 新しい順・exists = is_dir・current = 設定 wiki_root と文字列が等しい。
+    /// root が使えない（error の枝）でも返す・無効なら {enabled, root} だけ
+    #[test]
+    fn status_lists_workspaces() {
+        let e = env("ws");
+        let cur = e.root.to_string_lossy().to_string();
+        let blog = e.base.join("home/Documents/blog");
+        std::fs::create_dir_all(&blog).unwrap();
+        let blog = blog.to_string_lossy().to_string();
+        let gone = e.base.join("home/Documents/gone").to_string_lossy().to_string();
+        let raw = json!({
+            cur.clone(): {"last_used": 200, "ref_dirs": ["/kb"]},
+            blog.clone(): {"last_used": 300},
+            gone.clone(): {"last_used": 100, "future": 1},
+        })
+        .to_string();
+        let ctx = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
+        let want = json!([
+            {"root": blog, "last_used": 300, "exists": true, "current": false},
+            {"root": cur, "last_used": 200, "exists": true, "current": true},
+            {"root": gone, "last_used": 100, "exists": false, "current": false},
+        ]);
+        let st = status(&ctx, &json!({})).unwrap();
+        assert_eq!(st["workspaces"], want);
+        assert!(st.get("error").is_none());
+        // 現在の root が消えた = error の枝でも履歴は返す（出口になる）
+        let lost = Ctx { root: Some(gone.clone()), ..ctx.clone() };
+        let st = status(&lost, &json!({})).unwrap();
+        assert!(st["error"].is_string(), "{st}");
+        assert_eq!(st["workspaces"].as_array().unwrap().len(), 3);
+        assert_eq!(st["workspaces"][2]["current"], json!(true));
+        assert_eq!(st["workspaces"][1]["current"], json!(false));
+        // 履歴が空 = 空の配列
+        assert_eq!(status(&e.ctx, &json!({})).unwrap()["workspaces"], json!([]));
+        // 無効 = 今どおり {enabled, root} だけ
+        let off = Ctx { enabled: false, ..ctx };
+        assert_eq!(status(&off, &json!({})).unwrap(), json!({"enabled": false, "root": cur}));
+    }
+
+    /// current は canonical な root と比べる: 設定 wiki_root が symlink・末尾 `/` の綴りでも、canonical の鍵が current
+    #[test]
+    fn status_current_uses_canonical_root() {
+        let e = env("ws-canon");
+        let real = e.root.to_string_lossy().to_string();
+        let link = e.base.join("home/Documents/vault-link");
+        std::os::unix::fs::symlink(&e.root, &link).unwrap();
+        let raw = json!({real.clone(): {"last_used": 2}}).to_string();
+        for spelled in [link.to_string_lossy().to_string(), format!("{real}/")] {
+            let ctx = Ctx { root: Some(spelled.clone()), workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
+            let st = status(&ctx, &json!({})).unwrap();
+            assert_eq!(st["workspaces"], json!([{"root": real, "last_used": 2, "exists": true, "current": true}]), "{spelled}");
+            assert_eq!(st["root"], json!(real), "{spelled}");
+        }
+    }
+
+    /// from_db: wiki_workspaces が壊れていても失敗しない（空）= MCP / CLI の読みを止めない。読めれば Map
+    #[test]
+    fn from_db_tolerates_broken_workspaces() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(Ctx::from_db(&db).unwrap().workspaces.is_empty());
+        db.set_setting(workspaces::KEY, "not json").unwrap();
+        assert!(Ctx::from_db(&db).unwrap().workspaces.is_empty());
+        db.set_setting(workspaces::KEY, "[1]").unwrap();
+        assert!(Ctx::from_db(&db).unwrap().workspaces.is_empty());
+        db.set_setting(workspaces::KEY, r#"{"/a": {"last_used": 5}}"#).unwrap();
+        assert_eq!(workspaces::order(&Ctx::from_db(&db).unwrap().workspaces), vec![("/a".to_string(), 5)]);
+    }
+
+    /// pin: 履歴の鍵と文字列で等しい root だけ受ける（空・空白・symlink・末尾 `/`・履歴に無い = unknown_root で root は変えない）。
+    /// pinned_from は最初の pin の前の設定 wiki_root のまま
+    #[test]
+    fn pin_accepts_only_history_keys() {
+        let e = env("pin");
+        let cur = e.root.to_string_lossy().to_string();
+        let blog = e.base.join("home/Documents/blog");
+        std::fs::create_dir_all(&blog).unwrap();
+        let blog_s = blog.to_string_lossy().to_string();
+        let link = e.base.join("home/Documents/blog-link");
+        std::os::unix::fs::symlink(&blog, &link).unwrap();
+        let raw = json!({cur.clone(): {"last_used": 2}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let base = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
+        assert_eq!(base.setting_root(), Some(cur.as_str()));
+        let code = |r: Result<()>| match r {
+            Err(CoreError::Wiki { code, .. }) => code,
+            other => panic!("{other:?}"),
+        };
+        for bad_root in [String::new(), " ".into(), link.to_string_lossy().to_string(), format!("{blog_s}/"), "/nope".into(), format!(" {blog_s}")] {
+            let mut c = base.clone();
+            assert_eq!(code(c.pin(&bad_root)), codes::UNKNOWN_ROOT, "{bad_root:?}");
+            assert_eq!(c.root.as_deref(), Some(cur.as_str()), "拒否したら root は変えない: {bad_root:?}");
+            assert_eq!(c.pinned_from, None);
+        }
+        let mut c = base.clone();
+        c.pin(&blog_s).unwrap();
+        assert_eq!(c.root.as_deref(), Some(blog_s.as_str()));
+        assert_eq!(c.setting_root(), Some(cur.as_str()), "設定の root は覚えておく");
+        // 2 度目の pin（現在の root へ）でも設定の root は最初の値のまま
+        c.pin(&cur).unwrap();
+        assert_eq!((c.root.as_deref(), c.setting_root()), (Some(cur.as_str()), Some(cur.as_str())));
+        assert_eq!(c.pinned_from, Some(Some(cur.clone())));
+        // 履歴が空 = どの root も受けない（設定 wiki_root と同じ値でも = 照合は履歴だけ）
+        let mut empty = e.ctx.clone();
+        assert_eq!(code(empty.pin(&cur)), codes::UNKNOWN_ROOT);
+        let msg = e.ctx.clone().pin("/nope").unwrap_err().to_string();
+        assert!(msg.starts_with("履歴に無いワークスペースです: /nope"), "{msg}");
+    }
+
+    /// 固定した root の ready() はその root の索引・status の root / index_path / 件数はその root の物・workspaces[].current は
+    /// 設定 wiki_root のまま（設定の root が使えなくても生の値で current を決める）・一覧も固定した root を読む
+    #[test]
+    fn pinned_ctx_reads_that_root_and_status_current_stays() {
+        let e = env("pin-ready");
+        let cur = e.root.to_string_lossy().to_string();
+        let blog = e.base.join("home/Documents/blog");
+        std::fs::create_dir_all(&blog).unwrap();
+        let blog_s = blog.to_string_lossy().to_string();
+        put(&e.root, "kb.md", "# KB\n");
+        put(&blog, "post.md", "# Post\n");
+        put(&blog, "draft.md", "# Draft\n");
+        let raw = json!({cur.clone(): {"last_used": 2}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let base = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
+        let app = base.app_dir.clone().unwrap();
+        let mut pinned = base.clone();
+        pinned.pin(&blog_s).unwrap();
+        let (ip, root) = pinned.ready().unwrap();
+        assert_eq!((ip.clone(), root.clone()), (index::index_path(&app, &blog), blog.clone()));
+        assert_ne!(ip, base.ready().unwrap().0);
+        let st = status(&pinned, &json!({})).unwrap();
+        assert_eq!(st["root"], json!(blog_s));
+        assert_eq!(st["index_path"], json!(ip.to_string_lossy()));
+        assert_eq!(st["pages"], json!(2), "{st}");
+        let cur_of = |st: &Value| -> Vec<(String, bool)> {
+            st["workspaces"].as_array().unwrap().iter().map(|w| (w["root"].as_str().unwrap().to_string(), w["current"] == json!(true))).collect()
+        };
+        assert_eq!(cur_of(&st), vec![(cur.clone(), true), (blog_s.clone(), false)], "current は設定 wiki_root");
+        let paths = |c: &Ctx| -> Vec<String> {
+            list(c, &json!({})).unwrap()["pages"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(paths(&pinned), vec!["draft.md".to_string(), "post.md".into()]);
+        assert_eq!(paths(&base), vec!["kb.md".to_string()], "固定しなければ設定の root");
+        // 設定の root が symlink の綴り = current は canonical で照合
+        let link = e.base.join("home/Documents/kb-link");
+        std::os::unix::fs::symlink(&e.root, &link).unwrap();
+        let mut spelled = Ctx { root: Some(link.to_string_lossy().into()), ..base.clone() };
+        spelled.pin(&blog_s).unwrap();
+        assert_eq!(cur_of(&status(&spelled, &json!({})).unwrap()), vec![(cur.clone(), true), (blog_s.clone(), false)]);
+        // 設定の root が消えた（使えない）= 生の値と比べる・固定した root は読める
+        let gone = e.base.join("home/Documents/gone").to_string_lossy().to_string();
+        let raw2 = json!({gone.clone(): {"last_used": 3}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let mut lost = Ctx { root: Some(gone.clone()), workspaces: workspaces::parse(Some(&raw2)).unwrap(), ..base.clone() };
+        lost.pin(&blog_s).unwrap();
+        let st = status(&lost, &json!({})).unwrap();
+        assert!(st.get("error").is_none(), "{st}");
+        assert_eq!(cur_of(&st), vec![(gone.clone(), true), (blog_s.clone(), false)]);
+        // 無効 = {enabled, root} だけ（root は固定した root）
+        let off = Ctx { enabled: false, ..pinned.clone() };
+        assert_eq!(status(&off, &json!({})).unwrap(), json!({"enabled": false, "root": blog_s}));
+    }
+
+    /// from_db_pinned: 引数 root が無い・null = 設定の root・文字列 = pin（空も unknown_root）・他の型 = BadInput
+    #[test]
+    fn from_db_pinned_reads_root_arg() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting("wiki_root", "/v/a").unwrap();
+        db.set_setting(workspaces::KEY, r#"{"/v/a": {"last_used": 2}, "/v/b": {"last_used": 1}}"#).unwrap();
+        for a in [json!({}), json!({"root": null}), json!({"path": "x.md"})] {
+            let c = Ctx::from_db_pinned(&db, &a).unwrap();
+            assert_eq!((c.root.as_deref(), c.pinned_from.clone()), (Some("/v/a"), None), "{a}");
+        }
+        let c = Ctx::from_db_pinned(&db, &json!({"root": "/v/b"})).unwrap();
+        assert_eq!((c.root.as_deref(), c.setting_root()), (Some("/v/b"), Some("/v/a")));
+        for r in ["", "/v/c", "/v/b/"] {
+            match Ctx::from_db_pinned(&db, &json!({"root": r})) {
+                Err(CoreError::Wiki { code, .. }) => assert_eq!(code, codes::UNKNOWN_ROOT, "{r:?}"),
+                other => panic!("{r:?}: {other:?}"),
+            }
+        }
+        assert!(matches!(Ctx::from_db_pinned(&db, &json!({"root": 1})), Err(CoreError::BadInput(_))));
+        assert!(matches!(Ctx::from_db_pinned(&db, &json!({"root": ["/v/b"]})), Err(CoreError::BadInput(_))));
     }
 
     /// エラーの契約: 画面が分岐する code を持ち、文（Display）は msg のまま = MCP / CLI の出力は変わらない。
@@ -1099,7 +1387,7 @@ mod tests {
         assert_eq!(code(&r), Some(codes::REBUILDING));
         assert!(r.to_string().contains("42"), "進捗は文に残る");
         assert_eq!(code(&list(&Ctx::default(), &json!({})).unwrap_err()), Some(codes::UNAVAILABLE));
-        let unset = Ctx { enabled: true, root: None, app_dir: Some("/tmp/x".into()), home: Some("/Users/x".into()), watched: false };
+        let unset = Ctx { enabled: true, root: None, app_dir: Some("/tmp/x".into()), home: Some("/Users/x".into()), watched: false, ..Default::default() };
         assert_eq!(code(&list(&unset, &json!({})).unwrap_err()), Some(codes::UNAVAILABLE));
         // 語に英数字も和文も無い（tag も無い）= bad_query。文は従来の BadInput と同じ前置き
         let e = env("codes");
@@ -1310,7 +1598,7 @@ mod tests {
         assert!(read(&e.ctx, &json!({"path": "g.md"})).unwrap_err().to_string().contains("大きすぎて読めません"));
     }
 
-    /// 監視中（watched）に索引が壊れて退避・作り直された = 空の索引（last_scan なし）は省かずに走査する（QA M2）
+    /// 監視中（watched）に索引が壊れて退避・作り直された = 空の索引（last_scan なし）は省かずに走査する
     #[test]
     fn watched_scans_index_recreated_after_corruption() {
         let e = env("watched-corrupt");
@@ -1657,7 +1945,7 @@ mod tests {
         let (Ok(root), Ok(app)) = (std::env::var("OPENREF_WIKI_BENCH_ROOT"), std::env::var("OPENREF_WIKI_BENCH_APP")) else {
             return;
         };
-        let ctx = Ctx { enabled: true, root: Some(root), app_dir: Some(PathBuf::from(&app)), home: std::env::var_os("HOME").map(PathBuf::from), watched: false };
+        let ctx = Ctx { enabled: true, root: Some(root), app_dir: Some(PathBuf::from(&app)), home: std::env::var_os("HOME").map(PathBuf::from), watched: false, ..Default::default() };
         let (ip, root) = ctx.ready().unwrap();
         let size = |ip: &Path| -> u64 {
             ["", "-wal", "-shm"].iter().filter_map(|s| std::fs::metadata(format!("{}{s}", ip.display())).ok()).map(|m| m.len()).sum()
@@ -1724,7 +2012,7 @@ mod tests {
         }
     }
 
-    /// 複数プロセスが同時に開く・作り直し中に開く（M3）: どれも「database is locked」にならず、Ok か作り直し中を返す
+    /// 複数プロセスが同時に開く・作り直し中に開く: どれも「database is locked」にならず、Ok か作り直し中を返す
     #[test]
     fn multi_process_open_and_rebuild() {
         let e = env("multi");

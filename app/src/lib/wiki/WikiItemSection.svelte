@@ -9,6 +9,8 @@
 
   let { itemKey }: { itemKey: string } = $props();
 
+  /** 画面のワークスペース（値が変わったときだけ読み直す = 同じ root の状態の読み直しでは読まない） */
+  const wsRoot = $derived(wk.status?.root ?? null);
   let pages = $state<WikiBacklink[]>([]);
   let err = $state<string | null>(null);
   let loaded = $state(false);
@@ -32,10 +34,11 @@
     );
   }
 
-  // 対象の item が変わった（か有効になった）= 前の結果を消してから読む
+  // 対象の item が変わった（か有効になった・画面のワークスペースが変わった） = 前の結果を消してから読む
   $effect(() => {
     const key = itemKey;
     const on = app.wikiOn;
+    void wsRoot; // 読む先 = 画面の root（最後に前面だった OpenNote タブ）。クリックで開くタブも同じ root を継ぐ
     pages = [];
     err = null;
     loaded = false;

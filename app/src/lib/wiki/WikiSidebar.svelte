@@ -9,7 +9,7 @@
   import type { WikiListEntry } from "./types";
   import { baseName } from "./render/asset";
   import WikiSegment from "./WikiSegment.svelte";
-  import { openWikiPage, vaultName, wk } from "./wiki.svelte";
+  import { openWikiPage, vaultName, wk, workspaceList } from "./wiki.svelte";
   import { toggleTag } from "./search.svelte";
 
   /** Tags 箱を畳んだときに出す数 */
@@ -95,12 +95,14 @@
     return f.kind === "md" ? b.replace(/\.md$/i, "") : b;
   }
 
-  /** ワークスペース名の行のクリック / 右クリック: ホーム / OpenNote のフォルダを選び直す… / 参照フォルダ（読み取り専用）を追加…（WikiDialogs が出す）。位置はボタンの直下 */
+  /** ワークスペース名の行のクリック / 右クリック: ホーム / 最近のワークスペース / 別のフォルダを選ぶ… / 参照フォルダ（読み取り専用）を追加…
+      （WikiDialogs が出す）。位置はボタンの直下。y の上限 = メニューの高さの見積もり（パス + 3 項目 + 見出し + 区切り = 約 165px・履歴 1 行 = 約 28px） */
   function vaultMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    wk.menu = { kind: "vault", path: wk.status?.root ?? "", x: Math.min(r.left, window.innerWidth - 280), y: Math.min(r.bottom + 2, window.innerHeight - 130) };
+    const h = 165 + 28 * Math.max(1, workspaceList().length);
+    wk.menu = { kind: "vault", path: wk.status?.root ?? "", x: Math.min(r.left, window.innerWidth - 280), y: Math.max(4, Math.min(r.bottom + 2, window.innerHeight - h)) };
   }
 
   /** 右クリック: ページ = 名前の変更・ゴミ箱 / フォルダ = その中に新規ページ・新規フォルダ・フォルダをゴミ箱（WikiDialogs が出す）。
@@ -121,7 +123,7 @@
 
 <nav class="wk-sidebar">
   <WikiSegment />
-  <!-- ワークスペース名 = メニュー（ホーム / OpenNote のフォルダを選び直す… / 参照フォルダ（読み取り専用）を追加…）。Settings のメニュー項目「フォルダを選ぶ…」をここへ移した -->
+  <!-- ワークスペース名 = メニュー（ホーム / 最近のワークスペース / 別のフォルダを選ぶ… / 参照フォルダ（読み取り専用）を追加…）。Settings のメニュー項目「フォルダを選ぶ…」をここへ移した -->
   <button class="wk-vault" class:wk-cur={current === null} title={wk.status?.root ?? ""} aria-haspopup="menu" aria-expanded={wk.menu?.kind === "vault"} onclick={vaultMenu} oncontextmenu={vaultMenu}>
     {vaultName() || "OpenNote"}
     {#if wk.pages.length}<span class="wk-n">{wk.pages.length}</span>{/if}

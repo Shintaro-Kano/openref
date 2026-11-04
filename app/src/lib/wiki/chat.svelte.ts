@@ -1,10 +1,14 @@
 // OpenNote のチャットの画面側の状態と動詞。受け渡しは types.ts の「チャットの契約」だけ:
 // command = wiki_chat_status / wiki_chat_set_enabled / wiki_chat_start / wiki_chat_send / wiki_chat_interrupt /
-// wiki_chat_undo / wiki_chat_set_model / wiki_chat_auth（invoke(name, { args })。契約の wiki_chat_stop は画面からは呼ばない）・Tauri event "wiki-chat"（line / stderr / state / changes / exit）と "wiki-chat-consent"。
+// wiki_chat_undo / wiki_chat_set_model / wiki_chat_auth / wiki_chat_stop（invoke(name, { args })。stop は別のワークスペースの会話を替えるときだけ）・
+// Tauri event "wiki-chat"（line / stderr / state / changes / exit）と "wiki-chat-consent"。
 // stream-json の解釈は chat.ts の reduceChat（純粋）。OpenRef は会話本文を保存しない（この画面の表示は起動の間だけ）。
 // - チャットが無効（status.enabled = false）の間は右ペインにタブを出さない（原則 1）・子プロセスも起こさない（初回の送信で起こす）
 // - Wiki が無効の間は event を積まない・invoke しない
 // - 自動で起こし直さない（異常終了は知らせるだけ = 利用枠の嵐を作らない）
+// - ワークスペース: 子は 1 本・起こした root に縛られる（start / send に前面の root）。会話の root（chat.root）と前面の root
+//   （画面の root = 前面 / 最後の前面の OpenNote タブ）が違う間は会話を隠して 1 行（chatHidden）= タブの行き来では消さない・子も止めない。
+//   その状態で送ると前の子を止めて（wiki_chat_stop）前面の root で起こし直す = 新しい会話
 // - Claude の書込（wiki_write も Edit / Write も）はワークスペースの監視（wiki-changed）と編集の規則（edit.svelte.ts）で画面に反映される（ここでは何もしない）。
 //   [元に戻す] に出るのは wiki_write / wiki_move の変更だけ
 
@@ -26,7 +30,7 @@ import type {
   WikiChatStatus,
   WikiChatUndoResult,
 } from "./types";
-import { wk } from "./wiki.svelte";
+import { shownRoot, wk } from "./wiki.svelte";
 
 /** 診断（stderr）に持つ行数・1 行の長さの上限（古い行から捨てる・長い行は切る） */
 export const STDERR_MAX = 300;
@@ -47,7 +51,7 @@ export const chat = $state({
   conv: emptyConv() as Conv,
   /** 今の会話の id（event の session_id と違えば別の会話 = 表示を新しくする） */
   session: null as string | null,
-  /** 会話を始めた vault の root（変わったら表示を消す） */
+  /** 表示している会話のワークスペース（子の root = wiki_chat_status.root・起こした root）。前面の root と違う間は会話を隠す（chatHidden） */
   root: null as string | null,
   /** 保存済みの会話を --resume で続けた（過去の発言はここに出ない旨の知らせ） */
   resumed: false,
@@ -146,6 +150,14 @@ export function busy(): boolean {
   return st === "busy" || st === "starting" || st === "stopping";
 }
 
+/** 表示している会話が別のワークスペースの物（会話の root ≠ 前面の root）で、隠す物がある（発言がある・子が生きている） = 会話を隠して 1 行。
+    root が分からない間（起動直後・子も会話も無い）は隠さない */
+export function chatHidden(): boolean {
+  const front = shownRoot();
+  if (!chat.root || !front || chat.root === front) return false;
+  return chat.conv.entries.length > 0 || (!!chat.status && chat.status.state !== "off");
+}
+
 /** 状態を読み直す（右ペインを開いた・state / exit・wiki-state・start の後）。失敗は toast と画面に出し、無効として扱う（タブを出さない）。
     force = 画面の [再確認]（Rust が覚えた claude auth status を捨てて読む）。自動の読み直しは force なし = Rust は 30 秒の間 auth status を起こさない */
 export async function loadChatStatus(opts: { force?: boolean } = {}) {
@@ -164,8 +176,12 @@ export async function loadChatStatus(opts: { force?: boolean } = {}) {
     chat.statusError = null;
     lastStatusError = null;
     if (s.enabled) void loadTabPref();
-    // 会話が無くなった = 子がいない（off）・送信中でない・session_id が null のときだけ表示を消す（vault の root の変化は initChat の effect）。
-    // 別の会話 = 新しくする
+    // 子がいる = その root の会話（session_id は子の物）。子がいない = session_id は設定の root（= 前面）の保存済みの会話 =
+    // 隠している別の root の会話とは比べない（タブの行き来で消さない = 戻れば見える）
+    if (typeof s.root === "string" && s.root) chat.root = s.root;
+    else if (chatHidden()) return;
+    else chat.root = shownRoot() ?? chat.root;
+    // 会話が無くなった = 子がいない（off）・送信中でない・session_id が null のときだけ表示を消す。別の会話 = 新しくする
     if (s.session_id == null) {
       if (chat.session != null && s.state === "off" && !chat.sending) newView(null);
     } else if (chat.session && s.session_id !== chat.session) newView(s.session_id);
@@ -238,12 +254,15 @@ function newView(session: string | null) {
   chat.model = null;
 }
 
-/** 子プロセスを起こす（new = 新しい会話）。起こせなければ例外。成否によらず返った後に状態を読み直す（starting のまま固まらない） */
-async function start(fresh: boolean): Promise<void> {
+/** 子プロセスを起こす（new = 新しい会話・root = そのワークスペースで = 前面の root）。起こせなければ例外。
+    成否によらず返った後に状態を読み直す（starting のまま固まらない） */
+async function start(fresh: boolean, root: string | null = shownRoot()): Promise<void> {
   if (chat.status) chat.status = { ...chat.status, state: "starting" };
   try {
-    const r = await call<WikiChatStartResult>("wiki_chat_start", { new: fresh });
-    if (fresh || (chat.session && chat.session !== r.session_id)) newView(r.session_id);
+    const r = await call<WikiChatStartResult>("wiki_chat_start", root ? { new: fresh, root } : { new: fresh });
+    // 別のワークスペースの会話から替えた = 前の会話の表示は捨てる（同じ session_id でも = root ごとの会話）
+    if (fresh || (chat.session && chat.session !== r.session_id) || (root && chat.root && chat.root !== root)) newView(r.session_id);
+    if (root) chat.root = root;
     chat.session = r.session_id;
     chat.resumed = r.resumed && !chat.conv.entries.length;
     chat.notice = r.notice ?? null;
@@ -326,12 +345,21 @@ export async function send(): Promise<boolean> {
   try {
     // 文脈は Enter を押したとき（起動を待つ間にタブを切り替えても、見えていたチップのものを添える）
     const ctx = currentContext();
-    if (!chat.status || chat.status.state === "off") await start(false);
+    // 送る先 = 前面の root。会話が別のワークスペースの物（隠している） = 前の子を止めて前面の root で起こし直す = 新しい会話
+    const root = shownRoot();
+    const other = chatHidden();
+    if (other && chat.status && chat.status.state !== "off") {
+      expectExitAt = Date.now(); // 止めた子の終了を異常として知らせない
+      await call("wiki_chat_stop");
+    }
+    if (other || !chat.status || chat.status.state === "off") await start(false, root);
     apply({ t: "user", text, ctx });
     id = chat.conv.entries[chat.conv.entries.length - 1].id;
     chat.draft = "";
     chat.sel = null; // 選択範囲はこの発言に添えた（次の発言には付けない）
-    const r = await call<WikiChatSendResult>("wiki_chat_send", ctx ? { text, context: ctx } : { text });
+    const args: Record<string, unknown> = ctx ? { text, context: ctx } : { text };
+    if (root) args.root = root;
+    const r = await call<WikiChatSendResult>("wiki_chat_send", args);
     apply({ t: "turn", id, turn: r.turn });
     apply({ t: "prune" }); // 刈るのは送れた後（送れなければ何も刈らない）
     if (chat.stopIds.includes(id)) {
@@ -546,20 +574,13 @@ export function initChat(): () => void {
     if (app.wikiOn) chat.consent = true;
   });
   document.addEventListener("selectionchange", onSelection);
-  // vault の root が変わった = 前の vault の会話・変更の一覧を消す
   const stopRoot = $effect.root(() => {
     // Wiki が有効になった（起動時の設定の読込・Settings で ON）= チャットの状態を読む。右ペイン（WikiRight）の mount を待たない:
     // MY LIBRARY の PDF のタブの [チャット] は chat.status で出るので、起動直後に OpenNote を開かないと出なかった
     $effect(() => {
       if (app.wikiOn) untrack(() => void loadChatStatus());
     });
-    $effect(() => {
-      const root = wk.status?.root ?? null;
-      const had = untrack(() => chat.root);
-      if (root === had) return;
-      chat.root = root;
-      if (had != null) newView(null);
-    });
+    // ワークスペース: 前面の root が変わっても会話は消さない（chatHidden が隠す・戻れば見える）
     // 文脈の元（ページ / 文献）が変わった = 外した文脈を戻し、別の元の選択を捨てる
     $effect(() => {
       const k = sourceKey(currentSource());

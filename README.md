@@ -70,7 +70,7 @@ curl -fsSL https://openref.unitedradiology.jp/uninstall.sh | bash
 | `sql` | 読み取り専用 SQL（`PRAGMA query_only` + SQLite Authorizer により `SELECT` 系のみ許可・10 秒上限） |
 | `call` | GUI と同一の書込・読取コマンド群を実行（初回書込前に `backup/pre-agent-*.sqlite` へ自動スナップショットを作成。OpenRef / OpenNote のチャットと、許可一覧（`OPENREF_MCP_ALLOW`）で起動したセッションは `backup/pre-chat-*.sqlite`） |
 
-OpenRef / OpenNote（OpenRef のページ機能。Settings › OpenNote で有効にしたとき）のワークスペース（ページを置くフォルダ）も `call` の `wiki_*` で読み書きできます（`wiki_write` の上書きは上書き前を `wiki-history/` に退避）。環境変数 `OPENREF_MCP_ALLOW`（例 `read,wiki`）で起動すると、使えるコマンドをその一覧に絞れます。
+OpenRef / OpenNote（OpenRef のページ機能。Settings › OpenNote で有効にしたとき）のワークスペース（ページを置くフォルダ）も `call` の `wiki_*` で読み書きできます（`wiki_write` の上書きは上書き前を `wiki-history/` に退避）。読み書きの先は省略すると OpenRef の前面のタブのワークスペースで、複数のワークスペースを使うときは `wiki_*` の引数 `root`（`wiki_status` の `workspaces[].root`）で固定できます。OpenRef を更新した後は Claude Desktop / Claude Code を開き直してください（起動中の MCP は古い版のまま動き続けます）。環境変数 `OPENREF_MCP_ALLOW`（例 `read,wiki`）で起動すると、使えるコマンドをその一覧に絞れます。
 
 ### OpenRef / OpenNote のチャット（任意・既定 OFF）
 

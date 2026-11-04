@@ -146,6 +146,7 @@ mod tests {
             app_dir: Some(app),
             home: Some(home),
             watched: false,
+            ..Default::default()
         };
         Fix { base, root, ctx }
     }

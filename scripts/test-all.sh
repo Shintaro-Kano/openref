@@ -46,6 +46,8 @@ run "wiki chat" node app/src/lib/wiki/chat.test.mjs
 run "wiki ime" node app/src/lib/wiki/ime.test.mjs
 # エラーの契約(実部品 wiki.svelte.ts + jsdom): wiki_run の {"code","message"} を ipc.ts が解き、画面は code(rebuilding / bad_query)で分岐・欄と toast は message
 run "wiki ipc" node app/src/lib/wiki/ipc.test.mjs
+# ワークスペースの切替(実部品 wiki.svelte.ts + jsdom・invoke は差し替え): 一覧(新しい順・現在は ✓)・切替は先に保存してからタブをホームへ・履歴から外す・仮の状態からの最初の読みは変化と見ない
+run "wiki workspaces" node app/src/lib/wiki/workspaces.test.mjs
 # Word: citeproc 実整形(同梱スタイル・型・誌名スタイル)・OpenRef.dotm の整形とダイアログ・dotm の生成器
 run "word cite" node word/test-cite.cjs
 run "word types" node word/test-types.cjs

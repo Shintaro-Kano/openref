@@ -912,50 +912,56 @@ fn cite_install_file(db: &mut Db, a: &Value) -> Result<Value> {
 }
 
 // ---------------- 読み: OpenNote（コマンドは wiki_*） ----------------
-// 設定と app_dir を読んだら Db を使わず core::wiki の索引を呼ぶ
+// 設定と app_dir を読んだら Db を使わず core::wiki の索引を呼ぶ。引数 root（任意）があればその root に固定（Ctx::from_db_pinned）
 
 fn wiki_status(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::status(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::status(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_list(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::list(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::list(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_read(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::read_agent(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::read_agent(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_backlinks(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::backlinks(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::backlinks(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_search(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::search(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::search(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_tags(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::tags(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::tags(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_inbox(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::commands::inbox(&wiki::Ctx::from_db(db)?, a)
+    wiki::commands::inbox(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 // ---------------- 書込: OpenNote（ワークスペースのファイルを書く・DB は変えない） ----------------
 
 /// 上書きは if_sha256 の有無によらず必ず退避（GUI の自動保存の包みは退避しない edit::write = 別の関数）
 fn wiki_write(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::edit::write_agent(&wiki::Ctx::from_db(db)?, a)
+    wiki::edit::write_agent(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 fn wiki_move(db: &mut Db, a: &Value) -> Result<Value> {
-    wiki::edit::move_(&wiki::Ctx::from_db(db)?, a)
+    wiki::edit::move_(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
 // ---------------- 表 ----------------
 
 const KEY: (&str, &str, &str) = ("key", "string", "item の key（8 桁）");
+/// wiki_* の任意の引数 root（履歴にある root だけ・Ctx::pin）
+const WIKI_ROOT: (&str, &str, &str) = (
+    "root",
+    "string",
+    "履歴にあるワークスペースを指定（wiki_status の workspaces の root）。省略 = 設定 wiki_root = 利用者が前面で見ているワークスペース。複数のワークスペースを使う agent は固定する",
+);
 const COLLECTION: &str = "フォルダの key（8 桁）かパス（'親/子'・大小無視）。数値 id は不可";
 
 fn c(
@@ -1054,8 +1060,8 @@ fn build() -> Vec<Command> {
           schema(&[("lang", "string", "例 en-US / ja-JP")], &["lang"]), cite_locale_xml),
         // ---- 読み: OpenNote（コマンドは wiki_*。ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。有効化とフォルダの指定は GUI だけ） ----
         c("wiki_status", false, &[],
-          "OpenNote（コマンドは wiki_*）の状態: 有効か・ワークスペースの root・件数（ページ・種類別・リンク・未解決・同名で曖昧・ingest/ の件数・frontmatter）・最終走査（unix 秒）。無効でもエラーにしない（他の wiki_* は無効ならエラー）",
-          schema(&[], &[]), wiki_status),
+          "OpenNote（コマンドは wiki_*）の状態: 有効か・ワークスペースの root・件数（ページ・種類別・リンク・未解決・同名で曖昧・ingest/ の件数・frontmatter）・最終走査（unix 秒）・`workspaces`（最近のワークスペース = root・last_used・exists・current・新しい順）。無効でもエラーにしない（root が履歴に無ければエラー・他の wiki_* は無効ならエラー）",
+          schema(&[WIKI_ROOT], &[]), wiki_status),
         c("wiki_list", false, &[],
           "ワークスペースのページの一覧（パス順）: path（ワークスペース相対）・title・kind（md / html / media = 画像・動画・音声・pdf / other）・tags・items（参照している item の key）・mtime（unix 秒）・size。total が count より大きければ limit で切れている",
           schema(&[
@@ -1064,6 +1070,7 @@ fn build() -> Vec<Command> {
               ("tag", "string", "tag（大小無視・# は付けても付けなくてもよい）"),
               ("tags", "string[]", "複数の tag（AND。tag と併用可）"),
               ("limit", "integer", "既定 1000"),
+              WIKI_ROOT,
           ], &[]), wiki_list),
         c("wiki_read", false, &[],
           "ワークスペースのファイルを 1 つ読む。md / html = content（本文）・title・tags・items・frontmatter（[{key, value}]・解けなかった項目は raw: true で原文）・links（kind・target・解決先 path・ambiguous）・sha256（wiki_write の if_sha256 に渡す）。画像（中身が png / jpeg / gif / webp・base64 で 5 MB = 生データ 3,932,160 バイトまで）= 画像そのもの（MCP の image content）・pdf = content に抽出テキスト（頁区切り \\f・pages = 総頁数・from_page / to_page = 実際に切り出した範囲・範囲外は空で out_of_range・抽出できなければ text_error）・それ以外の画像（svg / avif / heic・上限超）と動画・音声・other = path・abs_path・size・種類だけ。ワークスペースの外・`..`・`.` 始まりの区画・ワークスペースの外を指す symlink は拒否",
@@ -1072,6 +1079,7 @@ fn build() -> Vec<Command> {
               ("max_chars", "integer", "content の上限（既定 200000・truncated で切れたかを示す）"),
               ("from_page", "integer", "pdf: 1 始まり"),
               ("to_page", "integer", "pdf: この頁まで（含む）"),
+              WIKI_ROOT,
           ], &["path"]), wiki_read),
         c("wiki_backlinks", false, &[],
           "そのページ（path）か item（key）を参照しているページの一覧（path・title・kind・link_kinds・excerpt = 一致した行）。path と key はどちらか 1 つ",
@@ -1079,6 +1087,7 @@ fn build() -> Vec<Command> {
               ("path", "string", "ワークスペース相対のパス"),
               KEY,
               ("limit", "integer", "既定 200"),
+              WIKI_ROOT,
           ], &[]), wiki_backlinks),
         c("wiki_search", false, &[],
           "ワークスペースのページを探す: 題名の部分一致（完全一致 → 前方一致 → 全語を含む）を上に、続いて md / html の本文の全文検索（和文可・語は空白区切りで AND・最後の語は前方一致）。pages = path・title・kind・tags・mtime・size・match（title / body / title+body）・snippet（一致箇所を U+E000 … U+E001 で囲んだ抜粋）。tag / tags は AND の絞込（query を省けば tag を全部持つページを題名順）",
@@ -1087,13 +1096,14 @@ fn build() -> Vec<Command> {
               ("tag", "string", "tag で絞る（大小無視）"),
               ("tags", "string[]", "複数の tag（AND。tag と併用可）"),
               ("limit", "integer", "既定 50・最大 1000（total が絞込後の総数）"),
+              WIKI_ROOT,
           ], &[]), wiki_search),
         c("wiki_tags", false, &[],
           "ワークスペースの tag の一覧と件数（ページ数の多い順。大小だけ違う表記は 1 つに束ねる）",
-          schema(&[("limit", "integer", "既定 500（total が tag の総数）")], &[]), wiki_tags),
+          schema(&[("limit", "integer", "既定 500（total が tag の総数）"), WIKI_ROOT], &[]), wiki_tags),
         c("wiki_inbox", false, &[],
           "inbox = ワークスペースの ingest/（未処理の素材）にあるファイル（下位フォルダも・`.` 始まりは除く）: path（ワークスペース相対）・name・kind・media（image / video / audio / pdf）・size・mtime。フォルダが無ければ空。OpenRef は素材を動かさない（記事にしたら skill が sources/ へ移す）。dir = chat-log でチャットの記録（chat-log/・新しい順）の一覧",
-          schema(&[("limit", "integer", "既定 1000"), ("dir", "string", "ingest（既定）か chat-log")], &[]), wiki_inbox),
+          schema(&[("limit", "integer", "既定 1000"), ("dir", "string", "ingest（既定）か chat-log"), WIKI_ROOT], &[]), wiki_inbox),
         // ---- 書込: OpenNote（ワークスペースのファイルだけ・DB は変えない = DB のスナップショットは取らない） ----
         c("wiki_write", true, &[],
           "ワークスペースに md / html のページを書く（新規はフォルダも作る・戻り値 created）。既存を上書きするときは必ず上書き前を <app_dir>/wiki-history/ に退避して backup（退避先のパス）を返す。sha256 = 書いた後の内容。if_sha256（wiki_read の sha256）が今のファイルと違えば書かずに {ok: false, conflict: true, sha256: 今の値} = 読み直してから書き直す。ワークスペースの外・`..`・`.` 始まり・symlink・md / html 以外の拡張子・新しく作る名前の `[ ] | # ^ \\ :` は拒否。item へのリンクは `[題名](openref://open?key=KEY)`（KEY は get_item / list_items で確かめた実在の key だけ）。frontmatter の items / sources / tags は任意。用例: 「ingest/ の素材を記事に」= wiki_inbox → wiki_read（素材）→ wiki_write（記事）→ wiki_move（素材を ingest/ の外へ）・「選んだ論文の要約ページを作る」= get_item・get_fulltext → wiki_write（openref:// のリンク付き）→ wiki_backlinks {key} で確かめる",
@@ -1101,12 +1111,14 @@ fn build() -> Vec<Command> {
               ("path", "string", "ワークスペース相対のパス（.md / .html）"),
               ("content", "string", "ファイルの中身の全体"),
               ("if_sha256", "string", "この sha256 のときだけ上書き（競合保護・省略 = 照合しないで上書き）"),
+              WIKI_ROOT,
           ], &["path", "content"]), wiki_write),
         c("wiki_move", true, &[],
           "ワークスペースの中のファイルの移動 / 改名（例: ingest/ の素材を記事にした後に別のフォルダへ）。移動先が既にあれば拒否（上書きしない）・拡張子（大小無視）を変える移動も拒否。戻り値 from / to（逆の move で戻せる）。リンクは書き換えない（参照しているページは呼び手が直す）",
           schema(&[
               ("from", "string", "ワークスペース相対のパス（今の場所）"),
               ("to", "string", "ワークスペース相対のパス（移動先・途中のフォルダは作る）"),
+              WIKI_ROOT,
           ], &["from", "to"]), wiki_move),
         // ---- 書込: item ----
         c("set_star", true, &[],
@@ -1270,6 +1282,8 @@ mod tests {
     fn wiki_file_names_are_fixed() {
         use crate::wiki::{edit, index};
         assert_eq!(index::INDEX_FILE, "wiki-index.sqlite");
+        assert_eq!(index::INDEX_DIR, "wiki-index");
+        assert_eq!(crate::wiki::workspaces::KEY, "wiki_workspaces");
         assert_eq!(edit::HISTORY_DIR, "wiki-history");
         let doc = find("wiki_write").unwrap().doc;
         assert!(doc.contains(&format!("<app_dir>/{}/", edit::HISTORY_DIR)), "{doc}");
@@ -1394,6 +1408,56 @@ mod tests {
         }
         assert!(writes_db(find("import_pdf").unwrap()) && !writes_db(find("list_items").unwrap()));
         assert!(call_err(&mut db, "wiki_write", json!({"path": "a.md", "content": "x", "force": true})).contains("未知の引数 force"));
+    }
+
+    /// 登録表の wiki_* 9 本は任意の引数 root を受け（schema に載る = validate が通る）、履歴に無い root は無効でも
+    /// unknown_root（pin が先）・履歴にある root は受けてその先へ進む（in-memory = 索引の置き場が無い）・wiki_status は固定した root を返す
+    #[test]
+    fn wiki_commands_take_root() {
+        let nine = [
+            ("wiki_status", json!({})),
+            ("wiki_list", json!({})),
+            ("wiki_read", json!({"path": "a.md"})),
+            ("wiki_backlinks", json!({"path": "a.md"})),
+            ("wiki_search", json!({"query": "x"})),
+            ("wiki_tags", json!({})),
+            ("wiki_inbox", json!({})),
+            ("wiki_write", json!({"path": "a.md", "content": "x"})),
+            ("wiki_move", json!({"from": "a.md", "to": "b.md"})),
+        ];
+        let wiki: Vec<&str> = registry().iter().filter(|c| is_wiki(c)).map(|c| c.name).collect();
+        assert_eq!(wiki, nine.iter().map(|(n, _)| *n).collect::<Vec<_>>(), "登録表の wiki_* が増えたら root を足してここに");
+        let with_root = |a: &Value, r: &str| {
+            let mut a = a.clone();
+            a["root"] = json!(r);
+            a
+        };
+        let code = |r: Result<Value>| match r {
+            Err(CoreError::Wiki { code, .. }) => Some(code),
+            _ => None,
+        };
+        let mut db = Db::open_in_memory().unwrap();
+        for (name, args) in &nine {
+            let c = find(name).unwrap();
+            assert_eq!(c.args["properties"]["root"]["type"], "string", "{name}");
+            assert!(c.args["properties"]["root"]["description"].as_str().unwrap().contains("wiki_status の workspaces の root"), "{name}");
+            validate(name, &with_root(args, "/v/a")).unwrap();
+            for r in ["/v/a", ""] {
+                assert_eq!(code(call(&mut db, name, &with_root(args, r))), Some(wiki::codes::UNKNOWN_ROOT), "無効でも先に root を照合: {name} {r:?}");
+            }
+        }
+        db.set_setting("wiki_enabled", "1").unwrap();
+        db.set_setting("wiki_root", "/tmp").unwrap();
+        db.set_setting(wiki::workspaces::KEY, r#"{"/v/a": {"last_used": 1}}"#).unwrap();
+        for (name, args) in &nine[1..] {
+            assert_eq!(code(call(&mut db, name, &with_root(args, "/v/b"))), Some(wiki::codes::UNKNOWN_ROOT), "{name}");
+            let e = call(&mut db, name, &with_root(args, "/v/a")).unwrap_err();
+            assert!(e.to_string().contains("in-memory"), "履歴にある root は受ける: {name}: {e}");
+        }
+        let st = call_ok(&mut db, "wiki_status", json!({"root": "/v/a"}));
+        assert_eq!(st["root"], "/v/a");
+        assert_eq!(st["workspaces"], json!([{"root": "/v/a", "last_used": 1, "exists": false, "current": false}]), "current は設定 wiki_root");
+        assert!(call_err(&mut db, "wiki_list", json!({"root": 3})).contains("root は文字列"));
     }
 
     #[test]

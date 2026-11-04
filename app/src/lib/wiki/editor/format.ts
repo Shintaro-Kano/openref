@@ -93,7 +93,7 @@ export function toggleList(view: EditorView, ordered: boolean): boolean {
 }
 
 /** caret（主の選択）に文字列を入れて、その後ろへ caret を置く。選択があれば置き換える（貼付・ドロップの `![[…]]`）。
-    マウスの位置ではなく caret（Tauri の dragDropEnabled では HTML5 の drop がエディタに届かない・CLAUDE.md §6） */
+    マウスの位置ではなく caret（Tauri の dragDropEnabled では HTML5 の drop がエディタに届かない） */
 export function insertAtCaret(view: EditorView, text: string): void {
   const r = view.state.selection.main;
   view.dispatch({

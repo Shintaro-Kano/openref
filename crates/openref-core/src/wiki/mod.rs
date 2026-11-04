@@ -1,5 +1,5 @@
 //! OpenNote の core 側: vault の root の検査・索引（index）・走査（scan）・解析
-//! （frontmatter / parse_md / parse_html / links）・登録表の読みの command（commands）。
+//! （frontmatter / parse_md / parse_html / links）・登録表の読みの command（commands）・最近のワークスペースの設定（workspaces）。
 //! ここの関数は Db を要しない（設定を読む間だけ Db を握り、走査・検査・索引はロックの外で行う）。
 
 pub mod commands;
@@ -11,6 +11,7 @@ pub mod parse_html;
 pub mod parse_md;
 pub mod paths;
 pub mod scan;
+pub mod workspaces;
 
 pub use commands::Ctx;
 
@@ -24,6 +25,8 @@ pub mod codes {
     pub const BAD_QUERY: &str = "bad_query";
     /// ワークスペースのファイル操作の失敗（読めない区画・ゴミ箱へ移せない）
     pub const FS: &str = "fs";
+    /// 引数 root が最近のワークスペースの履歴（設定 wiki_workspaces の鍵）に無い（鍵と文字列で等しい root だけ受ける）
+    pub const UNKNOWN_ROOT: &str = "unknown_root";
 }
 pub use index::{with_index, Fresh, Index};
 

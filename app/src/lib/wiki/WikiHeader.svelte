@@ -21,6 +21,9 @@
     <span class="wk-head-note">{t("索引を作成中…")} {wk.status.rebuilding.percent}%</span>
   {:else if wk.status?.statusError}
     <span class="wk-head-bad" title={wk.status.statusError}>{t("⚠ OpenNote の状態を読めません")}</span>
+  {:else if wk.status?.frontError}
+    <!-- 設定をこのワークスペースへ揃えられない（未接続のディスク等 = core の文「…見つかりません」は title と toast）。揃え直せたら消える -->
+    <span class="wk-head-bad" title={wk.status.frontError}>{t("⚠ ワークスペースを切り替えられません")}</span>
   {:else if wk.error}
     <span class="wk-head-bad" title={wk.error}>{t("⚠ 変更の自動反映が止まっています")}</span>
   {/if}

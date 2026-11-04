@@ -381,7 +381,7 @@ assert.ok(CH.chatShown(), "有効なのに [チャット] を出す判定が fal
 assert.equal(calls.filter((c) => c.name === "wiki_chat_status").length, 1, "起動時の読みが 1 回でない");
 tests++;
 
-// ⑤ 無効 = タブなし（WikiInfo だけ）・有効 = タブ・Settings で OFF（enabled event）= タブが消える（M1）・state event では status を読まない・タブを押すと入力欄へ focus
+// ⑤ 無効 = タブなし（WikiInfo だけ）・有効 = タブ・Settings で OFF（enabled event） = タブが消える・state event では status を読まない・タブを押すと入力欄へ focus
 {
   mock.enabled = false;
   const target = document.createElement("div");
@@ -410,7 +410,7 @@ tests++;
   stateEv("idle");
   await sleep(20);
   assert.ok(!calls.some((c) => c.name === "wiki_chat_status"), "state event で status を読み直した");
-  // M1: Settings で OFF = Rust は wiki-chat {type: enabled, enabled: false} を出す → タブを消して読み直す
+  // Settings で OFF = Rust は wiki-chat {type: enabled, enabled: false} を出す → タブを消して読み直す
   mock.enabled = false;
   emit("wiki-chat", { type: "enabled", enabled: false });
   flushSync();
@@ -438,7 +438,7 @@ const typeDraft = (s) => {
 };
 const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...o }));
 
-// M2: start の後に状態を読み直す（Rust の state が来なくても starting で固まらない）・失敗したら off に戻す
+// start の後に状態を読み直す（Rust の state が来なくても starting で固まらない）・失敗したら off に戻す
 {
   handlers.wiki_chat_start = () => {
     mock.state = "idle"; // state event を出さない Rust
@@ -486,8 +486,9 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
     ["wiki_chat_start", "wiki_chat_send"],
     "未起動なら起こしてから送る"
   );
-  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_start").args, { new: false }, "保存済みの会話を続ける");
-  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "このページを要約して", context: { path: "notes/a.md", selection: "選んだ文" } });
+  // 子を起こす・送る root = 前面の root（画面の root）
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_start").args, { new: false, root: "/v" }, "保存済みの会話を続ける");
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "このページを要約して", context: { path: "notes/a.md", selection: "選んだ文" }, root: "/v" });
   await waitFor(() => CH.chat.conv.entries[0]?.turn === 1);
   flushSync();
   assert.equal(ta().value, "", "送った後に入力欄を空にしない");
@@ -504,7 +505,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   enter();
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_send")));
   assert.deepEqual(calls.filter((c) => c.name !== "wiki_chat_status").map((c) => c.name), ["wiki_chat_send"], "起動済みなのに起こし直した");
-  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "次" }, "外した文脈を添えた");
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "次", root: "/v" }, "外した文脈を添えた");
   assert.ok(await waitFor(() => !CH.chat.sending), "送信が終わらない"); // invoke の後の後始末（ipc.ts の包みの分だけ遅れる）を待つ
   CH.pageChanged("other.md");
   assert.equal(CH.chat.ctxOff, null, "ページが変わっても外したまま");
@@ -666,7 +667,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   newBtn().click();
   assert.ok(await waitFor(() => CH.chat.session?.startsWith("N") && !CH.chat.sending));
   flushSync();
-  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_start").args, { new: true });
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_start").args, { new: true, root: "/v" });
   assert.equal(CH.chat.conv.entries.length, 0, "新しい会話で表示を空にしない");
   assert.deepEqual(CH.chat.changes, {});
   mock.state = "off";
@@ -689,21 +690,87 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   tests++;
 }
 
-// vault の切替 = 会話・changes・undo・stopped を消す（root の変化 / 状態の session_id が null）
+// ワークスペース: 前面の root（画面の root）が会話の root（子の root = wiki_chat_status.root）と違う間は会話を隠して 1 行
+// （消さない・状態の読み直しでも消さない）・戻れば見える・隠している間に送る = wiki_chat_stop → wiki_chat_start {root: 前面} → wiki_chat_send {…, root: 前面}
+// = 新しい会話。会話が無くなった（状態の session_id が null・off・隠していない）= 表示を消す
 {
+  mock.state = "idle";
+  mock.session = "S3";
+  mock.over = { root: "/v" }; // 子の root
+  await CH.loadChatStatus();
   emit("wiki-chat", { type: "changes", session_id: "S3", turn: 1, changes: [{ kind: "create", path: "z.md", sha256_after: "x" }] });
   CH.chat.undo["1:0"] = { ok: true };
   CH.chat.stopped = [1];
   assert.equal(CH.chat.conv.entries.length, 1);
+  assert.equal(CH.chat.root, "/v", "会話の root（子の root）を覚えない");
+  assert.equal(CH.chatHidden(), false);
+  // 前面が別のワークスペースのタブ（画面の root = /other）= 隠す・消さない
   W.wk.status = { enabled: true, root: "/other" };
   flushSync();
-  assert.deepEqual([CH.chat.conv.entries.length, CH.chat.changes, CH.chat.undo, CH.chat.stopped], [0, {}, {}, []], "vault を替えても前の会話を残した");
-  emit("wiki-chat", { type: "line", session_id: "S3", turn: 2, line: L({ type: "assistant", message: { id: "y", content: [{ type: "text", text: "x" }] } }) });
-  emit("wiki-chat", { type: "changes", session_id: "S3", turn: 2, changes: [{ kind: "create", path: "y.md", sha256_after: "x" }] });
+  assert.equal(CH.chatHidden(), true, "別の root なのに会話を隠さない");
+  assert.deepEqual([CH.chat.conv.entries.length, Object.keys(CH.chat.changes), Object.keys(CH.chat.undo), [...CH.chat.stopped]], [1, ["1"], ["1:0"], [1]], "別の root へ移っただけで会話を消した");
+  const other = $(".wk-ch-list .wk-ch-other");
+  assert.ok(other, "隠した 1 行が無い");
+  assert.equal(other.textContent, "この会話は v のワークスペースのものです。ここで送ると新しい会話になります");
+  assert.equal($(".wk-ch-list").children.length, 1, "隠しているのに会話を出した");
+  // 状態の読み直し（wiki-state）でも消さない（子は生きている = タブの行き来で止めない）
+  emit("wiki-state", null);
+  await sleep(10);
+  assert.equal(CH.chat.conv.entries.length, 1, "隠している間の状態の読み直しで会話を消した");
+  // 子がいなくても（状態の session_id は前面の root の物）隠している会話は消さない
+  mock.over = {};
+  mock.state = "off";
+  mock.session = "OTHER-SAVED";
+  emit("wiki-state", null);
+  await sleep(10);
+  assert.equal(CH.chat.conv.entries.length, 1, "子がいない間の状態の読み直しで隠している会話を消した");
+  assert.equal(CH.chat.session, "S3");
+  // 戻る = 会話がそのまま見える
+  W.wk.status = { enabled: true, root: "/v" };
+  flushSync();
+  assert.equal(CH.chatHidden(), false);
+  assert.equal($(".wk-ch-other"), null, "戻っても 1 行が残った");
+  assert.ok($(".wk-ch-list").children.length >= 1 && CH.chat.conv.entries.length === 1, "戻っても会話が見えない");
+  // 隠している間に送る = 前の子を止めて前面の root で起こし直し、その root で送る（新しい会話）
+  mock.state = "idle";
+  mock.session = "S3";
+  mock.over = { root: "/v" };
+  await CH.loadChatStatus();
+  W.wk.status = { enabled: true, root: "/other" };
+  flushSync();
+  handlers.wiki_chat_stop = () => {
+    mock.state = "off";
+    return {};
+  };
+  handlers.wiki_chat_start = (a) => {
+    mock.over = { root: a.root };
+    stateEv("idle", "O1");
+    return { session_id: "O1", resumed: false };
+  };
+  handlers.wiki_chat_send = () => ({ turn: 1 });
+  calls.length = 0;
+  typeDraft("別の root で");
+  enter();
+  assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_send")), "隠している間に送れない");
+  const seq = calls.filter((c) => c.name !== "wiki_chat_status").map((c) => c.name);
+  assert.deepEqual(seq, ["wiki_chat_stop", "wiki_chat_start", "wiki_chat_send"], `止めて起こし直さない: ${seq}`);
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_start").args, { new: false, root: "/other" }, "前面の root で起こさない");
+  assert.equal(calls.find((c) => c.name === "wiki_chat_send").args.root, "/other", "前面の root で送らない");
+  assert.equal(CH.chat.root, "/other");
+  assert.equal(CH.chat.session, "O1");
+  assert.equal(CH.chatHidden(), false);
+  assert.deepEqual(CH.chat.conv.entries.map((e) => [e.k, e.text]), [["user", "別の root で"]], "前の root の会話を新しい会話に混ぜた");
+  assert.deepEqual([CH.chat.changes, CH.chat.undo, CH.chat.stopped], [{}, {}, []], "前の root の changes・undo・stopped が残った");
+  flushSync();
+  assert.equal($(".wk-ch-other"), null);
+  // 会話が無くなった（session_id が null・off）= 表示を消す（隠していないとき）
   mock.session = null;
   mock.state = "off";
+  mock.over = {};
   emit("wiki-state", null);
   assert.ok(await waitFor(() => CH.chat.conv.entries.length === 0 && !Object.keys(CH.chat.changes).length), "会話が無くなっても前の表示を残した");
+  W.wk.status = { enabled: true, root: "/v" };
+  flushSync();
   tests++;
 }
 
@@ -783,7 +850,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   typeDraft("この文献は");
   enter();
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_send")));
-  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "この文献は", context: { item: "K1", title: "題名 T" } }, "文献の文脈を添えない");
+  assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "この文献は", context: { item: "K1", title: "題名 T" }, root: "/v" }, "文献の文脈を添えない");
   assert.ok(await waitFor(() => !CH.chat.sending), "送信が終わらない");
   assert.equal(CH.chat.error, null, "送信が失敗した");
   flushSync();
@@ -1066,7 +1133,7 @@ target.remove();
   unmount(c);
   c = mount(WikiRight, { target: t1 });
   assert.ok(await waitFor(() => reads().length === 2 && !CH.statusInFlight()), "mount のし直しで読み直さない");
-  assert.ok(Date.now() - began < 2000, "2 秒の内に終わらない");
+  assert.ok(Date.now() - began < 10_000, "時間待ちで読み直している");
   assert.deepEqual(reads().map((r) => r.args), [{}, {}], "自動の読み直しに force を付けた（Rust の覚えを捨てる）");
   flushSync();
   calls.length = 0;

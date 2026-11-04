@@ -1550,7 +1550,8 @@ async fn wiki_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result<bool, 
 }
 
 /// 左の木の vault 名 → フォルダ選択ダイアログ → 検査・保存・適用（Settings のメニュー項目「フォルダを選ぶ…」をここへ移した）。
-/// 取り消し = null。選んだ = {root, restart}（restart = 前のフォルダの配信が再起動まで残る）。toast は Rust が出す
+/// 取り消し = null。選んだ = {root, restart}（restart = 前のフォルダの配信が再起動まで残る = toast に一言・プロセスで最初の 1 回だけ）。
+/// toast は Rust が出す
 #[tauri::command]
 async fn wiki_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     blocking(move || {
@@ -1560,10 +1561,8 @@ async fn wiki_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value, Stri
         };
         match wiki_choose_root(&app, &p) {
             Ok((root, stale)) => {
-                wiki_toast(&app, en, true, "OpenNote のフォルダ", "OpenNote folder", Some(root.to_string_lossy().into_owned()));
-                if stale {
-                    wiki_restart_notice(&app, en);
-                }
+                let detail = wiki_toast_detail(en, root.to_string_lossy().into_owned(), wiki_restart_note(en, stale));
+                wiki_toast(&app, en, true, "OpenNote のフォルダ", "OpenNote folder", Some(detail));
                 Ok(serde_json::json!({"root": root.to_string_lossy(), "restart": stale}))
             }
             Err(e) => {
@@ -1571,6 +1570,92 @@ async fn wiki_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value, Stri
                 Err(e)
             }
         }
+    })
+    .await
+}
+
+/// `args.root`（文字列・空白は無し）
+fn root_arg(args: Option<serde_json::Value>) -> Option<String> {
+    obj_args(args)
+        .get("root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// 最近のワークスペース（wiki_status の workspaces）の 1 つへ切り替える。{root} → {root, restart}（restart = 前の root の
+/// 配信が再起動まで残る）。履歴に無い root・check_root に落ちる root は Err。成功・失敗の toast は Rust が出す（画面は出さない）
+#[tauri::command]
+async fn wiki_switch_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = root_arg(args);
+    blocking(move || {
+        let en = ui_en(&app);
+        let r = root
+            .ok_or_else(|| tr(en, "wiki_switch_root: root は必須です", "wiki_switch_root: root is required"))
+            .and_then(|r| wiki_switch_workspace(&app, &r));
+        match r {
+            Ok((root, stale)) => {
+                let detail = wiki_toast_detail(en, wiki_workspace_name(&root), wiki_restart_note(en, stale));
+                wiki_toast(&app, en, true, "ワークスペースを切り替えました", "Switched workspace", Some(detail));
+                Ok(serde_json::json!({"root": root.to_string_lossy(), "restart": stale}))
+            }
+            Err(e) => {
+                wiki_toast(&app, en, false, "ワークスペースを切り替えられません", "Could not switch workspace", Some(e.clone()));
+                Err(e)
+            }
+        }
+    })
+    .await
+}
+
+/// 最近のワークスペースの履歴から外す（その索引も消す）。{root} → {}。現在の root・履歴に無い root は Err。
+/// 成功・失敗の toast は Rust が出す。画面は "wiki-state" で wiki_status を読み直す
+#[tauri::command]
+async fn wiki_forget_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = root_arg(args);
+    blocking(move || {
+        let en = ui_en(&app);
+        let r = root
+            .ok_or_else(|| tr(en, "wiki_forget_root: root は必須です", "wiki_forget_root: root is required"))
+            .and_then(|r| wiki_forget_workspace(&app, &r).map(|()| r));
+        match r {
+            Ok(root) => {
+                // 外した root の索引と、その root の参照フォルダの設定（wiki_workspaces の項目ごと）も消えた
+                let note = tr(en, "索引と参照フォルダの設定も消しました", "its index and reference folder settings were removed too");
+                let detail = wiki_toast_detail(en, wiki_workspace_name(Path::new(&root)), Some(note));
+                wiki_toast(&app, en, true, "履歴から外しました", "Removed from the history", Some(detail));
+                Ok(serde_json::json!({}))
+            }
+            Err(e) => {
+                wiki_toast(&app, en, false, "履歴から外せません", "Could not remove from the history", Some(e.clone()));
+                Err(e)
+            }
+        }
+    })
+    .await
+}
+
+/// 前面の OpenNote タブの root に設定 wiki_root（= MCP / CLI と wiki_status の既定）と監視を揃える。{root} → {root, restart}
+/// （restart = 前の root の配信が再起動まで残る）。履歴にある root だけ（無ければ unknown_root）・last_used は変えない・チャットの子は
+/// 止めない・toast は出さない（失敗は Err = 画面がヘッダーの警告に出す）。asset scope への追加を済ませてから返る（監視の張り直しと走査の結果は
+/// "wiki-state" / "wiki-changed"）。画面はタブの行き来のたびに直列に呼ぶ
+#[tauri::command]
+async fn wiki_front_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = wiki_root_arg(&obj_args(args))?;
+    blocking(move || {
+        let en = ui_en(&app);
+        let root = root.ok_or_else(|| tr(en, "wiki_front_root: root は必須です", "wiki_front_root: root is required"))?;
+        let (root, stale) = wiki_front_workspace(&app, &root)?;
+        Ok(serde_json::json!({"root": root.to_string_lossy(), "restart": stale}))
     })
     .await
 }
@@ -1583,17 +1668,20 @@ async fn wiki_reindex(app: tauri::AppHandle) -> Result<(), String> {
 /// Wiki のページから実在ファイルをホストの open で開く（vault の中、または vault の外の実在する通常ファイル = wiki_open_target）。
 /// 文書の拡張子（WIKI_OPEN_EXT）以外・実行ビット付き・OpenWith の拡張属性付き・隠しフォルダの中（vault の外）は open せず
 /// `open -R`（Finder で場所を表示）に落とす。戻り値 = Finder で表示しただけ（呼び手が知らせる）。
+/// root = 画面のタブの root（履歴にあるものだけ = 無ければ unknown_root）。省略 = 設定 wiki_root。
 /// 既存の open_external は http(s) 専用・open_attachment は添付の id 専用なので別に置く
 #[tauri::command]
 async fn wiki_open_path(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
+    root: Option<String>,
 ) -> Result<bool, String> {
     let ctx = {
         let db = lock(&state.db)?;
         openref_core::wiki::Ctx::from_db(&db).map_err(err)?
     }; // ここでロックを外す
+    let ctx = wiki_pin(ctx, root.as_deref())?;
     let en = ui_en(&app);
     blocking(move || {
         let (_, root) = ctx.ready().map_err(err)?;
@@ -1620,17 +1708,30 @@ async fn wiki_open_path(
 
 // ---------- OpenNote: 参照フォルダと URL の別窓: command の包み（本体と節の説明は wiki_gui.rs） ----------
 
-/// {} → {dirs}。設定が解釈できなければ Err（画面が toast で知らせる）。検査（canonicalize）は main thread の外で
+/// {root?} → {dirs}（そのワークスペースの参照フォルダ = wiki_workspaces[root].ref_dirs・root = 画面のタブの root（履歴にあるものだけ）・
+/// 省略 = 設定 wiki_root）。解釈できない設定は退避して空から（Rust が toast）。検査（canonicalize）は main thread の外で
 #[tauri::command]
-async fn wiki_ref_dirs_get(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    blocking(move || Ok(serde_json::json!({"dirs": wiki_ref_dirs(&app)?}))).await
+async fn wiki_ref_dirs_get(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = wiki_root_arg(&obj_args(args))?;
+    blocking(move || Ok(serde_json::json!({"dirs": wiki_ref_dirs(&app, root.as_deref())?}))).await
 }
 
-/// フォルダの選択ダイアログを開いて検査し、足す → {dirs, added: path | null}（取り消し = null）。Wiki が有効ならその場で asset scope に足す
+/// {root?} → フォルダの選択ダイアログを開いて検査し、そのワークスペース（root = 画面のタブの root（履歴にあるものだけ）・省略 = 設定
+/// wiki_root）の参照フォルダに足す → {dirs, added: path | null}（取り消し = null）。Wiki が有効ならその場で asset scope に足す
 #[tauri::command]
-async fn wiki_ref_dir_add(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+async fn wiki_ref_dir_add(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = wiki_root_arg(&obj_args(args))?;
     blocking(move || {
         let en = ui_en(&app);
+        let root = root.as_deref();
+        // 履歴に無い root はフォルダを選ばせる前に断る（ctx = その root に固定 = vault の中の検査もその root で）
+        let ctx = wiki_pin(wiki_ctx(&app)?, root)?;
         let Some(p) = wiki_pick_folder_titled(
             &app,
             if en {
@@ -1640,9 +1741,8 @@ async fn wiki_ref_dir_add(app: tauri::AppHandle) -> Result<serde_json::Value, St
             },
         ) else {
             // 取り消しは静か（一覧が読めなければ null = 画面は今のまま）
-            return Ok(serde_json::json!({"dirs": wiki_ref_dirs(&app).ok(), "added": null}));
+            return Ok(serde_json::json!({"dirs": wiki_ref_dirs(&app, root).ok(), "added": null}));
         };
-        let (raw, ctx) = wiki_ref_dirs_raw(&app)?;
         let home = ctx.home.as_deref().ok_or_else(|| {
             tr(
                 en,
@@ -1657,32 +1757,22 @@ async fn wiki_ref_dir_add(app: tauri::AppHandle) -> Result<serde_json::Value, St
             ctx.app_dir.as_deref(),
             en,
         )?;
-        let plan = wiki_ref_dirs_for_add(raw.as_deref(), &canon, en);
-        let mut set_aside: Option<String> = None;
-        if let Some(reason) = &plan.broken {
-            // 解釈できない値は捨てずに別の鍵へ退避してから書く（sql の settings で読める）。知らせるのは画面（応答の set_aside）と stderr
-            let key = wiki_ref_dirs_broken_key(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            );
-            if !save_setting(&app, &key, raw.as_deref().unwrap_or("")) {
-                return Err(format!(
-                    "{}: {reason}",
-                    tr(
-                        en,
-                        "解釈できない設定 wiki_ref_dirs を退避できません（追加しません）",
-                        "Could not set aside the unreadable wiki_ref_dirs setting (nothing added)"
-                    )
-                ));
+        // その root の ref_dirs に足す。解釈できない設定は wiki_ws_tx が退避してから空で始める = 応答の set_aside で画面が知らせる
+        let (plan, ctx, set_aside) = wiki_ws_with(&app, false, |m, cur| {
+            let root = wiki_ws_target(m, root, cur)?.ok_or_else(|| {
+                tr(
+                    en,
+                    "ワークスペースのフォルダが未設定です（先にフォルダを選ぶ）",
+                    "No workspace folder is set (choose one first)",
+                )
+            })?;
+            let plan = wiki_ref_dirs_for_add(m, root, &canon);
+            if plan.changed {
+                wiki_save_ref_dirs(m, root, &plan.dirs);
             }
-            eprintln!("openref-app: wiki: 設定 {WIKI_REF_DIRS_KEY} を解釈できないので {key} に退避しました: {reason}");
-            set_aside = Some(key);
-        }
-        if plan.changed {
-            wiki_save_ref_dirs(&app, &plan.dirs)?;
-        }
+            Ok(plan)
+        })?;
+        let ctx = wiki_pin(ctx, root)?;
         if ctx.enabled {
             wiki_allow_dir(&app, &canon, plan.kind)?;
         }
@@ -1696,14 +1786,17 @@ async fn wiki_ref_dir_add(app: tauri::AppHandle) -> Result<serde_json::Value, St
     .await
 }
 
-/// {path} → {dirs, restart}。restart = このプロセスで asset scope に足してあった（配信は再起動まで続く・リンクは外部で開くようになる）
+/// {path, root?} → {dirs, restart}（root = 画面のタブの root（履歴にあるものだけ）・省略 = 設定 wiki_root）。restart = このプロセスで
+/// asset scope に足してあった（配信は再起動まで続く・リンクは外部で開くようになる）
 #[tauri::command]
 async fn wiki_ref_dir_remove(
     app: tauri::AppHandle,
     args: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let en = ui_en(&app);
-    let path = obj_args(args)
+    let a = obj_args(args);
+    let root = wiki_root_arg(&a)?;
+    let path = a
         .get("path")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
@@ -1715,11 +1808,13 @@ async fn wiki_ref_dir_remove(
             )
         })?;
     blocking(move || {
-        // 生の一覧から外す（検査に通らないものは残す = 見えないディスクの参照フォルダを消さない）
-        let (raw, ctx) = wiki_ref_dirs_raw(&app)?;
-        let mut dirs = wiki_ref_dirs_parse(raw.as_deref(), ui_en(&app))?;
-        dirs.retain(|d| *d != path);
-        wiki_save_ref_dirs(&app, &dirs)?;
+        // その root の生の一覧から外す（検査に通らないものは残す = 見えないディスクの参照フォルダを消さない）
+        let root = root.as_deref();
+        let (dirs, ctx, _) = wiki_ws(&app, |m, cur| {
+            let target = wiki_ws_target(m, root, cur)?;
+            Ok(wiki_ref_dirs_for_remove(m, target, &path))
+        })?;
+        let ctx = wiki_pin(ctx, root)?;
         let restart = app
             .state::<WikiRuntime>()
             .allowed
@@ -1732,7 +1827,8 @@ async fn wiki_ref_dir_remove(
     .await
 }
 
-/// {abs, max_chars?} → WikiPageData 相当 + external（参照フォルダ）。html は本文（script は画面側が落とす・リンクの解決は画面側 = links は空）・
+/// {abs, max_chars?, probe?, root?} → WikiPageData 相当 + external（参照フォルダ = root（画面のタブの root・履歴にあるものだけ）・省略 =
+/// 設定 wiki_root の参照フォルダ）。html は本文（script は画面側が落とす・リンクの解決は画面側 = links は空）・
 /// media は種類だけ。md・その他は Err（画面は外部で開く）。索引には触らない
 #[tauri::command]
 async fn wiki_read_ref(
@@ -1759,8 +1855,9 @@ async fn wiki_read_ref(
         .unwrap_or(200_000) as usize;
     // probe = 開けるかだけ確かめる（リンクを押したとき。拒否ならフロントはホストの open に落とす）
     let probe = a.get("probe").and_then(|v| v.as_bool()) == Some(true);
+    let root = wiki_root_arg(&a)?;
     blocking(move || {
-        let (dir, canon) = wiki_ref_target(&wiki_ref_dirs(&app)?, &abs, en)?;
+        let (dir, canon) = wiki_ref_target(&wiki_ref_dirs(&app, root.as_deref())?, &abs, en)?;
         let name = canon
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1878,24 +1975,25 @@ async fn wiki_chat_set_enabled(
     .await
 }
 
-/// {new?} → WikiChatStartResult。使えない（無効・claude が無い・未ログイン・openref-mcp が無い / 古い）なら Err（理由の文）。
+/// {new?, root?} → WikiChatStartResult。root = その root で子を起こす（画面の前面のタブの root・履歴にあるものだけ）・省略 = 設定
+/// wiki_root。使えない（無効・claude が無い・未ログイン・openref-mcp が無い / 古い）なら Err（理由の文）。
 /// 返る前に必ず "wiki-chat" {type: "state"} を出す（成功 = idle・失敗 = off）
 #[tauri::command]
 async fn wiki_chat_start(
     app: tauri::AppHandle,
     args: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let new = obj_args(args)
-        .get("new")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let a = obj_args(args);
+    let new = a.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
+    let root = wiki_root_arg(&a)?;
     let h = app.clone();
-    let res = wiki_chat_start_now(app, new).await;
+    let res = wiki_chat_start_now(app, new, root).await;
     wiki_chat_emit_state(&h);
     res
 }
 
-/// {text, context?: {path?, selection?, item?, title?}} → {turn}（item / title = PDF のタブで開いている文献）
+/// {text, context?: {path?, selection?, item?, title?}, root?} → {turn}（item / title = PDF のタブで開いている文献）。root = 画面の前面のタブの
+/// root: 子の root と違えば Err（送らない = 画面が先に wiki_chat_stop → wiki_chat_start {root} する）
 #[tauri::command]
 async fn wiki_chat_send(
     app: tauri::AppHandle,
@@ -1903,6 +2001,7 @@ async fn wiki_chat_send(
 ) -> Result<serde_json::Value, String> {
     let en = ui_en(&app);
     let a = obj_args(args);
+    let root = wiki_root_arg(&a)?;
     let text = a
         .get("text")
         .and_then(|v| v.as_str())
@@ -1936,7 +2035,8 @@ async fn wiki_chat_send(
     });
     blocking(move || {
         let item = item.as_ref().map(|(k, t)| (k.as_str(), t.as_str()));
-        let turn = app.state::<wiki_chat::Chat>().send_with(
+        let turn = app.state::<wiki_chat::Chat>().send_to(
+            root.as_deref().map(Path::new),
             &text,
             path.as_deref(),
             selection.as_deref(),
@@ -2122,7 +2222,12 @@ async fn wiki_chat_undo(
         if rec.undone {
             return Ok(refused(tr(en, "既に戻しています", "Already undone")));
         }
-        let ctx = wiki_ctx(&app)?;
+        // 戻す先 = 記録した子の root（設定 wiki_root は前面のタブの root で、子の root と違いうる）。履歴から外した root なら戻さない
+        let child = rec.root.clone().or_else(|| chat.root());
+        let ctx = match wiki_chat_undo_ctx(wiki_ctx(&app)?, child.as_deref()) {
+            Ok(c) => c,
+            Err(reason) => return Ok(refused(reason)),
+        };
         let trash_item = |key: &str| -> Result<(), String> {
             let st = app.state::<AppState>();
             let mut db = lock(&st.db)?;
@@ -2275,10 +2380,13 @@ fn main() {
                 wiki_emit(&h, "wiki-chat", v)
             })));
             let h = app.handle().clone();
+            // 起動時の root はここで同期に読む（背景の家事と適用はこの root にだけ効かせる = 画面の揃えが先に済んでも前面の root を
+            // touch しない・監視を起動時の root に張り直さない）
+            let start_root = wiki_ctx(&h).ok().and_then(|c| c.root);
             tauri::async_runtime::spawn_blocking(move || {
-                if let Err(e) = wiki_apply(&h, WikiScan::None) {
-                    eprintln!("openref-app: ワークスペースを asset scope に足せません: {e}");
-                }
+                // 旧の索引（app_dir 直下の wiki-index.sqlite）の削除・最近のワークスペースの更新・wiki-index/ の孤児の掃除→
+                // 設定が起動時のままなら asset scope と監視（root を変える段の鍵の中 = wiki_front_root と直列）
+                wiki_startup(&h, start_root);
             });
             Ok(())
         })
@@ -2378,6 +2486,9 @@ fn main() {
             wiki_reindex,
             wiki_open_path,
             wiki_pick_root,
+            wiki_switch_root,
+            wiki_forget_root,
+            wiki_front_root,
             wiki_ref_dirs_get,
             wiki_ref_dir_add,
             wiki_ref_dir_remove,
@@ -2459,7 +2570,10 @@ mod parity {
         ("wiki_reindex", "GUI の監視の張り直し + 全走査。agent の入口は鮮度規則で自動更新される"),
         ("wiki_open_path", "デスクトップのアプリで開く = ホストの open（ワークスペースの中の実在ファイルと、本文の file:// が指すワークスペースの外の実在する通常ファイル。許可一覧の外の拡張子等は Finder で表示）。agent は wiki_read の abs_path を直接開ける"),
         ("wiki_pick_root", "ワークスペースのフォルダは利用者が GUI のフォルダ選択で決める（agent が任意のフォルダをワークスペースにしない）"),
-        ("wiki_ref_dirs_get", "参照フォルダ（ワークスペースの外の読み取り専用のルート）の一覧。GUI の表示用。agent は sql の settings（wiki_ref_dirs）"),
+        ("wiki_switch_root", "ワークスペースの切替は利用者が GUI で決める（履歴にある root だけ）= agent が任意のフォルダへ切り替えて書き回らない。agent は wiki_status の workspaces で読む"),
+        ("wiki_forget_root", "最近のワークスペースの履歴から外す（GUI の [外す]・その索引も消す）。ワークスペースの選択は利用者が GUI で決める。agent は wiki_status の workspaces で読む"),
+        ("wiki_front_root", "前面の OpenNote タブの root に設定 wiki_root（= agent の既定の root）と監視を揃える GUI のタブの切替（履歴にある root だけ・last_used は変えない）。agent は既定を動かさず wiki_* の root で固定する"),
+        ("wiki_ref_dirs_get", "参照フォルダ（ワークスペースの外の読み取り専用のルート）の一覧。GUI の表示用。agent は sql の settings（wiki_workspaces）"),
         ("wiki_ref_dir_add", "参照フォルダは利用者が GUI のフォルダ選択で決める（agent が任意のフォルダを配信の範囲に足さない）"),
         ("wiki_ref_dir_remove", "参照フォルダを外す（GUI の [外す]）。agent には用途が無い"),
         ("wiki_read_ref", "参照フォルダの中のファイルを内蔵の表示に出すための読み（asset URL の組立てと html の本文）。agent はパスを直接読める"),

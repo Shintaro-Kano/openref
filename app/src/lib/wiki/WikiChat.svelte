@@ -10,9 +10,9 @@
   import { reveal } from "../state.svelte";
   import WikiChatMd from "./WikiChatMd.svelte";
   import { changeView, clipSelection, codePoints, groupByTurn, toolName, type ChatEntry } from "./chat";
-  import { authAction, busy, chat, claimFocus, currentSource, floatChat, interrupt, loadChatStatus, newConversation, send, setModel, sourceKey, undoChange, usable } from "./chat.svelte";
+  import { authAction, busy, chat, chatHidden, claimFocus, currentSource, floatChat, interrupt, loadChatStatus, newConversation, send, setModel, sourceKey, undoChange, usable } from "./chat.svelte";
   import type { WikiChatChange } from "./types";
-  import { openWikiPage } from "./wiki.svelte";
+  import { openWikiPage, workspaceName } from "./wiki.svelte";
 
   let list: HTMLDivElement | undefined = $state();
   let input: HTMLTextAreaElement | undefined = $state();
@@ -22,6 +22,8 @@
   const groups = $derived(groupByTurn(chat.conv.entries));
   const isBusy = $derived(busy());
   const ok = $derived(usable(st));
+  /** 会話が別のワークスペースの物 = 隠して 1 行（送ると前面の root で新しい会話） */
+  const hidden = $derived(chatHidden());
   // 文脈の元 = 前面のタブ（Wiki のページ / PDF のタブの文献）。チップの文 = ページは path・文献は題名（無ければ key）
   const src = $derived(currentSource());
   const srcKey = $derived(sourceKey(src));
@@ -37,7 +39,7 @@
     : t("未起動")
   );
 
-  // タブを押して開いた = 入力欄へ明示 focus（WKWebView は autofocus が効かない・CLAUDE.md §6）。
+  // タブを押して開いた = 入力欄へ明示 focus（WKWebView は autofocus が効かない）。
   // タブの切替で mount された直後でも拾う（setTab が立てた focusPending を mount の後に読む）。消費は見えている入力欄が focus できたときだけ
   // （隠れた PDF タブの WikiChat が先に消費すると見えている方に来ない = claimFocus）
   $effect(() => {
@@ -195,6 +197,9 @@
   {/if}
 
   <div class="wk-ch-list" bind:this={list} onscroll={onScroll}>
+    {#if hidden}
+      <p class="wk-ch-note wk-ch-other" title={chat.root ?? ""}>{t("この会話は {name} のワークスペースのものです。ここで送ると新しい会話になります").replace("{name}", workspaceName(chat.root ?? "") || (chat.root ?? ""))}</p>
+    {:else}
     {#if !chat.conv.entries.length && chat.resumed}
       <p class="wk-ch-dim">{t("前の会話の続きです（過去の発言はここには表示されません）")}</p>
     {/if}
@@ -262,6 +267,7 @@
         <p class="wk-ch-dim wk-ch-wait"><span class="wk-ch-spin"></span>{t("応答を待っています…")}</p>
       {/if}
     {/each}
+    {/if}
   </div>
 
   {#if chat.stderr.length}

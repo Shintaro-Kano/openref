@@ -11,7 +11,7 @@
   import { tick } from "svelte";
   import LabelBadge from "./LabelBadge.svelte";
   import { app, activateTab, closeTab, moveTab, openTabInMode, tabView, viewTitle, type Tab, type View } from "./state.svelte";
-  import { wikiTabTitle } from "./wiki/wiki.svelte";
+  import { wikiTabTitle, wikiTabWorkspace } from "./wiki/wiki.svelte";
 
   let listEl = $state<HTMLDivElement | null>(null);
   /** 並べ替えで掴んでいるタブの id と、見た目のずれ（配列上の枠の左端から px。transform で指に追わせる） */
@@ -29,6 +29,13 @@
     if (f.journal) parts.push(`${t("誌名")} ${f.journal}`);
     if (search) parts.push(`${t("「")}${search}${t("」")}`);
     return parts.join(" · ");
+  }
+
+  /** OpenNote のタブの tooltip = ページの path（ホームは題名）+ 次の行にワークスペース「{name} · {root}」（同じ題名のタブを見分ける） */
+  function wikiTip(w: NonNullable<Tab["wiki"]>): string {
+    const ws = wikiTabWorkspace(w);
+    const head = w.path ?? wikiTabTitle(w);
+    return ws ? `${head}\n${ws}` : head;
   }
 
   function onAux(e: MouseEvent, id: number) {
@@ -220,7 +227,7 @@
           role="tab"
           tabindex={front ? 0 : -1}
           aria-selected={front}
-          title={tab.viewer ? tab.viewer.title : tab.wiki && app.wikiOn ? (tab.wiki.path ?? wikiTabTitle(tab.wiki)) : tip(tab, v)}
+          title={tab.viewer ? tab.viewer.title : tab.wiki && app.wikiOn ? wikiTip(tab.wiki) : tip(tab, v)}
           onpointerdown={(e) => onTabDown(e, tab.id)}
           onclick={(e) => {
             if (e.button === 0) void activateTab(tab.id);

@@ -1,4 +1,5 @@
-//! 索引 `<app_dir>/wiki-index.sqlite`。`openref.sqlite` とは別ファイル・消しても再構築で戻るキャッシュ。
+//! 索引 `<app_dir>/wiki-index/<root の sha256 先頭 16>.sqlite`（ワークスペースごと = `index_path`。以前は
+//! `<app_dir>/wiki-index.sqlite` の 1 本 = `INDEX_FILE`）。`openref.sqlite` とは別ファイル・消しても再構築で戻るキャッシュ。
 //! 所有者は core: GUI・CLI・MCP のどの入口も同じ鮮度規則（`refresh_if_stale`）で更新する。
 //!
 //! - 接続は WAL・busy_timeout 5s。プロセスに 1 つ（`with_index` = `OnceLock<Mutex<Option<Index>>>`・索引パスか root が変われば開き直す）
@@ -6,7 +7,7 @@
 //! - 大きな走査（初回・作り直し・変更 500 件超）は `meta.rebuilding = <pid>:<開始 unix 秒>` を `BEGIN IMMEDIATE` で立ててから行う。
 //!   他のプロセスは待たずに「作り直し中（n%）」を返す。10 分を過ぎた旗（落ちたプロセスの物）と自分の pid の旗は引き継ぐ
 //! - 索引が壊れている（SQLITE_CORRUPT / SQLITE_NOTADB = malformed・not a database）と分かったら、ファイルを
-//!   `wiki-index.sqlite.corrupt-<unix 秒>`（1 世代だけ）へ退避して作り直す（`with_index`。索引は再生成できるキャッシュ）。
+//!   `<名前>.sqlite.corrupt-<unix 秒>`（1 世代だけ）へ退避して作り直す（`with_index`。索引は再生成できるキャッシュ）。
 //!   別の接続で開き直して壊れていなければ退避しない（他のプロセスが先に作り直した索引を捨てない）。作り直しは通常の鮮度規則
 //!   （大きな走査は rebuilding の旗）で行う
 //! - `meta.root` が違えば中身を捨てる。`meta.schema` が違えば表を作り直す（版 2 = 全文検索 pages_fts を足した）
@@ -42,8 +43,18 @@ const BIG_SCAN: usize = 500;
 const BATCH: usize = 300;
 /// 本文を読む上限（これより大きい md / html は本文を解析しない = リンク・tags なし）
 pub const BODY_MAX: i64 = 16 * 1024 * 1024;
-/// 索引のファイル名（app_dir の直下・再生成できるキャッシュ）
+/// 旧の索引のファイル名（app_dir の直下）。以前の置き場 = GUI の起動時の掃除が消す（今の置き場は `index_path`。他は quarantine の名前の控えだけ）
 pub const INDEX_FILE: &str = "wiki-index.sqlite";
+/// 索引の置き場（app_dir の下のフォルダ・ワークスペースごとに 1 ファイル = `index_path`）
+pub const INDEX_DIR: &str = "wiki-index";
+
+/// このワークスペースの索引 = `<app_dir>/wiki-index/<sha256_hex(root の文字列) の先頭 16 桁>.sqlite`。root は `check_root` の戻り
+/// （canonical）。文字列は NFC にしてから hash する（退避 wiki-history/ の鍵 `edit::history_dir` と同じ型 = 同じ root が NFC / NFD の
+/// どちらの綴りで来ても同じファイル）。GUI / MCP / CLI が `Ctx::ready()` 経由で同じ規則を使う
+pub fn index_path(app_dir: &Path, root: &Path) -> PathBuf {
+    let s: String = root.to_string_lossy().nfc().collect();
+    app_dir.join(INDEX_DIR).join(format!("{}.sqlite", &sha256_hex(s.as_bytes())[..16]))
+}
 /// 本文を読めなかったページの mtime の印。走査が出す mtime（0 以上。epoch 前・取れない = 0）と重ならない値にして、
 /// 次の走査で必ず mtime が合わず再試行される
 pub const READ_ERROR_MTIME: i64 = -1;
@@ -1251,6 +1262,27 @@ mod tests {
         remove_index(&ip).unwrap(); // 2 回目（ファイル無し）もエラーにしない
         let n = with_index(&ip, &root, |ix| Ok(ix.list(&ListQuery { limit: 10, ..Default::default() })?.0)).unwrap();
         assert_eq!(n, 0, "消した後は空の索引から");
+    }
+
+    /// index_path: 決定的・別の root は別名・名前 = 16 桁の hex + `.sqlite`・置き場 = app_dir/wiki-index/・NFC / NFD の綴りは同じ名
+    #[test]
+    fn index_path_per_workspace() {
+        let app = Path::new("/app");
+        let a = index_path(app, Path::new("/Users/u/Documents/kb"));
+        assert_eq!(a, index_path(app, Path::new("/Users/u/Documents/kb")), "決定的");
+        assert_eq!(a.parent().unwrap(), Path::new("/app/wiki-index"));
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name.len(), 16 + ".sqlite".len(), "{name}");
+        assert!(name.ends_with(".sqlite") && name[..16].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{name}");
+        assert_eq!(name[..16], sha256_hex(b"/Users/u/Documents/kb")[..16]);
+        let b = index_path(app, Path::new("/Users/u/Documents/blog"));
+        assert_ne!(a, b, "別の root は別のファイル");
+        assert_ne!(a, index_path(app, Path::new("/Users/u/Documents/kb/")), "文字列が違えば別（root は canonical で来る）");
+        let nfc = "/Users/u/マイドライブ/wiki";
+        let nfd: String = nfc.nfd().collect();
+        assert_ne!(nfd, nfc);
+        assert_eq!(index_path(app, Path::new(nfc)), index_path(app, Path::new(&nfd)), "NFC / NFD は同じ名");
+        assert_ne!(a, Path::new("/app").join(INDEX_FILE));
     }
 
     thread_local! {

@@ -95,6 +95,12 @@ impl Db {
         Ok(())
     }
 
+    /// settings の行を消す（無ければ何もしない）。GUI が旧キー（`wiki_ref_dirs` は `wiki_workspaces` へ移した）を消すのに使う
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     /// PDF 添付の書込先モード。'drive' = Drive 互換レイアウト / それ以外（未設定を含む）= managed storage。
     /// 読めなければ Err（黙って managed に倒すと、drive の利用者の添付が気づかれずに storage/ へ行く）
     pub fn pdf_write_mode(&self) -> Result<String> {
@@ -514,6 +520,19 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// delete_setting: 行を消す・無い鍵は何もしない・他の鍵は残る
+    #[test]
+    fn delete_setting_removes_only_that_key() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting("a", "1").unwrap();
+        db.set_setting("b", "2").unwrap();
+        db.delete_setting("a").unwrap();
+        db.delete_setting("a").unwrap();
+        db.delete_setting("none").unwrap();
+        assert_eq!(db.setting("a").unwrap(), None);
+        assert_eq!(db.setting("b").unwrap().as_deref(), Some("2"));
+    }
 
     /// v8 までの schema（旧バイナリが作った既存 DB の形）から開くと v9 で attachments.doi_check が増え、旧列はそのまま
     #[test]

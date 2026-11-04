@@ -4,6 +4,7 @@
 //! 安全網は 1 つ: このプロセスで最初の（DB を変える）書込コマンドの前に DB のスナップショット（core::backup・失敗したら書かない）。
 //! env `OPENREF_MCP_ALLOW`（分類 read / wiki とコマンド名のカンマ区切り）で起動すると、許可外のコマンドは一覧に出さず呼べない。
 //! 無い・空なら全部。env `OPENREF_MCP_CHAT=1`（OpenNote のチャットが付ける）は写しの接頭辞を `pre-chat-` にするだけ。
+//! env `OPENREF_WIKI_ROOT`（OpenNote のチャットが子の root を付ける）は root を省いた `wiki_*` と許可一覧の path の検査をその root に固定する。
 //! 依存は serde_json + rusqlite + openref-core のみ（SDK 非依存）。stdout = プロトコル専用（改行区切り JSON-RPC）、stderr = ログ。
 
 use openref_core::{backup, commands, datadir, wiki, Db};
@@ -60,6 +61,10 @@ fn main() {
     }
     let mut srv = Server::new(db);
     srv.allow = allow;
+    srv.wiki_root = std::env::var("OPENREF_WIKI_ROOT").ok().filter(|r| !r.trim().is_empty());
+    if let Some(r) = &srv.wiki_root {
+        eprintln!("openref-mcp: wiki_* のワークスペースを {r} に固定（OPENREF_WIKI_ROOT）");
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -142,6 +147,9 @@ impl Allow {
 struct Server {
     db: Db,
     allow: Allow,
+    /// env `OPENREF_WIKI_ROOT`（チャットの子は始めた root に縛る）。Some なら root を省いた wiki_* の args にこの値を入れ
+    /// （照合は core の Ctx::pin = 履歴にある root だけ）、許可一覧の path の検査もこの root で行う
+    wiki_root: Option<String>,
     /// `sql` 用の読み取り専用の別接続（初回に遅延で開く）
     ro: Option<Connection>,
     /// このプロセスで書込の前のスナップショットを済ませたか
@@ -170,7 +178,7 @@ fn check_tool_args(tool: &str, args: &Value, accepted: &[&str]) -> Result<(), St
 
 impl Server {
     fn new(db: Db) -> Self {
-        Server { db, allow: Allow::default(), ro: None, snapshotted: false, sql_budget: SQL_TIME_BUDGET }
+        Server { db, allow: Allow::default(), wiki_root: None, ro: None, snapshotted: false, sql_budget: SQL_TIME_BUDGET }
     }
 
     fn handle_message(&mut self, msg: &Value) -> Option<Value> {
@@ -243,6 +251,14 @@ impl Server {
         } else {
             args
         };
+        let pinned;
+        let args = match self.pin_wiki_args(cmd, args) {
+            Some(a) => {
+                pinned = a;
+                &pinned
+            }
+            None => args,
+        };
         let mut note = None;
         if commands::writes_db(cmd) && !self.snapshotted {
             match backup::snapshot(&self.db, self.allow.snapshot_prefix(), backup::AGENT_KEEP) {
@@ -266,8 +282,22 @@ impl Server {
         }
     }
 
+    /// env `OPENREF_WIKI_ROOT` があれば、root を省いた（無い・null）wiki_* の args にその値を入れたもの（None = そのまま渡す）。
+    /// root を渡した呼び出しはそのまま（履歴にある別の root も core の pin が受ける）。args が object でも null でもなければ触らない（登録表の検査に任せる）
+    fn pin_wiki_args(&self, cmd: &commands::Command, args: &Value) -> Option<Value> {
+        let root = self.wiki_root.as_deref().filter(|_| commands::is_wiki(cmd))?;
+        let mut a = match args {
+            Value::Null => serde_json::Map::new(),
+            Value::Object(m) if m.get("root").is_none_or(Value::is_null) => m.clone(),
+            _ => return None,
+        };
+        a.insert("root".into(), json!(root));
+        Some(Value::Object(a))
+    }
+
     /// 許可一覧のセッションでホストのファイルを読むコマンドの path を、vault の中の canonical なパスに替える
-    /// （vault の外・vault の中の symlink で外を指すもの・Wiki が無効 / 未設定は拒否。検査したパスそのものを渡す）
+    /// （vault の外・vault の中の symlink で外を指すもの・Wiki が無効 / 未設定は拒否。検査したパスそのものを渡す）。
+    /// vault = env `OPENREF_WIKI_ROOT` があればその root（履歴に無ければ拒否）・無ければ設定 wiki_root
     fn vault_path_arg(&self, args: &Value) -> Result<Value, String> {
         let mut a = args.clone();
         if let Some(p) = args.get("path").and_then(Value::as_str) {
@@ -276,7 +306,10 @@ impl Server {
                 openref_core::CoreError::BadInput(m) => m,
                 e => e.to_string(),
             };
-            let ctx = wiki::Ctx::from_db(&self.db).map_err(msg)?;
+            let mut ctx = wiki::Ctx::from_db(&self.db).map_err(msg)?;
+            if let Some(r) = &self.wiki_root {
+                ctx.pin(r).map_err(msg)?;
+            }
             let canon = ctx
                 .host_path_in_vault(Path::new(p))
                 .map_err(|e| format!("このセッションでは path にワークスペースの中のファイル（絶対パスかワークスペース相対）だけ渡せます（{}）", msg(e)))?;
@@ -514,7 +547,8 @@ const SCHEMA_NOTES: &str = "\
 - `import_sources` / `import_runs` / `import_objects` / `import_results` / `import_files` はライブラリ移行の由来・履歴・対応表・結果・コピー台帳。元レコードは引用用 CSL や全文索引とは別のローカル資料。削除済み対象の対応も残すので、履歴を削除して再作成・復元する操作はしない。
 - `PRAGMA data_version` は他の接続の書込で増える（app はこれを 2 秒ごとに見て一覧を読み直す = call の書込はすぐ画面に出る）。
 - sql の PRAGMA は値なしの読み（`PRAGMA user_version` 等）と表の情報（table_info・table_xinfo・table_list・index_list・index_info・index_xinfo・foreign_key_list・integrity_check・quick_check）だけ。表の情報は `SELECT * FROM pragma_table_info('items')` の形でも読める（JOIN・WHERE に使える）。
-- OpenNote（OpenRef のページ機能・任意・既定は無効。コマンドは `wiki_*`）: ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。正はディスクのファイルで、索引 `<app_dir>/wiki-index.sqlite` は再生成できるキャッシュ（sql からは見えない）。読むのは call の `wiki_status` / `wiki_list` / `wiki_read`（画像は画像そのもの・PDF は抽出テキスト）/ `wiki_backlinks` / `wiki_search`（題名 + 本文の全文検索・和文可・tag の AND 絞込）/ `wiki_tags` / `wiki_inbox`（`ingest/` に置かれた素材の一覧）、書くのは `wiki_write`（md / html）/ `wiki_move`（パスはワークスペース相対）。`wiki_write` で既存を上書きすると上書き前を `<app_dir>/wiki-history/<16 桁>/<unix 秒>.<拡張子>` に退避して応答の `backup` に返す（ファイルごとに新しい 10 世代・同じフォルダの `path.txt` が元のファイルの絶対パス）= 戻すときはその中身を `wiki_write` で書き戻す。有効化は GUI だけ（Settings › OpenNote・フォルダは左の木のワークスペース名のメニュー）。settings の `wiki_enabled`（\"1\" = 有効）`wiki_root`（ワークスペースの絶対パス）。ページから item へのリンクは `[題名](openref://open?key=KEY)`（KEY は実在の key だけ・`wiki_backlinks` の key で逆に引ける）。
+- OpenNote（OpenRef のページ機能・任意・既定は無効。コマンドは `wiki_*`）: ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。正はディスクのファイルで、索引 `<app_dir>/wiki-index/<hash>.sqlite`（ワークスペースごと）は再生成できるキャッシュ（sql からは見えない）。読むのは call の `wiki_status` / `wiki_list` / `wiki_read`（画像は画像そのもの・PDF は抽出テキスト）/ `wiki_backlinks` / `wiki_search`（題名 + 本文の全文検索・和文可・tag の AND 絞込）/ `wiki_tags` / `wiki_inbox`（`ingest/` に置かれた素材の一覧）、書くのは `wiki_write`（md / html）/ `wiki_move`（パスはワークスペース相対）。`wiki_write` で既存を上書きすると上書き前を `<app_dir>/wiki-history/<16 桁>/<unix 秒>.<拡張子>` に退避して応答の `backup` に返す（ファイルごとに新しい 10 世代・同じフォルダの `path.txt` が元のファイルの絶対パス）= 戻すときはその中身を `wiki_write` で書き戻す。有効化は GUI だけ（Settings › OpenNote・フォルダは左の木のワークスペース名のメニュー）。最近のワークスペースは `wiki_status` の `workspaces`（settings の `wiki_workspaces`・切替は GUI だけ）。settings の `wiki_enabled`（\"1\" = 有効）`wiki_root`（ワークスペースの絶対パス）。ページから item へのリンクは `[題名](openref://open?key=KEY)`（KEY は実在の key だけ・`wiki_backlinks` の key で逆に引ける）。
+- OpenNote のワークスペースの固定: `wiki_*` は任意の引数 `root`（`wiki_status` の `workspaces[].root` の文字列をそのまま = 履歴にあるものだけ・他はエラー）で読み書きするワークスペースを固定できる。省略 = settings の `wiki_root` = 利用者が OpenRef の前面のタブで見ているワークスペース（タブを行き来すると変わる。OpenRef のチャットの中では省略 = チャットを始めたワークスペース = env `OPENREF_WIKI_ROOT`）= 複数のワークスペースを使うとき・書いている間に既定が変わると困るときは `root` を渡す。`wiki_status {root}` の `root`・件数は固定した root の物で、`workspaces[].current` は settings の `wiki_root`（前面）のまま。
 - OpenNote の用例（雛形。何を書くかはその場の指示で決める）: (1) ingest/ の素材を記事に = `wiki_inbox` → `wiki_read`（素材）→ 関係する論文を `list_items` で探す → `wiki_write`（記事。frontmatter の `sources` に素材のパス・`items` に key・`tags`）→ `wiki_move`（素材を ingest/ の外の置き場へ）。(2) 選んだ論文の要約ページを作る = `get_item` と `get_fulltext` で読む → `wiki_write`（`[題名](openref://open?key=KEY)` 付き）→ `wiki_backlinks {key}` で載ったかを確かめる。書誌は get_item の値だけを使う（作らない）。
 ";
 
@@ -975,6 +1009,68 @@ mod tests {
         assert_eq!(r["isError"], true);
         assert!(!dir.join("backup").exists(), "DB の写しを作らない");
         assert!(!srv.snapshotted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// env `OPENREF_WIKI_ROOT`（チャットの子 = 始めた root に縛る）: root を省いた wiki_* はその root に固定・root を渡せばそれ・
+    /// 履歴に無い root は拒否・許可一覧の path の検査もその root・wiki 以外の args には触らない・env 無しは設定 wiki_root（今どおり）
+    #[test]
+    fn wiki_root_env_pins_wiki_args() {
+        let (mut srv, dir) = file_server("wikiroot");
+        let (a, b) = (dir.join("vault-a"), dir.join("vault-b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
+        srv.db.set_setting("wiki_enabled", "1").unwrap();
+        srv.db.set_setting("wiki_root", &a).unwrap();
+        srv.db
+            .set_setting("wiki_workspaces", &json!({a.clone(): {"last_used": 2}, b.clone(): {"last_used": 1}}).to_string())
+            .unwrap();
+        let status = |srv: &mut Server, args: Value| -> Value {
+            let r = tool(srv, "call", json!({"name": "wiki_status", "args": args}));
+            assert_eq!(r["isError"], false, "{}", text(&r));
+            serde_json::from_str(&text(&r)).unwrap()
+        };
+        let current = |st: &Value| -> Vec<String> {
+            st["workspaces"].as_array().unwrap().iter().filter(|w| w["current"] == true).map(|w| w["root"].as_str().unwrap().to_string()).collect()
+        };
+        // env 無し = 設定 wiki_root（tempdir はホームの外 = 検査に落ちて error の枝・root と workspaces は返る）
+        let st = status(&mut srv, json!({}));
+        assert_eq!((st["root"].as_str(), current(&st)), (Some(a.as_str()), vec![a.clone()]));
+        // env = B: 省けば B・渡せばそれ・current は設定（前面）の A のまま
+        srv.wiki_root = Some(b.clone());
+        let st = status(&mut srv, json!({}));
+        assert_eq!((st["root"].as_str(), current(&st)), (Some(b.as_str()), vec![a.clone()]));
+        assert_eq!(status(&mut srv, Value::Null)["root"], json!(b), "args 無し（null）も固定");
+        assert_eq!(status(&mut srv, json!({"root": a}))["root"], json!(a), "root を渡せばそれ");
+        assert_eq!(status(&mut srv, json!({"root": null}))["root"], json!(b), "null = 省いた");
+        // 旧 tool 名の直呼びも同じ（run_command を通る）・読みの先も固定した root（検査に落ちる文に B が出る）
+        let r = tool(&mut srv, "wiki_list", json!({}));
+        assert!(text(&r).contains(&b) && !text(&r).contains(&a), "{}", text(&r));
+        // wiki 以外は触らない・形の違う args も触らない（登録表の検査に任せる）
+        let find = |n: &str| commands::find(n).unwrap();
+        assert!(srv.pin_wiki_args(find("get_item"), &json!({})).is_none());
+        assert!(srv.pin_wiki_args(find("wiki_list"), &json!(["x"])).is_none());
+        assert!(srv.pin_wiki_args(find("wiki_list"), &json!({"root": a})).is_none());
+        assert_eq!(srv.pin_wiki_args(find("wiki_write"), &json!({"path": "p.md"})), Some(json!({"path": "p.md", "root": b})));
+        // 許可一覧の path の検査も B（検査に落ちる文に B が出る）
+        srv.allow = Allow::parse(Some("read,wiki,import_pdf"));
+        let pdf = dir.join("x.pdf");
+        std::fs::write(&pdf, openref_core::pdftools::minimal_pdf("x", None)).unwrap();
+        let r = tool(&mut srv, "call", json!({"name": "import_pdf", "args": {"path": pdf.to_string_lossy()}}));
+        assert_eq!(r["isError"], true);
+        assert!(text(&r).contains(&b) && !text(&r).contains(&format!("{a}（")), "{}", text(&r));
+        // 履歴に無い root = wiki_* も path の検査も拒否
+        srv.wiki_root = Some(dir.join("vault-c").to_string_lossy().to_string());
+        for r in [
+            tool(&mut srv, "call", json!({"name": "wiki_status", "args": {}})),
+            tool(&mut srv, "call", json!({"name": "wiki_write", "args": {"path": "p.md", "content": "x"}})),
+            tool(&mut srv, "call", json!({"name": "import_pdf", "args": {"path": pdf.to_string_lossy()}})),
+        ] {
+            assert_eq!(r["isError"], true);
+            assert!(text(&r).contains("履歴に無いワークスペースです"), "{}", text(&r));
+        }
+        assert!(!dir.join("vault-c").exists() && !dir.join("vault-a/p.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

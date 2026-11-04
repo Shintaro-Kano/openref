@@ -1,12 +1,12 @@
 <script lang="ts">
   /* OpenNote の右ペイン: ページ情報 / リンク先の文献（items の key を get_item で引いた item カード）/
-     バックリンク（wiki_backlinks）/ 目次（描画部品の onHeadings）。ホームは vault の概要。
+     バックリンク（wiki_backlinks）/ 目次（描画部品の onHeadings）。ホームは vault の概要・最近のワークスペース・参照フォルダ。
      書誌は捏造しない: 蔵書に無い key は「見つかりません」と key のまま出す */
   import { untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { api, type ItemDetail } from "../api";
   import { openViewer, reveal } from "../state.svelte";
-  import { backlinks, jumpToHeading, openWikiPage, touchedAny, wk } from "./wiki.svelte";
+  import { backlinks, forgetWorkspace, jumpToHeading, openWikiPage, pickRoot, rootInUse, switchWorkspace, touchedAny, wk, workspaceList, workspaceName } from "./wiki.svelte";
   import { addRefDir, removeRefDir } from "./refdirs.svelte";
   import type { WikiBacklink } from "./types";
 
@@ -14,6 +14,8 @@
   let { embedded = false }: { embedded?: boolean } = $props();
 
   const page = $derived(wk.page);
+  /** ホームのワークスペースの節（wiki_status.workspaces・新しい順） */
+  const workspaces = $derived(workspaceList());
   // 読み直しの鍵: wk.page は保存のたびに新しい物に置き換わる（本文・hash だけが変わる）ので、
   // 文献カードとバックリンクの effect は page の同一性ではなく path と items の中身だけに依存させる
   const pagePath = $derived(page?.path ?? null);
@@ -125,6 +127,28 @@
         {#if wk.status.last_scan}<p class="wk-dim">{t("最終走査")}: {date(wk.status.last_scan)}</p>{/if}
       {/if}
     </div>
+    <!-- ワークスペース: 最近のワークスペース。このタブの root は ✓・[開く] でこのタブだけ切替・[外す] で履歴から外す
+         （無いフォルダは灰色 = [開く] なし・どれかのタブが使っている root は [外す] なし）。切替・外す・選ぶの toast と一覧の読み直し（wiki-state）は Rust -->
+    <div class="wk-sec">
+      <h3>{t("ワークスペース")}{#if workspaces.length}<span class="wk-n">{workspaces.length}</span>{/if}</h3>
+      {#each workspaces as w (w.root)}
+        <div class="wk-ws" class:wk-ws-gone={!w.exists && !w.current} title={!w.exists && !w.current ? `${t("見つかりません")}: ${w.root}` : null}>
+          <div class="wk-ws-main">
+            <span class="wk-ws-name">{workspaceName(w.root) || w.root}</span>
+            <span class="wk-ref-path" title={w.root}>&lrm;{w.root}&lrm;</span>
+          </div>
+          {#if w.current}
+            <span class="wk-ws-cur">✓</span>
+          {:else}
+            {#if w.exists}<button class="wk-btn" title={w.root} onclick={() => void switchWorkspace(w.root)}>{t("開く")}</button>{/if}
+            {#if !rootInUse(w.root)}<button class="wk-btn" title={t("このワークスペースを履歴から外す")} onclick={() => void forgetWorkspace(w.root)}>{t("外す")}</button>{/if}
+          {/if}
+        </div>
+      {/each}
+      <div class="wk-card-acts">
+        <button class="wk-btn" onclick={() => void pickRoot()}>{t("別のフォルダを選ぶ…")}</button>
+      </div>
+    </div>
     <!-- 参照フォルダ: ワークスペースの外の読み取り専用のルート。その下の pdf / html / 画像へのリンクを内蔵の表示で開く -->
     <div class="wk-sec">
       <h3>{t("参照フォルダ")}{#if wk.refDirs.length}<span class="wk-n">{wk.refDirs.length}</span>{/if}</h3>
@@ -234,6 +258,12 @@
   .wk-card-acts { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
   .wk-ref { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; }
   .wk-ref-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .wk-ws { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; }
+  .wk-ws-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .wk-ws-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wk-ws .wk-ref-path { color: var(--dim); font-size: 11px; }
+  .wk-ws-gone { opacity: 0.55; }
+  .wk-ws-cur { flex: none; padding: 0 6px; color: var(--accent); font-weight: 700; }
   .wk-btn {
     border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; background: var(--bg); font-size: 11.5px; cursor: pointer;
     color: var(--text);

@@ -62,7 +62,7 @@ fn asset(bytes: &'static [u8], ctype: &'static str) -> impl IntoResponse {
 }
 
 /// DB が読めないときの応答 = 500 + `{error}`（ダイアログの「検索できません: HTTP 500」に出る。/api/status だけは別扱い）。
-/// 「該当なし」「蔵書に見つかりません」「0 件」に化けさせない（CLAUDE.md §4-3）
+/// 「該当なし」「蔵書に見つかりません」「0 件」に化けさせない
 fn db_error(what: &str, e: impl std::fmt::Display) -> Response {
     let msg = format!("{what}: {e}");
     eprintln!("openref-connectd: {msg}");
@@ -93,7 +93,7 @@ async fn api_status(State(st): State<Arc<St>>) -> Response {
         .filter_map(|(what, e)| e.map(|e| format!("{what}: {e}")))
         .collect();
     if !errs.is_empty() {
-        // 診断は VBA が MacJapanese で読んで表示する（CLAUDE.md §6）= 印字可能な ASCII だけにする
+        // 診断は VBA が MacJapanese で読んで表示する = 印字可能な ASCII だけにする
         // （非 ASCII・制御文字・JSON で \ が付く " と、MacJapanese で化ける \ ~ は ? に）
         let msg: String = errs
             .join(" / ")

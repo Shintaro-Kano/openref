@@ -5,7 +5,7 @@
    ③ 外部の書換え（未保存が無ければ黙って読み直す・あれば触らない）
    ④ caret への挿入（OS ドロップの wiki_import_file・貼付画像の wiki_save_blob・書式キー）
    ⑤ 保存に失敗したままタブを閉じようとすると止まる（state.svelte の closeTab → wiki.svelte の leave guard）
-   ⑥〜⑮ 本文を失わない終わり方・root の変化・ゴミ箱・改行・終了の要求・OS ドロップ・WikiPage の配線（各節の見出しに書く）
+   ⑥〜⑮ 本文を失わない終わり方・ワークスペース（編集は始めたときの root に固定・タブの行き来と明示の切替）・ゴミ箱・改行・終了の要求・OS ドロップ・WikiPage の配線（各節の見出しに書く）
    ⑯ 起動時に参照フォルダの一覧を読む（設定に残っているのに一覧が空のまま = リンクが外部で開く、を防ぐ）
    ⑰ 「/」メニュー（editor/slash.ts）: 開く条件・絞り込み・雛形の挿入（行の頭 / 文の途中）・埋め込みはファイル選択 → wiki_import_file
    ⑱ PICK_EXT = core の media_kind（取り込める拡張子の一覧の一致を Rust のソースを読んで固定）
@@ -431,23 +431,99 @@ handlers.get_ui_pref = () => null;
   tests++;
 }
 
-// ---------- ⑦ vault のフォルダが変わった = 新しい root へ書かずに止める ----------
+// ---------- ⑦ ワークスペース: 編集は始めたときの root に固定（args.root = ed.root）----------
+// (a) 編集中に別の root のタブへ = 先に元の root へ保存してから移る・移った後に終えても元の root へ書く・戻って続きを編集できる（元の root へ）
+// (b) 明示の切替（wiki_switch_root の戻り値）= 先に元の root へ保存 → 前面のタブだけホームへ・編集を終える（新しい root へは書かない）
+// (c) root の分からない編集（仮の状態のまま始めた = ed.root が null）は切替の後に新しい root へ書かない = 待つ間の打鍵は本文を残す
 {
   S.app.wikiOn = true;
-  W.wk.status = { enabled: true, root: "/old" };
   okWrite();
-  const h = session("r.md", "r", "+edit");
-  calls.length = 0;
-  handlers.wiki_status = () => ({ enabled: true, root: "/new", pages: 0, inbox: 0 });
+  handlers.list_items = () => [];
+  handlers.wiki_ref_dirs_get = () => ({ dirs: [] });
+  handlers.wiki_front_root = (a) => ({ root: a.root, restart: false });
+  const WS = [
+    { root: "/A", last_used: 2, exists: true, current: true },
+    { root: "/B", last_used: 1, exists: true, current: false },
+  ];
+  handlers.wiki_status = (a) => ({ enabled: true, root: a?.root ?? "/A", pages: 0, inbox: 0, workspaces: WS });
+  // 画面の root = /A（仮の状態から root 無しで読んで採る）
+  tab.wiki = { path: "a.md", root: "/A", scrollTop: 0, editing: true };
   await W.loadWikiStatus();
-  assert.equal(writes().length, 0, "フォルダが変わったのに書いた");
-  assert.equal(E.ed.path, null, "編集を止めていない");
-  assert.equal(tab.wiki.editing, false, "表示に戻していない");
-  assert.equal(E.ed.stranded.at(-1)?.content, "r+edit");
+  assert.equal(W.shownRoot(), "/A", "画面の root を採らない");
+  // (a) タブ 2 = /B のページ。タブ 1 で /A の a.md を編集中（未保存あり）→ タブ 2 へ
+  const t2 = { ...tab, id: 701, wiki: { path: "b.md", root: "/B", scrollTop: 0, editing: false }, viewer: null };
+  S.app.tabs.push(t2);
+  E.startEdit(page("a.md", "A", "A0"), "/A");
+  const h = editor("A");
+  type(h, "+1");
+  calls.length = 0;
+  await S.activateTab(701);
+  assert.equal(S.app.tab, 701, "タブ 2 へ移れない");
+  assert.equal(writes().length, 1, "移る前に保存しない");
+  assert.deepEqual(writes()[0].args, { path: "a.md", content: "A+1", if_sha256: "A0", root: "/A" }, "保存が編集を始めたときの root でない");
+  assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_front_root")), "移った先の root へ設定を揃えない");
+  assert.deepEqual(calls.find((c) => c.name === "wiki_front_root").args, { root: "/B" });
+  const iSave = calls.findIndex((c) => c.name === "wiki_save");
+  const iFront = calls.findIndex((c) => c.name === "wiki_front_root");
+  assert.ok(iSave < iFront, `元の root へ保存する前に設定を移した: ${calls.map((c) => c.name)}`);
+  assert.equal(W.shownRoot(), "/B");
+  // 画面の root が /B でも、編集のセッションの書込は /A（WikiPage が無い試験 = セッションはまだ生きている）
+  type(h, "+2");
+  assert.equal(await E.flush(), true);
+  assert.equal(writes().at(-1).args.root, "/A", "移った後の保存が画面の root（/B）へ行った");
+  assert.equal(E.ed.root, "/A");
+  // 戻って続きを編集（同じ /A のセッション）
+  await S.activateTab(tab.id);
+  assert.ok(await waitFor(() => W.shownRoot() === "/A"), "戻っても画面の root が /A に戻らない");
+  type(h, "+3");
+  assert.equal(await E.flush(), true);
+  assert.deepEqual([writes().at(-1).args.root, writes().at(-1).args.content], ["/A", "A+1+2+3"], "戻った後の続きが /A へ書かれない");
+  // 別の root の同じ相対パスは別のセッション（startEdit が前のセッションを始めたときの root へ書いて終える）
+  type(h, "+4");
+  E.detach(h);
+  calls.length = 0;
+  E.startEdit(page("a.md", "B の a", "BA0"), "/B");
+  assert.ok(await waitFor(() => writes().length === 1), "前のセッションの未保存を書かない");
+  assert.deepEqual([writes()[0].args.root, writes()[0].args.content], ["/A", "A+1+2+3+4"], "前のセッションの未保存を /A へ書かない");
+  assert.equal(E.ed.root, "/B");
+  E.discardEdit();
+  h.destroy();
+
+  // (b) 明示の切替（メニュー / ホームの [開く]）= 前面のタブだけ。先に元の root へ保存 → wiki_switch_root → 前面のタブを戻り値の root のホームへ・編集を終える
+  tab.wiki = { path: "m.md", root: "/A", scrollTop: 0, editing: true };
+  E.startEdit(page("m.md", "m", "m.md-0"), "/A");
+  const h2 = editor("m");
+  type(h2, "+edit");
+  calls.length = 0;
+  handlers.wiki_switch_root = (a) => ({ root: a.root, restart: false });
+  await W.switchWorkspace("/B");
+  assert.deepEqual(calls.filter((c) => c.name !== "wiki_status" && c.name !== "wiki_ref_dirs_get" && c.name !== "wiki_list" && c.name !== "wiki_tags" && c.name !== "wiki_inbox").map((c) => c.name), ["wiki_save", "wiki_switch_root"], `保存の前に切り替えた: ${calls.map((c) => c.name)}`);
+  assert.equal(writes()[0].args.root, "/A", "切替の前の保存が元の root でない");
+  assert.equal(E.ed.path, null, "切り替えたのに編集が残った");
+  assert.deepEqual({ ...tab.wiki }, { path: null, root: "/B", scrollTop: 0, editing: false }, "前面のタブが戻り値の root のホームにならない");
+  assert.deepEqual(S.app.tabs.find((x) => x.id === 701).wiki.root, "/B", "他のタブ（もともと /B）を触った");
+  assert.ok(!calls.some((c) => c.name === "wiki_front_root"), "明示の切替の後に wiki_front_root を呼んだ（Rust が済ませた）");
+  assert.equal(writes().length, 1, "新しい root へ書いた");
+  E.detach(h2);
+  h2.destroy();
+
+  // (c) root の分からない編集 = 切替を待つ間の打鍵は新しい root へ書かずに残す
+  const h3 = session("n.md", "n", "+x");
+  calls.length = 0;
+  handlers.wiki_switch_root = (a) => {
+    type(h3, "+待つ間"); // 切替を待つ間の打鍵
+    return { root: a.root, restart: false };
+  };
+  await W.switchWorkspace("/A");
+  assert.equal(writes().length, 1, "切替の前に保存しない / 切替の後に書いた");
+  assert.equal(writes()[0].args.root, undefined, "root の分からない編集に root を付けた");
+  assert.equal(E.ed.path, null, "編集が残った");
+  assert.equal(E.ed.stranded.at(-1)?.content, "n+x+待つ間", "待つ間の打鍵を残していない");
   assert.ok(S.app.toast.includes("フォルダが変わった"), S.app.toast);
   E.ed.stranded.length = 0;
-  E.detach(h);
-  h.destroy();
+  E.detach(h3);
+  h3.destroy();
+  S.app.tabs.splice(S.app.tabs.findIndex((x) => x.id === 701), 1);
   tests++;
 }
 
@@ -483,6 +559,8 @@ handlers.get_ui_pref = () => null;
   W.wk.newDirs.add("dx"); // 前方一致で似た名前は巻き込まない
   S.app.tabs.push({ ...tab, id: 998, wiki: { path: "d/other.md", scrollTop: 0, editing: false }, viewer: null });
   S.app.tabs.push({ ...tab, id: 997, wiki: { path: "dx/keep.md", scrollTop: 0, editing: false }, viewer: null });
+  // 別のワークスペースの同じ相対パスは別のファイル = 閉じない（ゴミ箱は画面の root の物）
+  S.app.tabs.push({ ...tab, id: 996, wiki: { path: "d/other.md", root: "/elsewhere-in-history", scrollTop: 0, editing: false }, viewer: null });
   calls.length = 0;
   // 移せなかった: 中のページの編集はそのまま・自動保存は再開（打鍵で書きに行く）・タブも newDirs も変わらない
   handlers.wiki_trash = () => {
@@ -492,7 +570,7 @@ handlers.get_ui_pref = () => null;
   await FL.doTrash("d", true);
   assert.ok(S.app.toast.includes("ゴミ箱に移せません"), `toast: ${S.app.toast}`);
   assert.equal(E.ed.path, "d/sub/t.md", "移せなかったのに編集を捨てた");
-  assert.equal(S.app.tabs.length, 3);
+  assert.equal(S.app.tabs.length, 4);
   assert.equal(W.wk.newDirs.size, 3);
   type(h, "!");
   await sleep(1400);
@@ -502,9 +580,10 @@ handlers.get_ui_pref = () => null;
   handlers.list_items = () => []; // タブを閉じると次のタブへ切り替わり、下の蔵書の一覧を読み直す
   await FL.doTrash("d", true);
   assert.ok(S.app.toast.includes("ゴミ箱に移しました"), `toast: ${S.app.toast}`);
-  assert.deepEqual(calls.filter((c) => c.name === "wiki_trash").map((c) => c.args), [{ path: "d", dir: true }], "wiki_trash はフォルダの path と dir で 1 回");
+  assert.deepEqual(calls.filter((c) => c.name === "wiki_trash").map((c) => c.args), [{ path: "d", dir: true, root: W.shownRoot() }], "wiki_trash はフォルダの path と dir（と画面の root）で 1 回");
   assert.equal(E.ed.path, null, "中のページの編集を捨てていない");
-  assert.ok(!S.app.tabs.some((x) => x.wiki?.path === "d/other.md"), "中のページのタブが残った");
+  assert.ok(!S.app.tabs.some((x) => x.wiki?.path === "d/other.md" && x.wiki.root !== "/elsewhere-in-history"), "中のページのタブが残った");
+  assert.ok(S.app.tabs.some((x) => x.id === 996), "別のワークスペースの同じ相対パスのタブを閉じた");
   assert.ok(S.app.tabs.some((x) => x.wiki?.path === "dx/keep.md"), "似た名前のフォルダのタブを閉じた");
   assert.deepEqual([...W.wk.newDirs].sort(), ["dx"], "覚えていた空フォルダ");
   assert.ok(!S.app.tabs.some((x) => x.id === tab.id), "前面（中のページ）のタブを閉じていない");
@@ -553,6 +632,95 @@ handlers.get_ui_pref = () => null;
   await dp;
   assert.equal(h2.getText(), "two", "別のページに挿入した");
   close(h2);
+  tests++;
+}
+
+// ---------- ⑩b 複数ファイルの取込・貼付の途中でタブを移った = 残りは編集を始めたときの root 以外へ書かない ----------
+// 1 本目を待つ間に別のワークスペース（B）のタブで編集が始まる / 表示だけのタブへ移る（ed.root = null）= 2 本目以降は取り込まずに止めて知らせる。
+// 取り込んだが本文に入れなかったファイルも知らせに並べる（最後の 1 本の最中に離れた場合も）。移らなければ全部が始めたときの root（A）へ
+{
+  const imports = () => calls.filter((c) => c.name === "wiki_import_file").map((c) => [c.args.abs, c.args.page, c.args.root ?? null]);
+  const blobs = () => calls.filter((c) => c.name === "wiki_save_blob").map((c) => [c.args.page, c.args.root ?? null]);
+  // 移らない = 全部 A（root は始めたときの物を渡す）
+  calls.length = 0;
+  handlers.wiki_import_file = (a) => ({ path: "attachments/" + a.abs.split("/").pop(), embed: `![[${a.abs.split("/").pop()}]]`, copied: true });
+  E.startEdit(page("a.md", "A", "A0"), "/A");
+  let h = editor("A");
+  assert.equal(await E.dropPaths(["/x/one.png", "/x/two.png", "/x/three.png"]), true);
+  assert.deepEqual(imports(), [["/x/one.png", "a.md", "/A"], ["/x/two.png", "a.md", "/A"], ["/x/three.png", "a.md", "/A"]]);
+  close(h);
+  // 1 本目を待つ間に B のタブで編集が始まった = 2 本目以降は B へも A へも書かない・知らせる
+  for (const toView of [false, true]) {
+    calls.length = 0;
+    E.startEdit(page("a.md", "A", "A0"), "/A");
+    h = editor("A");
+    let n = 0;
+    handlers.wiki_import_file = (a) => {
+      if (++n === 1) {
+        E.stopEdit();
+        if (!toView) E.startEdit(page("b.md", "B", "B0"), "/B"); // 行き先のタブで編集が始まった / 表示だけのタブ（ed.root = null）
+      }
+      return { path: "attachments/" + a.abs.split("/").pop(), embed: `![[${a.abs}]]`, copied: true };
+    };
+    S.app.toast = ""; // 知らせ（setNotice）は wiki.svelte.ts を読んだ後は toast
+    assert.equal(await E.dropPaths(["/x/one.png", "/x/two.png", "/x/three.png"]), true);
+    assert.deepEqual(imports(), [["/x/one.png", "a.md", "/A"]], `移った後の取込を書いた（${toView ? "表示へ" : "B の編集へ"}）: ${JSON.stringify(imports())}`);
+    assert.ok(S.app.toast.includes("残りのファイルを取り込みませんでした") && S.app.toast.includes("two.png, three.png"), `知らせない: ${S.app.toast}`);
+    assert.ok(S.app.toast.includes("取り込んだファイルを本文に入れませんでした: attachments/one.png"), `取り込んだが入れなかった分を知らせない: ${S.app.toast}`);
+    E.detach(h);
+    h.destroy();
+    E.discardEdit();
+  }
+  // 最後の 1 本の最中に離れた（残りは無い） = 取り込んだ分を知らせる・1 本だけでも同じ
+  for (const files of [["/x/one.png", "/x/two.png"], ["/x/solo.png"]]) {
+    calls.length = 0;
+    E.startEdit(page("a.md", "A", "A0"), "/A");
+    h = editor("A");
+    let m = 0;
+    handlers.wiki_import_file = (a) => {
+      if (++m === files.length) E.stopEdit();
+      return { path: "attachments/" + a.abs.split("/").pop(), embed: `![[${a.abs}]]`, copied: true };
+    };
+    S.app.toast = "";
+    await E.dropPaths(files);
+    const want = files.map((f) => "attachments/" + f.split("/").pop()).join(", ");
+    assert.ok(S.app.toast.includes(`取り込んだファイルを本文に入れませんでした: ${want}`), `最後の 1 本の最中に離れたのに知らせない: ${JSON.stringify(S.app.toast)}`);
+    assert.ok(!S.app.toast.includes("残りのファイル"), "残りが無いのに「残り」を知らせた");
+    assert.equal(h.getText(), "A", "離れたのに本文に入れた");
+    E.detach(h);
+    h.destroy();
+    E.discardEdit();
+  }
+  // 移らなければ知らせない
+  calls.length = 0;
+  E.startEdit(page("a.md", "A", "A0"), "/A");
+  h = editor("A");
+  handlers.wiki_import_file = (a) => ({ path: "attachments/" + a.abs.split("/").pop(), embed: "![[ok]]", copied: true });
+  S.app.toast = "";
+  await E.dropPaths(["/x/a.png", "/x/b.png"]);
+  assert.equal(S.app.toast, "", `移らないのに知らせた: ${S.app.toast}`);
+  close(h);
+  // 貼付（wiki_save_blob）も同じ = 始めたときの root・移ったら止める
+  calls.length = 0;
+  E.startEdit(page("a.md", "A", "A0"), "/A");
+  h = editor("A");
+  let k = 0;
+  handlers.wiki_save_blob = (a) => {
+    if (++k === 1) {
+      E.stopEdit();
+      E.startEdit(page("b.md", "B", "B0"), "/B");
+    }
+    return { path: "attachments/" + a.name, embed: `![[${a.name}]]` };
+  };
+  const png = (name) => new File([new Uint8Array([137, 80, 78, 71])], name, { type: "image/png" });
+  S.app.toast = "";
+  await E.pasteImages([png("p1.png"), png("p2.png")]);
+  assert.deepEqual(blobs(), [["a.md", "/A"]], `移った後の貼付を書いた: ${JSON.stringify(blobs())}`);
+  assert.ok(S.app.toast.includes("残りのファイルを取り込みませんでした") && S.app.toast.includes("p2.png"), `貼付の残りを知らせない: ${S.app.toast}`);
+  assert.ok(S.app.toast.includes("取り込んだファイルを本文に入れませんでした: attachments/"), `貼付で書いたが入れなかった分を知らせない: ${S.app.toast}`);
+  E.detach(h);
+  h.destroy();
+  E.discardEdit();
   tests++;
 }
 
@@ -672,24 +840,26 @@ handlers.get_ui_pref = () => null;
   handlers.wiki_create = (a) => ({ path: (a.dir ? a.dir + "/" : "") + a.name });
   handlers.wiki_rename = (a) => ({ path: a.to, rewritten: [] });
   const made = () => calls.filter((c) => c.name === "wiki_create" || c.name === "wiki_rename").map((c) => [c.name, c.args]);
+  /** 画面の root で呼ぶ（wikiArgs が args.root を足す。分からなければ付けない） */
+  const R = (o) => (W.shownRoot() ? { ...o, root: W.shownRoot() } : o);
   calls.length = 0;
   W.wk.dialog = { kind: "new", dir: "d" };
   assert.equal(await FL.createPage("d", "memo", "html"), true);
   assert.deepEqual(made(), [
-    ["wiki_create", { dir: "d", name: "Untitled.html" }],
-    ["wiki_rename", { from: "d/Untitled.html", to: "d/memo.html", rewrite: false }],
+    ["wiki_create", R({ dir: "d", name: "Untitled.html" })],
+    ["wiki_rename", R({ from: "d/Untitled.html", to: "d/memo.html", rewrite: false })],
   ]);
   assert.equal(W.wk.dialog, null);
   assert.deepEqual([tab.wiki.path, tab.wiki.editing], ["d/memo.html", true], "作ったページを編集で開く");
   calls.length = 0;
   await FL.createPage("", "p.md.", "html"); // 名前の拡張子が優先（末尾の . は落とす）= 作る形式も md
   assert.deepEqual(made(), [
-    ["wiki_create", { dir: "", name: "Untitled.md" }],
-    ["wiki_rename", { from: "Untitled.md", to: "p.md", rewrite: false }],
+    ["wiki_create", R({ dir: "", name: "Untitled.md" })],
+    ["wiki_rename", R({ from: "Untitled.md", to: "p.md", rewrite: false })],
   ]);
   calls.length = 0;
   await FL.createPage("", "  ", "md"); // 空の名前 = Untitled のまま・改名しない
-  assert.deepEqual(made(), [["wiki_create", { dir: "", name: "Untitled.md" }]]);
+  assert.deepEqual(made(), [["wiki_create", R({ dir: "", name: "Untitled.md" })]]);
   assert.equal(tab.wiki.path, "Untitled.md");
   calls.length = 0;
   assert.equal(await FL.createPage("", ".html", "md"), false);
@@ -700,7 +870,7 @@ handlers.get_ui_pref = () => null;
   calls.length = 0;
   W.wk.dialog = { kind: "newdir", dir: "d/e" };
   assert.equal(await FL.createFolder("d/e", " 新しい "), true);
-  assert.deepEqual(calls.filter((c) => c.name === "wiki_mkdir").map((c) => c.args), [{ dir: "d/e", name: "新しい" }]);
+  assert.deepEqual(calls.filter((c) => c.name === "wiki_mkdir").map((c) => c.args), [R({ dir: "d/e", name: "新しい" })]);
   assert.ok(W.wk.newDirs.has("d/e/新しい"), "作ったフォルダを覚えていない");
   for (const p of ["d", "d/e", "d/e/新しい"]) assert.ok(W.wk.open.has(p), `開いていない: ${p}`);
   assert.equal(W.wk.dialog, null);
@@ -715,7 +885,7 @@ handlers.get_ui_pref = () => null;
   calls.length = 0;
   W.wk.dialog = { kind: "rename", path: "n.md" };
   await FL.previewRename("n.md", "m");
-  assert.deepEqual(calls.filter((c) => c.name === "wiki_rename").map((c) => c.args), [{ from: "n.md", to: "m.md", rewrite: false }], "ログだけの参照で確認を出した");
+  assert.deepEqual(calls.filter((c) => c.name === "wiki_rename").map((c) => c.args), [R({ from: "n.md", to: "m.md", rewrite: false })], "ログだけの参照で確認を出した");
   handlers.wiki_rename_preview = (a) => ({ from: a.from, to: a.to, links: 0, files: [], other: [...chatOnly, { path: "p.html", kind: "wiki" }] });
   calls.length = 0;
   W.wk.dialog = { kind: "rename", path: "n.md" };
@@ -737,7 +907,7 @@ handlers.get_ui_pref = () => null;
   S.app.wikiOn = true;
   W.wk.status = { enabled: true, root: "/v" };
   W.wk.page = null;
-  tab.wiki = { path: "w.md", scrollTop: 0, editing: false };
+  tab.wiki = { path: "w.md", root: "/v", scrollTop: 0, editing: false };
   const target = document.createElement("div");
   document.body.append(target);
   const cmp = mount(WikiPage, { target });
@@ -748,6 +918,8 @@ handlers.get_ui_pref = () => null;
   cmdE();
   assert.ok(await waitFor(() => has(".cm-editor"), 3000), "⌘E でエディタを開かない");
   assert.equal(E.ed.path, "w.md");
+  assert.equal(E.ed.root, "/v", "WikiPage が編集をタブの root で始めない（書込の root の固定）");
+  assert.equal(calls.filter((c) => c.name === "wiki_read_gui").at(-1)?.args.root, "/v", "ページをタブの root で読まない");
   // 打鍵（実部品のエディタへ）→ ⌘E で表示へ = 保存してから
   cmView().dispatch({ changes: { from: cmView().state.doc.length, insert: "追記" }, userEvent: "input" });
   cmdE();
@@ -766,16 +938,25 @@ handlers.get_ui_pref = () => null;
   await tick();
   assert.ok(has(".cm-editor"), "ゴミ箱に移せなかったのにエディタを閉じた");
   assert.ok(E.editText().startsWith("X# W"), "ゴミ箱に移せなかったのに本文を捨てた");
-  // root の変化 = 書かずに止める（エディタを閉じ・本文を残す）
+  // ワークスペースの明示の切替（戻り値の root で前面のタブだけ） = 先に元の root（このタブの root）へ保存 → エディタを閉じる → タブは新しい root のホームへ。
+  // 新しい root へは書かない（編集は始めたときの root に固定 = ed.root）
   calls.length = 0;
-  handlers.wiki_status = () => ({ enabled: true, root: "/other", pages: 0, inbox: 0 });
-  await W.loadWikiStatus();
-  assert.ok(await waitFor(() => !has(".cm-editor")), "root が変わったのにエディタが残った");
-  assert.equal(writes().length, 0, "root が変わったのに書いた");
-  assert.ok(E.ed.stranded.at(-1)?.content.startsWith("X# W"), "root が変わった本文を残していない");
-  E.ed.stranded.length = 0;
-  // Wiki OFF = 本文を残して畳む
-  tab.wiki.editing = true;
+  handlers.wiki_switch_root = (a) => ({ root: a.root, restart: false });
+  handlers.wiki_status = (a) => ({ enabled: true, root: a?.root ?? "/other", pages: 0, inbox: 0 });
+  handlers.wiki_ref_dirs_get = () => ({ dirs: [] });
+  assert.equal(E.ed.root, tab.wiki.root ?? null, "編集の root がタブの root でない");
+  const edRoot = E.ed.root;
+  await W.switchWorkspace("/other");
+  assert.ok(await waitFor(() => !has(".cm-editor")), "切り替えたのにエディタが残った");
+  assert.equal(writes().length, 1, `切替の前に 1 回だけ保存する: ${writes().length}`);
+  assert.equal(writes()[0].args.root, edRoot ?? undefined, "切替の前の保存が元の root でない");
+  assert.ok(writes()[0].args.content.startsWith("X# W"), "切替の前に未保存を保存しない");
+  assert.equal(E.ed.stranded.length, 0, "保存できた本文を残した");
+  // 前面のタブだけ新しい root のホームへ（前の root の相対パスを新しい root で開かない）
+  assert.deepEqual({ ...tab.wiki }, { path: null, root: "/other", scrollTop: 0, editing: false }, "前面のタブが新しい root のホームに戻らない");
+  assert.equal(W.shownRoot(), "/other");
+  // Wiki OFF = 本文を残して畳む（新しい root でページを開き直して編集）
+  tab.wiki = { path: "w.md", scrollTop: 0, editing: true };
   assert.ok(await waitFor(() => has(".cm-editor"), 3000), "編集に戻れない");
   cmView().dispatch({ changes: { from: 0, insert: "OFF" }, userEvent: "input" });
   failWrite();

@@ -3,7 +3,9 @@
      部品の遷移の要求（WikiNav）は wiki.svelte.ts の navigate が実行する。ホーム（path = null）は vault の概要だけ。
      読み直し = 前面の path が変わった・索引の変更（wiki-changed）にこのページが入った。スクロール位置はタブ（TabWiki.scrollTop）に持つ。
      編集: [表示 / 編集 / 分割]（⌘E = 表示 ⇄ 編集・⌘S = 保存）。編集はエディタ（WikiEditor = CodeMirror の動的 import）、
-     分割は左にエディタ・右にプレビュー（入力中の本文を debounce で描き直す・スクロール同期なし）。保存の規則は edit.svelte.ts */
+     分割は左にエディタ・右にプレビュー（入力中の本文を debounce で描き直す・スクロール同期なし）。保存の規則は edit.svelte.ts。
+     ワークスペース: ページはそのタブの root で読む（root と path の組が変われば読み直す）・設定を前面の root に揃え終えてから読む
+     （rootReady = wiki_front_root が asset scope に足し終えた = 初めて前面にした root の画像が 403 のまま残らない）・編集はその root に固定 */
   import { onDestroy, tick, untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { composing } from "../input";
@@ -25,6 +27,7 @@
     openPath,
     readPage,
     requestFind,
+    rootReady,
     setEditing,
     setHeadings,
     toggleHeadColors,
@@ -40,10 +43,12 @@
   const NO_LINKS: WikiLink[] = [];
   const tw = $derived(frontWiki());
   const path = $derived(tw?.path ?? null);
+  /** 前面のタブのワークスペース（分からなければ null = 画面の root で読む） */
+  const root = $derived(tw?.root ?? null);
   let body = $state<HTMLDivElement | null>(null);
   let seq = 0;
 
-  async function load(p: string | null, keepScroll: boolean) {
+  async function load(p: string | null, r: string | null, keepScroll: boolean) {
     const my = ++seq;
     const jump = wk.scrollTo?.nonce;
     wk.headings = [];
@@ -52,8 +57,10 @@
       wk.pageError = null;
       return;
     }
+    await rootReady(); // 前面の root を揃え終えてから（起動の門・タブの行き来の wiki_front_root）
+    if (my !== seq) return;
     try {
-      const page = await readPage(p);
+      const page = await readPage(p, r);
       if (my !== seq) return;
       wk.page = page;
       wk.pageError = null;
@@ -70,15 +77,16 @@
     if (body && want && want.path === p) body.scrollTop = keepScroll ? want.scrollTop : 0;
   }
 
-  // 前面の path が変わった（タブの切替・遷移）
-  // load の同期部分が読む状態（wk.scrollTo 等）を依存にしない = path が変わったときだけ（untrack）
+  // 前面の path か root が変わった（タブの切替・遷移・明示の切替）
+  // load の同期部分が読む状態（wk.scrollTo 等）を依存にしない = path / root が変わったときだけ（untrack）
   // path が変わった = 前のページの見出しへの scrollTo を消す（タブの切替で戻った html ページが前のページの id へ着地しない。
   // `[[page#見出し]]` の着地は読込の後の onHeadings → jumpToHeading が新しく立てる）
   $effect(() => {
     const p = path;
+    const r = root;
     untrack(() => {
       wk.scrollTo = null;
-      void load(p, true);
+      void load(p, r, true);
     });
   });
 
@@ -92,8 +100,9 @@
     const p = frontWiki()?.path ?? null;
     if (!p || !touched(p)) return;
     untrack(() => {
-      if (ed.path === p) void refreshFromDisk().then((pg) => pg && ed.path === p && adopt(pg));
-      else void load(p, true);
+      const r = frontWiki()?.root ?? null;
+      if (ed.path === p && ed.root === r) void refreshFromDisk().then((pg) => pg && ed.path === p && adopt(pg));
+      else void load(p, r, true);
     });
   });
 
@@ -144,7 +153,8 @@
     if (nav.kind === "page" && external) {
       const abs = absOf(external, nav.path);
       // 参照フォルダが vault を含むとき（KB 本体を参照フォルダにできる）: vault の中のファイルは vault のページとして開く（ref の別タブに二重に出さない）
-      const inVault = wk.status?.root ? relInRoot(wk.status.root, abs) : null;
+      const ws = root ?? wk.status?.root;
+      const inVault = ws ? relInRoot(ws, abs) : null;
       if (inVault) return navigate({ kind: "page", path: inVault, heading: nav.heading }, newTab);
       return navigate(refViewable(abs) ? { kind: "ref", abs } : { kind: "open", abs }, newTab);
     }
@@ -157,7 +167,7 @@
   const viewBase = $derived(
     viewOn
       ? {
-          root: external ?? wk.status?.root ?? "",
+          root: external ?? root ?? wk.status?.root ?? "",
           refs: wk.refDirs,
           onNavigate: external ? navigateRef : navigate,
           readPage,
@@ -183,9 +193,10 @@
   $effect(() => {
     const p = shown;
     const on = editing;
+    const r = root;
     untrack(() => {
-      if (on && p) startEdit(p);
-      else if (ed.path && (!p || ed.path !== p.path || !on)) stopEdit();
+      if (on && p) startEdit(p, r); // 編集はこのタブの root に固定（ed.root）
+      else if (ed.path && (!p || ed.path !== p.path || ed.root !== r || !on)) stopEdit();
     });
   });
   onDestroy(() => {

@@ -41,6 +41,7 @@ fn live_rig() -> LiveRig {
         app_dir: db.parent().map(Path::to_path_buf),
         home,
         watched: false,
+        ..Default::default()
     };
     LiveRig {
         chat,

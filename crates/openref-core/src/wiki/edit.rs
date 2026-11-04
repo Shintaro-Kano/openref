@@ -1289,7 +1289,7 @@ mod tests {
         let app = home.join("scratch-app");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&app).unwrap();
-        let ctx = Ctx { enabled: true, root: Some(root.to_string_lossy().into()), app_dir: Some(app.clone()), home: Some(home), watched: false };
+        let ctx = Ctx { enabled: true, root: Some(root.to_string_lossy().into()), app_dir: Some(app.clone()), home: Some(home), watched: false, ..Default::default() };
         Env { base, ctx, root, app, _serial }
     }
     fn put(root: &Path, rel: &str, body: &str) {
@@ -1747,7 +1747,7 @@ mod tests {
         assert!(e.root.join("real/r.md").is_file());
     }
 
-    /// M1: 5 秒以内に外部が書いたリンクも改名で数える（鮮度規則を待たず stat 走査）
+    /// 5 秒以内に外部が書いたリンクも改名で数える（鮮度規則を待たず stat 走査）
     #[test]
     fn rename_sees_links_written_just_before() {
         let e = env("fresh");
@@ -1761,7 +1761,7 @@ mod tests {
         assert_eq!(commands::status(&e.ctx, &json!({})).unwrap()["unresolved"], 0);
     }
 
-    /// M2: 作る名前に `[ ] | # ^ \ :` は使えない（既存の名前の上書きは可）。frontmatter の引用を壊す名前は書き換えず other に
+    /// 作る名前に `[ ] | # ^ \ :` は使えない（既存の名前の上書きは可）。frontmatter の引用を壊す名前は書き換えず other に
     #[test]
     fn new_names_are_checked_and_frontmatter_quotes_kept() {
         let e = env("names");
@@ -2070,6 +2070,7 @@ mod tests {
             app_dir: Some(app.clone()),
             home: Some(vol.clone()),
             watched: false,
+            ..Default::default()
         };
         // 素の errno（記録用）
         let probe = root.join(".probe.tmp");

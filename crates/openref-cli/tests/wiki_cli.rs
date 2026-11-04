@@ -69,3 +69,32 @@ fn wiki_tags_and_inbox_dir_reach_the_registry() {
     let bad = s.cmd().args(["inbox", "--dir", "notes"]).output().unwrap();
     assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("dir は"));
 }
+
+/// wiki status: 索引はワークスペースごと（<app_dir>/wiki-index/<16 桁>.sqlite・旧の wiki-index.sqlite は作らない）・
+/// settings の wiki_workspaces が workspaces に新しい順で出る（exists = フォルダとして実在・current = wiki_root と同じ文字列）
+#[test]
+fn wiki_status_lists_workspaces_and_per_workspace_index() {
+    let s = Scratch::new();
+    let vault = s.root.join("vault").to_string_lossy().into_owned();
+    let gone = s.root.join("gone").to_string_lossy().into_owned();
+    let ws = serde_json::json!({vault.clone(): {"last_used": 5, "ref_dirs": []}, gone.clone(): {"last_used": 9}});
+    Db::open(&s.db).unwrap().set_setting("wiki_workspaces", &ws.to_string()).unwrap();
+    let st = s.wiki(&["status"]);
+    assert_eq!(
+        st["workspaces"],
+        serde_json::json!([
+            {"root": gone, "last_used": 9, "exists": false, "current": false},
+            {"root": vault, "last_used": 5, "exists": true, "current": true},
+        ]),
+        "{st}"
+    );
+    let ip = PathBuf::from(st["index_path"].as_str().unwrap());
+    assert_eq!(ip.parent().unwrap(), s.root.join("app/wiki-index"));
+    let name = ip.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.len() == 16 + 7 && name.ends_with(".sqlite"), "{name}");
+    assert!(ip.exists());
+    assert!(!s.root.join("app/wiki-index.sqlite").exists(), "旧の置き場は作らない");
+    // 壊れた wiki_workspaces でも status は落ちない（workspaces は空）
+    Db::open(&s.db).unwrap().set_setting("wiki_workspaces", "not json").unwrap();
+    assert_eq!(s.wiki(&["status"])["workspaces"], serde_json::json!([]));
+}

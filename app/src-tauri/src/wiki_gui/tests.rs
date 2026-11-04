@@ -25,7 +25,7 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
-/// 設定 wiki_ref_dirs: 未設定・空・`[]` は空。解釈できない値は Err（黙って空にしない = 次の追加で上書きしない）
+/// 旧キー wiki_ref_dirs（以前の形・取り込みだけが読む）: 未設定・空・`[]` は空。解釈できない値は Err（黙って空にしない = 退避してから消す）
 #[test]
 fn ref_dirs_setting_is_a_json_array() {
     assert_eq!(wiki_ref_dirs_parse(None, false).unwrap(), Vec::<PathBuf>::new());
@@ -49,49 +49,337 @@ fn ref_dirs_setting_is_a_json_array() {
     );
 }
 
-/// [追加…]: 生の一覧に足す（検査に通らないものも残す）・すでにあれば書かない・解釈できなければ退避して 1 件から作り直す
+/// [追加…] / [外す]: 現在の root の生の一覧に足す / から外す（検査に通らないものも残す）・すでにあれば書かない・他の root の一覧に触らない
 #[test]
 fn ref_dirs_for_add_rules() {
+    use openref_core::wiki::workspaces;
     let kb = PathBuf::from("/kb");
     let gone = PathBuf::from("/Volumes/gone");
-    let raw = Some("[\"/Volumes/gone\"]");
+    let mut m = workspaces::parse(Some(
+        r#"{"/a": {"last_used": 1, "ref_dirs": ["/Volumes/gone"]}, "/b": {"ref_dirs": ["/other"]}}"#,
+    ))
+    .unwrap();
     // 見えないディスクの参照フォルダは残したまま足す
+    let plan = wiki_ref_dirs_for_add(&m, "/a", &kb);
     assert_eq!(
-        wiki_ref_dirs_for_add(raw, &kb, false),
+        plan,
         WikiRefAdd {
             dirs: vec![gone.clone(), kb.clone()],
             changed: true,
-            broken: None,
             kind: WikiDir::Ref,
         }
     );
+    wiki_save_ref_dirs(&mut m, "/a", &plan.dirs);
     // すでにある = 書かない
-    let again = wiki_ref_dirs_for_add(Some("[\"/Volumes/gone\", \"/kb\"]"), &kb, false);
-    assert!(!again.changed && again.broken.is_none());
+    let again = wiki_ref_dirs_for_add(&m, "/a", &kb);
+    assert!(!again.changed);
     assert_eq!(again.dirs, vec![gone.clone(), kb.clone()]);
-    // 未設定 = 1 件
-    let first = wiki_ref_dirs_for_add(None, &kb, false);
-    assert_eq!((first.dirs.clone(), first.changed, first.broken.clone()), (vec![kb.clone()], true, None));
-    // 解釈できない = 退避の理由を持ち帰り、1 件から作り直す（旧い一覧を黙って上書きしない）
-    let broken = wiki_ref_dirs_for_add(Some("not json"), &kb, true);
-    assert_eq!(broken.dirs, vec![kb.clone()]);
-    assert!(broken.changed);
-    assert!(broken.broken.as_deref().is_some_and(|e| e.starts_with("The wiki_ref_dirs setting")), "{broken:?}");
-    assert_eq!(broken.kind, WikiDir::Ref);
+    // 項目の無い root = 1 件
+    let first = wiki_ref_dirs_for_add(&m, "/c", &kb);
+    assert_eq!((first.dirs.clone(), first.changed), (vec![kb.clone()], true));
+    // 他の root（/b）と last_used は変わらない
+    assert_eq!(wiki_ref_dirs_of(&m, Some("/b")), vec![PathBuf::from("/other")]);
+    assert_eq!(m["/a"]["last_used"], serde_json::json!(1));
+    // [外す]: 外す・無いものは書かない・root 未設定は空
+    assert_eq!(wiki_ref_dirs_for_remove(&mut m, Some("/a"), &gone), vec![kb.clone()]);
+    assert_eq!(wiki_ref_dirs_of(&m, Some("/a")), vec![kb.clone()]);
+    let before = m.clone();
+    assert_eq!(wiki_ref_dirs_for_remove(&mut m, Some("/a"), Path::new("/nope")), vec![kb.clone()]);
+    assert_eq!(m, before);
+    assert!(wiki_ref_dirs_for_remove(&mut m, Some("/none"), &kb).is_empty());
+    assert!(!m.contains_key("/none"), "外すだけで項目を作らない");
+    assert!(wiki_ref_dirs_for_remove(&mut m, None, &kb).is_empty());
+    assert!(wiki_ref_dirs_of(&m, None).is_empty());
 }
 
-/// 壊れた設定の退避先の鍵 = UTC の日時
+/// 壊れた設定の退避先の鍵 = `<鍵>.broken-<UTC の日時>`
 #[test]
 fn ref_dirs_broken_key_is_utc_stamp() {
-    assert_eq!(wiki_ref_dirs_broken_key(0), "wiki_ref_dirs.broken-19700101T000000Z");
+    assert_eq!(wiki_broken_key(WIKI_REF_DIRS_KEY, 0), "wiki_ref_dirs.broken-19700101T000000Z");
     assert_eq!(
-        wiki_ref_dirs_broken_key(1_793_491_200),
+        wiki_broken_key(WIKI_REF_DIRS_KEY, 1_793_491_200),
         "wiki_ref_dirs.broken-20261101T000000Z"
     );
     assert_eq!(
-        wiki_ref_dirs_broken_key(1_793_491_200 + 3 * 3600 + 4 * 60 + 5),
-        "wiki_ref_dirs.broken-20261101T030405Z"
+        wiki_broken_key("wiki_workspaces", 1_793_491_200 + 3 * 3600 + 4 * 60 + 5),
+        "wiki_workspaces.broken-20261101T030405Z"
     );
+}
+
+/// 設定を読む（テスト）
+fn setting(db: &openref_core::Db, k: &str) -> Option<String> {
+    db.setting(k).unwrap()
+}
+
+/// wiki_ws_tx: 旧キー wiki_ref_dirs の取り込み（現在の root に ref_dirs が無いときだけ・値を失わない）と削除・root 未設定なら触らない・
+/// 読めない旧キーは退避して消す
+#[test]
+fn ws_tx_adopts_legacy_ref_dirs_once() {
+    use openref_core::wiki::workspaces;
+    let db = openref_core::Db::open_in_memory().unwrap();
+    let read = |db: &openref_core::Db| {
+        wiki_ws_tx(db, 0, false, None, |m, root| Ok(wiki_ref_dirs_of(m, root))).0.unwrap()
+    };
+    // root 未設定 = 取り込む先が無い = 旧キーは残す・wiki_workspaces は書かない
+    db.set_setting(WIKI_REF_DIRS_KEY, r#"["/kb", "/Volumes/gone"]"#).unwrap();
+    assert!(read(&db).is_empty());
+    assert!(setting(&db, WIKI_REF_DIRS_KEY).is_some());
+    assert_eq!(setting(&db, workspaces::KEY), None);
+    // root を設定 → 読むときに取り込んで旧キーを消す（現在の root の分だけ）
+    db.set_setting("wiki_root", "/v/a").unwrap();
+    let (dirs, note) = wiki_ws_tx(&db, 0, false, None, |m, root| Ok(wiki_ref_dirs_of(m, root)));
+    assert_eq!(dirs.unwrap(), vec![PathBuf::from("/kb"), PathBuf::from("/Volumes/gone")]);
+    assert!(note.adopted_legacy && note.set_aside.is_empty());
+    assert_eq!(setting(&db, WIKI_REF_DIRS_KEY), None, "旧キーは消える = 二重に持たない");
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(workspaces::ref_dirs(&m, "/v/a"), vec!["/kb".to_string(), "/Volumes/gone".into()]);
+    assert!(m["/v/a"].get("last_used").is_none(), "取り込みは履歴の時刻を作らない");
+    // 別の root では見えない
+    db.set_setting("wiki_root", "/v/b").unwrap();
+    assert!(read(&db).is_empty());
+    // 旧キーが（古い版で）また書かれても、現在の root に ref_dirs があれば採用せずに消す
+    db.set_setting("wiki_root", "/v/a").unwrap();
+    db.set_setting(WIKI_REF_DIRS_KEY, r#"["/stale"]"#).unwrap();
+    let (dirs, note) = wiki_ws_tx(&db, 0, false, None, |m, root| Ok(wiki_ref_dirs_of(m, root)));
+    assert_eq!(dirs.unwrap(), vec![PathBuf::from("/kb"), PathBuf::from("/Volumes/gone")]);
+    assert!(!note.adopted_legacy);
+    assert_eq!(setting(&db, WIKI_REF_DIRS_KEY), None);
+    // 読めない旧キー = 退避して消す（値は退避先に残る）
+    db.set_setting(WIKI_REF_DIRS_KEY, "not json").unwrap();
+    let (_, note) = wiki_ws_tx(&db, 1_793_491_200, false, None, |m, root| Ok(wiki_ref_dirs_of(m, root)));
+    let to = "wiki_ref_dirs.broken-20261101T000000Z";
+    assert_eq!(note.set_aside.len(), 1);
+    assert_eq!((note.set_aside[0].0.as_str(), note.set_aside[0].1.as_str()), (WIKI_REF_DIRS_KEY, to));
+    assert_eq!(setting(&db, to).as_deref(), Some("not json"));
+    assert_eq!(setting(&db, WIKI_REF_DIRS_KEY), None);
+    assert_eq!(read(&db), vec![PathBuf::from("/kb"), PathBuf::from("/Volumes/gone")], "ref_dirs は無傷");
+}
+
+/// wiki_ws_tx: 壊れた wiki_workspaces は退避して空から（値は退避先に残る）・f が Err なら f の変更は書かない・変わらなければ書かない・
+/// 未知の項目は保つ
+#[test]
+fn ws_tx_sets_aside_broken_and_discards_failed_changes() {
+    use openref_core::wiki::workspaces;
+    let db = openref_core::Db::open_in_memory().unwrap();
+    db.set_setting("wiki_root", "/v/a").unwrap();
+    db.set_setting(workspaces::KEY, "[broken").unwrap();
+    let (r, note) = wiki_ws_tx(&db, 0, true, None, |m, root| {
+        Ok(workspaces::touch(m, root.unwrap(), 100, workspaces::MAX))
+    });
+    assert!(r.unwrap().is_empty());
+    assert_eq!(note.set_aside.len(), 1);
+    assert_eq!(note.set_aside[0].1, "wiki_workspaces.broken-19700101T000000Z");
+    assert!(note.set_aside[0].2.contains("wiki_workspaces"), "{:?}", note.set_aside);
+    assert_eq!(setting(&db, "wiki_workspaces.broken-19700101T000000Z").as_deref(), Some("[broken"));
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(workspaces::order(&m), vec![("/v/a".to_string(), 100)]);
+    // f が Err = f の変更は捨てる（書かない）
+    let (r, note) = wiki_ws_tx(&db, 0, false, None, |m, _| -> Result<(), String> {
+        workspaces::touch(m, "/v/zzz", 999, workspaces::MAX);
+        Err("だめ".into())
+    });
+    assert_eq!(r.unwrap_err(), "だめ");
+    assert!(note.set_aside.is_empty());
+    assert!(!workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap().contains_key("/v/zzz"));
+    // 変わらない読みは書かない（外から整形して書いた値がそのまま残る = 書いていない）
+    db.set_setting(workspaces::KEY, r#"{ "/v/a" : { "last_used" : 100, "future" : [1] } }"#).unwrap();
+    let (r, _) = wiki_ws_tx(&db, 0, false, None, |m, _| Ok(m.len()));
+    assert_eq!(r.unwrap(), 1);
+    assert_eq!(
+        setting(&db, workspaces::KEY).as_deref(),
+        Some(r#"{ "/v/a" : { "last_used" : 100, "future" : [1] } }"#)
+    );
+    // 書けば未知の項目は保つ
+    wiki_ws_tx(&db, 0, false, None, |m, _| Ok(workspaces::touch(m, "/v/b", 200, workspaces::MAX))).0.unwrap();
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(m["/v/a"]["future"], serde_json::json!([1]));
+    // 何も無い DB を読むだけなら書かない
+    let empty = openref_core::Db::open_in_memory().unwrap();
+    wiki_ws_tx(&empty, 0, false, None, |m, _| Ok(m.len())).0.unwrap();
+    assert_eq!(setting(&empty, workspaces::KEY), None);
+}
+
+/// 切替 / [外す] の検査: 切替は履歴にある root だけ・[外す] は現在の root を拒否・履歴に無ければ Err・外したら保存される
+#[test]
+fn switch_and_forget_rules() {
+    use openref_core::wiki::workspaces;
+    let db = openref_core::Db::open_in_memory().unwrap();
+    db.set_setting("wiki_root", "/v/a").unwrap();
+    db.set_setting(workspaces::KEY, r#"{"/v/a": {"last_used": 2}, "/v/b": {"last_used": 1, "ref_dirs": ["/kb"]}}"#).unwrap();
+    let switch = |root: &str| wiki_ws_tx(&db, 0, false, None, |m, _| wiki_switch_in(m, root, false)).0;
+    assert!(switch("/v/b").is_ok());
+    assert!(switch("/v/a").is_ok(), "現在への切替は止めない（画面が押させない・押しても選び直しと同じ）");
+    assert_eq!(switch("/v/c").unwrap_err(), "履歴に無いワークスペースです");
+    assert_eq!(
+        wiki_ws_tx(&db, 0, true, None, |m, _| wiki_switch_in(m, "/v/c", true)).0.unwrap_err(),
+        "That workspace is not in the history"
+    );
+    let forget = |root: &str, en: bool| wiki_ws_tx(&db, 0, en, None, |m, cur| wiki_forget_in(m, &[cur], root, en)).0;
+    assert_eq!(forget("/v/a", false).unwrap_err(), "現在のワークスペースは履歴から外せません");
+    assert_eq!(forget("/v/a", true).unwrap_err(), "The current workspace cannot be removed from the history");
+    assert_eq!(forget("/v/c", false).unwrap_err(), "履歴に無いワークスペースです");
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(m.len(), 2, "拒否は何も変えない");
+    forget("/v/b", false).unwrap();
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(m.keys().cloned().collect::<Vec<_>>(), vec!["/v/a".to_string()]);
+    assert_eq!(forget("/v/b", false).unwrap_err(), "履歴に無いワークスペースです");
+    // 現在の root が未設定なら、現在の保護は効かない（履歴にあれば外せる）
+    let db2 = openref_core::Db::open_in_memory().unwrap();
+    db2.set_setting(workspaces::KEY, r#"{"/v/a": {}}"#).unwrap();
+    wiki_ws_tx(&db2, 0, false, None, |m, cur| wiki_forget_in(m, &[cur], "/v/a", false)).0.unwrap();
+}
+
+/// 前の root の配信が残る知らせ: stale のときプロセスで最初の 1 回だけ・stale でなければ印を使わない
+#[test]
+fn stale_note_only_once() {
+    let told = AtomicBool::new(false);
+    assert!(!wiki_stale_once(&told, false));
+    assert!(!wiki_stale_once(&told, false), "stale でない呼び出しは印を使わない");
+    assert!(wiki_stale_once(&told, true));
+    assert!(!wiki_stale_once(&told, true));
+    assert!(!wiki_stale_once(&told, false));
+    // toast の detail = 名前 + 一言（1 枠の toast にまとめる）
+    assert_eq!(wiki_toast_detail(false, "blog".into(), None), "blog");
+    assert_eq!(wiki_toast_detail(false, "blog".into(), Some("前の".into())), "blog（前の）");
+    assert_eq!(wiki_toast_detail(true, "blog".into(), Some("Files".into())), "blog (Files)");
+    assert_eq!(wiki_workspace_name(Path::new("/Users/u/Documents/blog")), "blog");
+    assert_eq!(wiki_workspace_name(Path::new("/")), "/");
+}
+
+/// wiki-index/ の掃除の判定: keep に無い `<16 桁>.sqlite` の一族（-wal / -shm / 退避）だけ・他の名前・keep の一族には触らない
+#[test]
+fn index_sweep_plan_rules() {
+    let cur = "0123456789abcdef.sqlite".to_string();
+    let hist = "fedcba9876543210.sqlite".to_string();
+    let keep: HashSet<String> = [cur.clone(), hist.clone()].into_iter().collect();
+    let orphan = "aaaaaaaaaaaaaaaa";
+    let names: Vec<String> = [
+        cur.clone(),
+        format!("{cur}-wal"),
+        format!("{cur}-shm"),
+        format!("{cur}.corrupt-1700000000"),
+        hist.clone(),
+        format!("{hist}-wal"),
+        format!("{orphan}.sqlite"),
+        format!("{orphan}.sqlite-wal"),
+        format!("{orphan}.sqlite-shm"),
+        format!("{orphan}.sqlite.corrupt-1700000000"),
+        format!("{orphan}.sqlite.corrupt-1700000000-wal"),
+        // 触らない: 16 桁でない・大文字・hex でない・知らない接尾辞・他の種類のファイル
+        "abc.sqlite".into(),
+        "AAAAAAAAAAAAAAAA.sqlite".into(),
+        "gggggggggggggggg.sqlite".into(),
+        format!("{orphan}.sqlite.bak"),
+        format!("{orphan}.sqlite.corrupt-"),
+        format!("{orphan}.sqlite.corrupt-x"),
+        "notes.txt".into(),
+        ".DS_Store".into(),
+        "wiki-index.sqlite".into(),
+    ]
+    .into_iter()
+    .collect();
+    let mut plan = wiki_index_sweep_plan(&names, &keep);
+    plan.sort();
+    assert_eq!(
+        plan,
+        vec![
+            format!("{orphan}.sqlite"),
+            format!("{orphan}.sqlite-shm"),
+            format!("{orphan}.sqlite-wal"),
+            format!("{orphan}.sqlite.corrupt-1700000000"),
+            format!("{orphan}.sqlite.corrupt-1700000000-wal"),
+        ]
+    );
+    // keep が空 = 16 桁の一族は全部（現在の root が無い = 起動時に無効・未設定）
+    assert_eq!(wiki_index_sweep_plan(&names, &HashSet::new()).len(), 4 + 2 + 5);
+    // 旧の置き場（app_dir 直下）= wiki-index.sqlite の一族だけ。DB の openref.sqlite・-wal には触らない
+    let app: Vec<String> = [
+        "openref.sqlite",
+        "openref.sqlite-wal",
+        "openref.sqlite-shm",
+        "wiki-index.sqlite",
+        "wiki-index.sqlite-wal",
+        "wiki-index.sqlite-shm",
+        "wiki-index.sqlite.corrupt-1700000000",
+        "wiki-index.sqlite.corrupt-1700000000-wal",
+        "wiki-index",
+        "wiki-history",
+        "storage",
+        "wiki-index.sqlite.bak",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let mut legacy = wiki_legacy_index_plan(&app);
+    legacy.sort();
+    assert_eq!(
+        legacy,
+        vec![
+            "wiki-index.sqlite",
+            "wiki-index.sqlite-shm",
+            "wiki-index.sqlite-wal",
+            "wiki-index.sqlite.corrupt-1700000000",
+            "wiki-index.sqlite.corrupt-1700000000-wal",
+        ]
+    );
+}
+
+/// 起動時の掃除（実ファイル・偽の app_dir）: 旧の索引の一族は消え DB は残る・wiki-index/ は履歴と現在の root の索引を残して孤児だけ消す・
+/// 掃除の開始より後に変更されたファイルは残す
+#[test]
+fn startup_sweep_on_real_files() {
+    use openref_core::wiki::index::{index_path, INDEX_DIR, INDEX_FILE};
+    let app = scratch("sweep");
+    let touch = |p: &Path| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    };
+    for n in ["openref.sqlite", "openref.sqlite-wal", "openref.sqlite-shm"] {
+        touch(&app.join(n));
+    }
+    for n in [INDEX_FILE, "wiki-index.sqlite-wal", "wiki-index.sqlite-shm", "wiki-index.sqlite.corrupt-1"] {
+        touch(&app.join(n));
+    }
+    let cur = "/Users/u/Documents/kb";
+    let hist = "/Users/u/Documents/blog";
+    let orphan = "/Users/u/Documents/old";
+    for r in [cur, hist, orphan] {
+        let ip = index_path(&app, Path::new(r));
+        touch(&ip);
+        touch(&PathBuf::from(format!("{}-wal", ip.display())));
+    }
+    touch(&app.join(INDEX_DIR).join("README.txt"));
+    let started = SystemTime::now() + Duration::from_secs(60); // ここまでに作ったものは「前から有った」
+    let gone = wiki_drop_legacy_index(&app);
+    assert_eq!(gone.len(), 4, "{gone:?}");
+    for n in [INDEX_FILE, "wiki-index.sqlite-wal", "wiki-index.sqlite-shm", "wiki-index.sqlite.corrupt-1"] {
+        assert!(!app.join(n).exists(), "{n}");
+    }
+    for n in ["openref.sqlite", "openref.sqlite-wal", "openref.sqlite-shm"] {
+        assert!(app.join(n).exists(), "DB は残る: {n}");
+    }
+    assert!(wiki_drop_legacy_index(&app).is_empty(), "2 回目は何もしない");
+    let keep = wiki_index_keep(&app, [cur, hist]);
+    let swept = wiki_index_sweep(&app, &keep, started);
+    assert_eq!(swept.len(), 2, "{swept:?}");
+    for r in [cur, hist] {
+        let ip = index_path(&app, Path::new(r));
+        assert!(ip.exists() && PathBuf::from(format!("{}-wal", ip.display())).exists(), "{r} は残る");
+    }
+    assert!(!index_path(&app, Path::new(orphan)).exists());
+    assert!(app.join(INDEX_DIR).join("README.txt").exists(), "知らない名前には触らない");
+    // 掃除の開始より後に変更された孤児は残す（掃除の途中で作られた索引を消さない）
+    let late = index_path(&app, Path::new("/Users/u/Documents/new"));
+    touch(&late);
+    assert!(wiki_index_sweep(&app, &keep, SystemTime::now() - Duration::from_secs(60)).is_empty());
+    assert!(late.exists());
+    // wiki-index/ が無くても落ちない
+    let empty = scratch("sweep-empty");
+    assert!(wiki_index_sweep(&empty, &keep, started).is_empty());
+    assert!(wiki_drop_legacy_index(&empty).is_empty());
+    let _ = std::fs::remove_dir_all(&app);
+    let _ = std::fs::remove_dir_all(&empty);
 }
 
 /// 前の root の配信が残るか: 同じ root の選び直し = false・別の root = true・参照フォルダは数えない
@@ -419,7 +707,7 @@ fn wiki_live_plan() {
     assert!(!l.prime(g2));
 }
 
-/// 監視の印（A-16・QA M1）: prime の前（Prime）に索引が握られていれば（背景の走査・作り直し）待たずに watched = false
+/// 監視の印: prime の前（Prime）に索引が握られていれば（背景の走査・作り直し）待たずに watched = false
 /// （core の入口が busy の経路で進捗を返す）。握られていなければ stat 走査して watched = true・以後は走査しない（Skip）
 #[test]
 fn wiki_watched_does_not_wait_for_busy_index() {
@@ -437,6 +725,7 @@ fn wiki_watched_does_not_wait_for_busy_index() {
         app_dir: Some(app_dir),
         home: Some(home),
         watched: false,
+        ..Default::default()
     };
     let (ip, croot) = ctx.ready().unwrap();
     let live = WikiLive::default();
@@ -1409,6 +1698,7 @@ fn fs_ingest_reports_core_written_new_page_as_modified() {
         app_dir: Some(app_dir.clone()),
         home: Some(home.clone()),
         watched: false,
+        ..Default::default()
     };
     let (ip, root) = ctx.ready().unwrap();
     with_index(&ip, &root, |ix| ix.refresh().map(|_| ())).unwrap();
@@ -1559,4 +1849,757 @@ fn enable_step_picks_only_when_needed_and_cancel_restores() {
         wiki_enable_step(false, || Some(PathBuf::from("/v"))),
         EnableStep::Go(Some(PathBuf::from("/v")))
     );
+}
+
+// ---------- AppHandle 無しの段取りを tempdir の DB と偽の app_dir で ----------
+
+/// tempdir の (base, 偽の HOME, app_dir, 共有の DB)。base は canonical（macOS の /var → /private/var を吸収 = check_root が通る）
+fn ws_env(tag: &str) -> (PathBuf, PathBuf, PathBuf, Mutex<openref_core::Db>) {
+    let base = std::fs::canonicalize(scratch(&format!("ws-{tag}"))).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(home.join("Documents")).unwrap();
+    let app = base.join("app");
+    let db = openref_core::Db::open(&app.join("openref.sqlite")).unwrap();
+    (base, home, app, Mutex::new(db))
+}
+
+/// DB の設定から読んだ Ctx（HOME だけ偽の HOME に = このプロセスの環境変数は変えない）
+fn ctx_home(db: &Mutex<openref_core::Db>, home: &Path) -> openref_core::wiki::Ctx {
+    let mut c = openref_core::wiki::Ctx::from_db(&db.lock().unwrap()).unwrap();
+    c.home = Some(home.to_path_buf());
+    c
+}
+
+fn ws_map(db: &Mutex<openref_core::Db>) -> openref_core::wiki::workspaces::Map {
+    let raw = setting(&db.lock().unwrap(), openref_core::wiki::workspaces::KEY);
+    openref_core::wiki::workspaces::parse(raw.as_deref()).unwrap()
+}
+
+fn put_file(p: &Path) {
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, b"x").unwrap();
+}
+
+/// 索引の本体と -wal を置く（偽の app_dir）
+fn put_index(app: &Path, root: &str) -> PathBuf {
+    let ip = openref_core::wiki::index::index_path(app, Path::new(root));
+    put_file(&ip);
+    put_file(&PathBuf::from(format!("{}-wal", ip.display())));
+    ip
+}
+
+fn wal_of(ip: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", ip.display()))
+}
+
+/// 掃除の開始（これより前に作ったファイルは「前から有った」）
+fn later() -> SystemTime {
+    SystemTime::now() + Duration::from_secs(60)
+}
+
+/// 設定 wiki_root が symlink・末尾 `/` の綴りでも、起動の段取りの後は wiki_root = canonical・履歴は canonical の 1 件
+/// （生の鍵の ref_dirs と未知の項目は寄せる）・[外す] は canonical / 生の綴りのどちらでも current を拒む・現在の索引は残る
+#[test]
+fn startup_canonicalizes_root_spelling() {
+    use openref_core::wiki::workspaces;
+    for kind in ["symlink", "slash"] {
+        let (base, home, app, db) = ws_env(&format!("canon-{kind}"));
+        let real = home.join("Documents/kb-real");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_s = real.to_string_lossy().to_string();
+        let spelled = if kind == "symlink" {
+            let l = home.join("Documents/kb");
+            std::os::unix::fs::symlink(&real, &l).unwrap();
+            l.to_string_lossy().to_string()
+        } else {
+            format!("{real_s}/")
+        };
+        {
+            let g = db.lock().unwrap();
+            g.set_setting("wiki_enabled", "1").unwrap();
+            g.set_setting("wiki_root", &spelled).unwrap();
+            // 割れた履歴（再現: 生の鍵 = ref_dirs・last_used 0 / canonical の鍵 = 時刻）
+            let ws = serde_json::json!({
+                spelled.clone(): {"last_used": 0, "ref_dirs": ["/ref"], "future": 1},
+                real_s.clone(): {"last_used": 50},
+                "/v/other": {"last_used": 40},
+            });
+            g.set_setting(workspaces::KEY, &ws.to_string()).unwrap();
+        }
+        let cur_ix = put_index(&app, &real_s);
+        let canon = wiki_root_canon(&ctx_home(&db, &home));
+        assert_eq!(canon, Some((spelled.clone(), real_s.clone())), "{kind}");
+        let (r, note) = wiki_startup_steps(&db, &app, true, Some(&spelled), canon.as_ref(), 1000, false, later());
+        let done = r.unwrap();
+        assert!(note.set_aside.is_empty());
+        assert_eq!(done.rewrote, Some((spelled.clone(), real_s.clone())), "{kind}");
+        assert_eq!(setting(&db.lock().unwrap(), "wiki_root").as_deref(), Some(real_s.as_str()), "{kind}: wiki_root は canonical に");
+        let m = ws_map(&db);
+        assert_eq!(
+            workspaces::order(&m),
+            vec![(real_s.clone(), 1000), ("/v/other".to_string(), 40)],
+            "{kind}: 履歴は canonical の 1 件"
+        );
+        assert_eq!(workspaces::ref_dirs(&m, &real_s), vec!["/ref".to_string()], "{kind}: ref_dirs は寄せる");
+        assert_eq!(m[&real_s]["future"], serde_json::json!(1), "{kind}: 未知の項目も寄せる");
+        // [外す]: 書き直しの後の canon・書き直し前の canon のどちらでも current を拒み、現在の索引は残る
+        let canon2 = wiki_root_canon(&ctx_home(&db, &home));
+        assert_eq!(canon2, Some((real_s.clone(), real_s.clone())));
+        for c in [canon2.as_ref(), canon.as_ref()] {
+            let (r, _) = wiki_forget_steps(&db, Some(&app), c, &real_s, 0, false);
+            assert_eq!(r.unwrap_err(), "現在のワークスペースは履歴から外せません", "{kind}");
+        }
+        let (r, _) = wiki_forget_steps(&db, Some(&app), canon.as_ref(), &spelled, 0, false);
+        assert!(r.is_err(), "{kind}: 生の綴りも現在として守る");
+        assert!(cur_ix.exists() && wal_of(&cur_ix).exists(), "{kind}: 使用中の索引は消えない");
+        assert_eq!(ws_map(&db).len(), 2);
+        // 2 回目の起動 = 書き直さない・時刻だけ
+        let (r, _) = wiki_startup_steps(&db, &app, true, Some(&real_s), canon2.as_ref(), 2000, false, later());
+        assert_eq!(r.unwrap().rewrote, None);
+        assert_eq!(workspaces::order(&ws_map(&db))[0], (real_s.clone(), 2000));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// ①: 読み書きの入口（wiki_ws_db）の root は canonical = 旧キーの取り込みも canonical の鍵へ（生の綴りの鍵を作らない）。
+/// canon が無い（root が使えない）・canon の生の値が設定と違う（ロックの外で読んだ後に書き換わった）なら設定の生の値
+#[test]
+fn ws_db_root_is_canonical() {
+    let (base, home, _app, db) = ws_env("canon-legacy");
+    let real = home.join("Documents/kb-real");
+    std::fs::create_dir_all(&real).unwrap();
+    let real_s = real.to_string_lossy().to_string();
+    let link = home.join("Documents/kb");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link_s = link.to_string_lossy().to_string();
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_root", &link_s).unwrap();
+        g.set_setting(WIKI_REF_DIRS_KEY, r#"["/refdir"]"#).unwrap();
+    }
+    // 無効でも canonical は求まる（check_root は有効 / 無効を問わない）
+    let canon = wiki_root_canon(&ctx_home(&db, &home));
+    assert_eq!(canon, Some((link_s.clone(), real_s.clone())));
+    let (r, note) = wiki_ws_db(&db, 0, false, canon.as_ref(), |m, root| {
+        Ok((root.map(str::to_string), wiki_ref_dirs_of(m, root)))
+    });
+    let ((root, dirs), ctx) = r.unwrap();
+    assert_eq!(root.as_deref(), Some(real_s.as_str()));
+    assert_eq!(dirs, vec![PathBuf::from("/refdir")]);
+    assert!(note.adopted_legacy);
+    assert_eq!(ctx.root.as_deref(), Some(link_s.as_str()), "Ctx は設定の値（書き直しは起動の家事）");
+    let m = ws_map(&db);
+    assert_eq!(m.keys().cloned().collect::<Vec<_>>(), vec![real_s.clone()], "生の綴りの鍵を作らない");
+    let (r, _) = wiki_ws_db(&db, 0, false, None, |_, root| Ok(root.map(str::to_string)));
+    assert_eq!(r.unwrap().0.as_deref(), Some(link_s.as_str()), "canon 無し = 生の値");
+    let stale = ("/v/elsewhere".to_string(), "/v/elsewhere-real".to_string());
+    let (r, _) = wiki_ws_db(&db, 0, false, Some(&stale), |_, root| Ok(root.map(str::to_string)));
+    assert_eq!(r.unwrap().0.as_deref(), Some(link_s.as_str()), "canon の生の値が設定と違う = 生の値");
+    // 消えた root = canonical が求まらない
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(wiki_root_canon(&ctx_home(&db, &home)), None);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 起動の段取り = 上限で落ちた root の索引と孤児だけ消え、履歴の root・現在の root の索引は残る（keep から履歴の鍵を外す
+/// 変異はここで落ちる）・旧の置き場の索引は消え DB は残る
+#[test]
+fn startup_steps_keep_history_and_drop_evicted() {
+    use openref_core::wiki::workspaces;
+    let (base, home, app, db) = ws_env("startup-keep");
+    let cur = home.join("Documents/kb");
+    std::fs::create_dir_all(&cur).unwrap();
+    let cur_s = cur.to_string_lossy().to_string();
+    let hist: Vec<String> = (0..workspaces::MAX).map(|i| format!("/Users/u/w{i}")).collect();
+    let mut ws = serde_json::Map::new();
+    for (i, r) in hist.iter().enumerate() {
+        ws.insert(r.clone(), serde_json::json!({"last_used": 100 + i}));
+    }
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "1").unwrap();
+        g.set_setting("wiki_root", &cur_s).unwrap();
+        g.set_setting(workspaces::KEY, &serde_json::Value::Object(ws).to_string()).unwrap();
+    }
+    let ixs: Vec<PathBuf> = hist.iter().map(|r| put_index(&app, r)).collect();
+    let cur_ix = put_index(&app, &cur_s);
+    let orphan_ix = put_index(&app, "/Users/u/orphan");
+    put_file(&app.join(openref_core::wiki::index::INDEX_FILE));
+    let canon = wiki_root_canon(&ctx_home(&db, &home));
+    assert_eq!(canon, Some((cur_s.clone(), cur_s.clone())));
+    let (r, _) = wiki_startup_steps(&db, &app, true, Some(&cur_s), canon.as_ref(), 1000, false, later());
+    let done = r.unwrap();
+    assert_eq!(done.evicted, vec![hist[0].clone()], "最も古い w0 が落ちる");
+    assert!(!ixs[0].exists() && !wal_of(&ixs[0]).exists(), "落ちた root の索引は消える");
+    for ix in &ixs[1..] {
+        assert!(ix.exists() && wal_of(ix).exists(), "履歴の root の索引は残る: {}", ix.display());
+    }
+    assert!(cur_ix.exists() && wal_of(&cur_ix).exists(), "現在の root の索引は残る");
+    assert!(!orphan_ix.exists() && !wal_of(&orphan_ix).exists(), "孤児は消える");
+    assert!(!app.join(openref_core::wiki::index::INDEX_FILE).exists());
+    assert!(app.join("openref.sqlite").exists(), "DB は残る");
+    let order = workspaces::order(&ws_map(&db));
+    assert_eq!(order.len(), workspaces::MAX);
+    assert_eq!(order[0], (cur_s.clone(), 1000));
+    // 無効 = touch しない（履歴の時刻は変わらない）が、掃除はする（履歴と現在は残す）
+    let stray = put_index(&app, "/Users/u/stray");
+    {
+        db.lock().unwrap().set_setting("wiki_enabled", "0").unwrap();
+    }
+    let (r, _) = wiki_startup_steps(&db, &app, false, Some(&cur_s), canon.as_ref(), 5000, false, later());
+    assert!(r.unwrap().evicted.is_empty());
+    assert_eq!(workspaces::order(&ws_map(&db))[0], (cur_s.clone(), 1000));
+    assert!(!stray.exists());
+    assert!(ixs[1].exists() && cur_ix.exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// [外す] の段取り = 外した root の索引だけ消える（現在と他の履歴の索引は残る）・現在は拒否して何も消さない
+#[test]
+fn forget_steps_drop_only_that_index() {
+    use openref_core::wiki::workspaces;
+    let (base, home, app, db) = ws_env("forget");
+    let cur = home.join("Documents/kb");
+    std::fs::create_dir_all(&cur).unwrap();
+    let cur_s = cur.to_string_lossy().to_string();
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_root", &cur_s).unwrap();
+        let ws = serde_json::json!({cur_s.clone(): {"last_used": 3}, "/Users/u/a": {"last_used": 2, "ref_dirs": ["/r"]}, "/Users/u/b": {"last_used": 1}});
+        g.set_setting(workspaces::KEY, &ws.to_string()).unwrap();
+    }
+    let (cur_ix, a_ix, b_ix) = (put_index(&app, &cur_s), put_index(&app, "/Users/u/a"), put_index(&app, "/Users/u/b"));
+    let canon = wiki_root_canon(&ctx_home(&db, &home));
+    let (r, _) = wiki_forget_steps(&db, Some(&app), canon.as_ref(), "/Users/u/a", 0, false);
+    r.unwrap();
+    assert!(!a_ix.exists() && !wal_of(&a_ix).exists());
+    assert!(b_ix.exists() && cur_ix.exists());
+    let m = ws_map(&db);
+    assert_eq!(workspaces::order(&m).into_iter().map(|(r, _)| r).collect::<Vec<_>>(), vec![cur_s.clone(), "/Users/u/b".into()]);
+    let (r, _) = wiki_forget_steps(&db, Some(&app), canon.as_ref(), &cur_s, 0, false);
+    assert!(r.is_err());
+    assert!(cur_ix.exists() && wal_of(&cur_ix).exists(), "拒否したら何も消さない");
+    let (r, _) = wiki_forget_steps(&db, Some(&app), canon.as_ref(), "/Users/u/a", 0, false);
+    assert_eq!(r.unwrap_err(), "履歴に無いワークスペースです");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// root の確定（wiki_choose_root の設定の段） = wiki_root を書き・履歴に入れ（touch）・上限で落ちた root の索引だけ消す
+#[test]
+fn root_commit_writes_root_and_touches_history() {
+    use openref_core::wiki::workspaces;
+    let (base, _home, app, db) = ws_env("commit");
+    let hist: Vec<String> = (0..workspaces::MAX).map(|i| format!("/Users/u/w{i}")).collect();
+    let mut ws = serde_json::Map::new();
+    for (i, r) in hist.iter().enumerate() {
+        ws.insert(r.clone(), serde_json::json!({"last_used": 100 + i}));
+    }
+    db.lock().unwrap().set_setting(workspaces::KEY, &serde_json::Value::Object(ws).to_string()).unwrap();
+    let ixs: Vec<PathBuf> = hist.iter().map(|r| put_index(&app, r)).collect();
+    let (r, _) = wiki_root_commit(&db, Some(&app), "/Users/u/new", 1000, false);
+    assert_eq!(r.unwrap(), vec![hist[0].clone()]);
+    assert_eq!(setting(&db.lock().unwrap(), "wiki_root").as_deref(), Some("/Users/u/new"));
+    let order = workspaces::order(&ws_map(&db));
+    assert_eq!(order[0], ("/Users/u/new".to_string(), 1000));
+    assert_eq!(order.len(), workspaces::MAX);
+    assert!(!ixs[0].exists());
+    assert!(ixs[1..].iter().all(|p| p.exists()));
+    // 同じ root の選び直し = 何も落ちない・時刻だけ
+    let (r, _) = wiki_root_commit(&db, Some(&app), "/Users/u/new", 2000, false);
+    assert!(r.unwrap().is_empty());
+    assert_eq!(workspaces::order(&ws_map(&db))[0], ("/Users/u/new".to_string(), 2000));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 掃除は一族ごと = 一族のどれかが開始より後に変更されていれば一族まるごと残す・変更時刻を読めないものは前から有った扱い・
+/// keep の一族は時刻を問わず残す
+#[test]
+fn index_sweep_plan_at_keeps_fresh_families() {
+    let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    let old = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(500));
+    let new = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2000));
+    let (a, b, c, d, k) = (
+        "aaaaaaaaaaaaaaaa.sqlite",
+        "bbbbbbbbbbbbbbbb.sqlite",
+        "cccccccccccccccc.sqlite",
+        "dddddddddddddddd.sqlite",
+        "eeeeeeeeeeeeeeee.sqlite",
+    );
+    let e = |n: String, t: Option<SystemTime>| (n, t);
+    let entries = vec![
+        // a: 本体は古いが -wal が新しい = 一族ごと残す
+        e(a.into(), old),
+        e(format!("{a}-wal"), new),
+        e(format!("{a}-shm"), old),
+        // b: 全部古い = 一族ごと消す
+        e(b.into(), old),
+        e(format!("{b}-wal"), old),
+        e(format!("{b}.corrupt-1"), old),
+        // c: 時刻を読めない = 前から有った
+        e(c.into(), None),
+        e(format!("{c}-wal"), None),
+        // d: 退避の -wal だけ新しい = 一族ごと残す
+        e(d.into(), old),
+        e(format!("{d}.corrupt-5-wal"), new),
+        // k: keep（新旧を問わず残す）
+        e(k.into(), old),
+        e(format!("{k}-wal"), old),
+        e("notes.txt".into(), old),
+    ];
+    let keep: HashSet<String> = [k.to_string()].into_iter().collect();
+    let mut plan = wiki_index_sweep_plan_at(&entries, &keep, started);
+    plan.sort();
+    assert_eq!(
+        plan,
+        vec![b.to_string(), format!("{b}-wal"), format!("{b}.corrupt-1"), c.to_string(), format!("{c}-wal")]
+    );
+}
+
+// ---------- タブごとのワークスペース: AppHandle 無しの段取りと純関数 ----------
+
+/// wiki_err の JSON（{"code", "message"}）の code
+fn err_code(e: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(e).ok()?["code"].as_str().map(str::to_string)
+}
+
+/// 段の選び方 = タブの行き来（Front）は last_used を変えず・チャットの子を止めない。明示の切替（Choose）は touch し、
+/// 子の root が違えば止める（同じ root・子が無ければ止めない）
+#[test]
+fn root_change_kinds() {
+    let (a, b) = (Path::new("/v/a"), Path::new("/v/b"));
+    assert!(RootChange::Choose.touches() && !RootChange::Front.touches());
+    assert!(RootChange::Choose.stops_chat(Some(a), b));
+    assert!(!RootChange::Choose.stops_chat(Some(b), b));
+    assert!(!RootChange::Choose.stops_chat(None, b));
+    assert!(!RootChange::Front.stops_chat(Some(a), b), "タブの行き来では子を止めない");
+    assert!(!RootChange::Front.stops_chat(Some(b), b));
+    assert!(!RootChange::Front.stops_chat(None, b));
+}
+
+/// wiki_front_root の設定の段（Front） = 履歴にある root だけ（空・生の綴り・履歴に無い = unknown_root で何も書かない）・
+/// wiki_root を canonical で書く・最近のワークスペース（last_used・順・ref_dirs）は設定の値ごと変えない。
+/// wiki_choose_root の段（Choose）は従来どおり履歴の外のフォルダも選べて touch する
+#[test]
+fn front_root_steps_write_root_without_touch() {
+    use openref_core::wiki::workspaces;
+    let (base, home, app, db) = ws_env("front");
+    let kb = home.join("Documents/kb");
+    let blog = home.join("Documents/blog");
+    let other = home.join("Documents/other");
+    for d in [&kb, &blog, &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let link = home.join("Documents/blog-link");
+    std::os::unix::fs::symlink(&blog, &link).unwrap();
+    let s = |p: &Path| p.to_string_lossy().to_string();
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "1").unwrap();
+        g.set_setting("wiki_root", &s(&kb)).unwrap();
+        let ws = serde_json::json!({s(&kb): {"last_used": 100, "ref_dirs": ["/r"]}, s(&blog): {"last_used": 50}});
+        g.set_setting(workspaces::KEY, &ws.to_string()).unwrap();
+    }
+    let ws_raw = || setting(&db.lock().unwrap(), workspaces::KEY);
+    let root_now = || setting(&db.lock().unwrap(), "wiki_root");
+    let before = ws_raw();
+    let (r, note) = wiki_root_steps(&db, &ctx_home(&db, &home), &blog, RootChange::Front, 999, false);
+    assert_eq!(r.unwrap(), blog);
+    assert_eq!(note, WikiWsNote::default());
+    assert_eq!(root_now(), Some(s(&blog)));
+    assert_eq!(ws_raw(), before, "last_used も順も変えない（設定の値そのまま）");
+    // 履歴に無い = unknown_root（wiki_err の JSON）・何も書かない
+    for p in [other.clone(), PathBuf::new(), link.clone(), PathBuf::from(format!("{}/", s(&kb)))] {
+        let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &p, RootChange::Front, 999, false);
+        let e = r.unwrap_err();
+        assert_eq!(err_code(&e).as_deref(), Some("unknown_root"), "{p:?}: {e}");
+    }
+    assert_eq!((root_now(), ws_raw()), (Some(s(&blog)), before.clone()));
+    // Choose = 従来どおり（履歴の外も選べる・touch）
+    let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &other, RootChange::Choose, 1000, false);
+    assert_eq!(r.unwrap(), other);
+    let order = || workspaces::order(&ws_map(&db));
+    assert_eq!(order(), vec![(s(&other), 1000), (s(&kb), 100), (s(&blog), 50)]);
+    // Front で前のワークスペースへ戻す = wiki_root だけ・時刻は変わらない
+    let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &kb, RootChange::Front, 2000, false);
+    assert_eq!(r.unwrap(), kb);
+    assert_eq!(root_now(), Some(s(&kb)));
+    assert_eq!(order(), vec![(s(&other), 1000), (s(&kb), 100), (s(&blog), 50)]);
+    assert_eq!(workspaces::ref_dirs(&ws_map(&db), &s(&kb)), vec!["/r".to_string()]);
+    // check_root に落ちる（履歴にはあるが消えた）= Err・何も書かない
+    std::fs::remove_dir_all(&blog).unwrap();
+    let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &blog, RootChange::Front, 3000, false);
+    assert!(r.is_err());
+    assert_eq!(root_now(), Some(s(&kb)));
+    let _ = app;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 参照フォルダの対象の root = タブの root（履歴にあるものだけ = 無ければ unknown_root で履歴に項目を作らない）・None は設定の root。
+/// root ごと = B に足しても A の一覧は変わらない
+#[test]
+fn ref_dirs_target_is_per_root() {
+    use openref_core::wiki::workspaces;
+    let db = openref_core::Db::open_in_memory().unwrap();
+    db.set_setting("wiki_root", "/v/a").unwrap();
+    db.set_setting(workspaces::KEY, r#"{"/v/a": {"last_used": 2, "ref_dirs": ["/ra"]}, "/v/b": {"last_used": 1}}"#).unwrap();
+    let read = |root: Option<&str>| wiki_ws_tx(&db, 0, false, None, |m, cur| Ok(wiki_ref_dirs_of(m, wiki_ws_target(m, root, cur)?))).0;
+    assert_eq!(read(None).unwrap(), vec![PathBuf::from("/ra")], "None = 設定の root");
+    assert_eq!(read(Some("/v/a")).unwrap(), vec![PathBuf::from("/ra")]);
+    assert!(read(Some("/v/b")).unwrap().is_empty());
+    for bad in ["/v/c", "", "/v/b/"] {
+        let e = read(Some(bad)).unwrap_err();
+        assert_eq!(err_code(&e).as_deref(), Some("unknown_root"), "{bad:?}");
+    }
+    // B に足す（main.rs の wiki_ref_dir_add の f と同じ組み立て）= B だけ変わる
+    let add = |root: Option<&str>, dir: &str| {
+        wiki_ws_tx(&db, 0, false, None, |m, cur| {
+            let r = wiki_ws_target(m, root, cur)?.ok_or("未設定")?;
+            let plan = wiki_ref_dirs_for_add(m, r, Path::new(dir));
+            if plan.changed {
+                wiki_save_ref_dirs(m, r, &plan.dirs);
+            }
+            Ok(plan.changed)
+        })
+        .0
+    };
+    assert!(add(Some("/v/b"), "/rb").unwrap());
+    assert_eq!(read(Some("/v/b")).unwrap(), vec![PathBuf::from("/rb")]);
+    assert_eq!(read(Some("/v/a")).unwrap(), vec![PathBuf::from("/ra")]);
+    // 履歴に無い root には足さない（項目を作らない）
+    assert_eq!(err_code(&add(Some("/v/c"), "/rc").unwrap_err()).as_deref(), Some("unknown_root"));
+    let m = workspaces::parse(setting(&db, workspaces::KEY).as_deref()).unwrap();
+    assert_eq!(m.len(), 2);
+    // B から外す = B だけ
+    let removed = wiki_ws_tx(&db, 0, false, None, |m, cur| {
+        Ok(wiki_ref_dirs_for_remove(m, wiki_ws_target(m, Some("/v/b"), cur)?, Path::new("/rb")))
+    })
+    .0
+    .unwrap();
+    assert!(removed.is_empty());
+    assert_eq!(read(Some("/v/a")).unwrap(), vec![PathBuf::from("/ra")]);
+}
+
+/// command の引数 root = 無い・null は None・文字列はそのまま（空も = pin が拒否）・他の型は Err。wiki_pin = 履歴の鍵だけ（JSON の code）
+#[test]
+fn root_arg_and_pin() {
+    use serde_json::json;
+    assert_eq!(wiki_root_arg(&json!({})).unwrap(), None);
+    assert_eq!(wiki_root_arg(&json!({"root": null})).unwrap(), None);
+    assert_eq!(wiki_root_arg(&json!({"root": ""})).unwrap().as_deref(), Some(""));
+    assert_eq!(wiki_root_arg(&json!({"root": "/v/a"})).unwrap().as_deref(), Some("/v/a"));
+    assert!(wiki_root_arg(&json!({"root": 1})).is_err());
+    let ctx = openref_core::wiki::Ctx {
+        root: Some("/v/a".into()),
+        workspaces: openref_core::wiki::workspaces::parse(Some(r#"{"/v/a": {}, "/v/b": {}}"#)).unwrap(),
+        ..Default::default()
+    };
+    assert_eq!(wiki_pin(ctx.clone(), None).unwrap().root.as_deref(), Some("/v/a"));
+    let b = wiki_pin(ctx.clone(), Some("/v/b")).unwrap();
+    assert_eq!((b.root.as_deref(), b.setting_root()), (Some("/v/b"), Some("/v/a")));
+    for bad in ["", "/v/c"] {
+        assert_eq!(err_code(&wiki_pin(ctx.clone(), Some(bad)).unwrap_err()).as_deref(), Some("unknown_root"), "{bad:?}");
+    }
+}
+
+/// 固定した root（args.root）が監視中の root と違えば入口の stat 走査を省かない（WikiLive::plan が root を比べる）・同じなら省く
+#[test]
+fn watched_is_off_for_pinned_other_root() {
+    let live = WikiLive::default();
+    let g = live.begin(Some("/v/kb".into()));
+    live.armed(g);
+    assert!(live.prime(g));
+    let ctx = openref_core::wiki::Ctx {
+        enabled: true,
+        root: Some("/v/kb".into()),
+        workspaces: openref_core::wiki::workspaces::parse(Some(r#"{"/v/kb": {}, "/v/blog": {}}"#)).unwrap(),
+        ..Default::default()
+    };
+    assert!(wiki_watched(&live, &ctx), "監視中の root = 省く");
+    let mut blog = ctx.clone();
+    blog.pin("/v/blog").unwrap();
+    assert!(!wiki_watched(&live, &blog), "固定した別の root = 省かない");
+    let mut kb = ctx.clone();
+    kb.pin("/v/kb").unwrap();
+    assert!(wiki_watched(&live, &kb), "固定した root が監視中と同じ = 省く");
+}
+
+/// "wiki-changed" の payload = 監視中の root（canonical な文字列）+ WikiChanged の鍵（平らに・形は従来のまま）
+#[test]
+fn wiki_changed_event_carries_root() {
+    use serde_json::json;
+    assert_eq!(
+        serde_json::to_value(WikiChangedEvent::new(Path::new("/v/kb"), WikiChanged::everything())).unwrap(),
+        json!({"root": "/v/kb", "all": true, "added": [], "removed": [], "modified": []})
+    );
+    let c = WikiChanged {
+        added: vec!["n.md".into()],
+        modified: vec!["a.md".into()],
+        ..WikiChanged::default()
+    };
+    assert_eq!(
+        serde_json::to_value(WikiChangedEvent::new(Path::new("/v/blog"), c)).unwrap(),
+        json!({"root": "/v/blog", "all": false, "added": ["n.md"], "removed": [], "modified": ["a.md"]})
+    );
+}
+
+/// チャットの [元に戻す] は記録した子の root で戻す（設定 wiki_root = 前面のタブの root が別でも）。設定の root のままだと
+/// 「別のワークスペース」で断る（固定が要る理由）・子の root が履歴に無ければ戻さない・記録に root が無ければ設定のまま
+#[test]
+fn chat_undo_uses_child_root() {
+    use crate::wiki_chat::{undo_record, Change, Record, Undo};
+    use openref_core::wiki::{edit, workspaces, Ctx};
+    let (base, home, app, _db) = ws_env("undo-root");
+    let kb = home.join("Documents/kb");
+    let blog = home.join("Documents/blog");
+    std::fs::create_dir_all(&kb).unwrap();
+    std::fs::create_dir_all(&blog).unwrap();
+    let (kb_s, blog_s) = (kb.to_string_lossy().to_string(), blog.to_string_lossy().to_string());
+    let ws = |roots: &[&str]| {
+        let m: serde_json::Map<String, serde_json::Value> = roots.iter().map(|r| (r.to_string(), serde_json::json!({}))).collect();
+        workspaces::parse(Some(&serde_json::Value::Object(m).to_string())).unwrap()
+    };
+    // 設定 = kb（前面のタブ）・子 = blog（Claude がそこにページを作った）
+    let setting = Ctx {
+        enabled: true,
+        root: Some(kb_s.clone()),
+        app_dir: Some(app.clone()),
+        home: Some(home.clone()),
+        workspaces: ws(&[&kb_s, &blog_s]),
+        ..Default::default()
+    };
+    let child = wiki_pin(setting.clone(), Some(&blog_s)).unwrap();
+    let w = edit::write_agent(&child, &serde_json::json!({"path": "c.md", "content": "x"})).unwrap();
+    let rec = Record {
+        change: Change::Create {
+            path: "c.md".into(),
+            sha256_after: w["sha256"].as_str().unwrap().into(),
+        },
+        root: Some(blog.clone()),
+        moved_sha: None,
+        undone: false,
+    };
+    let no_trash = |_: &Path| -> Result<String, String> { panic!("呼ばない") };
+    let no_item = |_: &str| -> Result<(), String> { panic!("呼ばない") };
+    assert!(
+        matches!(undo_record(&setting, &rec, None, false, no_trash, no_item), Undo::Refused(s) if s.contains("別のワークスペース")),
+        "設定の root のまま = 戻せない"
+    );
+    // 履歴に無い子の root = 戻さない（理由の文）
+    let lost = Ctx { workspaces: ws(&[&kb_s]), ..setting.clone() };
+    let e = wiki_chat_undo_ctx(lost, Some(&blog)).unwrap_err();
+    assert!(e.contains("履歴に無いワークスペース"), "{e}");
+    // 記録に root が無い = 設定のまま
+    assert_eq!(wiki_chat_undo_ctx(setting.clone(), None).unwrap().root, Some(kb_s.clone()));
+    // 子の root に固定 = 戻せる（ゴミ箱の代わりに消す）・設定の root（kb）には触らない
+    let ctx = wiki_chat_undo_ctx(setting.clone(), Some(&blog)).unwrap();
+    let mut trashed = None;
+    let out = undo_record(&ctx, &rec, None, false, |p: &Path| {
+        trashed = Some(p.to_path_buf());
+        std::fs::remove_file(p).map(|()| "test".to_string()).map_err(|e| e.to_string())
+    }, no_item);
+    assert!(matches!(&out, Undo::Done { path: Some(p), .. } if p == "c.md"), "{out:?}");
+    assert_eq!(trashed, Some(blog.join("c.md")));
+    assert!(!blog.join("c.md").exists() && std::fs::read_dir(&kb).unwrap().next().is_none());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------- 有効化 = OpenNote の起動（OFF で起動した後でも現在の root が履歴に入る = args.root の pin が通る） ----------
+
+/// OFF で起動（履歴は空のまま）→ 有効化（wiki_enable_with = 家事を touch で）→ 履歴に canonical な root が 1 件・pin が通る
+#[test]
+fn enable_after_off_startup_adds_root_to_history() {
+    use openref_core::wiki::workspaces;
+    let (base, home, _app, db) = ws_env("enable-off");
+    let kb = home.join("Documents/kb");
+    std::fs::create_dir_all(&kb).unwrap();
+    let kb_s = kb.to_string_lossy().to_string();
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "0").unwrap();
+        g.set_setting("wiki_root", &kb_s).unwrap();
+    }
+    // 起動時（無効 = touch しない）
+    let ctx = ctx_home(&db, &home);
+    let (r, _) = wiki_chores_steps(&db, &ctx, ctx.root.as_deref(), ctx.enabled, 1000, false, later()).unwrap();
+    assert!(r.unwrap().evicted.is_empty());
+    assert!(ws_map(&db).is_empty(), "OFF の起動では履歴に入らない");
+    assert!(ctx_home(&db, &home).pin(&kb_s).is_err(), "このままでは pin が通らない（直す前の不具合）");
+    // 有効化 = 設定を書いてから家事（touch）
+    db.lock().unwrap().set_setting("wiki_enabled", "1").unwrap();
+    let touch = wiki_enable_chores(true, true).expect("有効化は家事を回す");
+    let (r, note) = wiki_chores_steps(&db, &ctx_home(&db, &home), Some(&kb_s), touch, 2000, false, later()).unwrap();
+    assert_eq!(r.unwrap().rewrote, None, "既に canonical");
+    assert!(note.set_aside.is_empty());
+    assert_eq!(workspaces::order(&ws_map(&db)), vec![(kb_s.clone(), 2000)]);
+    ctx_home(&db, &home).pin(&kb_s).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 有効化: 設定 wiki_root が symlink の綴りなら canonical に書き直し、履歴は canonical の 1 件（生の綴りの鍵を作らない）
+#[test]
+fn enable_rewrites_symlink_root_to_canonical() {
+    use openref_core::wiki::workspaces;
+    let (base, home, _app, db) = ws_env("enable-link");
+    let real = home.join("Documents/kb-real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = home.join("Documents/kb");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (real_s, link_s) = (real.to_string_lossy().to_string(), link.to_string_lossy().to_string());
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "1").unwrap();
+        g.set_setting("wiki_root", &link_s).unwrap();
+    }
+    let touch = wiki_enable_chores(true, true).unwrap();
+    let (r, _) = wiki_chores_steps(&db, &ctx_home(&db, &home), Some(&link_s), touch, 3000, false, later()).unwrap();
+    assert_eq!(r.unwrap().rewrote, Some((link_s.clone(), real_s.clone())));
+    assert_eq!(setting(&db.lock().unwrap(), "wiki_root").as_deref(), Some(real_s.as_str()));
+    assert_eq!(workspaces::order(&ws_map(&db)), vec![(real_s.clone(), 3000)]);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 無効化は家事を回さない（履歴を変えない）。有効化のフォルダ選択の経路（wiki_choose_root が touch 済み）は touch しない =
+/// last_used は選んだときのまま（二重にしない）
+#[test]
+fn disable_and_chosen_enable_do_not_touch() {
+    use openref_core::wiki::workspaces;
+    assert_eq!(wiki_enable_chores(false, true), None);
+    assert_eq!(wiki_enable_chores(false, false), None);
+    assert_eq!(wiki_enable_chores(true, false), Some(false));
+    let (base, home, app, db) = ws_env("enable-chosen");
+    let kb = home.join("Documents/kb");
+    std::fs::create_dir_all(&kb).unwrap();
+    let kb_s = kb.to_string_lossy().to_string();
+    {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "0").unwrap();
+        g.set_setting(workspaces::KEY, r#"{"/Users/u/old": {"last_used": 7}}"#).unwrap();
+    }
+    // メニューの有効化でフォルダを選んだ = wiki_choose_root（Choose = touch）→ 有効化の家事は touch = false
+    let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &kb, RootChange::Choose, 1000, false);
+    assert_eq!(r.unwrap(), kb);
+    db.lock().unwrap().set_setting("wiki_enabled", "1").unwrap();
+    let before = setting(&db.lock().unwrap(), workspaces::KEY);
+    let touch = wiki_enable_chores(true, false).unwrap();
+    let (r, _) = wiki_chores_steps(&db, &ctx_home(&db, &home), Some(&kb_s), touch, 5000, false, later()).unwrap();
+    r.unwrap();
+    assert_eq!(setting(&db.lock().unwrap(), workspaces::KEY), before, "last_used は選んだときのまま");
+    assert_eq!(workspaces::order(&ws_map(&db)), vec![(kb_s.clone(), 1000), ("/Users/u/old".to_string(), 7)]);
+    let _ = app;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------- 起動時の家事は起動時の root にだけ効かせる・揃えの no-op ----------
+
+/// 画面の揃え（Front）が起動時の家事より先に済んだ = 家事は起動時の root（A）だけを touch し、前面の root（B）の last_used は変えない・
+/// 設定 wiki_root（B）を書き換えない・起動時の適用は省く。揃えが無ければ従来どおり（touch・適用する）
+#[test]
+fn startup_chores_touch_only_start_root() {
+    use openref_core::wiki::workspaces;
+    let (base, home, _app, db) = ws_env("startup-front");
+    let a = home.join("Documents/kb");
+    let b = home.join("Documents/blog");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let link = home.join("Documents/kb-link");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let (a_s, b_s, link_s) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string(), link.to_string_lossy().to_string());
+    let reset = |root: &str| {
+        let g = db.lock().unwrap();
+        g.set_setting("wiki_enabled", "1").unwrap();
+        g.set_setting("wiki_root", root).unwrap();
+        let ws = serde_json::json!({a_s.clone(): {"last_used": 100}, b_s.clone(): {"last_used": 50}});
+        g.set_setting(workspaces::KEY, &ws.to_string()).unwrap();
+    };
+    let root_now = || setting(&db.lock().unwrap(), "wiki_root");
+    for start in [a_s.clone(), link_s.clone()] {
+        reset(&start);
+        // setup が同期に読んだ root = start → 家事より先に画面が B へ揃えた
+        let (r, _) = wiki_root_steps(&db, &ctx_home(&db, &home), &b, RootChange::Front, 999, false);
+        r.unwrap();
+        let (r, _) = wiki_chores_steps(&db, &ctx_home(&db, &home), Some(&start), true, 2000, false, later()).unwrap();
+        let done = r.unwrap();
+        assert_eq!(done.rewrote, None, "{start}: 揃えた後の設定を起動時の root で書き換えない");
+        assert_eq!(root_now(), Some(b_s.clone()), "{start}");
+        assert_eq!(
+            workspaces::order(&ws_map(&db)),
+            vec![(a_s.clone(), 2000), (b_s.clone(), 50)],
+            "{start}: touch は起動時の root（canonical）だけ・前面の B は触らない"
+        );
+        assert!(!wiki_startup_apply(root_now().as_deref(), Some(&start), done.rewrote.as_ref()), "{start}: 適用を省く");
+    }
+    // 揃えが無い = 従来どおり（symlink の綴りは canonical に書き直し・touch・適用する）
+    reset(&link_s);
+    let (r, _) = wiki_chores_steps(&db, &ctx_home(&db, &home), Some(&link_s), true, 3000, false, later()).unwrap();
+    let done = r.unwrap();
+    assert_eq!(done.rewrote, Some((link_s.clone(), a_s.clone())));
+    assert_eq!(root_now(), Some(a_s.clone()));
+    assert_eq!(workspaces::order(&ws_map(&db))[0], (a_s.clone(), 3000));
+    assert!(wiki_startup_apply(root_now().as_deref(), Some(&link_s), done.rewrote.as_ref()));
+    assert!(wiki_startup_apply(Some(&a_s), Some(&a_s), None));
+    assert!(wiki_startup_apply(None, None, None), "未設定のまま = 適用（無効・未設定の枝は wiki_apply が扱う）");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 揃えの no-op = 設定が既に root で、監視がその root に張られて生きている（Prime / Skip）ときだけ。設定が違う・監視が別の root・
+/// 張り終える前・止めた・失敗した = 揃える
+#[test]
+fn front_noop_only_when_watched_same_root() {
+    let live = WikiLive::default();
+    assert!(!wiki_front_noop(&live, Some("/v/a"), "/v/a"), "監視なし");
+    let g = live.begin(Some("/v/a".into()));
+    assert!(!wiki_front_noop(&live, Some("/v/a"), "/v/a"), "張り終える前");
+    live.armed(g);
+    assert!(wiki_front_noop(&live, Some("/v/a"), "/v/a"), "張った後（prime 前）");
+    assert!(live.prime(g));
+    assert!(wiki_front_noop(&live, Some("/v/a"), "/v/a"));
+    assert!(!wiki_front_noop(&live, Some("/v/b"), "/v/a"), "設定が違う");
+    assert!(!wiki_front_noop(&live, Some("/v/b"), "/v/b"), "監視は別の root");
+    assert!(!wiki_front_noop(&live, None, "/v/a"));
+    live.fail(g);
+    assert!(!wiki_front_noop(&live, Some("/v/a"), "/v/a"), "監視の失敗");
+    let g2 = live.begin(Some("/v/a".into()));
+    live.armed(g2);
+    live.stop();
+    assert!(!wiki_front_noop(&live, Some("/v/a"), "/v/a"), "止めた");
+}
+
+/// 起動時の段取り（鍵の中で 家事 → 適用 = 監視を張る）の最中に画面の揃え（wiki_front_root = 同じ鍵）が来ると、揃えは鍵を待ち、
+/// 適用の後に no-op の判定をする = 同じ root なら何もせず返る（ページの門は起動時の適用の後に開く）。鍵を取らない揃えは張る前を見る（対照）
+#[test]
+fn front_waits_for_startup_apply_under_roots_lock() {
+    use std::sync::mpsc;
+    let rt = Arc::new(WikiRuntime::default());
+    let (held_tx, held_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let startup = {
+        let rt = rt.clone();
+        std::thread::spawn(move || {
+            let _roots = rt.lock_roots();
+            held_tx.send(()).unwrap();
+            // 対照を見終えるまで張らない = 混んだ CI でも時間に依らない
+            go_rx.recv().unwrap();
+            // 家事（canonicalize・掃除）の代わり → 適用（wiki_apply の監視を張る段 = begin → armed）
+            std::thread::sleep(Duration::from_millis(50));
+            let g = rt.live.begin(Some("/v/a".into()));
+            rt.live.armed(g);
+        })
+    };
+    held_rx.recv().unwrap();
+    assert!(!wiki_front_noop(&rt.live, Some("/v/a"), "/v/a"), "鍵を取らなければ適用の前を見る（対照）");
+    go_tx.send(()).unwrap();
+    let noop = {
+        let _roots = rt.lock_roots();
+        wiki_front_noop(&rt.live, Some("/v/a"), "/v/a")
+    };
+    assert!(noop, "揃えは起動時の段取りを待つ = 適用の後に同じ root なら no-op");
+    startup.join().unwrap();
+    // 毒（段の途中の panic）は無視して握れる
+    let rt2 = rt.clone();
+    let _ = std::thread::spawn(move || {
+        let _roots = rt2.lock_roots();
+        panic!("段の途中で落ちた");
+    })
+    .join();
+    drop(rt.lock_roots());
 }

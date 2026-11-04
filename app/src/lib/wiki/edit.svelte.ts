@@ -6,6 +6,8 @@
 // - 未保存の内容を黙って失わない: 書けないまま編集を終えた（Wiki を無効にした・フォルダが変わった・conflict のまま等）本文は
 //   ed.stranded に残し、WikiRescue が「保存できていない変更があります」とクリップボードへのコピーを出す
 // - 改行: エディタの中は \n・書き出しはファイルの改行コード（editor/eol.ts）。読んだ原文とは同じ正規化で比べる（開いて離れるだけで書かない）
+// - ワークスペース: 書込・読み直し・取込は編集を始めたときの root（ed.root）へ固定（args.root） = タブの行き来・明示の切替で
+//   設定 wiki_root が動いても、編集中のページの root へ書く。root の分からない編集（null）は付けない = 設定の root
 // state.svelte（タブ）と wiki.svelte（木）には依存しない = 部品テスト（edit.test.mjs）で invoke を差し替えて確かめる
 
 import { invoke } from "./ipc";
@@ -27,6 +29,8 @@ export type SaveState = "clean" | "dirty" | "saving" | "saved" | "error" | "conf
 export const ed = $state({
   /** 編集中のページ（vault 相対・null = 編集していない） */
   path: null as string | null,
+  /** 編集中のページのワークスペース（編集を始めたときのタブの root・canonical。null = 分からない = args.root を付けない） */
+  root: null as string | null,
   state: "clean" as SaveState,
   error: null as string | null,
   /** 競合のダイアログを出している（「キャンセル」で閉じても state は conflict のまま = 自動保存しない） */
@@ -67,7 +71,11 @@ let saving: Promise<boolean> | null = null;
 let saveGen = 0;
 
 const current = (): string => (handle ? handle.getText() : text);
-const readFile = (path: string) => invoke<WikiPageData>("wiki_read_gui", { args: { path, max_chars: 2_000_000 } });
+/** args に編集の root を足す（無ければ足さない = 設定の root） */
+const rooted = (args: Record<string, unknown>, root: string | null = ed.root): Record<string, unknown> => (root ? { ...args, root } : args);
+/** 待つ前と同じ編集のセッションか（同じページ・同じワークスペース = 別の root の同じ相対パスのページを取り違えない） */
+const same = (path: string | null, root: string | null): boolean => ed.path === path && ed.root === root;
+const readFile = (path: string) => invoke<WikiPageData>("wiki_read_gui", { args: rooted({ path, max_chars: 2_000_000 }) });
 /** 読んだ原文をエディタと同じ規則に（孤立した \r → ファイルの改行コード） */
 const normal = (s: string) => withEol(s, eolOf(s));
 
@@ -82,11 +90,13 @@ export function editable(p: WikiPageData | null | undefined): boolean {
   return !p.truncated && (!p.content.includes("\uFFFD") || wroteFffd.has(p.path));
 }
 
-/** 編集を始める（同じページなら何もしない）。前のページの未保存は stopEdit が書きに行く */
-export function startEdit(p: WikiPageData) {
-  if (ed.path === p.path) return;
+/** 編集を始める（同じワークスペースの同じページなら何もしない）。前のページの未保存は stopEdit が（前のページの root へ）書きに行く。
+    root = そのページを開いているタブのワークスペース（以後の書込はこの root に固定） */
+export function startEdit(p: WikiPageData, root: string | null = null) {
+  if (ed.path === p.path && ed.root === root) return;
   if (ed.path) stopEdit();
   ed.path = p.path;
+  ed.root = root;
   base = p.sha256 ?? null;
   saved = text = normal(p.content ?? "");
   ed.state = "clean";
@@ -127,9 +137,9 @@ export function changed() {
   timer = setTimeout(() => void flush(), cfg.delay);
 }
 
-/** 照合は必ず付ける（base が無いページは editable が編集させない = 無条件に書く経路を作らない） */
-function body(path: string, content: string, b = base): Record<string, unknown> {
-  return { path, content, if_sha256: b };
+/** 照合は必ず付ける（base が無いページは editable が編集させない = 無条件に書く経路を作らない）。root = 編集を始めたときの root */
+function body(path: string, content: string, b = base, root: string | null = ed.root): Record<string, unknown> {
+  return rooted({ path, content, if_sha256: b }, root);
 }
 
 function wrote(path: string, content: string, r: { sha256: string; size: number; mtime: number }) {
@@ -149,6 +159,7 @@ export async function flush(): Promise<boolean> {
     return false;
   }
   const path = ed.path;
+  const root = ed.root;
   const content = current();
   if (content === saved) {
     if (ed.state === "dirty" || ed.state === "error") ed.state = "clean";
@@ -160,7 +171,7 @@ export async function flush(): Promise<boolean> {
   let ok = false;
   try {
     const r = await invoke<WikiWriteResult>("wiki_save", { args: body(path, content) });
-    if (ed.path !== path) return (ok = r.ok); // 待つ間に編集を終えた（stopEdit 済み）
+    if (!same(path, root)) return (ok = r.ok); // 待つ間に編集を終えた（stopEdit 済み）
     if (r.ok) {
       warnIndex(r);
       base = r.sha256;
@@ -177,12 +188,12 @@ export async function flush(): Promise<boolean> {
       ed.dialog = true;
     }
   } catch (e) {
-    if (ed.path === path) {
+    if (same(path, root)) {
       ed.state = "error";
       ed.error = String(e);
       // 一定の間合いで自動で再試行（⌘S なら即）
       retryTimer = setTimeout(() => {
-        if (ed.path === path && ed.state === "error") void flush();
+        if (same(path, root) && ed.state === "error") void flush();
       }, cfg.retry);
     }
   } finally {
@@ -208,6 +219,7 @@ export function leave(): true | Promise<boolean> {
     cancel = ダイアログだけ閉じる（自動保存は止めたまま・⌘S でまた尋ねる）。読み直した page を返す（wk.page の更新用） */
 export async function resolveConflict(choice: "reload" | "overwrite" | "cancel"): Promise<WikiPageData | null> {
   const path = ed.path;
+  const root = ed.root;
   if (!path || ed.state !== "conflict") return null;
   if (choice === "cancel") {
     ed.dialog = false;
@@ -216,7 +228,7 @@ export async function resolveConflict(choice: "reload" | "overwrite" | "cancel")
   try {
     if (choice === "reload") {
       const p = await readFile(path);
-      if (ed.path !== path) return null;
+      if (!same(path, root)) return null;
       if (!editable(p)) throw new Error(t("このページは編集できない形になりました（外部のアプリで確かめてください）"));
       base = p.sha256 ?? null;
       saved = normal(p.content ?? "");
@@ -229,7 +241,7 @@ export async function resolveConflict(choice: "reload" | "overwrite" | "cancel")
     const content = current();
     // 同じ照合（if_sha256 = 読んだときの hash）+ force = core が上書き前を退避してから書く
     const r = await invoke<WikiWriteResult>("wiki_save", { args: { ...body(path, content), force: true } });
-    if (ed.path !== path) return null;
+    if (!same(path, root)) return null;
     if (!r.ok) throw new Error(t("上書きできませんでした"));
     warnIndex(r);
     base = r.sha256;
@@ -263,6 +275,7 @@ function settle(s: SaveState) {
     （次の保存が conflict = ダイアログ）。読んだ page を返す（題名・リンクの更新用・読めなければ null） */
 export async function refreshFromDisk(): Promise<WikiPageData | null> {
   const path = ed.path;
+  const root = ed.root;
   if (!path) return null;
   const g = saveGen;
   let p: WikiPageData;
@@ -272,7 +285,7 @@ export async function refreshFromDisk(): Promise<WikiPageData | null> {
     return null; // 消えた等。次の保存が conflict（sha256 = null）になる
   }
   // 読む間に保存した・編集を終えた = 読んだ内容は古いかもしれない（呼び出し側に adopt させない）
-  if (ed.path !== path || g !== saveGen || saving) return null;
+  if (!same(path, root) || g !== saveGen || saving) return null;
   if (p.sha256 === base) return p; // 自分の保存の知らせ
   if (ed.state !== "conflict" && current() === saved && editable(p)) {
     base = p.sha256 ?? null;
@@ -296,6 +309,7 @@ function endSession() {
   clearTimeout(retryTimer);
   clearTimeout(previewTimer);
   ed.path = null;
+  ed.root = null;
   ed.state = "clean";
   ed.error = null;
   ed.dialog = false;
@@ -309,6 +323,7 @@ function endSession() {
 export function stopEdit() {
   if (!ed.path) return;
   const path = ed.path;
+  const root = ed.root; // 終えた後も始めたときの root へ書く（前面のタブが別のワークスペースへ移った後でも）
   const content = current();
   const b = base;
   const conflict = ed.state === "conflict";
@@ -319,7 +334,7 @@ export function stopEdit() {
     strand(path, content, t("外部で書き換えられています"));
     return;
   }
-  invoke<WikiWriteResult>("wiki_save", { args: body(path, content, b) })
+  invoke<WikiWriteResult>("wiki_save", { args: body(path, content, b, root) })
     .then((r) => {
       if (r.ok) wrote(path, content, r);
       else strand(path, content, t("外部で書き換えられています"));
@@ -354,9 +369,9 @@ export function resumeAutosave() {
   if (ed.path && ed.state !== "conflict" && current() !== saved) timer = setTimeout(() => void flush(), cfg.delay);
 }
 
-/** 改名に追随（wiki_rename の後） */
-export function renamed(from: string, to: string) {
-  if (ed.path === from) ed.path = to;
+/** 改名に追随（wiki_rename の後）。root = 改名したワークスペース（別の root の同じ相対パスの編集は追わない） */
+export function renamed(from: string, to: string, root: string | null = null) {
+  if (ed.path === from && (!root || !ed.root || ed.root === root)) ed.path = to;
 }
 
 /** ArrayBuffer → base64（大きな画像でも String.fromCharCode の引数の上限を越えないよう区切る） */
@@ -381,36 +396,65 @@ export function blobName(f: { name?: string; type: string }, now = new Date()): 
 /** 貼り付けた画像を attachments/ へ保存して caret に `![[…]]`（wiki_save_blob） */
 export async function pasteImages(files: File[]) {
   const path = ed.path;
+  const root = ed.root;
   if (!path) return;
   const embeds: string[] = [];
-  for (const f of files) {
+  /** 書けたファイル（ワークスペースの相対パス）= 編集を離れて本文に入れられなければ知らせる */
+  const done: string[] = [];
+  for (const [i, f] of files.entries()) {
     try {
       const data_base64 = toBase64(await f.arrayBuffer());
-      const r = await invoke<WikiSaveBlobResult>("wiki_save_blob", { args: { name: blobName(f), data_base64, page: path } });
+      // 待つ間に編集を離れた（タブの行き来・別のページ）= 残りは書かない（別のワークスペースへ黙って書かない = 編集を始めたときの root に固定）
+      if (!same(path, root)) return gaveUp(done, files.slice(i).map((x) => x.name || blobName(x)));
+      const r = await invoke<WikiSaveBlobResult>("wiki_save_blob", { args: rooted({ name: blobName(f), data_base64, page: path }, root) });
       embeds.push(r.embed);
+      done.push(r.path || blobName(f));
     } catch (e) {
       notice(`✗ ${t("画像を保存できません")}: ${String(e).slice(0, 200)}`);
     }
   }
-  if (embeds.length && ed.path === path) handle?.insert(embeds.join("\n"));
+  if (!embeds.length) return;
+  if (same(path, root)) handle?.insert(embeds.join("\n"));
+  else gaveUp(done, []); // 最後の 1 枚の最中に離れた = 書いた分を知らせる
 }
 
 /** OS からのドロップ（App の onDragDropEvent）。編集中なら各ファイルを vault へ（wiki_import_file）→ caret に `![[…]]`。
     編集中でなければ false（呼び出し側が「編集モードで」と知らせる。蔵書へは流さない） */
 export async function dropPaths(paths: string[]): Promise<boolean> {
   const path = ed.path;
+  const root = ed.root;
   if (!path || !handle) return false;
   const embeds: string[] = [];
-  for (const abs of paths) {
+  /** 取り込めたファイル（ワークスペースの相対パス）= 編集を離れて本文に入れられなければ知らせる */
+  const done: string[] = [];
+  const base = (abs: string) => abs.split("/").pop() ?? abs;
+  for (const [i, abs] of paths.entries()) {
+    // 待つ間に編集を離れた（タブの行き来・別のページ）= 残りは取り込まない（別のワークスペースへ黙って書かない = 編集を始めたときの root に固定）
+    if (!same(path, root)) {
+      gaveUp(done, paths.slice(i).map(base));
+      return true;
+    }
     try {
-      const r = await invoke<WikiImportResult>("wiki_import_file", { args: { abs, page: path } });
+      const r = await invoke<WikiImportResult>("wiki_import_file", { args: rooted({ abs, page: path }, root) });
       embeds.push(r.embed);
+      done.push(r.path || base(abs));
     } catch (e) {
-      notice(`✗ ${t("取り込めません")}: ${abs.split("/").pop()} · ${String(e).slice(0, 160)}`);
+      notice(`✗ ${t("取り込めません")}: ${base(abs)} · ${String(e).slice(0, 160)}`);
     }
   }
-  if (embeds.length && ed.path === path) handle?.insert(embeds.join("\n")); // 待つ間に別のページへ移ったら入れない
+  if (!embeds.length) return true;
+  if (same(path, root)) handle?.insert(embeds.join("\n"));
+  else gaveUp(done, []); // 最後の 1 本の最中に離れた（待つ間に別のページへ移った）= 本文に入れず、取り込んだ分を知らせる
   return true;
+}
+
+/** 取込・貼付の途中で編集を離れた = 知らせる: 取り込んだ（書いた）が本文に入れなかったファイル（編集を始めたときのワークスペースに残る = 場所を出す）と、
+    取り込まなかった残りのファイル（どちらも無ければ何もしない） */
+function gaveUp(done: string[], rest: string[]) {
+  const parts: string[] = [];
+  if (done.length) parts.push(`${t("編集中のページを離れたので、取り込んだファイルを本文に入れませんでした")}: ${done.join(", ").slice(0, 160)}`);
+  if (rest.length) parts.push(`${t("編集中のページを離れたので、残りのファイルを取り込みませんでした")}: ${rest.join(", ").slice(0, 160)}`);
+  if (parts.length) notice(`✗ ${parts.join(" / ")}`);
 }
 
 /** 取り込めるファイルの拡張子（core の media_kind と同じ = 画像・動画・音声・PDF） */
