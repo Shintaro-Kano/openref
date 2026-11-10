@@ -2660,7 +2660,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openref-app"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "http-range",
  "libc",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "openref-cli"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "openref-connectd"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "openref-core"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "fastrand",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "openref-mcp"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "openref-core",
  "rusqlite",

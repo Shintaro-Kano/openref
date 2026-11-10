@@ -14,6 +14,7 @@
     consumeDragClick,
     noteDirty,
     openNoteEditor,
+    openPrimaryPdf,
     saveNote,
     select,
     toggleCheck,
@@ -166,7 +167,18 @@
                 else void openNoteEditor(it.key);
               }}>{t("メモ")}</button>
           {/if}
-          <span class="pdf">{it.hasPdf ? "PDF" : ""}</span>
+          {#if it.hasPdf}
+            <button
+              class="pdf"
+              title={t("PDF を読む")}
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={(e) => {
+                e.stopPropagation();
+                void openPrimaryPdf(it.key);
+              }}>PDF</button>
+          {:else}
+            <span class="pdf"></span>
+          {/if}
         </span>
       </div>
       {#if app.noteEditor && app.noteEditor.key === it.key}

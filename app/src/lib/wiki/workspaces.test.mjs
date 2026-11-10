@@ -946,7 +946,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
 
 // ---- ⑰ チャットの子が使っている root には [外す] を出さない ----
 {
-  const CH = await import("./chat.svelte.ts");
+  const CH = await import("../chat/chat.svelte.ts");
   await reset([[null, "/ws/a"]], 0);
   CH.chat.status = { enabled: true, cli: "/c", version: "1", logged_in: true, auth: null, model: null, mcp: "/m", state: "idle", session_id: "S", root: "/ws/b" };
   assert.equal(W.rootInUse("/ws/b"), true, "チャットの子の root を使用中と見ない");

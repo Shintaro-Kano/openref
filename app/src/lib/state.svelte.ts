@@ -7,11 +7,14 @@ import {
   type ItemDetail,
   type ImportStatus,
   type ItemSummary,
+  type ListSortKey,
   type StyleEntry,
   type TagRow,
   type ViewCounts,
 } from "./api";
 import { formatBibliographyMany } from "./cite";
+import { shelfIpc } from "./shelf/ipc";
+import type { ShelfBookTab, ShelfSortKey, ShelfTab } from "./shelf/tree";
 
 export type ImportFileStatus = "pending" | "running" | "canceled" | ImportStatus;
 export interface ImportFile {
@@ -82,11 +85,15 @@ export interface Tab {
   viewer: TabViewer | null;
   /** Wiki タブ（一覧の状態は下に持ったまま = 一覧に戻すと見える） */
   wiki: TabWiki | null;
+  /** 本棚のタブ（wiki と同じ = 一覧の状態は下に持ったまま・前面も含めて常にここが正） */
+  shelf: ShelfTab | null;
+  /** 本棚の読み手のタブ（viewer と同じ = 読み手のインスタンスがタブに付いて生きている） */
+  shelfBook: ShelfBookTab | null;
 }
 
 let nextTabId = 1;
 function blankTab(view: View = { kind: "all" }, search = "", filters: Filters = { author: null, journal: null }): Tab {
-  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null, wiki: null };
+  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null, wiki: null, shelf: null, shelfBook: null };
 }
 const firstTab = blankTab();
 
@@ -104,6 +111,12 @@ export const app = $state({
   /** OpenNote が有効（settings.wiki_enabled。wiki/wiki.svelte.ts の loadWikiStatus が書く）。false の間は Wiki の UI を描かない */
   wikiOn: false,
   items: [] as ItemSummary[],
+  /** 本棚の並びの既定（ui_shelf_sort・shelf.svelte の loadShelf が読む）。新しい本棚のタブがこれで始まる */
+  shelfSort: "title" as ShelfSortKey,
+  /** 一覧の右ペイン（ItemDetail）を出す（ui_detail = "0" で隠す）。行の選択では開かない。隠しても詳細は読む（reveal / ★ / メモ・チャットの文脈 = viewing が app.detail を読む） */
+  detailOpen: true,
+  /** PDF ビューアの右バー（検索 / 注釈 / 目次 / ページ）を出す（ui_viewer_side = "0" で隠す）。全 PDF タブで共通の 1 つ */
+  viewerSideOpen: true,
   /** 詳細パネルに出している 1 件（クリック選択） */
   selected: null as string | null,
   /** チェックボックスで選んだ複数件（一括操作の対象。Paperpile の select references） */
@@ -111,7 +124,9 @@ export const app = $state({
   /** shift クリック範囲選択の起点 */
   checkAnchor: null as string | null,
   /** 一括ツールバーで開いているメニュー（Esc の優先順位制御のため state に置く） */
-  listMenu: null as null | "folder" | "label" | "cite",
+  listMenu: null as null | "folder" | "label" | "cite" | "sort",
+  /** 一覧の並び（ui_list_sort に永続・全タブ共通 = ui_tabs には入れない）。検索中も同じ並び */
+  listSort: { key: "added", desc: true } as ListSort,
   detail: null as ItemDetail | null,
   collections: [] as CollectionRow[],
   /** サイドバーのフォルダの並び（Sort folders）。ui_folder_sort に永続 */
@@ -210,6 +225,12 @@ export async function refreshSidebar() {
   app.tags = tags.sort(cmpFor(app.tagSort));
 }
 
+/** 一覧の並び（ListToolbar のメニュー・refreshList が core へ渡す） */
+export interface ListSort {
+  key: ListSortKey;
+  desc: boolean;
+}
+
 /** list_items は非同期（本文検索が重いことがある）。連打で古い応答が後から届いても新しい一覧を上書きしない */
 let listSeq = 0;
 
@@ -225,6 +246,8 @@ export async function refreshList() {
     authorFamily: app.filters.author?.family ?? null,
     authorInitial: app.filters.author?.initial ?? null,
     journal: app.filters.journal,
+    sort: app.listSort.key,
+    desc: app.listSort.desc,
     limit: 500,
   });
   if (seq !== listSeq) return;
@@ -293,9 +316,9 @@ export async function reveal(key: string) {
 }
 
 async function revealNow(key: string) {
-  if (frontViewer() || frontWiki()) {
+  if (frontViewer() || frontWiki() || frontShelf() || frontShelfBook()) {
     await openTab();
-    if (frontViewer() || frontWiki()) {
+    if (frontViewer() || frontWiki() || frontShelf() || frontShelfBook()) {
       toast(t("✗ 一覧に表示できませんでした（新しいタブを開けません。処理中・取込の実行中は後で開いてください）"));
       return;
     }
@@ -324,6 +347,9 @@ async function revealNow(key: string) {
     return;
   }
   await select(key);
+  // 右ペインを閉じていると詳細が見えない = 行を見せる（reveal でも右ペインは開かない。チャットの柱を開いていても同じ）
+  await tick();
+  if (app.tab === tab && app.selected === key) rowsEl()?.querySelector(".row.selected")?.scrollIntoView({ block: "nearest" });
 }
 
 function closeDetail() {
@@ -398,10 +424,26 @@ export function frontWiki(): TabWiki | null {
   return app.wikiOn ? (app.tabs.find((t) => t.id === app.tab)?.wiki ?? null) : null;
 }
 
-/** ⌘T・TabStrip の ＋ = 今のモードで新しいタブ（前面が Wiki なら Wiki のホーム = 前面のタブのワークスペースを継ぐ・それ以外は一覧の「すべて」） */
+/** 前面のタブの本棚（無ければ null） */
+export function frontShelf(): ShelfTab | null {
+  return app.tabs.find((t) => t.id === app.tab)?.shelf ?? null;
+}
+
+/** 前面のタブの読み手（無ければ null） */
+export function frontShelfBook(): ShelfBookTab | null {
+  return app.tabs.find((t) => t.id === app.tab)?.shelfBook ?? null;
+}
+
+/** 本棚の入口（検索語なし・並びは既定） */
+export function shelfHome(root: string, dir: string | null = null): ShelfTab {
+  return { root, dir, query: "", sort: app.shelfSort, scrollTop: 0 };
+}
+
+/** ⌘T・TabStrip の ＋ = 今のモードで新しいタブ（前面が Wiki なら Wiki のホーム = 前面のタブのワークスペースを継ぐ・本棚 / 読み手ならその本棚の「すべての本」・それ以外は一覧の「すべて」） */
 export function openTabInMode() {
   const w = frontWiki();
-  return openTab({ kind: "all" }, w ? { path: null, root: w.root ?? null, scrollTop: 0, editing: false } : null);
+  const s = frontShelf() ?? frontShelfBook();
+  return openTab({ kind: "all" }, w ? { path: null, root: w.root ?? null, scrollTop: 0, editing: false } : null, s ? shelfHome(s.root) : null);
 }
 
 /** タブの操作（切替・開く・閉じる）を受け付けるか。処理中（busy）・エディタ・モーダル・取込中は受け付けない
@@ -410,6 +452,19 @@ export function openTabInMode() {
     モーダルは本体の app.modal と Wiki のダイアログ（modalOpen）の両方 */
 export function tabOpsAllowed(): boolean {
   return !app.busy && !app.editorOpen && !modalOpen() && !app.importJob;
+}
+
+/** Settings › 他の文献管理ソフトから移行…（Rust の event "migration-open"）= MigrationModal を開く。
+    参照エディタ・モーダル（Wiki のダイアログを含む）・PDF 取込の間は開かない（その窓の上に重ねない = 押しても何もしない）。
+    MigrationModal は App と一緒に mount されたまま進行中の job を読み続ける = 「バックグラウンドで続行」して閉じた後に押すと進行中の窓に戻る。
+    メニューバーのクリックは DOM のクリックにならない = 開いていたメニューは閉じず、フォーカスも裏に残る → 「＋ 新規 ▾」を閉じ、
+    フォーカスを外す（裏のエディタ・入力欄に打鍵が入らない）。OpenNote / 本棚の浮きメニューは App の受け口が閉じる。戻り値 = 開いたか */
+export function openMigration(): boolean {
+  if (app.editorOpen || modalOpen() || app.importJob) return false;
+  app.newMenu = false;
+  (document.activeElement as HTMLElement | null)?.blur?.();
+  app.modal = "migration";
+  return true;
 }
 
 /** モーダルが開いているか = 本体の app.modal か、Wiki のダイアログ（wiki.svelte が登録する guard）。タブの操作と ⌘⌥I が見る */
@@ -527,8 +582,8 @@ async function switchTab(id: number, closeFront: boolean): Promise<boolean> {
 }
 
 /** 新しいタブを末尾に足して前面で開く（⌘T・＋・⌘クリック / 中クリック・フォルダの「新しいタブで開く」）。
-    中身は v（既定 = すべて）だけ = 検索語・チップ・チェックなし。wiki を渡すと Wiki タブ（下の一覧は v） */
-export async function openTab(v: View = { kind: "all" }, wiki: TabWiki | null = null) {
+    中身は v（既定 = すべて）だけ = 検索語・チップ・チェックなし。wiki を渡すと Wiki タブ・shelf を渡すと本棚のタブ（下の一覧は v） */
+export async function openTab(v: View = { kind: "all" }, wiki: TabWiki | null = null, shelf: ShelfTab | null = null) {
   if (!tabOpsAllowed()) return;
   const live = viewLive(v);
   // 開いているメモは先に保存して閉じる（保存に失敗したらタブを作らない = 切り替えられない空のタブを残さない）。
@@ -537,12 +592,33 @@ export async function openTab(v: View = { kind: "all" }, wiki: TabWiki | null = 
   if (app.noteEditor || !tabOpsAllowed() || (live && !viewLive(v))) return;
   const t = blankTab($state.snapshot(v) as View);
   t.wiki = wiki;
+  t.shelf = shelf;
+  await pushTab(t);
+}
+
+/** 作ったタブを末尾に足して前面に。切り替えられなかった（Wiki の編集を保存できない等）= 作ったタブを残さない（空のタブを置き去りにしない） */
+async function pushTab(t: Tab) {
   app.tabs.push(t);
-  // 切り替えられなかった（Wiki の編集を保存できない等）= 作ったタブを残さない（空のタブを置き去りにしない）
   if (!(await switchTab(t.id, false)) && app.tab !== t.id) {
     const i = app.tabs.findIndex((x) => x.id === t.id);
     if (i >= 0) app.tabs.splice(i, 1);
   }
+}
+
+/** 本を読み手のタブで開く（PDF のタブと同じ = 新しいタブ・同じ本のタブがあればそれを前面に）。下の一覧は「すべて」 */
+export async function openShelfBookTab(book: ShelfBookTab) {
+  if (!tabOpsAllowed()) return;
+  const same = (t: Tab) => t.shelfBook?.root === book.root && t.shelfBook.path === book.path;
+  const open = app.tabs.find(same);
+  if (open) {
+    await activateTab(open.id);
+    return;
+  }
+  await autoSaveAndCloseNote();
+  if (app.noteEditor || !tabOpsAllowed() || app.tabs.some(same)) return;
+  const t = blankTab();
+  t.shelfBook = book;
+  await pushTab(t);
 }
 
 /** タブを閉じる（× / 中クリック / ⌘W・PDF タブはビューアの × / Esc も）。最後の 1 枚は閉じない（PDF タブならビューアだけ
@@ -558,7 +634,9 @@ export async function closeTab(id: number) {
     const only = app.tabs.find((t) => t.id === id);
     if (!only) return;
     only.viewer = null;
-    only.wiki = null; // Wiki タブも中身を外して一覧に戻す
+    only.wiki = null; // Wiki タブ・本棚も中身を外して一覧に戻す
+    only.shelf = null;
+    only.shelfBook = null;
     return;
   }
   if (id !== app.tab) {
@@ -718,6 +796,9 @@ export function tabsPref(): string {
         ...(t.viewer ? { viewer: { key: t.viewer.itemKey, attachment: t.viewer.attachmentId, title: t.viewer.title } } : {}),
         // Wiki タブ = vault 相対の path（null = ホーム）+ ワークスペース（まだ分からなければ書かない = 復元で設定の root）
         ...(t.wiki ? { wiki: t.wiki.root ? { path: t.wiki.path, root: t.wiki.root } : { path: t.wiki.path } } : {}),
+        // 本棚 = root + dir（検索語・スクロールは戻さない）/ 読み手 = パス（走査なしで戻す = 題名と大きさも持つ）
+        ...(t.shelf ? { shelf: { root: t.shelf.root, dir: t.shelf.dir } } : {}),
+        ...(t.shelfBook ? { shelfBook: t.shelfBook } : {}),
       };
     }),
   });
@@ -775,6 +856,18 @@ function parseWiki(w: any): TabWiki | null {
   return { path: w.path, root: typeof w.root === "string" && w.root ? w.root : null, scrollTop: 0, editing: false };
 }
 
+/** ui_tabs の本棚のタブの値（root が文字列でなければ null = 一覧のタブとして戻す） */
+function parseShelf(s: any): ShelfTab | null {
+  return s && typeof s.root === "string" && s.root ? shelfHome(s.root, typeof s.dir === "string" && s.dir ? s.dir : null) : null;
+}
+
+/** ui_tabs の読み手のタブの値 */
+function parseShelfBook(b: any): ShelfBookTab | null {
+  if (!b || typeof b.root !== "string" || !b.root || typeof b.path !== "string" || !b.path || typeof b.id !== "string" || !b.id) return null;
+  const n = (x: unknown) => (typeof x === "number" ? x : 0);
+  return { root: b.root, id: b.id, path: b.path, title: typeof b.title === "string" ? b.title : "", size: n(b.size), mtime: n(b.mtime) };
+}
+
 /** 戻す PDF タブの item を引き、添付 id がその item の添付にあるか確かめる（id は削除後に再利用されうる・item が消えていることも
     ある = MCP / CLI）。あれば今の題名で返し、無ければ viewer = null（一覧のタブとして戻す）。引けない（IPC の失敗）は確かめずに
     そのまま戻して err を返す（保存済みの PDF タブを消さない。添付が本当に無ければビューアの読込のエラーが見える） */
@@ -790,11 +883,30 @@ async function checkViewer(v: TabViewer): Promise<{ viewer: TabViewer | null; er
   return { viewer: { ...v, title }, err: null };
 }
 
+/** 戻す本棚のタブの root を確かめる: 履歴の root の集合を返し（読めなければ null = 確かめない）、履歴にある root の asset scope を先に足す（走査しない）。
+    足せない（フォルダが無い）のは読み手・グリッドのエラーが見える = ここでは止めない */
+async function checkShelfRoots(roots: string[]): Promise<Set<string> | null> {
+  if (!roots.length) return null;
+  let known: Set<string>;
+  try {
+    const r = await shelfIpc.status();
+    if (!Array.isArray(r?.shelves)) return null; // 形が違う = 分からない（全部の本棚のタブを消さない）
+    known = new Set(r.shelves.map((s) => s.root));
+  } catch (e) {
+    toast(`✗ ${t("本棚の履歴を読めません")}: ${String(e).slice(0, 160)}`);
+    return null;
+  }
+  await Promise.all([...new Set(roots)].filter((r) => known.has(r)).map((r) => shelfIpc.frontRoot(r).catch(() => null)));
+  return known;
+}
+
 /** 起動時: ui_tabs からタブを戻す（refreshSidebar の後 = フォルダ / ラベルの実在を確かめてから。一覧は呼び出し側が取る）。
     無いフォルダ・ラベルのタブは捨て（前面だったら手前のタブを前面に）、0 枚なら既定の「すべて」1 枚のまま。
     PDF タブは item と添付を確かめて戻し（下の一覧のフォルダ・ラベルが消えていたら一覧は「すべて」・その item をチェックして
     詳細に出す = openViewer と同じ）、item や添付が無い・値が壊れていれば一覧のタブとして戻して（一覧のビューも無ければ捨てて）
     知らせる。確かめる IPC が失敗したらそのまま戻して知らせる。同じ PDF のタブが 2 枚あれば後の方は捨てる。
+    本棚 / 読み手のタブは走査なしで戻す: root が履歴にあるかだけ確かめ、asset scope を先に足す（shelf_front_root・読み手が開く前に要る）。
+    履歴に無い root のタブは文献の「すべて」へ（知らせるのは 1 回）。履歴を読めなければそのまま戻す（見えない本棚のタブを消さない）。
     読めなければ何も戻さず、保存もしない（tabsRestored を立てない = 保存済みを既定で上書きしない） */
 export async function restoreTabs() {
   // Settings › 起動時に前回のタブを開く（ui_restore_tabs = "0" で ②次回は初期状態）。保存は続ける = ①に戻せば直前の状態が戻る。
@@ -822,24 +934,31 @@ export async function restoreTabs() {
   }
   const list: any[] = Array.isArray(saved?.tabs) ? saved.tabs : [];
   const activeAt = Number.isInteger(saved?.active) ? (saved.active as number) : 0;
-  const found: { at: number; tab: Tab; viewer: TabViewer | null; wiki: TabWiki | null; orphan: boolean }[] = [];
+  const found: { at: number; tab: Tab; viewer: TabViewer | null; wiki: TabWiki | null; shelf: ShelfTab | null; shelfBook: ShelfBookTab | null; orphan: boolean }[] = [];
   let lost = 0; // 開けない PDF タブ（値が壊れている・item / 添付が無い）
+  let shelfLost = 0; // 開けない本棚 / 読み手のタブ（値が壊れている・root が履歴に無い）
   list.forEach((s, at) => {
     const view = parseView(s?.view);
     const viewer = parseViewer(s?.viewer);
     if (s?.viewer != null && !viewer) lost++;
     const wiki = viewer ? null : parseWiki(s?.wiki);
-    if (!view && !viewer && !wiki) return;
+    // 中身は常に 1 つ（壊れた値で 2 つ持っていたら先の種類だけ）
+    const shelfBook = viewer || wiki ? null : parseShelfBook(s?.shelfBook);
+    const shelf = viewer || wiki || shelfBook ? null : parseShelf(s?.shelf);
+    if (!viewer && !wiki && !shelfBook && !shelf && (s?.shelfBook != null || s?.shelf != null)) shelfLost++;
+    if (!view && !viewer && !wiki && !shelfBook && !shelf) return;
     const tab = blankTab(view ?? { kind: "all" }, typeof s.search === "string" ? s.search : "", parseFilters(s.filters));
     tab.wiki = wiki;
-    found.push({ at, tab, viewer, wiki, orphan: !view });
+    found.push({ at, tab, viewer, wiki, shelf, shelfBook, orphan: !view });
   });
+  const shelfRoots = await checkShelfRoots(found.flatMap((f) => f.shelf?.root ?? f.shelfBook?.root ?? []));
   const checked = await Promise.all(found.map((f) => (f.viewer ? checkViewer(f.viewer) : null)));
   const tabs: Tab[] = [];
   const seen = new Set<string>(); // 確かめた PDF（key + 添付 id）。同じ PDF のタブは 1 枚 = openViewer と同じ（後の方を捨てる）
   let active = 0;
   let failed = 0;
   let err = "";
+  const seenBook = new Set<string>(); // 読み手も同じ本のタブは 1 枚 = openShelfBookTab と同じ
   found.forEach((f, i) => {
     const c = checked[i];
     if (c?.err) {
@@ -848,7 +967,18 @@ export async function restoreTabs() {
     }
     const v = c?.viewer ?? null;
     if (f.viewer && !v) lost++;
-    if (f.orphan && !v && !f.wiki) return;
+    const sr = f.shelf?.root ?? f.shelfBook?.root;
+    if (sr && shelfRoots && !shelfRoots.has(sr)) {
+      shelfLost++;
+      f.tab.view = { kind: "all" }; // 文献の「すべて」へ
+      f.orphan = false;
+    } else if (f.shelfBook) {
+      const id = `${sr}\u0000${f.shelfBook.path}`;
+      if (seenBook.has(id)) return;
+      seenBook.add(id);
+      f.tab.shelfBook = f.shelfBook;
+    } else if (f.shelf) f.tab.shelf = f.shelf;
+    if (f.orphan && !v && !f.wiki && !f.tab.shelf && !f.tab.shelfBook) return;
     if (v) {
       const id = `${v.itemKey}\u0000${v.attachmentId}`;
       if (seen.has(id)) return;
@@ -864,6 +994,7 @@ export async function restoreTabs() {
   const notes: string[] = [];
   if (lost) notes.push(`${t("PDF タブ")} ${lost} ${t("枚を開けません（item か PDF が見つからない・保存値が壊れている）")}`);
   if (failed) notes.push(`${t("PDF タブ")} ${failed} ${t("枚を確かめられません（そのまま開きます）")}: ${err.slice(0, 120)}`);
+  if (shelfLost) notes.push(`${t("本棚のタブ")} ${shelfLost} ${t("枚を開けません（履歴に無い本棚・保存値が壊れている）")}`);
   if (notes.length) toast("✗ " + notes.join(" / "));
   if (tabs.length) {
     app.tabs = tabs;
@@ -1457,6 +1588,26 @@ export async function openViewer(itemKey: string, attachmentId: number, title: s
   await switchTab(t.id, false);
 }
 
+/** 一覧の行の「PDF」= 主 PDF（ItemDetail と同じ = 実在する最初の添付）を開く。行の選択は変えない（開くのは新しいタブ・同じ PDF のタブがあればそこへ = openViewer）。
+    hasPdf は添付の行があるだけで実在は見ていない = 無ければ知らせる。待つ間に別のタブへ切り替わったらやめる */
+export async function openPrimaryPdf(key: string) {
+  const tab = app.tab;
+  let d: ItemDetail | null;
+  try {
+    d = app.detail?.key === key ? app.detail : await api.getItem(key);
+  } catch (e) {
+    toast(`✗ ${t("詳細を読めません")}: ${String(e).slice(0, 200)}`);
+    return;
+  }
+  if (app.tab !== tab) return;
+  const a = d?.attachments.find((x) => x.exists);
+  if (!d || !a) {
+    toast(t("✗ PDF の実体が見つかりません"));
+    return;
+  }
+  await openViewer(key, a.id, d.csl?.title ?? "");
+}
+
 // ---------- 引用スタイル ----------
 
 /** 表示名（導入済み一覧から。未知の id はそのまま） */
@@ -1622,6 +1773,66 @@ export async function loadLangPref() {
   } catch (e) {
     toast(t("✗ 言語の設定の読込に失敗: ") + String(e).slice(0, 160));
   }
+}
+
+/** 起動時: 一覧の右ペインの開閉（ui_detail）。main.ts が mount の前に待つ（mount の後に閉じると最初の 1 フレームに出て消える）。読めなければ既定（開く） */
+export async function loadDetailPref() {
+  try {
+    app.detailOpen = (await api.getUiPref("ui_detail")) !== "0";
+  } catch (e) {
+    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
+  }
+}
+
+/** 一覧の右ペインの開閉（ListToolbar のボタン・⌘⌥I） */
+export function toggleDetail() {
+  app.detailOpen = !app.detailOpen;
+  saveUiPref("ui_detail", app.detailOpen ? "1" : "0");
+}
+
+/** 起動時: PDF ビューアの右バーの開閉（ui_viewer_side）。main.ts が mount の前に待つ（ui_detail と同じ = 最初の描画で出て消えない）。
+    読めなければ既定（開く） */
+export async function loadViewerSidePref() {
+  try {
+    app.viewerSideOpen = (await api.getUiPref("ui_viewer_side")) !== "0";
+  } catch (e) {
+    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
+  }
+}
+
+/** PDF ビューアの右バーの開閉（ツールバーの右端のボタン・PDF のタブが前面のときの ⌘⌥I） */
+export function toggleViewerSide() {
+  app.viewerSideOpen = !app.viewerSideOpen;
+  saveUiPref("ui_viewer_side", app.viewerSideOpen ? "1" : "0");
+}
+
+/** 右バーの中身が目的地の操作（⌘F・ツールバーの ⌕）の前に: 閉じていれば開く（開いていれば何もしない = 書かない） */
+export function showViewerSide() {
+  if (!app.viewerSideOpen) toggleViewerSide();
+}
+
+/** 起動時: 一覧の並び（ui_list_sort = `added:desc` の形）。main.ts が mount の前に待つ（最初の一覧から選んだ並び）。読めない・形が違えば既定（追加日・降順） */
+export async function loadListSortPref() {
+  try {
+    const m = /^(added|published|journal):(asc|desc)$/.exec((await api.getUiPref("ui_list_sort")) ?? "");
+    if (m) app.listSort = { key: m[1] as ListSortKey, desc: m[2] === "desc" };
+  } catch (e) {
+    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
+  }
+}
+
+/** ListToolbar の並びのメニュー: 選択中の項目 = 向きを反転・別の項目 = その項目の自然な向き（誌名 = A→Z・日付 = 新しい順）。登録表の list_items の desc の省略と同じ */
+export async function pickListSort(key: ListSortKey) {
+  const cur = app.listSort;
+  const desc = cur.key === key ? !cur.desc : key !== "journal";
+  app.listSort = { key, desc };
+  saveUiPref("ui_list_sort", `${key}:${desc ? "desc" : "asc"}`);
+  const tab = app.tab;
+  await refreshList();
+  // 並べ替えたら先頭から見せる（途中の位置に残すと、どこを見ているか分からなくなる）
+  await tick();
+  const el = rowsEl();
+  if (el && app.tab === tab) el.scrollTop = 0;
 }
 
 /** 起動時の新版確認（Settings › 起動時に新版を確認・core update.rs）。新しい版があれば App がヘッダー下の帯に出す。

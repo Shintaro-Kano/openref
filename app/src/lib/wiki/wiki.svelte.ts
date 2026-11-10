@@ -1,14 +1,14 @@
 // OpenNote の画面側の状態と動詞。骨組み = モード・タブ・木・ページの遷移・右ペインの読込。
 // 描画は MdView / HtmlView / MediaView。Tauri command は main.rs の wiki_*（読みは登録表と同じ形 = invoke(name, { args })）。
-// Wiki が無効（app.wikiOn = false）の間は何も描かず、既存の挙動を変えない（原則 1）
-// 検索の動詞 = search.svelte.ts・ファイル操作（新規 / 改名 / ゴミ箱）= files.svelte.ts・参照フォルダの追加 / 外す = refdirs.svelte.ts（B-33。どれもここを読む一方向）
+// Wiki が無効（app.wikiOn = false）の間は何も描かず、既存の挙動を変えない
+// 検索の動詞 = search.svelte.ts・ファイル操作（新規 / 改名 / ゴミ箱）= files.svelte.ts・参照フォルダの追加 / 外す = refdirs.svelte.ts（どれもここを読む一方向）
 
 import { errorCode, invoke, WIKI_CODES } from "./ipc";
 import { listen } from "@tauri-apps/api/event";
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import { t } from "../i18n.svelte";
 import { api } from "../api";
-import { activateTab, app, frontWiki, modalOpen, openTab, reveal, setLeaveGuard, setModalGuard, setRootGuard, setView, tabOpsAllowed, toast, type TabWiki } from "../state.svelte";
+import { activateTab, app, frontViewer, frontWiki, modalOpen, openTab, reveal, setLeaveGuard, setModalGuard, setRootGuard, setView, tabOpsAllowed, toast, toggleDetail, toggleViewerSide, type TabWiki } from "../state.svelte";
 import { viewKindOf } from "./render/asset.ts";
 import { findHeading } from "./render/sanitize.ts";
 import type {
@@ -27,7 +27,7 @@ import type {
   WikiWorkspace,
 } from "./types";
 import { dirty, discardEdit, dropPaths, ed, flush, leave, setNotice, setOnSaved, stopEdit, strandEdit } from "./edit.svelte";
-import { chat } from "./chat.svelte"; // chat.svelte も wk を読む（循環）= guard の中でだけ読む（module の評価では触らない）
+import { chat } from "../chat/chat.svelte"; // chat.svelte も wk を読む（循環）= guard の中でだけ読む（module の評価では触らない）
 
 // 読み取り専用の大きな配列（木の 1 万件・検索の結果・箱・tag）は $state.raw = 丸ごと置き換えるだけ（push / splice しない = grep で確認）。
 // wk の深い proxy に入れると読むたびに要素まで proxy に包まれる（1 万件の木の組み直しごと）ので、wk には getter / setter で見せる
@@ -243,7 +243,7 @@ export function isRefPath(p: string | null | undefined): boolean {
   return !!p && p.startsWith("/");
 }
 
-/** 1 ページを読む。既定の 20 万字では KB の最大級（425KB）が切れるので 200 万字まで（core の 16MB 上限はそのまま）。
+/** 1 ページを読む。既定の 20 万字では大きなページ（425KB 級）が切れるので 200 万字まで（core の 16MB 上限はそのまま）。
     絶対パス = 参照フォルダの中のファイル（wiki_read_ref・索引に触らない）。root = そのタブのワークスペース（省けば画面の root） */
 export function readPage(path: string, root?: string | null): Promise<WikiPageData> {
   const r = root ? { root } : {};
@@ -545,9 +545,18 @@ export function toggleInfo() {
   savePref("ui_wiki_info", wk.infoOpen);
 }
 
-/** ⌘⌥I（右ペインの開閉）を受け付けるか = 前面が Wiki で、モーダル（本体・Wiki のダイアログ）が開いていない（App の keydown が見る） */
+/** ⌘⌥I（右ペインの開閉）を受け付けるか（App の keydown が見る）= モーダル（本体・Wiki のダイアログ）が開いていない。
+    前面が OpenNote なら常に・それ以外（一覧 / PDF のタブ = 右バー / 本棚 / 本）はエディタ・取込の下では受け付けない */
 export function infoKeyAllowed(): boolean {
-  return !!frontWiki() && !modalOpen();
+  if (modalOpen()) return false;
+  return !!frontWiki() || (!app.editorOpen && !app.importJob);
+}
+
+/** ⌘⌥I = 前面のモードの右ペインを開閉する（OpenNote = ui_wiki_info・PDF のタブ = 右バーの ui_viewer_side・一覧 / 本棚 / 本 = ui_detail） */
+export function togglePane() {
+  if (frontWiki()) toggleInfo();
+  else if (frontViewer()) toggleViewerSide();
+  else toggleDetail();
 }
 
 /** md ページの見出しの色分けの切替（WikiPage のツールバー） */
@@ -1204,17 +1213,21 @@ export function onShown(w: TabWiki | null | undefined): w is TabWiki {
   return !w.root || !shown || w.root === shown;
 }
 
-/** セグメント [MY LIBRARY | OPENNOTE] の押下。一覧タブ ⇄ Wiki ホームはそのタブを変える・PDF タブからは新しいタブ */
+/** セグメント [MY LIBRARY | OPENNOTE] の押下。一覧タブ ⇄ Wiki ホームはそのタブを変える・PDF / 読み手のタブからは新しいタブ。
+    本棚のタブから MY NOTE = 本棚を外して Wiki に（中身は常に 1 つ）。本棚は MY LIBRARY 側の中身 = MY LIBRARY を押しても変わらない */
 export async function switchMode(to: "library" | "wiki") {
   const tab = app.tabs.find((x) => x.id === app.tab);
   if (!tab || !tabOpsAllowed()) return; // 処理中・モーダル・エディタ・取込中はタブの切替と同じく受け付けない
   if (tab.wiki && to === "library" && !(await canLeave())) return; // 編集中の未保存を保存してから
-  if (tab.viewer) {
+  if (tab.viewer || tab.shelfBook) {
     await openTab({ kind: "all" }, to === "wiki" ? home(rootForNew()) : null);
     return;
   }
   if (to === "wiki") {
-    if (!tab.wiki) tab.wiki = home(rootForNew()); // 前面は OpenNote でない = 最後の OpenNote の root（画面の root）= 写しはそのまま
+    if (!tab.wiki) {
+      tab.shelf = null;
+      tab.wiki = home(rootForNew()); // 前面は OpenNote でない = 最後の OpenNote の root（画面の root）= 写しはそのまま
+    }
     return;
   }
   if (!tab.wiki) return;
@@ -1300,7 +1313,7 @@ export async function navigate(nav: WikiNav, newTab = false) {
         await reveal(nav.key);
         return;
       case "external":
-        // http(s) は設定（Settings › OpenNote › リンク（URL）を OpenRef の窓で開く）で別窓 / 外部ブラウザ。mailto 等は今どおり
+        // http(s) は wiki_open_url（Rust が http(s) か検査して既定のブラウザで開く）。mailto 等は open_external
         if (/^https?:/i.test(nav.url)) await invoke("wiki_open_url", { url: nav.url });
         else await api.openExternal(nav.url);
         return;

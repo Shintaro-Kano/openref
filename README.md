@@ -37,7 +37,6 @@ curl -fsSL https://openref.unitedradiology.jp/uninstall.sh | bash
 1. **Chrome 拡張（OpenRef Capture）の有効化**
    - Chrome で `chrome://extensions` を開き、右上の「デベロッパーモード」を ON
    - 「パッケージ化されていない拡張機能を読み込む」から `~/Applications/OpenRef Capture` を選択
-   - （Zotero Connector 互換 API も `:23119` で待機しているため、既存の Zotero Connector からの保存も可能です）
 2. **Microsoft Word で引用を使う**
    - インストーラが Word の Startup フォルダにテンプレート `OpenRef.dotm` を置きます（ローカル証明書の信頼登録で macOS のパスワード確認が 1 回出ることがあります）
    - Word を終了して開き直すと、リボンに **OpenRef** タブが表示されます
@@ -74,13 +73,13 @@ OpenRef / OpenNote（OpenRef のページ機能。Settings › OpenNote で有�
 
 ### OpenRef / OpenNote のチャット（任意・既定 OFF）
 
-Settings › OpenNote › チャット を有効にすると、OpenNote の右ペインと内蔵の PDF ビューアの [チャット] タブで Claude と対話しながらワークスペースを編集できます（PDF のタブでは開いている文献と選択した本文が発言に添えられます）。
+Settings › OpenNote › チャット を有効にすると、タブ列の右端のボタン（または ⌘⌥C）で画面右端にチャットが開き、Claude と対話しながらワークスペースを編集できます。どのタブを開いていても同じ場所・同じ会話で、前面の物が発言に添えられます（OpenNote = 開いているページと選択した範囲・PDF = 開いている文献と選択した本文・一覧 = 選んでいる文献。× で外せます）。
 
 - **利用者が自分でインストールした Claude Code CLI（`claude` コマンド）** を子プロセスとして起動します。ログインはご自身の Claude Code のものを使います（チャットの [ログイン] はターミナルに `claude auth login` を開くだけ・[ログアウト] は `claude auth logout`）。OpenRef は認証情報・API キーを保持しません。利用量はご自身の Claude のプランに計上されます（Claude Code に API キーや Bedrock / Vertex を設定している場合はその課金）。モデルはチャットの欄で選べます（`--model`）。
 - 発言と、Claude が読んだページ・添付ファイル・蔵書の情報は、Claude Code を通じて **Anthropic に送信されます**。会話記録は Claude Code が `~/.claude/projects/` に保存します（チャットを無効にしても残ります。OpenRef が持つのは会話の id だけです）。
 - Claude のふるまいは **Claude Code をターミナルで普通に使うときと同じ**です: 組み込みの道具（Read / Edit / Write / Bash / Web…）を確認なしで使え（`--permission-mode bypassPermissions`）、ご自身の Claude Code の設定（`~/.claude/`）と ワークスペースの `CLAUDE.md` を読みます。MCP は `openref-mcp`（蔵書と OpenNote の全コマンド）だけを読み込みます。ふるまいの規則は ワークスペースの **`CLAUDE.md`** に書きます（無ければ初回に既定の文を置きます。自由に編集でき、OpenRef は上書きしません）。`wiki_write` / `wiki_move` で書いたページは上書き前の内容が `wiki-history/` に退避され、チャットの [元に戻す] で 1 件ずつ戻せます（Edit / Write / Bash で直接変えたファイルは追跡しません）。
 - **会話のログ**（既定 ON・Settings › OpenNote › チャットのログを chat-log/ に残す で OFF）: 発言・応答・使った道具・変えたファイルの一覧を ワークスペースの `chat-log/<日時> <最初の発言>.md` に追記します。ワークスペースの中なので検索と以後のチャットから参照できます（原本は Claude Code の `~/.claude/projects/`）。
-- **参照フォルダと URL**: OpenNote のページからワークスペースの外のファイルを指すリンクは、右ペインの home の「参照フォルダ」に親フォルダを追加すると、その下の PDF / html / 画像を内蔵の表示で開けます（読み取り専用。追加した範囲は再起動まで外せません）。http(s) のリンクは既定で OS のブラウザに開きます。Settings › OpenNote › リンク（URL）を OpenRef の窓で開く で OpenRef の別窓に切り替えられます（Cookie はブラウザと別なので、ログインが要るサイトは既定のままを推奨）。
+- **参照フォルダと URL**: OpenNote のページからワークスペースの外のファイルを指すリンクは、右ペインの home の「参照フォルダ」に親フォルダを追加すると、その下の PDF / html / 画像を内蔵の表示で開けます（読み取り専用。追加した範囲は再起動まで外せません）。http(s) のリンクは OS の既定のブラウザで開きます。
 
 ---
 
@@ -111,7 +110,7 @@ DB の既定パス: `~/Library/Application Support/OpenRef/openref.sqlite`（`--
 
 配布版 1.1.0 以降で利用できます。
 
-「＋ 新規 ▾ → 他の文献管理ソフトから移行…」で Paperpile または Zotero を選び、書誌ファイルと添付フォルダを指定します。
+メニューバーの「Settings › 他の文献管理ソフトから移行…」で Paperpile または Zotero を選び、書誌ファイルと添付フォルダを指定します。
 事前確認で新規・既存への追加・保留・PDF 不足・対象外・コピー容量を確認してから開始します。
 移行中も画面を閉じてライブラリを閲覧でき、中止後は同じ入力で再確認すると保存済みの文献を再利用します。
 過去の結果と JSON 保存、全文索引の再試行も同じ画面から行えます。
@@ -170,6 +169,19 @@ OpenRef はテレメトリ・アナリティクスを一切行いません。ま
 
 ---
 
+## 3.0.0 で外した物と代わりの方法
+
+| 外した物 | 代わりの方法 |
+|---|---|
+| Zotero Connector からの保存（`:23119` の `/connector/*` 互換 API） | **OpenRef Capture 拡張**を使います（上の「初回セットアップ」）。3.0.0 以降、`/connector/*` への要求にはエラー（404）を返します |
+| OpenNote の「リンク（URL）を OpenRef の窓で開く」設定 | http(s) のリンクは常に OS の既定のブラウザで開きます |
+| OpenNote の右ペイン・PDF ビューア・一覧の [チャット] タブと、浮かせたチャットのパネル | 画面右端のチャット 1 か所（タブ列の右端のボタン・⌘⌥C）。どのタブでも同じ会話です |
+| 「＋ 新規 ▾」の「他の文献管理ソフトから移行…」 | メニューバーの Settings › 他の文献管理ソフトから移行…（機能は同じです） |
+
+3.0.0 で足した物: PDF ビューアの右バー（検索 / 注釈 / 目次 / ページ）の開閉（ツールバー右端のボタン・⌘⌥I）。
+
+---
+
 ## 既知の制約（Known Limitations）
 
 - **Quick Add の URL 入力**: 出版社ページの URL 直貼りは非対応です。PubMed URL / `doi.org` URL / PMID / DOI を入力するか、ブラウザ上で **OpenRef Capture** 拡張を使って保存してください。
@@ -179,7 +191,6 @@ OpenRef はテレメトリ・アナリティクスを一切行いません。ま
 - **終了直前（⌘Q の 300ms 以内）のタブ操作**: アプリ終了直前の 300ms 以内に行ったタブ開閉はデバウンスにより次回起動時のタブ復元に含まれない場合があります。
 - **Chrome 拡張・Word アドインの導入方式**: Chrome 拡張は `chrome://extensions` からのパッケージ化されていない拡張機能の読み込み（load unpacked）、Word 連携は Word の Startup フォルダに置くテンプレート（`OpenRef.dotm`）方式です。
 - **Unpaywall 経路**: デフォルトでは無効（opt-in）です。利用する場合はユーザー自身のメールアドレスを環境変数 `OPENREF_EMAIL` に設定してください。
-- **OpenNote の「リンク（URL）を OpenRef の窓で開く」**: 開いたページからカメラ / マイクは使えません（`navigator.mediaDevices` が無く `getUserMedia` は呼べません）。ログインが要るサイトは Cookie がブラウザと別なので、既定（OS のブラウザで開く）のままを推奨します。
 - **`openref sync`（Google Drive 等との差分スキャン）**: macOS の「システム設定 > プライバシーとセキュリティ > ファイルとフォルダ」でターミナルへのアクセス許可が必要です。
 
 ---

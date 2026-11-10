@@ -887,6 +887,12 @@ fn fulltext_search_hits_pdf_body() {
     assert_eq!(hits.iter().map(|h| h.item.key.as_str()).collect::<Vec<_>>(), vec![a.key.as_str(), b.key.as_str()]);
     assert!(hits[0].fulltext_snippet.is_none());
     assert!(hits[1].fulltext_snippet.is_some());
+    // 並びを選ぶと「メタ hit が先」もやめて選んだ並びだけ（本文のみの hit も混ざる・抜粋は付いたまま）
+    db.conn.execute("UPDATE items SET date_added = '2026-01-01 00:00:00' WHERE key = ?1", [&a.key]).unwrap();
+    db.conn.execute("UPDATE items SET date_added = '2026-02-01 00:00:00' WHERE key = ?1", [&b.key]).unwrap();
+    let hits = list_items(&db, &ListFilter { search: Some("pancreatic".into()), sort: Some("added".into()), desc: true, ..Default::default() }).unwrap();
+    assert_eq!(hits.iter().map(|h| h.item.key.as_str()).collect::<Vec<_>>(), vec![b.key.as_str(), a.key.as_str()]);
+    assert!(hits[0].fulltext_snippet.is_some() && hits[1].fulltext_snippet.is_none());
     // 複数語は AND（本文とメタを跨いでは成立しない）
     assert_eq!(q("zebrafish elastography").len(), 0, "語は同じ索引（本文 or メタ）内で全て一致する必要がある");
     // metadata_only（Word の引用検索）は本文 hit を出さない
@@ -1532,6 +1538,174 @@ fn unreadable_sql_is_an_error_not_a_default() {
     assert!(pdfingest::is_review_stub(&db, &added.key).is_err(), "数えられないのを「stub でない」にしない");
     drop(db);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// 並びの試験の 1 件（題名に検索語 sortable・追加日は指定）。`extra` = issued / container-title 等
+fn sort_item(db: &mut Db, name: &str, extra: serde_json::Value, added: &str) -> String {
+    let mut csl = json!({"type": "article-journal", "title": format!("Sortable study {name}")});
+    csl.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    let r = Resolved { csl, retracted: None, source: "test", warnings: vec![] };
+    let key = ingest::add_item(db, &r).unwrap().key;
+    db.conn.execute("UPDATE items SET date_added = ?1 WHERE key = ?2", [added, key.as_str()]).unwrap();
+    key
+}
+
+/// 一覧の順を題名の末尾（`sort_item` の name）で読む
+fn sorted(db: &Db, f: search::ListFilter) -> Vec<String> {
+    let rows = search::list_items(db, &f).unwrap();
+    rows.iter().map(|r| r.summary().title.rsplit(' ').next().unwrap().to_string()).collect()
+}
+
+fn by(sort: &str, desc: bool) -> search::ListFilter {
+    search::ListFilter { sort: Some(sort.into()), desc, ..Default::default() }
+}
+
+/// 出版日: 年 → 月 → 日 → 追加日・年 / 月 / 日の無い物はその段の末尾（昇降どちらでも）。文字列の date-parts も数に読む
+#[test]
+fn list_sort_published() {
+    let mut db = Db::open_in_memory().unwrap();
+    let mut add = |name: &str, issued: serde_json::Value, added: &str| {
+        let extra = if issued.is_null() { json!({}) } else { json!({"issued": issued}) };
+        sort_item(&mut db, name, extra, added);
+    };
+    add("mar5", json!({"date-parts": [[2024, 3, 5]]}), "2026-01-01 00:00:00");
+    add("mar20", json!({"date-parts": [[2024, 3, 20]]}), "2026-01-02 00:00:00");
+    add("mar", json!({"date-parts": [[2024, 3]]}), "2026-01-03 00:00:00");
+    add("y2024", json!({"date-parts": [[2024]]}), "2026-01-04 00:00:00");
+    add("dec2023", json!({"date-parts": [[2023, 12, 31]]}), "2026-01-05 00:00:00");
+    add("none", json!(null), "2026-01-06 00:00:00");
+    add("literal", json!({"literal": "in press"}), "2026-01-07 00:00:00");
+    add("str2025", json!({"date-parts": [["2025", "2"]]}), "2026-01-08 00:00:00");
+    add("mar5b", json!({"date-parts": [[2024, 3, 5]]}), "2026-01-09 00:00:00");
+    add("blank", json!({"date-parts": [[""]]}), "2026-01-10 00:00:00");
+    add("month0", json!({"date-parts": [[2024, 0, 5]]}), "2026-01-11 00:00:00"); // 月 0 = 月の無い物と同じ（日はそのまま見る）
+    add("day0", json!({"date-parts": [[2023, 6, 0]]}), "2026-01-12 00:00:00"); // 日 0 = 日の無い物と同じ
+    add("jun1", json!({"date-parts": [[2023, 6, 1]]}), "2026-01-13 00:00:00");
+    add("str9", json!({"date-parts": [["2022", "9"]]}), "2026-01-14 00:00:00"); // 文字列のままだと "10" < "9"
+    add("str10", json!({"date-parts": [["2022", "10"]]}), "2026-01-15 00:00:00");
+    add("strd9", json!({"date-parts": [[2021, 3, "9"]]}), "2026-01-16 00:00:00");
+    add("strd10", json!({"date-parts": [[2021, 3, "10"]]}), "2026-01-17 00:00:00");
+    assert_eq!(
+        sorted(&db, by("published", true)),
+        [
+            "str2025", "mar20", "mar5b", "mar5", "mar", "month0", "y2024", "dec2023", "jun1", "day0", "str10", "str9", "strd10", "strd9",
+            "blank", "literal", "none"
+        ]
+    );
+    assert_eq!(
+        sorted(&db, by("published", false)),
+        [
+            "strd9", "strd10", "str9", "str10", "jun1", "day0", "dec2023", "mar5", "mar5b", "mar20", "mar", "month0", "y2024", "str2025",
+            "none", "literal", "blank"
+        ]
+    );
+}
+
+/// 追加日が同じ（一括取込は秒が揃う）= id の順も昇降に従う = 反転が 1 件もずれない
+#[test]
+fn list_sort_added_ties_by_id() {
+    let mut db = Db::open_in_memory().unwrap();
+    for name in ["first", "second", "third"] {
+        sort_item(&mut db, name, json!({}), "2026-01-01 00:00:00");
+    }
+    assert_eq!(sorted(&db, by("added", true)), ["third", "second", "first"]);
+    assert_eq!(sorted(&db, by("added", false)), ["first", "second", "third"]);
+}
+
+/// 誌名: 表示と同じ規則（文字列の short があればそれ）・大小無視・無い物は昇降どちらでも末尾・同じ誌の中は年の新しい順 → 追加日の新しい順（昇降に依らず）
+#[test]
+fn list_sort_journal() {
+    let mut db = Db::open_in_memory().unwrap();
+    let mut add = |name: &str, extra: serde_json::Value, added: &str| {
+        sort_item(&mut db, name, extra, added);
+    };
+    add("short2020", json!({"container-title-short": "radiology", "container-title": "A Very First Journal", "issued": {"date-parts": [[2020]]}}), "2026-01-01 00:00:00");
+    add("full2023", json!({"container-title": "RADIOLOGY", "issued": {"date-parts": [[2023]]}}), "2026-01-02 00:00:00");
+    add("abdom", json!({"container-title": "Abdominal Radiology", "issued": {"date-parts": [[2021]]}}), "2026-01-03 00:00:00");
+    add("zeit", json!({"container-title-short": "Zeit", "issued": {"date-parts": [[2021]]}}), "2026-01-04 00:00:00");
+    add("nojournal", json!({"issued": {"date-parts": [[2024]]}}), "2026-01-05 00:00:00");
+    add("array", json!({"container-title": ["A Listed Title"]}), "2026-01-06 00:00:00"); // 文字列でない = 表示は空
+    add("blank", json!({"container-title": "   "}), "2026-01-07 00:00:00");
+    add("noyear", json!({"container-title": "Radiology"}), "2026-01-08 00:00:00");
+    add("full2023b", json!({"container-title": "Radiology", "issued": {"date-parts": [[2023]]}}), "2026-01-09 00:00:00");
+    add("shortarray", json!({"container-title-short": ["Aaa"], "container-title": "Mid Journal"}), "2026-01-10 00:00:00"); // 文字列でない short = 表示は container-title
+    add("tabzeit", json!({"container-title": "\tZulu"}), "2026-01-11 00:00:00"); // 前の空白は並びの鍵に入れない
+    add("wide", json!({"container-title": "\t\n\u{a0}\u{3000}"}), "2026-01-12 00:00:00"); // 空白だけ = 表示は空に見える
+    let tail = ["nojournal", "wide", "blank", "array"]; // 無い物の中も年の新しい順 → 追加日の新しい順
+    let asc = sorted(&db, by("journal", false));
+    assert_eq!(asc[..8], ["abdom", "shortarray", "full2023b", "full2023", "short2020", "noyear", "zeit", "tabzeit"]);
+    assert_eq!(asc[8..], tail);
+    let desc = sorted(&db, by("journal", true));
+    assert_eq!(desc[..8], ["tabzeit", "zeit", "full2023b", "full2023", "short2020", "noyear", "shortarray", "abdom"]);
+    assert_eq!(desc[8..], tail);
+    // 並びの鍵は行に出している誌名と同じ（表示の空 = 末尾）
+    let rows = search::list_items(&db, &by("journal", false)).unwrap();
+    assert_eq!(rows[1].summary().container, "Mid Journal");
+    assert_eq!(rows[4].summary().container, "radiology");
+    assert_eq!(rows[11].summary().container, "");
+}
+
+/// 追加日 + 検索中も選んだ並び・LIMIT の切り出しが並びに従う・sort 無しは今までの順（Word の引用検索・CLI）・どのビューでも同じ並び・不明な値はエラー
+#[test]
+fn list_sort_with_search_limit_views() {
+    use openref_core::{edit, tags};
+    let mut db = Db::open_in_memory().unwrap();
+    // 題名の繰り返しで一致度の順を追加日の順と変える
+    let mut keys = Vec::new();
+    for (name, abstract_, journal, year, added) in [
+        ("old", "sortable sortable sortable", "Zeta", 2024, "2026-01-01 00:00:00"),
+        ("mid", "other", "Alpha", 2020, "2026-01-02 00:00:00"),
+        ("new", "sortable", "Mid", 2022, "2026-01-03 00:00:00"),
+    ] {
+        let extra = json!({"abstract": abstract_, "container-title": journal, "issued": {"date-parts": [[year]]}});
+        keys.push(sort_item(&mut db, name, extra, added));
+    }
+    assert_eq!(sorted(&db, by("added", true)), ["new", "mid", "old"]);
+    assert_eq!(sorted(&db, by("added", false)), ["old", "mid", "new"]);
+
+    // sort 無し = 今までの順（検索なし = 追加日の新しい順・検索あり = 一致度の順 = search::search と同じ）
+    assert_eq!(sorted(&db, search::ListFilter::default()), ["new", "mid", "old"]);
+    assert_eq!(sorted(&db, search::ListFilter { sort: Some("  ".into()), ..Default::default() }), ["new", "mid", "old"], "空白だけは未指定");
+    let q = |f: search::ListFilter| search::ListFilter { search: Some("sortable".into()), ..f };
+    let rank: Vec<String> = search::search(&db, "sortable", 10).unwrap().iter().map(|i| i.key.clone()).collect();
+    let listed: Vec<String> = search::list_items(&db, &q(Default::default())).unwrap().iter().map(|r| r.item.key.clone()).collect();
+    assert_eq!(listed, rank);
+    assert_eq!(rank[0], keys[0], "試験の前提: 一致度の 1 位は語の多い old");
+
+    // 検索中も選んだ並び
+    assert_eq!(sorted(&db, q(by("added", true))), ["new", "mid", "old"]);
+    assert_eq!(sorted(&db, q(by("published", true))), ["old", "new", "mid"]);
+    assert_eq!(sorted(&db, q(by("journal", false))), ["mid", "new", "old"]);
+
+    // LIMIT は並べてから切る（既定の順で切ると new が残る）
+    let top = |f: search::ListFilter| sorted(&db, search::ListFilter { limit: 1, ..f });
+    assert_eq!(top(by("journal", false)), ["mid"]);
+    assert_eq!(top(by("published", true)), ["old"]);
+    assert_eq!(top(q(by("journal", false))), ["mid"]);
+
+    // ビュー（フォルダ / ラベル / ★ / ゴミ箱）と著者チップでも同じ並び
+    db.conn.execute_batch("INSERT INTO collections (key, name) VALUES ('SORT0001', 'SortCol')").unwrap();
+    let cid: i64 = db.conn.query_row("SELECT id FROM collections WHERE key = 'SORT0001'", [], |r| r.get(0)).unwrap();
+    let tid = tags::create_tag(&db, "sorted", None).unwrap();
+    for k in &keys {
+        edit::add_to_collection(&db, k, cid).unwrap();
+        tags::attach_tag(&db, k, tid).unwrap();
+        edit::set_starred(&db, k, true).unwrap();
+    }
+    let want = ["old", "new", "mid"];
+    assert_eq!(sorted(&db, search::ListFilter { collection_id: Some(cid), ..by("published", true) }), want);
+    assert_eq!(sorted(&db, search::ListFilter { tag_id: Some(tid), ..by("published", true) }), want);
+    assert_eq!(sorted(&db, search::ListFilter { starred_only: true, ..by("published", true) }), want);
+    for k in &keys {
+        edit::trash(&db, k).unwrap();
+    }
+    assert_eq!(sorted(&db, search::ListFilter { trashed: true, ..by("published", true) }), want);
+
+    match search::list_items(&db, &by("author", true)) {
+        Err(CoreError::BadInput(m)) => assert!(m.contains("published") && m.contains("author"), "{m}"),
+        Err(e) => panic!("unexpected error: {e}"),
+        Ok(_) => panic!("不明な並びが通った"),
+    }
 }
 
 fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

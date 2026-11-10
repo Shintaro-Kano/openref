@@ -7,10 +7,12 @@ use openref_core::{
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use shelf_gui::*;
 use tauri::{Emitter, Manager};
 use wiki_asset::*;
 use wiki_gui::*;
 mod migration;
+mod shelf_gui;
 mod wiki_chat;
 mod wiki_chat_log;
 mod wiki_asset;
@@ -747,10 +749,54 @@ async fn open_attachment(state: tauri::State<'_, AppState>, id: i64) -> Result<(
 /// open はパスを NFD で書き出す（DB の値は NFC のことがある = 文字列置換では当たらない）ので、最初の `/` から最後の `/`
 /// まで（= ディレクトリ部分）を落とす。ファイル名に `/` は入らない
 fn open_file(path: &str) -> Result<(), String> {
-    open_with_default_app(path).map_err(|e| match (e.find('/'), e.rfind('/')) {
+    open_with_default_app(path).map_err(drop_dir_part)
+}
+
+/// open の失敗の文のディレクトリ部分（最初の `/` から最後の `/` まで）を落とす
+fn drop_dir_part(e: String) -> String {
+    match (e.find('/'), e.rfind('/')) {
         (Some(i), Some(j)) => format!("{}{}", &e[..i], &e[j + 1..]),
         _ => e,
-    })
+    }
+}
+
+/// Settings › PDF の保存先 › 保存先のフォルダを Finder で開く。戻り値 = toast の文（普通に開けたら無し）。
+/// open_file が失敗の文からパスを落とす（Drive のパスはアカウント名を含む）。呼び手は spawn_blocking の中で呼ぶ
+fn reveal_storage_folder(db: &Mutex<Db>, en: bool) -> Option<String> {
+    reveal_storage_with(db, en, open_file)
+}
+
+/// 今の保存先（core mount::storage_folder）を `open` に渡す。`open` を分けるのは試験で Finder を開かないため。
+/// ロックは設定を読む間だけ・Drive を見るのは drive モードのときだけ
+fn reveal_storage_with(
+    db: &Mutex<Db>,
+    en: bool,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Option<String> {
+    let opened = (|| {
+        let (mode, app_dir) = {
+            let db = lock(db)?;
+            let dir = db.app_dir().ok_or("in-memory DB には保存先がありません")?;
+            (db.pdf_write_mode().map_err(err)?, dir)
+        };
+        let mount = (mode == "drive")
+            .then(openref_core::mount::detect)
+            .flatten();
+        let (folder, degraded) =
+            openref_core::mount::storage_folder(&mode, &app_dir, mount.as_deref());
+        open(&folder.to_string_lossy()).map(|()| degraded)
+    })();
+    match opened {
+        Ok(false) => None,
+        Ok(true) if en => {
+            Some("Google Drive was not found, so new PDFs are being saved on this Mac".into())
+        }
+        Ok(true) => {
+            Some("Google Drive が見つからないため、新しい PDF は Mac 内に保存されています".into())
+        }
+        Err(e) if en => Some(format!("✗ Could not open the storage folder: {e}")),
+        Err(e) => Some(format!("✗ 保存先のフォルダを開けません: {e}")),
+    }
 }
 
 #[tauri::command]
@@ -769,10 +815,14 @@ const LANG_JA_ID: &str = "lang_ja";
 const LANG_EN_ID: &str = "lang_en";
 /// Settings › 起動時に新版を確認（settings の update_check・"0" で止める = core update.rs。確認は App 起動時の check_update）
 const UPDATE_CHECK_ID: &str = "update_check";
-/// Settings › PDF の保存先 › ローカル (Mac 内) / Google Drive / ローカル保存済みの PDF を Drive へ移行
+/// Settings › PDF の保存先 › ローカル (Mac 内) / Google Drive / ローカル保存済みの PDF を Drive へ移行 / 保存先のフォルダを Finder で開く
 const PDF_STORAGE_MANAGED_ID: &str = "pdf_storage_managed";
 const PDF_STORAGE_DRIVE_ID: &str = "pdf_storage_drive";
 const PDF_MIGRATE_DRIVE_ID: &str = "pdf_migrate_drive";
+const PDF_REVEAL_STORAGE_ID: &str = "pdf_reveal_storage";
+/// Settings › 他の文献管理ソフトから移行…（MenuItem）。webview へ "migration-open" を emit し、App が MigrationModal を開く
+/// （参照エディタ・モーダル・PDF 取込の間は開かない = state.svelte.ts の openMigration）
+const MIGRATION_OPEN_ID: &str = "migration_open";
 const QUIT_ID: &str = "quit";
 
 /// on_menu_event から項目のチェック状態やラベルを読み書きするために持つ（Menu::get の再帰に頼らない）
@@ -785,11 +835,12 @@ struct SettingsItems {
     pdf_managed: tauri::menu::CheckMenuItem<tauri::Wry>,
     pdf_drive: tauri::menu::CheckMenuItem<tauri::Wry>,
     pdf_migrate: tauri::menu::MenuItem<tauri::Wry>,
+    pdf_reveal: tauri::menu::MenuItem<tauri::Wry>,
+    migration: tauri::menu::MenuItem<tauri::Wry>,
     wiki_enabled: tauri::menu::CheckMenuItem<tauri::Wry>,
     wiki_reindex: tauri::menu::MenuItem<tauri::Wry>,
     wiki_drop_index: tauri::menu::MenuItem<tauri::Wry>,
     wiki_chat: tauri::menu::CheckMenuItem<tauri::Wry>,
-    wiki_url_window: tauri::menu::CheckMenuItem<tauri::Wry>,
     wiki_chat_log: tauri::menu::CheckMenuItem<tauri::Wry>,
     quit: tauri::menu::MenuItem<tauri::Wry>,
 }
@@ -846,6 +897,22 @@ fn pdf_migrate_text(en: bool) -> &'static str {
     }
 }
 
+fn pdf_reveal_text(en: bool) -> &'static str {
+    if en {
+        "Show Storage Folder in Finder"
+    } else {
+        "保存先のフォルダを Finder で開く"
+    }
+}
+
+fn migration_open_text(en: bool) -> &'static str {
+    if en {
+        "Migrate from another reference manager…"
+    } else {
+        "他の文献管理ソフトから移行…"
+    }
+}
+
 /// app_menu の初期状態（起動時の設定の値。チェック項目と表示の言語）
 struct MenuInit {
     restore_tabs: bool,
@@ -854,7 +921,6 @@ struct MenuInit {
     pdf_drive_mode: bool,
     wiki_enabled: bool,
     wiki_chat: bool,
-    wiki_url_window: bool,
     wiki_chat_log: bool,
 }
 
@@ -872,7 +938,6 @@ fn app_menu(
         pdf_drive_mode,
         wiki_enabled,
         wiki_chat,
-        wiki_url_window,
         wiki_chat_log,
     }: MenuInit,
 ) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
@@ -974,6 +1039,13 @@ fn app_menu(
         true,
         None::<&str>,
     )?;
+    let pdf_reveal = MenuItem::with_id(
+        app,
+        PDF_REVEAL_STORAGE_ID,
+        pdf_reveal_text(en),
+        true,
+        None::<&str>,
+    )?;
     let pdf_storage = Submenu::with_items(
         app,
         pdf_storage_text(en),
@@ -983,7 +1055,15 @@ fn app_menu(
             &pdf_drive,
             &PredefinedMenuItem::separator(app)?,
             &pdf_migrate,
+            &pdf_reveal,
         ],
+    )?;
+    let migration = MenuItem::with_id(
+        app,
+        MIGRATION_OPEN_ID,
+        migration_open_text(en),
+        true,
+        None::<&str>,
     )?;
     let lang_ja = CheckMenuItem::with_id(app, LANG_JA_ID, "日本語", true, !en, None::<&str>)?;
     let lang_en = CheckMenuItem::with_id(app, LANG_EN_ID, "English", true, en, None::<&str>)?;
@@ -1020,16 +1100,7 @@ fn app_menu(
         wiki_enabled && wiki_chat,
         None::<&str>,
     )?;
-    // ページの http(s) リンクを OpenRef の別窓で開く（既定 = 外部ブラウザ）・チャットのログをワークスペースの chat-log/ に残す（既定 ON）。
-    // どちらも Wiki が有効なときだけ押せる（チェックは設定の値）
-    let wiki_url_window = CheckMenuItem::with_id(
-        app,
-        WIKI_URL_WINDOW_ID,
-        wiki_url_window_text(en),
-        wiki_enabled,
-        wiki_url_window,
-        None::<&str>,
-    )?;
+    // チャットのログをワークスペースの chat-log/ に残す（既定 ON）。Wiki が有効なときだけ押せる（チェックは設定の値）
     let wiki_chat_log = CheckMenuItem::with_id(
         app,
         WIKI_CHAT_LOG_ID,
@@ -1044,7 +1115,6 @@ fn app_menu(
         true,
         &[
             &wiki_on,
-            &wiki_url_window,
             &PredefinedMenuItem::separator(app)?,
             &wiki_reindex,
             &wiki_drop_index,
@@ -1062,11 +1132,12 @@ fn app_menu(
         pdf_managed: pdf_managed.clone(),
         pdf_drive: pdf_drive.clone(),
         pdf_migrate: pdf_migrate.clone(),
+        pdf_reveal: pdf_reveal.clone(),
+        migration: migration.clone(),
         wiki_enabled: wiki_on.clone(),
         wiki_reindex: wiki_reindex.clone(),
         wiki_drop_index: wiki_drop_index.clone(),
         wiki_chat: wiki_chat.clone(),
-        wiki_url_window: wiki_url_window.clone(),
         wiki_chat_log: wiki_chat_log.clone(),
         quit: quit.clone(),
     });
@@ -1074,7 +1145,15 @@ fn app_menu(
         app,
         "Settings",
         true,
-        &[&restore, &update_check, &pdf_storage, &wiki, &language],
+        &[
+            &restore,
+            &update_check,
+            &pdf_storage,
+            &wiki,
+            &language,
+            &PredefinedMenuItem::separator(app)?,
+            &migration,
+        ],
     )?;
     Menu::with_items(app, &[&app_menu, &edit, &view, &settings, &window])
 }
@@ -1134,11 +1213,12 @@ fn on_menu_event(app: &tauri::AppHandle, ev: tauri::menu::MenuEvent) {
                 .and(items.pdf_storage.set_text(pdf_storage_text(now_en)))
                 .and(items.pdf_managed.set_text(pdf_managed_text(now_en)))
                 .and(items.pdf_migrate.set_text(pdf_migrate_text(now_en)))
+                .and(items.pdf_reveal.set_text(pdf_reveal_text(now_en)))
+                .and(items.migration.set_text(migration_open_text(now_en)))
                 .and(items.wiki_enabled.set_text(wiki_enabled_text(now_en)))
                 .and(items.wiki_reindex.set_text(wiki_reindex_text(now_en)))
                 .and(items.wiki_drop_index.set_text(wiki_drop_index_text(now_en)))
                 .and(items.wiki_chat.set_text(wiki_chat_text(now_en)))
-                .and(items.wiki_url_window.set_text(wiki_url_window_text(now_en)))
                 .and(items.wiki_chat_log.set_text(wiki_chat_log_text(now_en)))
                 .and(items.quit.set_text(quit_text(now_en)));
             if let Err(e) = menu {
@@ -1297,25 +1377,38 @@ fn on_menu_event(app: &tauri::AppHandle, ev: tauri::menu::MenuEvent) {
                 let _ = app.emit("menu-toast", msg);
             });
         }
+        PDF_REVEAL_STORAGE_ID => {
+            let en = items.lang_en.is_checked().unwrap_or(false);
+            let app = app.clone();
+            // Drive の検出と stat は File Provider の応答待ちで秒単位になりうる・open の終了も待つ → main thread から外す
+            tauri::async_runtime::spawn_blocking(move || {
+                let st = app.state::<AppState>();
+                if let Some(msg) = reveal_storage_folder(&st.db, en) {
+                    let _ = app.emit("menu-toast", msg);
+                }
+            });
+        }
+        // 画面を開くのは webview（App の listen → openMigration）。開けない間（エディタ・モーダル・取込）は何もしない
+        MIGRATION_OPEN_ID => {
+            if let Err(e) = app.emit("migration-open", ()) {
+                eprintln!("openref-app: migration-open を webview へ送れません: {e}");
+            }
+        }
         WIKI_CHAT_ID => {
             let en = items.lang_en.is_checked().unwrap_or(false);
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || wiki_chat_menu(&app, en));
         }
         // 反転後の値を書く（書けなければ戻す）。ログの ON/OFF は動いている子を止めずに次の発言から効く（下の Chat::set_log）
-        id @ (WIKI_URL_WINDOW_ID | WIKI_CHAT_LOG_ID) => {
-            let (item, key) = if id == WIKI_URL_WINDOW_ID {
-                (&items.wiki_url_window, WIKI_URL_WINDOW_KEY)
-            } else {
-                (&items.wiki_chat_log, WIKI_CHAT_LOG_KEY)
-            };
+        WIKI_CHAT_LOG_ID => {
+            let item = &items.wiki_chat_log;
             let checked = match item.is_checked() {
                 Ok(c) => c,
                 Err(e) => return eprintln!("openref-app: メニューのチェック状態を読めません: {e}"),
             };
-            if !save_setting(app, key, if checked { "1" } else { "0" }) {
+            if !save_setting(app, WIKI_CHAT_LOG_KEY, if checked { "1" } else { "0" }) {
                 let _ = item.set_checked(!checked);
-            } else if id == WIKI_CHAT_LOG_ID {
+            } else {
                 // ログを書くのは親（Chat の Inner）なので子は止めない = 応答中でも切り替わる（次の発言から）
                 if let Some(c) = app.try_state::<wiki_chat::Chat>() {
                     c.set_log(checked);
@@ -1500,6 +1593,14 @@ async fn wiki_rename(
     args: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     wiki_run(&state, None, args, openref_core::wiki::edit::rename).await
+}
+
+#[tauri::command]
+async fn wiki_duplicate(
+    state: tauri::State<'_, AppState>,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    wiki_run(&state, None, args, openref_core::wiki::edit::duplicate).await
 }
 
 #[tauri::command]
@@ -1706,7 +1807,128 @@ async fn wiki_open_path(
     .await
 }
 
-// ---------- OpenNote: 参照フォルダと URL の別窓: command の包み（本体と節の説明は wiki_gui.rs） ----------
+// ---------- 本棚: command の包み（本体と節の説明は shelf_gui.rs・core は openref_core::shelf） ----------
+// 引数は OpenNote と同じ invoke(name, { args: {...} })。root = 履歴の鍵（shelf_status の root）
+
+/// `args.root`（無ければ Err = root は必須）
+fn shelf_root_arg(name: &str, args: &serde_json::Value) -> Result<String, String> {
+    openref_core::shelf::commands::root_arg(args).map_err(|e| format!("{name}: {}", shelf_err(e)))
+}
+
+/// `args.id`
+fn shelf_id_arg(name: &str, args: &serde_json::Value) -> Result<String, String> {
+    args.get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{name}: id は必須です"))
+}
+
+/// 履歴（登録表と同じ関数）。壊れた設定は退避して空から（Rust が toast）
+#[tauri::command]
+async fn shelf_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        openref_core::shelf::commands::status(&shelf_ctx(&app)?, &serde_json::json!({}))
+            .map_err(shelf_err)
+    })
+    .await
+}
+
+/// 表示の設定（登録表と同じ関数・同じ検査）。{root, collapse_single?, aliases?, issue_titles?, name?} → 書いた後の設定
+#[tauri::command]
+async fn shelf_set_opts(
+    state: tauri::State<'_, AppState>,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let args = obj_args(args);
+    let db = state.db.clone();
+    blocking(move || {
+        openref_core::commands::validate("shelf_set_opts", &args).map_err(shelf_err)?;
+        openref_core::shelf::commands::set_opts(&*lock(&db)?, &args).map_err(shelf_err)
+    })
+    .await
+}
+
+/// フォルダを本棚として開く。→ {root}（native のフォルダの選択ダイアログ・取り消し = {root: null}）。失敗の toast は Rust が出す。
+/// 引数を受けない = 本棚のフォルダは利用者の選択だけが決める（webview から任意のフォルダを履歴と asset scope に足す道を作らない）
+#[tauri::command]
+async fn shelf_open_root(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    blocking(move || shelf_open(&app)).await
+}
+
+/// 履歴の本棚へ切り替える（走査し直す = 画面の読み直しもこれ）。{root} → {root}。履歴に無い root は Err。失敗の toast は Rust が出す
+#[tauri::command]
+async fn shelf_switch_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = shelf_root_arg("shelf_switch_root", &obj_args(args))?;
+    blocking(move || shelf_switch(&app, &root)).await
+}
+
+/// 履歴から外す（走査結果の表と表紙も消す）。{root} → {thumbs, unknown}。結果の toast は Rust が出す
+#[tauri::command]
+async fn shelf_forget_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = shelf_root_arg("shelf_forget_root", &obj_args(args))?;
+    blocking(move || shelf_forget(&app, &root)).await
+}
+
+/// 再起動で戻したタブの本棚を画面が読めるようにする（走査しない・last_used を変えない）。{root} → {root}
+#[tauri::command]
+async fn shelf_front_root(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = shelf_root_arg("shelf_front_root", &obj_args(args))?;
+    blocking(move || shelf_front(&app, &root)).await
+}
+
+/// 走査結果を読む。{root} → {root, dir: null, tree, unreadable, used_find, thumbs_dir}（shelf_list の形 + 表紙の置き場）。表に無い・設定が変わった = 1 回走査する
+#[tauri::command]
+async fn shelf_tree(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let root = shelf_root_arg("shelf_tree", &obj_args(args))?;
+    blocking(move || shelf_tree_of(&app, &root)).await
+}
+
+/// 表紙。{root, id} → {path}（無ければ作る・png の絶対パス・asset URL は画面が組む）
+#[tauri::command]
+async fn shelf_thumb(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let args = obj_args(args);
+    let root = shelf_root_arg("shelf_thumb", &args)?;
+    let id = shelf_id_arg("shelf_thumb", &args)?;
+    blocking(move || shelf_thumb_of(&app, &root, &id)).await
+}
+
+/// Finder で表示。{root, id}
+#[tauri::command]
+async fn shelf_reveal(app: tauri::AppHandle, args: Option<serde_json::Value>) -> Result<(), String> {
+    let args = obj_args(args);
+    let root = shelf_root_arg("shelf_reveal", &args)?;
+    let id = shelf_reveal_id(&args)?;
+    blocking(move || shelf_reveal_book(&app, &root, id.as_deref())).await
+}
+
+/// 既定のアプリで開く。{root, id}
+#[tauri::command]
+async fn shelf_open_external(
+    app: tauri::AppHandle,
+    args: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let args = obj_args(args);
+    let root = shelf_root_arg("shelf_open_external", &args)?;
+    let id = shelf_id_arg("shelf_open_external", &args)?;
+    blocking(move || shelf_open_book(&app, &root, &id)).await
+}
+
+// ---------- OpenNote: 参照フォルダと URL: command の包み（本体と節の説明は wiki_gui.rs） ----------
 
 /// {root?} → {dirs}（そのワークスペースの参照フォルダ = wiki_workspaces[root].ref_dirs・root = 画面のタブの root（履歴にあるものだけ）・
 /// 省略 = 設定 wiki_root）。解釈できない設定は退避して空から（Rust が toast）。検査（canonicalize）は main thread の外で
@@ -1900,41 +2122,12 @@ async fn wiki_read_ref(
     .await
 }
 
-/// {url} → http(s) を、設定 wiki_url_window なら OpenRef の別窓で、でなければ既定のブラウザで開く（Wiki のページのリンク専用。
-/// MY LIBRARY の open_external は今どおり外部ブラウザ）
+/// {url} → http(s) を既定のブラウザで開く（Wiki のページのリンク専用。検査は wiki_url_checked = http(s) 以外は拒む）。
+/// OpenRef の別窓で開く設定は 3.0.0 で外した = DB に古い設定の行が残っていても読まない
 #[tauri::command]
 async fn wiki_open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let en = ui_en(&app);
-    let u = tauri::Url::parse(url.trim()).map_err(|_| tr(en, "URL ではありません", "Not a URL"))?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return Err(tr(en, "http(s) のみ許可", "Only http(s) is allowed"));
-    }
-    let window = {
-        let st = app.state::<AppState>();
-        let db = lock(&st.db)?;
-        db.setting(WIKI_URL_WINDOW_KEY).map_err(err)?.as_deref() == Some("1")
-    };
-    if !window {
-        return blocking(move || open_with_default_app(u.as_str())).await;
-    }
-    // 窓は main thread で作る（WebviewWindowBuilder::build）。結果を待つ
-    let (tx, rx) = std::sync::mpsc::channel();
-    let h = app.clone();
-    app.run_on_main_thread(move || {
-        let _ = tx.send(wiki_url_window_show(&h, u));
-    })
-    .map_err(err)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
-            tr(
-                en,
-                "窓を開く処理が応答しません",
-                "Opening the window did not respond",
-            )
-        })?
-    })
-    .await
-    .map_err(err)?
+    let u = wiki_url_checked(&url, ui_en(&app))?;
+    blocking(move || open_with_default_app(u.as_str())).await
 }
 
 // ---------- OpenNote（チャット）: command の包み（設定・status の本体と節の説明は wiki_gui.rs・子プロセスは wiki_chat.rs） ----------
@@ -1992,7 +2185,7 @@ async fn wiki_chat_start(
     res
 }
 
-/// {text, context?: {path?, selection?, item?, title?}, root?} → {turn}（item / title = PDF のタブで開いている文献）。root = 画面の前面のタブの
+/// {text, context?: {path?, selection?, item?, title?}, root?} → {turn}（item / title = PDF のタブで開いている文献・一覧のタブで選んでいる文献）。root = 画面の前面のタブの
 /// root: 子の root と違えば Err（送らない = 画面が先に wiki_chat_stop → wiki_chat_start {root} する）
 #[tauri::command]
 async fn wiki_chat_send(
@@ -2297,14 +2490,13 @@ fn main() {
     }) == "drive";
     let wiki_enabled = pref("wiki_enabled").as_deref() == Some("1");
     let wiki_chat = pref(WIKI_CHAT_KEY).as_deref() == Some("1");
-    let wiki_url_window = pref(WIKI_URL_WINDOW_KEY).as_deref() == Some("1");
     let wiki_chat_log = wiki_chat_log_on(pref(WIKI_CHAT_LOG_KEY).as_deref());
     WIKI_ON.store(wiki_enabled, std::sync::atomic::Ordering::Relaxed);
     let wiki_live = Arc::new(WikiLive::default());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // asset:// は自前で配信する（Tauri の既定と同じ scope・同じ URL の形。違い = 要求した webview を見て main 以外には 403）。
-        // Tauri は External URL の窓（wiki-url）にも asset を登録するので、既定のままだと外部ページが vault / 参照フォルダを読める
+        // Tauri は External URL の窓にも asset を登録するので、窓を足したときに外部ページが vault / 参照フォルダを読めないように
         .register_asynchronous_uri_scheme_protocol("asset", |ctx, req, responder| {
             let label = ctx.webview_label().to_string();
             let scope = ctx.app_handle().asset_protocol_scope();
@@ -2320,14 +2512,6 @@ fn main() {
         .plugin(
             tauri::plugin::Builder::<tauri::Wry, ()>::new("openref-wiki-nav")
                 .on_navigation(|webview, url| {
-                    // URL の別窓は http(s) だけ（アプリの中身 = asset / tauri には触れない）
-                    if webview.label() == WIKI_URL_LABEL {
-                        let ok = wiki_url_window_nav_allowed(url);
-                        if !ok {
-                            eprintln!("openref-app: URL の窓の遷移を止めました: {url}");
-                        }
-                        return ok;
-                    }
                     let dev = if tauri::is_dev() {
                         webview.config().build.dev_url.clone()
                     } else {
@@ -2363,7 +2547,6 @@ fn main() {
                     pdf_drive_mode,
                     wiki_enabled,
                     wiki_chat,
-                    wiki_url_window,
                     wiki_chat_log,
                 },
             )
@@ -2388,6 +2571,9 @@ fn main() {
                 // 設定が起動時のままなら asset scope と監視（root を変える段の鍵の中 = wiki_front_root と直列）
                 wiki_startup(&h, start_root);
             });
+            // 本棚: 表紙の置き場を asset scope へ（root は開いたとき）
+            let h = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || shelf_startup(&h));
             Ok(())
         })
         .manage(AppState {
@@ -2400,6 +2586,7 @@ fn main() {
             ..WikiRuntime::default()
         })
         .manage(WikiExit::default())
+        .manage(ShelfRuntime::default())
         .invoke_handler(tauri::generate_handler![
             list_items,
             get_item,
@@ -2479,6 +2666,7 @@ fn main() {
             wiki_mkdir,
             wiki_rename_preview,
             wiki_rename,
+            wiki_duplicate,
             wiki_trash,
             wiki_save_blob,
             wiki_import_file,
@@ -2502,7 +2690,17 @@ fn main() {
             wiki_chat_stop,
             wiki_chat_undo,
             wiki_chat_set_model,
-            wiki_chat_auth
+            wiki_chat_auth,
+            shelf_status,
+            shelf_set_opts,
+            shelf_open_root,
+            shelf_switch_root,
+            shelf_forget_root,
+            shelf_front_root,
+            shelf_tree,
+            shelf_thumb,
+            shelf_reveal,
+            shelf_open_external
         ])
         .build(tauri::generate_context!())
         .expect("Tauri 起動に失敗しました")
@@ -2513,24 +2711,11 @@ fn main() {
                     api.prevent_exit()
                 })
             }
-            // URL の別窓の × は保留しない（未保存の編集は main の窓にしか無い）
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },
                 ..
-            } if label != WIKI_URL_LABEL => {
-                wiki_exit_event(app, ExitKind::Close(label), || api.prevent_close())
-            }
-            // main の窓が閉じたら URL の別窓も閉じる（別窓だけが残ってアプリが生き続けない）
-            tauri::RunEvent::WindowEvent {
-                label,
-                event: tauri::WindowEvent::Destroyed,
-                ..
-            } if label == "main" => {
-                if let Some(w) = app.get_webview_window(WIKI_URL_LABEL) {
-                    let _ = w.close();
-                }
-            }
+            } => wiki_exit_event(app, ExitKind::Close(label), || api.prevent_close()),
             // チャットの子プロセスを残さない（⌘Q・窓の × は保留の後にここへ来る・Dock の終了・ログアウトは直接ここへ来る）
             tauri::RunEvent::Exit => {
                 if let Some(c) = app.try_state::<wiki_chat::Chat>() {
@@ -2577,18 +2762,19 @@ mod parity {
         ("wiki_ref_dir_add", "参照フォルダは利用者が GUI のフォルダ選択で決める（agent が任意のフォルダを配信の範囲に足さない）"),
         ("wiki_ref_dir_remove", "参照フォルダを外す（GUI の [外す]）。agent には用途が無い"),
         ("wiki_read_ref", "参照フォルダの中のファイルを内蔵の表示に出すための読み（asset URL の組立てと html の本文）。agent はパスを直接読める"),
-        ("wiki_open_url", "ページの http(s) リンクを設定どおり別窓 / 既定のブラウザで開く（GUI の操作）。agent には用途が無い"),
+        ("wiki_open_url", "ページの http(s) リンクを既定のブラウザで開く（GUI の操作）。agent には用途が無い"),
         ("wiki_create", "GUI の新規ページ（Untitled.md / .html の連番を作るだけ）。agent は wiki_write で名前と中身を決めて書く"),
         ("wiki_mkdir", "GUI の新規フォルダ（空のフォルダを作るだけ）。agent は wiki_write のパスで途中のフォルダを作れる"),
         ("wiki_rename_preview", "GUI の改名ダイアログの件数（書き換える [[旧名]] と相対リンク）。利用者が確かめてから書き換える前段"),
         ("wiki_rename", "リンクの一括書換え付きの改名は利用者が GUI で件数を見て決める（無確認の書換えはしない）"),
+        ("wiki_duplicate", "GUI の右クリックの複製（連番の名前で写して開く）。agent は wiki_read + wiki_write で名前も中身も決めて書ける"),
         ("wiki_trash", "macOS のゴミ箱へ（Finder の「戻す」）は利用者の操作。agent に消す口は出さない"),
         ("wiki_save_blob", "エディタへの画像の貼付（クリップボードの中身 = base64）。agent はファイルを直接ワークスペースに置ける"),
         ("wiki_import_file", "OS からのドロップ（Tauri の onDragDropEvent が渡す絶対パス）を attachments へコピー。agent はファイルを直接置ける"),
         ("wiki_read_gui", "画像・PDF は asset protocol で直接描くので base64 も抽出もしない read。登録表の wiki_read は read_agent（画像の base64・PDF の抽出テキスト）"),
         ("wiki_save", "エディタの保存: if_sha256 一致の自動保存は退避しない・競合ダイアログの force を受ける。登録表の wiki_write（write_agent）は上書きを必ず退避し force を持たない別の関数"),
         ("wiki_exit_ready", "⌘Q・窓の × の保留への GUI の応答（未保存の編集を保存してから終了）。agent には終了の段取りが無い"),
-        ("wiki_chat_status", "右ペインのチャット（Claude Code CLI を子プロセスで起こす GUI の機能）が使えるか。agent はそれ自体がホスト"),
+        ("wiki_chat_status", "画面右端のチャット（Claude Code CLI を子プロセスで起こす GUI の機能）が使えるか。agent はそれ自体がホスト"),
         ("wiki_chat_set_enabled", "チャットの有効化は利用者が GUI で同意して決める（既定 OFF）。agent が自分を起こす口にしない"),
         ("wiki_chat_start", "GUI が持つ Claude Code の子プロセスを起こす。agent から呼ぶと agent が agent を起こす（利用枠を使う）"),
         ("wiki_chat_send", "GUI のチャットの発言を子プロセスの stdin へ。agent には相手がいない"),
@@ -2597,6 +2783,14 @@ mod parity {
         ("wiki_chat_undo", "チャットのターンの記録（GUI のプロセスの中だけ）を鍵に戻す。agent は wiki-history の退避を wiki_write で書き戻せる"),
         ("wiki_chat_set_model", "GUI のチャットのモデルの選択（設定 wiki_chat_model）。agent 自身のモデルはホストが決める"),
         ("wiki_chat_auth", "GUI のチャットのログイン / ログアウト（利用者の Claude Code CLI の auth を呼ぶ）。agent には用途が無い"),
+        ("shelf_open_root", "本棚のフォルダは利用者が GUI のフォルダ選択で決める（agent が任意のフォルダを走査・配信の範囲に足さない）"),
+        ("shelf_switch_root", "本棚の切替は GUI のタブの操作（履歴にある root だけ・asset scope に足す）。agent は shelf_list の root で読む"),
+        ("shelf_forget_root", "本棚を履歴から外す（GUI の [外す]・表と表紙も消す）。本棚の選択は利用者が GUI で決める。agent は shelf_status で読む"),
+        ("shelf_front_root", "再起動で戻したタブの本棚を asset scope に足す GUI の段取り。agent はパスを直接読める"),
+        ("shelf_tree", "GUI のプロセス内の走査結果を読む（画面の表示用）。agent は shelf_list で毎回走査する"),
+        ("shelf_thumb", "表紙の PNG を作る（asset:// で描く GUI 用）。agent はパスを直接読める"),
+        ("shelf_reveal", "Finder で表示 = ホストの open -R（パスは shelf_list の path）"),
+        ("shelf_open_external", "既定のアプリで開く = ホストの open（パスは shelf_list の path）"),
     ];
 
     fn tauri_commands() -> Vec<String> {
@@ -2695,6 +2889,121 @@ mod parity {
         }
         assert!(checked >= 7, "走査が壊れている: {checked}");
     }
+
+    /// 本棚のフォルダは利用者のフォルダ選択だけが決める: shelf_open_root は引数を受けず、本体は native の picker を通る。
+    /// path を受ける形に戻すと、webview の invoke 1 回で任意のフォルダが履歴と asset scope（再帰）に入る
+    #[test]
+    fn shelf_open_root_takes_no_path() {
+        let head = |body: &str| body[..body.find('{').expect("fn の本体")].to_string();
+        let cmd = fn_body(include_str!("main.rs"), "async fn shelf_open_root(");
+        assert!(!head(&cmd).contains("args") && !head(&cmd).contains("path"), "{cmd}");
+        assert!(!cmd.contains("\"path\""), "{cmd}");
+        let open = fn_body(include_str!("shelf_gui.rs"), "pub(crate) fn shelf_open(");
+        assert_eq!(head(&open).matches(':').count(), 3, "引数は app だけ: {}", head(&open));
+        assert!(open.contains("wiki_pick_folder_titled("), "{open}");
+        // 履歴に鍵を足す段（shelf_open_steps）を呼ぶ command は picker の 1 本だけ
+        let gui = include_str!("shelf_gui.rs");
+        let code = &gui[..gui.find("#[cfg(test)]").expect("試験の節")];
+        assert_eq!(code.matches("shelf_open_steps(").count(), 2, "定義と shelf_open の 2 箇所だけ");
+    }
+
+    /// wiki_open_url は検査（wiki_url_checked = http(s) だけ）してから既定のブラウザで開くだけ（3.0.0）。
+    /// 設定を読んで OpenRef の別窓を作る枝を戻さない（DB に古い設定の行が残っていても挙動を変えない）
+    #[test]
+    fn wiki_open_url_opens_the_default_browser_only() {
+        let cmd = fn_body(include_str!("main.rs"), "async fn wiki_open_url(");
+        assert!(cmd.contains("let u = wiki_url_checked(&url, ui_en(&app))?;"), "{cmd}");
+        assert!(cmd.contains("blocking(move || open_with_default_app(u.as_str())).await"), "{cmd}");
+        for bad in ["setting(", "AppState", "run_on_main_thread", "Window", "navigate"] {
+            assert!(!cmd.contains(bad), "{bad}: {cmd}");
+        }
+    }
+
+    /// 共用でなくなった Settings › OpenNote › チャットのログの handler と、条件を外した窓の × の保留（機械の試験が無かった所）:
+    /// 反転後の値を WIKI_CHAT_LOG_KEY に書く・書けなければチェックを戻す・書けたら Chat::set_log（子は止めない）・
+    /// Wiki の ON/OFF で押せる / 押せないが変わる・窓の × は条件なしに wiki_exit_event を通す（未保存の編集を保存してから閉じる）
+    #[test]
+    fn chat_log_menu_and_close_hold_stay_wired() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("試験の節")];
+        let arm = &code[code.find("        WIKI_CHAT_LOG_ID => {").expect("chat-log の枝")..];
+        let arm = &arm[..arm.find("\n        }\n").expect("枝の終わり")];
+        for want in [
+            "let item = &items.wiki_chat_log;",
+            "if !save_setting(app, WIKI_CHAT_LOG_KEY, if checked { \"1\" } else { \"0\" }) {\n                let _ = item.set_checked(!checked);\n            } else {",
+            "c.set_log(checked);",
+        ] {
+            assert!(arm.contains(want), "{want}: {arm}");
+        }
+        assert!(
+            code.contains("event: tauri::WindowEvent::CloseRequested { api, .. },\n                ..\n            } => wiki_exit_event(app, ExitKind::Close(label), || api.prevent_close()),"),
+            "窓の × が wiki_exit_event を通らない"
+        );
+        let sync = fn_body(include_str!("wiki_gui.rs"), "fn wiki_chat_sync_menu(");
+        assert!(sync.contains("items.wiki_chat_log.set_enabled(wiki_on)"), "{sync}");
+    }
+
+    /// shelf_reveal は args の id を本体へ渡す（常に None にすると本のカードの「Finder で表示」が本棚のフォルダを出す）
+    #[test]
+    fn shelf_reveal_passes_the_id() {
+        let cmd = fn_body(include_str!("main.rs"), "async fn shelf_reveal(");
+        assert!(cmd.contains("let id = shelf_reveal_id(&args)?;"), "{cmd}");
+        assert!(cmd.contains("shelf_reveal_book(&app, &root, id.as_deref())"), "{cmd}");
+    }
+
+    /// 登録表と同名の shelf_*（shelf_status / shelf_set_opts）は登録表の handler と同じ core 関数を通す
+    #[test]
+    fn registry_named_shelf_commands_share_core_fn() {
+        let src = include_str!("main.rs");
+        let reg = include_str!("../../../crates/openref-core/src/commands.rs");
+        let core_fn = regex::Regex::new(r"\b(shelf::commands::[a-z_0-9]+)\(").unwrap();
+        let mut checked = 0;
+        for n in tauri_commands() {
+            if !n.starts_with("shelf_") || openref_core::commands::find(&n).is_none() {
+                continue;
+            }
+            let body = fn_body(src, &format!("async fn {n}("));
+            let rbody = fn_body(reg, &format!("fn {n}(db: &mut Db"));
+            let gui = core_fn.captures(&body).unwrap_or_else(|| panic!("{n} が core 関数を呼ばない"))[1].to_string();
+            let core = core_fn.captures(&rbody).unwrap_or_else(|| panic!("登録表の {n} の core 関数が見つからない"))[1].to_string();
+            assert_eq!(gui, core, "{n}: GUI と登録表で core 関数が違う");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "走査が壊れている");
+    }
+}
+
+#[cfg(test)]
+mod migration_menu {
+    /// Settings › 他の文献管理ソフトから移行…: 項目が Settings に並び、Language で文言が替わり、押すと "migration-open" を出す。
+    /// App.svelte は同じ名前を listen して openMigration を呼ぶ（名前が食い違うと押しても黙って何も起きない）。
+    /// 試験の節の文字列で通さない = 本体（最初の #[cfg(test)] より前）だけを見る
+    #[test]
+    fn menu_item_emits_what_the_app_listens() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("試験の節")];
+        let settings = &code[code.find("\"Settings\",").expect("Settings のメニュー")..];
+        let settings = &settings[..settings.find(")?;").expect("Settings の終わり")];
+        assert!(settings.contains("&migration,"), "Settings に並ばない: {settings}");
+        assert!(code.contains("items.migration.set_text(migration_open_text(now_en))"), "Language で文言が替わらない");
+        // 項目は押せる（enabled = true）
+        let item = &code[code.find("        MIGRATION_OPEN_ID,\n").expect("項目の組立て")..];
+        assert!(item.starts_with("        MIGRATION_OPEN_ID,\n        migration_open_text(en),\n        true,\n"), "押せない項目になっている");
+        // handler の枝は条件なしに emit する（枝の最初の文）
+        let arm = &code[code.find("        MIGRATION_OPEN_ID => {").expect("menu の handler")..];
+        let arm = &arm[..arm.find("\n        }\n").expect("枝の終わり")];
+        assert!(
+            arm.starts_with("        MIGRATION_OPEN_ID => {\n            if let Err(e) = app.emit(\"migration-open\", ()) {"),
+            "{arm}"
+        );
+        let app = include_str!("../../src/App.svelte");
+        assert!(
+            app.contains("listen(\"migration-open\", () => {\n      if (openMigration()) {"),
+            "App.svelte が migration-open を受けて openMigration を呼ばない"
+        );
+        assert_eq!(super::migration_open_text(false), "他の文献管理ソフトから移行…");
+        assert_eq!(super::migration_open_text(true), "Migrate from another reference manager…");
+    }
 }
 
 #[cfg(test)]
@@ -2747,6 +3056,86 @@ mod open_default_app {
             "フルパスはファイル名に置き換える: {e}"
         );
         assert!(!e.contains('\n'));
+    }
+
+    /// open に渡すフォルダと toast: 今の保存先を開く・開く間はロックを離す・Drive 未検出は storage + toast（ja / en）で
+    /// Drive 側に何も作らない。open は差し替え = Finder は開かない。OPENREF_MOUNT を読むのはこの crate の試験でここだけ
+    #[test]
+    fn reveal_storage_opens_the_current_folder() {
+        use std::path::{Path, PathBuf};
+        let top = std::env::temp_dir().join(format!(
+            "openref-reveal-{}-{}",
+            std::process::id(),
+            openref_core::keys::new_key()
+        ));
+        let (app, mount, none) = (top.join("app"), top.join("mount"), top.join("none"));
+        let db = openref_core::db::Db::open(&app.join("openref.sqlite")).unwrap();
+        std::fs::create_dir(app.join("storage")).unwrap();
+        std::fs::create_dir_all(mount.join("All Papers")).unwrap();
+        let db = std::sync::Mutex::new(db);
+        let reveal = |mode: &str, mount_env: &Path, en: bool| {
+            db.lock()
+                .unwrap()
+                .set_setting("pdf_write_mode", mode)
+                .unwrap();
+            std::env::set_var("OPENREF_MOUNT", mount_env);
+            let mut opened = None;
+            let toast = super::reveal_storage_with(&db, en, |p| {
+                assert!(db.try_lock().is_ok(), "open の間はロックを離す");
+                opened = Some(PathBuf::from(p));
+                Ok(())
+            });
+            (opened.expect("open を呼ぶ"), toast)
+        };
+        assert_eq!(
+            reveal("managed", &mount, false),
+            (app.join("storage"), None)
+        );
+        assert_eq!(
+            reveal("drive", &mount, false),
+            (mount.join("All Papers"), None)
+        );
+        let ja = "Google Drive が見つからないため、新しい PDF は Mac 内に保存されています";
+        let en = "Google Drive was not found, so new PDFs are being saved on this Mac";
+        assert_eq!(
+            reveal("drive", &none, false),
+            (app.join("storage"), Some(ja.to_string()))
+        );
+        assert_eq!(
+            reveal("drive", &none, true),
+            (app.join("storage"), Some(en.to_string()))
+        );
+        assert!(!none.exists(), "見るだけ = Drive 側に何も作らない");
+        std::env::remove_var("OPENREF_MOUNT");
+        std::fs::remove_dir_all(&top).ok();
+    }
+
+    /// 保存先を開けなければ toast に理由が出て、親のパスは出ない（Drive のパスはアカウント名を含む）。
+    /// DB の置き場を消してあるので open は失敗する = Finder は開かない
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn reveal_storage_failure_drops_the_path() {
+        let top = std::env::temp_dir().join(format!(
+            "openref-reveal-{}-{}",
+            std::process::id(),
+            openref_core::keys::new_key()
+        ));
+        let dir = top.join("GoogleDrive-account").join("OpenRefData");
+        let db = openref_core::db::Db::open(&dir.join("openref.sqlite")).unwrap();
+        std::fs::remove_dir_all(&top).unwrap();
+        let db = std::sync::Mutex::new(db);
+        for (en, prefix) in [
+            (false, "✗ 保存先のフォルダを開けません: "),
+            (true, "✗ Could not open the storage folder: "),
+        ] {
+            let msg = super::reveal_storage_folder(&db, en).unwrap();
+            assert!(msg.starts_with(prefix), "{msg}");
+            assert!(msg.contains("OpenRefData"), "理由はファイル名まで: {msg}");
+            assert!(
+                !msg.contains("GoogleDrive-account"),
+                "親のパスを出さない: {msg}"
+            );
+        }
     }
 
     /// 実 DB（本番の .backup コピー）で open_attachment と同じ経路（attachment_path → open）。

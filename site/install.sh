@@ -262,10 +262,10 @@ main() {
 PLIST
   launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"
 
-  # 起動確認(:23119 ping)
+  # 起動確認(:23119 の /capture/status = Capture 拡張と同じ接続確認。/connector/* は 3.0.0 で外した = 404)
   ok=""
   for _ in $(seq 1 30); do
-    if curl -fsS -m 1 "http://127.0.0.1:23119/connector/ping" >/dev/null 2>&1; then
+    if curl -fsS -m 1 "http://127.0.0.1:23119/capture/status" >/dev/null 2>&1; then
       ok=1; break
     fi
     sleep 0.5

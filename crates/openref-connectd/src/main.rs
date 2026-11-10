@@ -1,8 +1,9 @@
-//! openref-connectd — Zotero Connector 互換 API。
-//! 既製 Zotero Connector 拡張（+ translator 群）を OpenRef の取込口として流用する。
-//! localhost:23119 のみ bind。Word アドイン配信（HTTPS）も本デーモンが担う。
+//! openref-connectd — ブラウザからの取込口（自作 Capture 拡張の `/capture/*`）と Word 配信（HTTPS）の常駐サービス。
+//! localhost:23119（取込）/ :23120（Word）のみ bind。
 //!
-//! プロトコルは逆行分析ベース（非公式）。未知エンドポイントは 200 {} で寛容に受け、
+//! Zotero Connector 互換（`/connector/*`）は 3.0.0 で外した。`/connector` 配下は
+//! すべて 404 + 理由を返す（`connector_gone`）= 未知のパスの 200 {}（`fallback`）に落とさない
+//! （落とすと Zotero Connector に保存が成功したように見える）。それ以外の未知のパスは 200 {} で寛容に受け、
 //! stderr にログして観察できるようにする。
 
 #[cfg(test)]
@@ -13,48 +14,17 @@ mod word_v2;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri};
-use axum::response::{Html, IntoResponse};
-use axum::routing::{get, post};
+use axum::http::{Method, StatusCode, Uri};
+use axum::response::IntoResponse;
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use openref_core::{datadir, edit, ingest, model, pdffetch, pdfingest, resolver, search, zotero, Db};
+use openref_core::{datadir, edit, ingest, model, pdffetch, pdfingest, resolver, search, Db};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub struct St {
     pub db: Mutex<Db>,
-    /// sessionID → (connector item id → openref item key)。直近 `MAX_SESSIONS` 件だけ
-    sessions: Mutex<Sessions>,
-}
-
-/// Zotero Connector の session（保存 1 回ごとに新しい sessionID）を覚えておく数。saveAttachment / updateSession /
-/// hasAttachmentResolvers は saveItems の直後に同じ session で来る → 直近の数十件で足りる。常駐（KeepAlive）でも増え続けない
-const MAX_SESSIONS: usize = 64;
-
-/// sessionID → (connector item id → openref item key)。上限を超えたら最後に書き込まれたのが最も古い session を捨てる
-#[derive(Default)]
-struct Sessions {
-    map: HashMap<String, (u64, HashMap<String, String>)>,
-    tick: u64,
-}
-
-impl Sessions {
-    fn insert(&mut self, session: &str, connector_id: &str, key: &str) {
-        self.tick += 1;
-        let e = self.map.entry(session.to_string()).or_default();
-        e.0 = self.tick;
-        e.1.insert(connector_id.to_string(), key.to_string());
-        if self.map.len() > MAX_SESSIONS {
-            if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
-                self.map.remove(&oldest);
-            }
-        }
-    }
-
-    fn get(&self, session: &str) -> Option<&HashMap<String, String>> {
-        self.map.get(session).map(|(_, m)| m)
-    }
 }
 
 impl St {
@@ -63,11 +33,9 @@ impl St {
     pub fn db(&self) -> std::sync::MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
-    fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }
 
+/// `/capture/*` の応答に付けるヘッダ（Zotero Connector 互換だった頃の名残。/capture/* の契約を変えないため残す）
 const ZHEADERS: [(&str, &str); 2] = [
     ("X-Zotero-Version", "7.0.15"),
     ("X-Zotero-Connector-API-Version", "3"),
@@ -105,7 +73,6 @@ async fn main() {
     };
     let st = Arc::new(St {
         db: Mutex::new(db),
-        sessions: Mutex::new(Sessions::default()),
     });
 
     let app = connector_router(st.clone());
@@ -139,21 +106,13 @@ async fn main() {
 /// :23119 の要求 body の上限（PDF の受け取り）。axum 既定の 2MB では図の多い論文 PDF が 413 で弾かれる（localhost bind のみなので緩めて安全）
 const CONNECTOR_BODY_LIMIT: usize = 512 * 1024 * 1024;
 
-/// :23119 の router（Zotero Connector 互換 + Capture 拡張の /capture/*）。main と契約テスト（tests）が同じものを使う
+/// :23119 の router（Capture 拡張の /capture/* + 外した /connector/* の 404）。main と契約テスト（tests）が同じものを使う
 fn connector_router(st: Arc<St>) -> Router {
     Router::new()
-        .route("/connector/ping", get(ping_get).post(ping_post))
-        .route("/connector/getSelectedCollection", post(get_selected_collection))
-        .route("/connector/saveItems", post(save_items))
-        .route("/connector/saveAttachment", post(save_attachment))
-        .route("/connector/saveStandaloneAttachment", post(save_standalone_attachment))
-        .route("/connector/hasAttachmentResolvers", post(has_attachment_resolvers))
-        .route("/connector/saveAttachmentFromResolver", post(save_attachment_from_resolver))
-        .route("/connector/saveSnapshot", post(save_snapshot))
-        .route("/connector/updateSession", post(update_session))
-        .route("/connector/sessionProgress", post(session_progress))
-        .route("/connector/delaySync", post(ok_empty))
-        .route("/connector/getClientHostnames", post(ok_empty))
+        // ---- Zotero Connector 互換は 3.0.0 で外した: /connector 配下はどのメソッドでも 404 + 理由（fallback の 200 {} に落とさない）----
+        .route("/connector", any(connector_gone))
+        .route("/connector/", any(connector_gone))
+        .route("/connector/*rest", any(connector_gone))
         // ---- 自作 Capture 拡張用 API（Zotero 非依存の 1 クリック取込）----
         .route("/capture/status", get(capture_status))
         .route("/capture/collections", get(capture_collections))
@@ -172,7 +131,7 @@ fn env_port(name: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-/// Word アドイン配信（HTTPS）。cert・TLS の準備に失敗したらログを残して終わる（connector は止めない）
+/// Word アドイン配信（HTTPS）。cert・TLS の準備に失敗したらログを残して終わる（:23119 の取込は止めない）
 async fn word_https(st: Arc<St>, db_path: &std::path::Path) {
     let unavailable = |e: &str| eprintln!("openref-connectd: Word 配信（:23120）を起動できません: {e}");
     let Some(app_dir) = db_path.parent() else {
@@ -201,363 +160,10 @@ async fn word_https(st: Arc<St>, db_path: &std::path::Path) {
     }
 }
 
-async fn ping_get() -> impl IntoResponse {
-    (
-        ZHEADERS,
-        Html("<html><head><title>OpenRef</title></head><body>OpenRef is running (Zotero Connector compatible)</body></html>"),
-    )
-}
-
-/// Connector はこの prefs で挙動を決める（拡張の itemSaver.js を実読して確定）:
-/// - `supportsAttachmentUpload: true` … **ブラウザ側が PDF バイト列を saveAttachment へ送る**。
-///   これが false/欠落だと connector は「Zotero 本体が自力 DL する」前提になり、
-///   `items = data.items`（saveItems の応答）で undefined を掴んで保存エラーになる。
-///   paywall 論文の PDF が取れるのはこの経路だけ（ブラウザの認証済み session を使うため）。
-/// - `downloadAssociatedFiles: true` … PDF 添付を有効化（false だと PDF が捨てられる）。
-/// - `automaticSnapshots: false` … HTML スナップショットは保存しない（scope = 論文のみ）。
-async fn ping_post() -> impl IntoResponse {
-    zjson(
-        StatusCode::OK,
-        json!({
-            "prefs": {
-                "reportActiveURL": false,
-                "automaticSnapshots": false,
-                "downloadAssociatedFiles": true,
-                "supportsAttachmentUpload": true,
-                "supportsTagsAutocomplete": false,
-                "translatorsHash": "openref"
-            }
-        }),
-    )
-}
-
-async fn get_selected_collection(State(st): State<Arc<St>>) -> impl IntoResponse {
-    let db = st.db();
-    let mut targets = vec![json!({ "id": "L1", "name": "OpenRef", "level": 0 })];
-    if let Ok(rows) = search::collections(&db) {
-        // 親→子の順に並べる（level = 根からの深さ。根のフォルダが 1）
-        fn push_children(
-            rows: &[search::CollectionRow],
-            parent: Option<i64>,
-            level: usize,
-            out: &mut Vec<Value>,
-        ) {
-            for r in rows.iter().filter(|r| r.parent_id == parent) {
-                out.push(json!({
-                    "id": format!("C{}", r.id),
-                    "name": r.name,
-                    "level": level
-                }));
-                push_children(rows, Some(r.id), level + 1, out);
-            }
-        }
-        push_children(&rows, None, 1, &mut targets);
-    }
-    zjson(
-        StatusCode::OK,
-        json!({
-            "libraryID": 1,
-            "libraryName": "OpenRef",
-            "collectionID": null,
-            "id": "L1",
-            "name": "OpenRef",
-            "editable": true,
-            // filesEditable が false だと connector は PDF アップロードを丸ごと skip する
-            "filesEditable": true,
-            "targets": targets
-        }),
-    )
-}
-
-async fn save_items(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
-    let payload: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("saveItems: JSON parse 失敗: {e}");
-            return zjson(StatusCode::BAD_REQUEST, json!({ "error": "bad json" }));
-        }
-    };
-    let session = payload
-        .get("sessionID")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-    let target_collection = payload
-        .get("target")
-        .and_then(|v| v.as_str())
-        .and_then(parse_collection_target);
-    let empty = vec![];
-    let items = payload
-        .get("items")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty);
-
-    let mut saved = 0usize;
-    for zitem in items {
-        let Some(ci) = zotero::zotero_to_csl(zitem) else {
-            eprintln!("saveItems: title なし item を skip");
-            continue;
-        };
-        let pmid = model::s(&ci.csl, "PMID").map(str::to_string);
-        let doi = model::s(&ci.csl, "DOI").map(str::to_lowercase);
-
-        let (key, is_new) = {
-            let mut db = st.db();
-            match search::find_by_ids(&db, pmid.as_deref(), doi.as_deref()) {
-                Ok(Some((_id, key))) => {
-                    eprintln!("saveItems: 既存 {key} に一致（dedup）");
-                    (key, false)
-                }
-                _ => {
-                    let resolved = resolver::Resolved {
-                        csl: ci.csl.clone(),
-                        retracted: None,
-                        source: "connector",
-                        warnings: vec![],
-                    };
-                    match ingest::add_item(&mut db, &resolved) {
-                        Ok(added) => (added.key, true),
-                        Err(e) => {
-                            eprintln!("saveItems: 登録失敗: {e}");
-                            continue;
-                        }
-                    }
-                }
-            }
-        };
-        saved += 1;
-
-        if let Some(cid) = target_collection {
-            add_to_folder(&st.db(), &key, cid, "connector");
-        }
-        if let Some(cid_str) = &ci.connector_id {
-            st.sessions().insert(&session, cid_str, &key);
-        }
-
-        // 非同期 enrich: PMID/DOI があれば PubMed/doi.org でリッチ書誌を補完
-        if is_new && (pmid.is_some() || doi.is_some()) {
-            let st2 = st.clone();
-            let key2 = key.clone();
-            let input = pmid
-                .clone()
-                .map(resolver::AddInput::Pmid)
-                .or_else(|| doi.clone().map(resolver::AddInput::Doi))
-                .unwrap();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(richer) = resolver::resolve(&input) {
-                    let mut db = st2.db();
-                    // 変化の中身（書誌の補完 / 撤回の印）をログで分けるため、前の CSL を控える
-                    let row: Option<(i64, String)> = db
-                        .conn
-                        .query_row("SELECT id, csl FROM items WHERE key = ?1", [key2.as_str()], |r| {
-                            Ok((r.get(0)?, r.get(1)?))
-                        })
-                        .ok();
-                    if let Some((id, before)) = row {
-                        match ingest::merge_enrichment(&mut db, id, &richer) {
-                            Ok(true) => {
-                                let after: Option<String> = db
-                                    .conn
-                                    .query_row("SELECT csl FROM items WHERE id = ?1", [id], |r| r.get(0))
-                                    .ok();
-                                if after.as_deref() != Some(before.as_str()) {
-                                    eprintln!("enrich: {key2} に abstract/MeSH 等を補完");
-                                }
-                                if let Some(r) = &richer.retracted {
-                                    eprintln!("enrich: {key2} に撤回の印: {r}");
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(e) => eprintln!("enrich: {key2} 失敗: {e}"),
-                        }
-                    }
-                }
-            });
-        }
-
-        // 添付バイナリ POST が来なかった場合の保険: 30 秒後に translator が宣言した URL からサーバ側で直接 DL を試す。
-        // サーバ側の取得なので fetch-pdf と同じ採否（`pdffetch::verdict`・宣言所在 = Declared）を通し、照合の印も添付行に書く。
-        // 取得は core の `pdffetch::download_pdf`（https のみ・各ホップに SSRF ガード・200 MB 上限）。curl 子プロセスは使わない:
-        // ここは spawn_blocking の中なので core の ureq を呼んでよく（`/capture/fetch-oa` も同じ場所から呼ぶ）、
-        // cookie / リダイレクト / 上限に curl でしか満たせない要件もない。
-        // ① DB 読取 → ② ロック外でネットワーク + 照合 → ③ 再ロックして添付（Mutex をネットワークの間に握らない・`fetch_pdf_*` と同じ）
-        if is_new && !ci.pdf_urls.is_empty() {
-            let st3 = st.clone();
-            let key3 = key.clone();
-            let urls = ci.pdf_urls.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let _ = tokio::task::spawn_blocking(move || {
-                    // 読めなければ「添付あり」とみなす（DL も添付もしない）
-                    let has_attachment = |db: &Db| attachment_count(db, &key3).unwrap_or(1) > 0;
-                    let (csl, filename) = {
-                        let db = st3.db();
-                        if has_attachment(&db) {
-                            return;
-                        }
-                        let it = match search::get_by_key(&db, &key3) {
-                            Ok(Some(it)) => it,
-                            Ok(None) => {
-                                eprintln!("fallback DL: {key3} が見つからない（保存直後に消えた？）→ 中止");
-                                return;
-                            }
-                            Err(e) => {
-                                eprintln!("fallback DL: {key3} の読取に失敗: {e} → 中止");
-                                return;
-                            }
-                        };
-                        let f = pdffetch::suggest_filename(&it.csl);
-                        (it.csl, f)
-                    };
-                    for u in urls {
-                        let bytes = match pdffetch::download_pdf(&u, None, false) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("fallback DL: {key3} {u} → {e}");
-                                continue;
-                            }
-                        };
-                        let check = pdffetch::check_pdf_identity(&bytes, &csl);
-                        let mark = match pdffetch::verdict(pdffetch::LocationKind::Declared, &check) {
-                            pdffetch::Verdict::Attach { doi_check } => doi_check,
-                            pdffetch::Verdict::Mismatch { found_doi } => {
-                                eprintln!("fallback DL: {key3} {u} は別論文（DOI {found_doi}）→ 添付しない");
-                                continue;
-                            }
-                            pdffetch::Verdict::Unverified { why } => {
-                                eprintln!("fallback DL: {key3} {u} は{why}ため添付しない");
-                                continue;
-                            }
-                        };
-                        let db = st3.db();
-                        if has_attachment(&db) {
-                            eprintln!("fallback DL: {key3} は取得中に別経路で添付された → {u} の {} bytes は破棄", bytes.len());
-                            return;
-                        }
-                        match edit::attach_auto_bytes(&db, &key3, &filename, &bytes) {
-                            Ok(a) => {
-                                if let Some(m) = mark {
-                                    pdffetch::mark_doi_check(&db, a.id, m);
-                                }
-                                eprintln!(
-                                    "fallback DL: {key3} に添付（{u}・{:?}・doi_check={}）",
-                                    a.placement,
-                                    mark.unwrap_or("null")
-                                );
-                                return;
-                            }
-                            Err(e) => eprintln!("fallback DL: {key3} {u} の添付に失敗: {e}"),
-                        }
-                    }
-                })
-                .await;
-            });
-        }
-    }
-    eprintln!("saveItems: session={session} saved={saved}");
-    zjson(StatusCode::CREATED, json!({}))
-}
-
-fn parse_collection_target(t: &str) -> Option<i64> {
-    t.strip_prefix('C').and_then(|s| s.parse::<i64>().ok())
-}
-
 /// item をフォルダへ入れる。失敗はログだけ（保存・取込そのものは成功のまま）。who = ログの接頭辞
 fn add_to_folder(db: &Db, key: &str, cid: i64, who: &str) {
     if let Err(e) = edit::add_to_collection(db, key, cid) {
         eprintln!("{who}: {key} をフォルダ(id {cid})へ追加できず: {e}");
-    }
-}
-
-/// key の item の添付数（PDF に限らない）。None = 読めない（そのときの扱いは呼び手が決める）
-fn attachment_count(db: &Db, key: &str) -> Option<i64> {
-    db.conn
-        .query_row(
-            "SELECT COUNT(*) FROM attachments a JOIN items i ON i.id = a.item_id WHERE i.key = ?1",
-            [key],
-            |r| r.get(0),
-        )
-        .ok()
-}
-
-/// Connector が添付に付ける X-Metadata ヘッダ（JSON）。無い・JSON として読めなければ {}
-fn x_metadata(headers: &HeaderMap) -> Value {
-    headers
-        .get("X-Metadata")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}))
-}
-
-async fn save_attachment(
-    State(st): State<Arc<St>>,
-    Query(q): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let session = q.get("sessionID").cloned().unwrap_or_else(|| "default".into());
-    let meta = x_metadata(&headers);
-    let content_type = meta
-        .get("contentType")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let is_pdf = content_type.contains("pdf") || body.starts_with(b"%PDF");
-    if !is_pdf {
-        eprintln!("saveAttachment: PDF 以外（{content_type}）は skip");
-        return zjson(StatusCode::CREATED, json!({}));
-    }
-    let parent = meta
-        .get("parentItemID")
-        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())));
-    let Some(key) = key_for(&st, &session, parent.as_deref()) else {
-        eprintln!("saveAttachment: parent item を解決できず skip（session={session}）");
-        return zjson(StatusCode::CREATED, json!({}));
-    };
-    let db = st.db();
-    if attachment_count(&db, &key).unwrap_or(0) > 0 {
-        eprintln!("saveAttachment: {key} は既に添付あり skip");
-        return zjson(StatusCode::CREATED, json!({}));
-    }
-    let filename = search::get_by_key(&db, &key)
-        .ok()
-        .flatten()
-        .map(|it| pdffetch::suggest_filename(&it.csl))
-        .unwrap_or_else(|| {
-            meta.get("title")
-                .and_then(|v| v.as_str())
-                .map(|t| format!("{t}.pdf"))
-                .unwrap_or_else(|| "attachment.pdf".into())
-        });
-    match edit::attach_auto_bytes(&db, &key, &filename, &body) {
-        Ok(a) => {
-            if let edit::Placement::ManagedFallback { reason, .. } = &a.placement {
-                eprintln!("saveAttachment: ⚠ {reason}");
-            }
-            eprintln!("saveAttachment: {key} に {} bytes 添付", body.len());
-            zjson(StatusCode::CREATED, json!({}))
-        }
-        Err(e) => {
-            eprintln!("saveAttachment: 失敗 {e}");
-            zjson(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }))
-        }
-    }
-}
-
-/// session の connector item id → openref key を引く。item id が無ければ、その session の唯一の item（単数保存の一般ケース）
-fn key_for(st: &St, session: &str, item_id: Option<&str>) -> Option<String> {
-    let sessions = st.sessions();
-    let map = sessions.get(session)?;
-    match item_id {
-        Some(p) => map.get(p).cloned(),
-        None if map.len() == 1 => map.values().next().cloned(),
-        _ => None,
     }
 }
 
@@ -573,7 +179,7 @@ fn fetch_pdf_unlocked(st: &St, key: &str) -> openref_core::Result<pdffetch::Fetc
     pdffetch::fetch_pdf_attach(&db, &plan, dl)
 }
 
-/// `/capture/pdf` と saveStandaloneAttachment の PDF 取込の経路ごとの値（ログの文面は経路ごとに今のまま）
+/// `/capture/pdf` の PDF 取込の経路の値（ログの文面・stub の custom.source）
 struct PdfFrom<'a> {
     /// タブ / ページの題名（元ファイル名と stub の題名の既定）・URL（stub の URL）
     title: Option<&'a str>,
@@ -593,7 +199,7 @@ struct Ingested {
     note: Option<String>,
 }
 
-/// PDF 取込（pdfingest の 3 段）→ 識別子が無い / 解決できなければ要確認 stub（`/capture/pdf`・saveStandaloneAttachment で共通）。
+/// PDF 取込（pdfingest の 3 段）→ 識別子が無い / 解決できなければ要確認 stub（`/capture/pdf`）。
 /// ① md5 照合と ③ 登録・添付だけロックを取り、② 冒頭 2 頁の抽出・resolver・題名検索はロックの外（取込中も /capture/status・
 /// Word・他の保存を止めない）。stub は ③ のロックの中で作る（③ の md5 再照合と stub 作成の間に同じ PDF の別の取込が割り込まない）。
 /// 戻り値の guard = そのロック（呼び手は続けて要約・フォルダ所属に使う）。Err = DB / 添付の失敗だけ（抽出できない・
@@ -634,139 +240,6 @@ fn ingest_or_stub<'a>(st: &'a St, bytes: &[u8], from: &PdfFrom) -> Result<(std::
         }
     };
     Ok((db, Ingested { key, status, note: None }))
-}
-
-/// 誌面 PDF が取れなかった時に connector が問い合わせてくる: OA 経路の当てがあるか
-async fn has_attachment_resolvers(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
-    let p: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    let session = p.get("sessionID").and_then(|v| v.as_str()).unwrap_or("default");
-    let item_id = p.get("itemID").and_then(|v| v.as_str());
-    let has = key_for(&st, session, item_id)
-        .and_then(|k| {
-            let db = st.db();
-            search::get_by_key(&db, &k).ok().flatten()
-        })
-        .map(|it| {
-            model::s(&it.csl, "PMCID").is_some() || model::s(&it.csl, "DOI").is_some()
-        })
-        .unwrap_or(false);
-    zjson(StatusCode::OK, json!(has))
-}
-
-/// 上記が true の時に呼ばれる: OA（PMC / Unpaywall）から自力取得して添付名を返す
-async fn save_attachment_from_resolver(
-    State(st): State<Arc<St>>,
-    body: Bytes,
-) -> impl IntoResponse {
-    let p: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    let session = p.get("sessionID").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-    let item_id = p.get("itemID").and_then(|v| v.as_str()).map(str::to_string);
-    let Some(key) = key_for(&st, &session, item_id.as_deref()) else {
-        return zjson(StatusCode::INTERNAL_SERVER_ERROR, json!("item を解決できません"));
-    };
-    let st2 = st.clone();
-    let res = tokio::task::spawn_blocking(move || fetch_pdf_unlocked(&st2, &key).map(|f| f.filename)).await;
-    match res {
-        Ok(Ok(filename)) => {
-            eprintln!("resolver: OA から添付 {filename}");
-            zjson(StatusCode::CREATED, json!(filename))
-        }
-        Ok(Err(e)) => {
-            eprintln!("resolver: 取得できず {e}");
-            zjson(StatusCode::INTERNAL_SERVER_ERROR, json!(e.to_string()))
-        }
-        Err(e) => zjson(StatusCode::INTERNAL_SERVER_ERROR, json!(e.to_string())),
-    }
-}
-
-/// PDF ページを直接保存した場合（親 item なし）。本文から DOI/PMID を拾って書誌確定を試みる。
-async fn save_standalone_attachment(
-    State(st): State<Arc<St>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let meta = x_metadata(&headers);
-    if !body.starts_with(b"%PDF") {
-        return zjson(StatusCode::CREATED, json!({}));
-    }
-    let title = meta
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Untitled PDF")
-        .to_string();
-    let url = meta.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let st2 = st.clone();
-    // body（axum の Bytes）をそのまま blocking 側へ渡す（複製もファイルへの書き出しもしない）
-    let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        // /capture/pdf と同じ取込 → 失敗なら要確認 stub（理由・警告・要確認ラベル・import_note・Err のログ）
-        let from = PdfFrom {
-            title: Some(&title),
-            url: Some(&url),
-            source: "connector-standalone",
-            log: "saveStandaloneAttachment",
-            fail_subject: "",
-        };
-        ingest_or_stub(&st2, &body, &from).map(|(_, got)| got.key)
-    })
-    .await;
-    match res {
-        Ok(Ok(key)) => {
-            eprintln!("saveStandaloneAttachment: {key} として保存");
-            zjson(StatusCode::CREATED, json!({}))
-        }
-        Ok(Err(e)) => {
-            eprintln!("saveStandaloneAttachment: 失敗 {e}");
-            zjson(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e }))
-        }
-        Err(e) => zjson(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
-    }
-}
-
-async fn save_snapshot(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
-    let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let title = payload
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or(url);
-    if title.is_empty() {
-        return zjson(StatusCode::CREATED, json!({}));
-    }
-    let csl = json!({
-        "type": "webpage",
-        "title": title,
-        "URL": url,
-        "custom": { "source": "connector-snapshot" }
-    });
-    let mut db = st.db();
-    let resolved = resolver::Resolved { csl, retracted: None, source: "connector", warnings: vec![] };
-    match ingest::add_item(&mut db, &resolved) {
-        Ok(a) => eprintln!("saveSnapshot: webpage {} 登録（snapshot 本体は非保存・scope=論文のみ）", a.key),
-        Err(e) => eprintln!("saveSnapshot: {e}"),
-    }
-    zjson(StatusCode::CREATED, json!({}))
-}
-
-async fn update_session(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
-    let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    if let (Some(session), Some(target)) = (
-        payload.get("sessionID").and_then(|v| v.as_str()),
-        payload
-            .get("target")
-            .and_then(|v| v.as_str())
-            .and_then(parse_collection_target),
-    ) {
-        let keys: Vec<String> = st.sessions()
-            .get(session)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        let db = st.db();
-        for k in keys {
-            add_to_folder(&db, &k, target, "connector");
-        }
-        eprintln!("updateSession: session={session} → C{target}");
-    }
-    zjson(StatusCode::OK, json!({}))
 }
 
 // ---------------- Capture 拡張 API ----------------
@@ -921,7 +394,7 @@ fn capture_save_unlocked(
                     (added.key, "created")
                 }
                 Err(openref_core::CoreError::Duplicate { existing_key, .. }) => {
-                    // ② の間に別経路（同じ connectd の saveItems 等）が先に登録した: resolver が返した撤回を捨てない
+                    // ② の間に別経路（同じ connectd の別の /capture/* や GUI・CLI・MCP）が先に登録した: resolver が返した撤回を捨てない
                     if let Some(r) = &resolved.retracted {
                         dup_retraction = Some(r.clone());
                         record_retraction(&mut db, &existing_key, &resolved, r);
@@ -1095,7 +568,7 @@ fn not_pdf(body: &[u8]) -> Value {
 /// pdfingest の 3 段 = `ingest_or_stub`: md5 一致なら duplicate、本文 DOI は題名ガード付き、識別子が無ければタイトル検索まで試す）。
 /// 識別子が無い・本文の識別子を解決できない（doi.org 404 等）ときは、従来どおりの capture stub（type document・題名は
 /// Info /Title が妥当ならそれ、無ければタブ題名・URL・custom.source=capture）を作って添付し、ラベル「要確認」を付ける
-/// （PDF を失わない = save_standalone_attachment と同じ方針）。
+/// （PDF を失わない）。
 /// 戻り値は `/capture/save` と同形。status ∈ added | attached | attached_additional | duplicate | stub
 async fn capture_pdf(
     State(st): State<Arc<St>>,
@@ -1190,12 +663,16 @@ async fn capture_fetch_oa(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRe
     }
 }
 
-async fn session_progress() -> impl IntoResponse {
-    zjson(StatusCode::OK, json!({ "done": true, "items": [] }))
-}
-
-async fn ok_empty() -> impl IntoResponse {
-    zjson(StatusCode::OK, json!({}))
+/// 外した Zotero Connector 互換の口（`/connector` 配下）。404 + 理由の 1 行。ZHEADERS は付けない（Zotero を名乗らない）。
+/// Zotero Connector には「Zotero が起動していない」と見え、保存したつもりで保存されていない状態にならない
+async fn connector_gone(method: Method, uri: Uri) -> impl IntoResponse {
+    eprintln!("(外した口) {method} {uri} → 404（Zotero Connector 互換は 3.0.0 で外した）");
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "OpenRef は Zotero Connector 互換（/connector/*）を 3.0.0 で外しました。ブラウザからの取込は OpenRef Capture 拡張を使ってください"
+        })),
+    )
 }
 
 async fn fallback(uri: Uri) -> impl IntoResponse {
@@ -1210,7 +687,6 @@ mod tests {
     fn test_st() -> St {
         St {
             db: Mutex::new(Db::open_in_memory().unwrap()),
-            sessions: Mutex::new(Sessions::default()),
         }
     }
 
@@ -1339,7 +815,7 @@ mod tests {
         assert_eq!(t, json!({ "key": key, "status": "duplicate", "trashed": true }));
     }
 
-    /// ② の間に同じ DOI が印なしで先に入り（同じ connectd の saveItems 等）、resolver は撤回を返した: ③ の Duplicate で
+    /// ② の間に同じ DOI が印なしで先に入り（同じ connectd の別の /capture/* や GUI・CLI・MCP）、resolver は撤回を返した: ③ の Duplicate で
     /// resolver の撤回を捨てず、応答にも DB（retraction_flags）にも残す。題名ガードで却下されても応答の警告は出す（DB には書かない）
     #[test]
     fn duplicate_keeps_retraction_from_resolver() {
@@ -1371,33 +847,5 @@ mod tests {
         assert_eq!(v["retraction"], "Retracted");
         let id = search::get_by_key(&st.db(), &odd).unwrap().unwrap().id;
         assert_eq!(search::retraction_of(&st.db(), id).unwrap(), None);
-    }
-
-    /// session は直近 MAX_SESSIONS 件だけ残る: 上限を超えると最後の書き込みが最も古いものから消え、
-    /// 書き込み直した session（同じ保存の 2 件目）は新しい扱いで残る。key_for の引き方（item id あり / 唯一の item）は変わらない
-    #[test]
-    fn sessions_are_bounded() {
-        let st = test_st();
-        st.sessions().insert("S0", "a", "KEY0A");
-        for i in 1..MAX_SESSIONS {
-            st.sessions().insert(&format!("S{i}"), "a", &format!("KEY{i}"));
-        }
-        assert_eq!(key_for(&st, "S0", None).as_deref(), Some("KEY0A"));
-        // S0 に 2 件目 → S0 は最新。上限を 1 つ超えると最古の S1 が消える
-        st.sessions().insert("S0", "b", "KEY0B");
-        st.sessions().insert("NEW", "a", "KEYN");
-        assert_eq!(st.sessions().map.len(), MAX_SESSIONS);
-        assert_eq!(key_for(&st, "S1", None), None);
-        assert_eq!(key_for(&st, "S2", Some("a")).as_deref(), Some("KEY2"));
-        assert_eq!(key_for(&st, "S0", Some("b")).as_deref(), Some("KEY0B"));
-        assert_eq!(key_for(&st, "S0", None), None, "2 件ある session は item id なしでは引かない");
-        assert_eq!(key_for(&st, "NEW", None).as_deref(), Some("KEYN"));
-        for i in 0..200 {
-            st.sessions().insert(&format!("X{i}"), "a", "K");
-        }
-        assert_eq!(st.sessions().map.len(), MAX_SESSIONS);
-        assert_eq!(key_for(&st, "X199", None).as_deref(), Some("K"));
-        assert_eq!(key_for(&st, "X135", None), None);
-        assert_eq!(key_for(&st, "X136", None).as_deref(), Some("K"));
     }
 }

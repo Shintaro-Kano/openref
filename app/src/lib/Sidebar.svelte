@@ -17,6 +17,8 @@
   } from "./state.svelte";
   import { composing } from "./input";
   import WikiSegment from "./wiki/WikiSegment.svelte";
+  import ShelfHead from "./shelf/ShelfHead.svelte";
+  import ShelfMenu from "./shelf/ShelfMenu.svelte";
 
   function isActive(kind: string, id?: number): boolean {
     const v = app.view as any;
@@ -141,7 +143,7 @@
 <nav class="sidebar">
   <WikiSegment />
   <div class="sep sec-head">
-    <span>MY LIBRARY</span>
+    <ShelfHead />
     <span class="head-actions">
       <button title={t("新規フォルダ")} aria-label={t("新規フォルダ")} onclick={() => openFolderModal("newFolder")}>{t("＋")}</button>
       <button title={t("フォルダメニュー")} aria-label={t("フォルダメニュー")} onclick={(e) => openMenu(e, "folders")}>…</button>
@@ -271,6 +273,7 @@
     <span>{t("ゴミ箱")}</span><span class="n">{app.counts.trash}</span>
   </button>
 </nav>
+<ShelfMenu />
 
 {#if app.labelMenu}
   <div class="lmenu" style="top:{menuPos.top}px;left:{menuPos.left}px" role="menu" onclick={(e) => e.stopPropagation()}>

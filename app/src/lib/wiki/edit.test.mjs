@@ -16,6 +16,7 @@
    ㉒ Wiki のモーダル（wk.dialog・conflict・チャットの説明・救出）が開いている間はタブの切替・開く・閉じる（⌘1〜9・⌘⇧]・⌘T・⌘W）を受け付けない
    ㉓ Wiki OFF でダイアログ・メニュー・チャットの説明を畳む・「破棄して移る」の確認を待っていた閉じるは「移らない」で終わる（約束を宙に残さない・保存が通ってもタブは閉じない）
    ㉔ [＋ 新規] の再押下で閉じる（実部品 WikiHeader + WikiDialogs: ボタンの mousedown では閉じず click が閉じる・外側の mousedown では閉じる）
+   ㉕ 複製（実部品 WikiDialogs: ファイルのメニューの 2 行目・押すと wiki_duplicate → 同じタブで開く・編集中は先に保存・保存できなければ複製しない・待つ間にタブ / ページ / ワークスペースが変わったら開かない）
    出力 = `wiki edit: ok (N tests)`（N = 列 0 のブロックの数 = 検査の単位） */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -277,7 +278,7 @@ async function conflictCase(choice) {
 // ---------- ⑤ 保存に失敗したまま閉じようとすると止まる（破棄して移るは確認付き）・自動の再試行 ----------
 const S = await import("../state.svelte.ts");
 const W = await import("./wiki.svelte.ts"); // leave guard を登録する
-const FL = await import("./files.svelte.ts"); // 新規 / 改名 / ゴミ箱（B-33 で wiki.svelte.ts から分けた）
+const FL = await import("./files.svelte.ts"); // 新規 / 改名 / ゴミ箱（wiki.svelte.ts から分けた）
 const tick = () => sleep(5);
 const waitFor = async (f, ms = 1000) => {
   for (let i = 0; i < ms / 5 && !f(); i++) await tick();
@@ -1339,7 +1340,7 @@ handlers.get_ui_pref = () => null;
   flushSync();
   assert.ok(await waitFor(() => embedded().includes("復帰")), "失敗した読みを覚えて読み直さない");
   assert.equal(reads.length, 5);
-  // 旗を立てると計測が残る（受入の計測・以下のテストが描き直しの回数に使う）
+  // 旗を立てると計測が残る（以下のテストが描き直しの回数に使う）
   globalThis.__wkMeasure = true;
   props.page = mk(7);
   flushSync();
@@ -1357,7 +1358,7 @@ handlers.get_ui_pref = () => null;
   const target = document.createElement("div");
   document.body.append(target);
   const props = proxy({
-    page: { ...page("m.md", "[x](file:///Users/u/kb/journals/x.pdf) と [y](file:///Users/u/other/y.pdf)", "M0"), links: [] },
+    page: { ...page("m.md", "[x](file:///Users/u/ref/papers/x.pdf) と [y](file:///Users/u/other/y.pdf)", "M0"), links: [] },
     root: "/v",
     refs: [],
     onNavigate: () => {},
@@ -1370,14 +1371,14 @@ handlers.get_ui_pref = () => null;
   const links = () => [...(target.querySelector(".wk-md")?.shadowRoot?.querySelectorAll("a") ?? [])].map((a) => a.className);
   assert.ok(await waitFor(() => links().length === 2), "描かない");
   assert.deepEqual(links(), ["wk-l-open", "wk-l-open"], "参照フォルダが無いのに ref にした");
-  props.refs = ["/Users/u/kb"];
+  props.refs = ["/Users/u/ref"];
   flushSync();
   assert.ok(await waitFor(() => links()[0] === "wk-l-ref"), `参照フォルダを足しても古い分類のまま: ${links()}`);
   assert.deepEqual(links(), ["wk-l-ref", "wk-l-open"]);
   // 中身が同じ新しい配列（wiki-state ごとの loadRefDirs は毎回新しい配列を入れる）= 描き直さない
   const renders = () => performance.getEntriesByType("measure").filter((e) => e.name === "wk-render m.md").length;
   const r1 = renders();
-  props.refs = ["/Users/u/kb"];
+  props.refs = ["/Users/u/ref"];
   flushSync();
   await sleep(20);
   assert.equal(renders(), r1, "中身が同じ refs の新しい配列で描き直した");
@@ -1447,7 +1448,7 @@ handlers.get_ui_pref = () => null;
 }
 
 // ---------- ㉒ Wiki のモーダルが開いている間はタブ操作を受け付けない（⌘1〜9・⌘⇧]・⌘T・⌘W = state の tabOpsAllowed） ----------
-const C = await import("./chat.svelte.ts");
+const C = await import("../chat/chat.svelte.ts");
 {
   E.ed.stranded.length = 0; // 前の節が残した救出の本文（救出が出ている間はタブ操作を受け付けない = ここで確かめる対象）
   S.app.wikiOn = true;
@@ -1489,7 +1490,29 @@ const C = await import("./chat.svelte.ts");
   assert.equal(S.modalOpen(), false);
   assert.equal(W.infoKeyAllowed(), true, "モーダルを閉じたのに ⌘⌥I が効かない");
   tab.wiki = null;
-  assert.equal(W.infoKeyAllowed(), false, "前面が Wiki でないのに ⌘⌥I が効く");
+  // 前面が一覧 = 一覧の右ペインの開閉を受ける（togglePane が振り分ける）。PDF のタブ = 右バーの開閉を受ける。エディタ・取込の下・モーダルでは受けない
+  assert.equal(W.infoKeyAllowed(), true, "前面が一覧なのに ⌘⌥I が効かない");
+  tab.viewer = { itemKey: "K", attachmentId: 1, title: "T" };
+  assert.equal(W.infoKeyAllowed(), true, "前面が PDF のタブなのに ⌘⌥I（右バーの開閉）が効かない");
+  S.app.editorOpen = true;
+  assert.equal(W.infoKeyAllowed(), false, "エディタの下の PDF のタブで ⌘⌥I が効く");
+  S.app.editorOpen = false;
+  S.app.importJob = { running: true };
+  assert.equal(W.infoKeyAllowed(), false, "取込の下の PDF のタブで ⌘⌥I が効く");
+  S.app.importJob = null;
+  W.wk.dialog = { kind: "new", dir: "" };
+  assert.equal(W.infoKeyAllowed(), false, "モーダルの下の PDF のタブで ⌘⌥I が効く");
+  W.wk.dialog = null;
+  tab.viewer = null;
+  S.app.editorOpen = true;
+  assert.equal(W.infoKeyAllowed(), false, "エディタの下の一覧で ⌘⌥I が効く");
+  S.app.editorOpen = false;
+  S.app.importJob = { running: true };
+  assert.equal(W.infoKeyAllowed(), false, "取込の下の一覧で ⌘⌥I が効く");
+  S.app.importJob = null;
+  W.wk.dialog = { kind: "new", dir: "" };
+  assert.equal(W.infoKeyAllowed(), false, "モーダルの下の一覧で ⌘⌥I が効く");
+  W.wk.dialog = null;
   tab.wiki = { path: null, scrollTop: 0, editing: false };
   // 本体のモーダル（app.modal）の規則はそのまま
   S.app.modal = { kind: "x" };
@@ -1598,6 +1621,144 @@ const C = await import("./chat.svelte.ts");
   flushSync();
   assert.equal(W.wk.menu, null, "Esc で閉じない");
   unmount(hd);
+  unmount(cmp);
+  target.remove();
+  tests++;
+}
+
+// ---------- ㉕ 複製（実部品 WikiDialogs + files.svelte の duplicateFile） ----------
+{
+  S.app.wikiOn = true;
+  W.wk.status = { enabled: true, root: "/v" };
+  tab.wiki = { path: "d/f.md", root: "/v", scrollTop: 40, editing: false };
+  S.app.tab = tab.id;
+  const R = (o) => (W.shownRoot() ? { ...o, root: W.shownRoot() } : o);
+  handlers.wiki_list = () => ({ total: 0, count: 0, pages: [] });
+  handlers.wiki_duplicate = (a) => ({ path: a.path.replace(/(\.[^.]+)$/, " 1$1") });
+  const dups = () => calls.filter((c) => c.name === "wiki_duplicate").map((c) => c.args);
+  const { default: Dialogs } = await import("./WikiDialogs.svelte");
+  const target = document.createElement("div");
+  document.body.append(target);
+  const cmp = mount(Dialogs, { target });
+  const items = () => [...target.querySelectorAll(".wk-menu button")];
+  const labels = () => items().map((b) => b.textContent.trim());
+
+  // ファイルのメニュー = 「名前を変更…」の下・フォルダのメニューには無い
+  W.wk.menu = { kind: "dir", path: "d", x: 0, y: 0 };
+  flushSync();
+  assert.ok(!labels().includes("複製する"), `フォルダのメニューに出た: ${labels()}`);
+  W.wk.menu = { kind: "file", path: "d/f.md", x: 0, y: 0 };
+  flushSync();
+  assert.deepEqual(labels(), ["名前を変更…", "複製する", "ゴミ箱に移す…"]);
+
+  // 押す = メニューを閉じて複製・同じタブで開く（新しいタブにしない・表示で）・木を読み直す・toast は複製の名前
+  calls.length = 0;
+  const tabs = S.app.tabs.length;
+  items()[1].click();
+  flushSync();
+  assert.equal(W.wk.menu, null, "メニューが閉じない");
+  assert.ok(await waitFor(() => tab.wiki.path === "d/f 1.md"), `複製を開かない: ${tab.wiki.path}`);
+  assert.deepEqual(dups(), [R({ path: "d/f.md" })]);
+  assert.deepEqual([S.app.tabs.length, tab.wiki.editing, tab.wiki.scrollTop], [tabs, false, 0], "同じタブで頭から表示で開かない");
+  assert.ok(S.app.toast.includes("複製しました: f 1.md"), `toast: ${S.app.toast}`);
+  assert.ok(calls.some((c) => c.name === "wiki_list"), "木を読み直さない");
+
+  // 開いていないファイル（画像）の複製も同じタブ
+  tab.wiki.path = "d/f.md";
+  await FL.duplicateFile("img/図.png");
+  assert.equal(tab.wiki.path, "img/図 1.png");
+  assert.ok(S.app.toast.includes("複製しました: 図 1.png"), S.app.toast);
+
+  // core の拒否 = 理由を出す・開かない
+  handlers.wiki_duplicate = () => { throw new Error("書込権がありません（読み取り専用のフォルダ）: /v/ro"); };
+  tab.wiki.path = "d/f.md";
+  await FL.duplicateFile("ro/a.md");
+  assert.ok(S.app.toast.includes("複製できません") && S.app.toast.includes("読み取り専用"), S.app.toast);
+  assert.equal(tab.wiki.path, "d/f.md");
+
+  // 索引のエラー = 複製はできている = 開いて知らせる
+  handlers.wiki_duplicate = (a) => ({ path: "d/f 2.md", index_error: "ix" });
+  await FL.duplicateFile("d/f.md");
+  assert.equal(tab.wiki.path, "d/f 2.md");
+  assert.ok(S.app.toast.includes("索引を更新できませんでした") && S.app.toast.includes("f 2.md") && S.app.toast.includes("ix"), S.app.toast);
+
+  // 編集中: 未保存を先に保存してから写す（複製に入る）
+  handlers.wiki_duplicate = (a) => ({ path: a.path.replace(/(\.[^.]+)$/, " 1$1") });
+  handlers.wiki_save = (a) => ({ ok: true, path: a.path, sha256: "S9", size: a.content.length, mtime: 1, created: false });
+  tab.wiki = { path: "e.md", root: "/v", scrollTop: 0, editing: true };
+  let h = session("e.md", "x", "y");
+  calls.length = 0;
+  await FL.duplicateFile("e.md");
+  const order = calls.map((c) => c.name).filter((n) => n === "wiki_save" || n === "wiki_duplicate");
+  assert.deepEqual(order, ["wiki_save", "wiki_duplicate"], "保存より先に写した");
+  assert.equal(calls.find((c) => c.name === "wiki_save").args.content, "xy");
+  assert.deepEqual([tab.wiki.path, tab.wiki.editing], ["e 1.md", false], "複製を表示で開かない");
+  close(h);
+
+  // 編集中で保存できない = 複製しない（破棄して移るを断ったら元のページのまま）
+  failWrite();
+  tab.wiki = { path: "e.md", root: "/v", scrollTop: 0, editing: true };
+  h = session("e.md", "x", "y");
+  calls.length = 0;
+  const p = FL.duplicateFile("e.md");
+  assert.ok(await waitFor(() => W.wk.dialog?.kind === "discard"), "保存できないのに尋ねない");
+  W.answerDiscard(false);
+  await p;
+  assert.deepEqual(dups(), [], "保存できないのに複製した");
+  assert.equal(tab.wiki.path, "e.md");
+  // 破棄して移るを選んだ = 編集を捨てて保存済みの内容を写す（他の遷移と同じ canLeave）
+  const pd = FL.duplicateFile("e.md");
+  assert.ok(await waitFor(() => W.wk.dialog?.kind === "discard"));
+  W.answerDiscard(true);
+  await pd;
+  assert.deepEqual(dups(), [R({ path: "e.md" })]);
+  assert.deepEqual([tab.wiki.path, E.ed.path], ["e 1.md", null]);
+  E.detach(h);
+  h.destroy();
+
+  // 大きなコピーを待つ間に画面が変わった = 開かない（複製はできている = 知らせる）。finish = コピーの終わり
+  let finish = null;
+  handlers.wiki_duplicate = () => new Promise((r) => (finish = () => r({ path: "v 1.mp4" })));
+  /** 複製を待たせて move（画面を変える操作）を挟み、終わらせる */
+  const during = async (move) => {
+    finish = null;
+    S.app.toast = "";
+    const q = FL.duplicateFile("v.mp4");
+    await waitFor(() => !!finish);
+    await move();
+    finish();
+    await q;
+    assert.ok(S.app.toast.includes("複製しました: v 1.mp4"), S.app.toast);
+  };
+  // 別のタブへ切り替えた（同じページのタブ = ページの比較では止まらない。読むのは proxy = S.app.tabs の中。push した生のオブジェクトは書込みが届かない）
+  tab.wiki = { path: "v.mp4", root: "/v", scrollTop: 0, editing: false };
+  S.app.tabs.push({ ...tab, id: 998, wiki: { path: "v.mp4", root: "/v", scrollTop: 0, editing: false }, viewer: null });
+  await during(() => (S.app.tab = 998));
+  assert.equal(S.app.tabs.find((x) => x.id === 998).wiki.path, "v.mp4", "待つ間に切り替えたタブの中身を変えた");
+  assert.equal(tab.wiki.path, "v.mp4");
+  S.app.tabs.pop();
+  S.app.tab = tab.id;
+  // 同じタブの中で別のページへ移った
+  await during(() => W.openWikiPage("読んでいる.md"));
+  assert.equal(tab.wiki.path, "読んでいる.md", "読み始めたページから複製へ飛ばした");
+  // 同じタブのまま MY LIBRARY へ切り替えた = OpenNote へ引き戻さない・タブを増やさない
+  tab.wiki.path = "v.mp4";
+  const before = S.app.tabs.length;
+  await during(() => W.switchMode("library"));
+  assert.equal(S.app.tabs.length, before, "MY LIBRARY から複製のタブを開いた");
+  assert.equal(S.frontWiki(), null);
+  tab.wiki = { path: null, root: "/v", scrollTop: 0, editing: false };
+  // 同じタブのままワークスペースが変わった（ホームからホームへ = ページは同じ null）。provisional を抜けないと shownRoot が null で比べられない
+  handlers.wiki_front_root = () => ({});
+  handlers.wiki_status = (a) => ({ enabled: true, root: a?.root ?? "/v", workspaces: [] });
+  W.enterRoot("/v", true);
+  await waitFor(() => W.shownRoot() === "/v");
+  assert.equal(W.shownRoot(), "/v");
+  await during(() => {
+    W.enterRoot("/other", true);
+    tab.wiki = { path: null, root: "/other", scrollTop: 0, editing: false }; // 明示の切替 = 前面のタブをその root のホームへ
+  });
+  assert.equal(tab.wiki.path, null, "別のワークスペースで元の root の相対パスを開いた");
   unmount(cmp);
   target.remove();
   tests++;

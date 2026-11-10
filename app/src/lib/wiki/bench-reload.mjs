@@ -1,6 +1,7 @@
 /* OpenNote の画面側の読み直しの計測（test-all には入れない・手で走らせる）。
    使い方: node app/src/lib/wiki/bench-reload.mjs [<checkout>]   （checkout = 比べたい別の作業木。省略 = この repo）
    例: 新旧の比較 = `node app/src/lib/wiki/bench-reload.mjs` と `node app/src/lib/wiki/bench-reload.mjs /path/to/old-checkout`（node_modules は app/ に要る）
+   古い checkout = この bench で読むと chat.ts の import で落ちる → それぞれの checkout の bench を引数なしで走らせて比べる
    計るもの（偽のワークスペース = 自分で生成した約 1 万ページ・wiki_list は偽物 = IPC の時間は含まない）:
    1) loadTree 1 回（wiki_list の応答 → wk.pages の置換 → 木の派生（WikiSidebar の tree / rows）の組み直しまで）
    2) wk.pages を 1 回読み切る（深い proxy 越し / raw）
@@ -18,13 +19,13 @@ const { calls, handlers, emit, sleep } = setupHarness();
 const { mount, flushSync } = await import("svelte");
 const S = await import(`${CK}/app/src/lib/state.svelte.ts`);
 const W = await import(`${CK}/app/src/lib/wiki/wiki.svelte.ts`);
-const C = await import(`${CK}/app/src/lib/wiki/chat.ts`);
+const C = await import(`${CK}/app/src/lib/chat/chat.ts`);
 const { default: WikiSidebar } = await import(`${CK}/app/src/lib/wiki/WikiSidebar.svelte`);
 
-// 偽のワークスペース: 11 フォルダ × 2 段 × ページ（md 6 割・jpg 3.5 割・他）≈ 10,900 件（本番の KB の形に近い大きさ）
+// 偽のワークスペース: 11 フォルダ × 2 段 × ページ（md 6 割・jpg 3.5 割・他）≈ 10,900 件（大きめの実用のワークスペースに近い大きさ）
 const base = [];
 {
-  const dirs = ["abdrad", "clinneurol", "cotm", "journals", "litreport", "neuro", "notes-web", "notion-cases", "papers", "ingest", "chat-log"];
+  const dirs = ["papers", "cases", "notes", "journals", "reports", "neuro", "web-clips", "records", "books", "inbox", "chat-log"];
   let n = 0;
   for (const d of dirs) {
     for (let sub = 0; sub < 9; sub++) {

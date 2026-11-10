@@ -7,6 +7,8 @@
 //!   （409 は HTTP の status code で見分け、found_doi は読まない）
 //! - 拡張は読まないが応答の契約として固定するキー: found_doi・warnings・filename・ok・app・version
 //! - :23119 の body 上限（`CONNECTOR_BODY_LIMIT`）: ちょうど上限の body は受け、1 byte 超えると 413
+//! - 外した Zotero Connector 互換（`/connector` 配下）: どのパス・メソッドでも 404 + {error}（fallback の 200 {} に落ちない）。
+//!   404 を契約として固定する（要件は「非 200 の明示のエラー」。別の code に変えるならこの試験も意図して変える）
 
 use super::*;
 use std::collections::BTreeSet;
@@ -31,7 +33,7 @@ fn temp_lib(name: &str) -> TempLib {
     let db = Db::open(&dir.join("openref.sqlite")).unwrap();
     // 新しい DB は managed（drive だと Google Drive へ書く）
     assert_eq!(db.pdf_write_mode().unwrap(), "managed");
-    let st = Arc::new(St { db: Mutex::new(db), sessions: Mutex::new(Sessions::default()) });
+    let st = Arc::new(St { db: Mutex::new(db) });
     TempLib { dir, st }
 }
 
@@ -45,6 +47,12 @@ async fn serve(st: Arc<St>) -> u16 {
 
 /// 1 往復（Connection: close）。本文は JSON として解く（解けなければ生のまま panic に出す）
 async fn call(port: u16, method: &'static str, path: &str, ctype: &'static str, body: Vec<u8>) -> (u16, Value) {
+    let (code, _head, v) = call_full(port, method, path, ctype, body).await;
+    (code, v)
+}
+
+/// `call` と同じ 1 往復で、応答ヘッダ（status 行を含む生の文字列）も返す
+async fn call_full(port: u16, method: &'static str, path: &str, ctype: &'static str, body: Vec<u8>) -> (u16, String, Value) {
     let path = path.to_string();
     tokio::task::spawn_blocking(move || {
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -63,7 +71,7 @@ async fn call(port: u16, method: &'static str, path: &str, ctype: &'static str, 
         let rest = &raw[at + 4..];
         let v: Value = serde_json::from_slice(rest)
             .unwrap_or_else(|e| panic!("{path}: 応答が JSON でない（{e}）: {head}\n{}", String::from_utf8_lossy(rest)));
-        (code, v)
+        (code, head, v)
     })
     .await
     .unwrap()
@@ -373,4 +381,59 @@ async fn capture_body_limit() {
     let port = serve(lib.st.clone()).await;
     assert_eq!(post_sized(port, "/capture/attachment", CONNECTOR_BODY_LIMIT).await, 400, "上限ちょうどは受ける");
     assert_eq!(post_sized(port, "/capture/attachment", CONNECTOR_BODY_LIMIT + 1).await, 413, "上限超えは 413");
+}
+
+/// Zotero Connector 互換は 3.0.0 で外した: 旧 route 12 本（ping は GET / POST）も、`/connector` 配下の
+/// 未知のパスも、どのメソッドでも 404 + {error}（理由に Capture 拡張の案内）。Zotero を名乗るヘッダは付けない。
+/// fallback（200 {}）に落ちると Zotero Connector には保存が成功したように見える = ここで検出する。
+/// 旧 saveItems に item を送っても DB に書かない。`/connector` 配下でないパス（/connectorX・/capture/unknown）の fallback は今のまま
+#[tokio::test(flavor = "multi_thread")]
+async fn connector_paths_are_gone() {
+    let lib = temp_lib("connector-gone");
+    let port = serve(lib.st.clone()).await;
+    let item = json!({ "sessionID": "s1", "items": [{ "itemType": "journalArticle", "title": "Probe", "DOI": "10.1234/probe" }] });
+    let mut cases: Vec<(&'static str, String)> = vec![("GET", "/connector/ping".into())];
+    for p in [
+        "ping", "getSelectedCollection", "saveItems", "saveAttachment?sessionID=s1", "saveStandaloneAttachment",
+        "hasAttachmentResolvers", "saveAttachmentFromResolver", "saveSnapshot", "updateSession", "sessionProgress",
+        "delaySync", "getClientHostnames",
+    ] {
+        cases.push(("POST", format!("/connector/{p}")));
+    }
+    for (m, p) in [("GET", "/connector"), ("GET", "/connector/"), ("POST", "/connector/noSuchThing"), ("GET", "/connector/a/b"),
+        ("PUT", "/connector/saveItems"), ("DELETE", "/connector/ping"), ("OPTIONS", "/connector/ping"), ("GET", "/connector/ping?x=1"),
+        ("GET", "/connector/ping/"), ("POST", "/connector/saveItems/")]
+    {
+        cases.push((m, p.into()));
+    }
+    for (m, p) in &cases {
+        let (code, head, v) = call_full(port, m, p, "application/json", item.to_string().into_bytes()).await;
+        assert_eq!(code, 404, "{m} {p}: 外した口は 404: {v}");
+        assert_eq!(keys(&v), set(&["error"]), "{m} {p}: {v}");
+        assert!(v["error"].as_str().unwrap().contains("Capture"), "{m} {p}: 理由に代わりの案内: {v}");
+        assert!(!head.to_ascii_lowercase().contains("x-zotero"), "{m} {p}: Zotero を名乗らない: {head}");
+    }
+    // HEAD は本文が無い（JSON を読まない）: status 行だけ見る
+    let code = tokio::task::spawn_blocking(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"HEAD /connector/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        String::from_utf8_lossy(&raw).split(' ').nth(1).unwrap_or("").to_string()
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, "404", "HEAD /connector/ping も 404");
+    let n: i64 = lib.st.db().conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0, "旧 saveItems は DB に書かない");
+
+    // /connector 配下でない未知のパスは今までどおり fallback の 200 {}
+    shape("fallback(/connectorX)", &get_json(port, "/connectorX").await, 200, &[]);
+    shape("fallback(/capture/unknown)", &post_json(port, "/capture/unknown", json!({})).await, 200, &[]);
+    // /capture/* の応答ヘッダは今のまま（X-Zotero-Version を付ける）
+    let (code, head, v) = call_full(port, "GET", "/capture/status", "application/json", Vec::new()).await;
+    assert_eq!(code, 200, "{v}");
+    let head = head.to_ascii_lowercase();
+    assert!(head.contains("x-zotero-version: 7.0.15"), "{head}");
+    assert!(head.contains("x-zotero-connector-api-version: 3"), "{head}");
 }

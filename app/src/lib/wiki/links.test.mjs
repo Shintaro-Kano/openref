@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 import { renderMarkdown } from "./render/md.ts";
 import { purify, finish, collectLinks, classifyDest } from "./render/sanitize.ts";
-import { chatLinks } from "./chat.ts";
+import { chatLinks } from "../chat/chat.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = JSON.parse(readFileSync(join(here, "../../../../crates/openref-core/tests/fixtures/wiki-links.json"), "utf8"));
@@ -80,27 +80,27 @@ for (const c of fx.resolve.cases) {
 // 参照フォルダ: ワークスペースの外の file:// は、参照フォルダの中で内蔵で開ける種類（pdf / html / 画像 / 動画 / 音声）だけ ref・
 // それ以外（md・参照フォルダの外・隠しの区画・フォルダそのもの）は open のまま。vault の中は今どおり page
 {
-  const ctx = { root: "/vault", path: "notes/x.md", kind: "md", links: [], labels, refs: ["/Users/u/kb"] };
+  const ctx = { root: "/vault", path: "notes/x.md", kind: "md", links: [], labels, refs: ["/Users/u/ref"] };
   const nav = (d) => classifyDest(d, ctx, new Map());
-  assert.deepEqual(nav("file:///Users/u/kb/journals/a.pdf"), { t: "ref", abs: "/Users/u/kb/journals/a.pdf" });
-  assert.deepEqual(nav("file:///Users/u/kb/posts/view.html"), { t: "ref", abs: "/Users/u/kb/posts/view.html" });
-  assert.deepEqual(nav("file:///Users/u/kb/notes-web/p.png"), { t: "ref", abs: "/Users/u/kb/notes-web/p.png" });
-  assert.deepEqual(nav("file:///Users/u/kb/a/../journals/b.PDF"), { t: "ref", abs: "/Users/u/kb/journals/b.PDF" });
-  assert.deepEqual(nav("file:///Users/u/kb/notes/n.md"), { t: "open", abs: "/Users/u/kb/notes/n.md" }, "md は索引が無い = ホストの open");
+  assert.deepEqual(nav("file:///Users/u/ref/papers/a.pdf"), { t: "ref", abs: "/Users/u/ref/papers/a.pdf" });
+  assert.deepEqual(nav("file:///Users/u/ref/site/view.html"), { t: "ref", abs: "/Users/u/ref/site/view.html" });
+  assert.deepEqual(nav("file:///Users/u/ref/web/p.png"), { t: "ref", abs: "/Users/u/ref/web/p.png" });
+  assert.deepEqual(nav("file:///Users/u/ref/a/../papers/b.PDF"), { t: "ref", abs: "/Users/u/ref/papers/b.PDF" });
+  assert.deepEqual(nav("file:///Users/u/ref/notes/n.md"), { t: "open", abs: "/Users/u/ref/notes/n.md" }, "md は索引が無い = ホストの open");
   assert.deepEqual(nav("file:///Users/u/other/a.pdf"), { t: "open", abs: "/Users/u/other/a.pdf" }, "参照フォルダの外");
-  assert.deepEqual(nav("file:///Users/u/kb/.git/a.pdf"), { t: "open", abs: "/Users/u/kb/.git/a.pdf" }, "隠しの区画");
-  assert.deepEqual(nav("file:///Users/u/kb2/a.pdf"), { t: "open", abs: "/Users/u/kb2/a.pdf" }, "接頭辞だけ一致");
-  assert.deepEqual(nav("file:///Users/u/kb"), { t: "open", abs: "/Users/u/kb" }, "フォルダそのもの");
+  assert.deepEqual(nav("file:///Users/u/ref/.git/a.pdf"), { t: "open", abs: "/Users/u/ref/.git/a.pdf" }, "隠しの区画");
+  assert.deepEqual(nav("file:///Users/u/ref2/a.pdf"), { t: "open", abs: "/Users/u/ref2/a.pdf" }, "接頭辞だけ一致");
+  assert.deepEqual(nav("file:///Users/u/ref"), { t: "open", abs: "/Users/u/ref" }, "フォルダそのもの");
   assert.deepEqual(nav("file:///vault/a.pdf"), { t: "page", path: "a.pdf", heading: null }, "vault の中は page");
-  assert.deepEqual(classifyDest("file:///Users/u/kb/a.pdf", { ...ctx, refs: undefined }, new Map()), { t: "open", abs: "/Users/u/kb/a.pdf" }, "参照フォルダなし");
+  assert.deepEqual(classifyDest("file:///Users/u/ref/a.pdf", { ...ctx, refs: undefined }, new Map()), { t: "open", abs: "/Users/u/ref/a.pdf" }, "参照フォルダなし");
   // 参照フォルダのページ（root = そのフォルダ）の中の相対リンクは root 相対の page（WikiPage が絶対に戻す）
-  const inRef = { ...ctx, root: "/Users/u/kb", path: "posts/x/view.html", kind: "html" };
-  assert.deepEqual(classifyDest("../y/view.html", inRef, new Map()), { t: "page", path: "posts/y/view.html", heading: null });
+  const inRef = { ...ctx, root: "/Users/u/ref", path: "site/x/view.html", kind: "html" };
+  assert.deepEqual(classifyDest("../y/view.html", inRef, new Map()), { t: "page", path: "site/y/view.html", heading: null });
   // 描いた <a> から ref を読み戻せる
-  const frag = purify(win, renderMarkdown("[p](file:///Users/u/kb/journals/a.pdf)"));
+  const frag = purify(win, renderMarkdown("[p](file:///Users/u/ref/papers/a.pdf)"));
   finish(frag, ctx);
   const a = frag.querySelector("a");
-  assert.equal(a.getAttribute("data-wk-ref"), "/Users/u/kb/journals/a.pdf");
+  assert.equal(a.getAttribute("data-wk-ref"), "/Users/u/ref/papers/a.pdf");
   assert.ok(a.classList.contains("wk-l-ref"));
 }
 

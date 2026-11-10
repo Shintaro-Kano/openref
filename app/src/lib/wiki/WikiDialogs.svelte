@@ -5,7 +5,7 @@
   import { t } from "../i18n.svelte";
   import { composing, focusMe, onEnter } from "../input";
   import { answerDiscard, openWikiPage, pickRoot, switchWorkspace, wk, workspaceList, workspaceName } from "./wiki.svelte";
-  import { askNewFolder, askNewPage, askRename, askTrash, createFolder, createPage, doRename, doTrash, editingUnder, folderNameProblem, nameProblem, pageExt, pagesUnder, previewRename, type PageExt } from "./files.svelte";
+  import { askNewFolder, askNewPage, askRename, askTrash, createFolder, createPage, doRename, doTrash, duplicateFile, editingUnder, folderNameProblem, nameProblem, pageExt, pagesUnder, previewRename, type PageExt } from "./files.svelte";
   import { addRefDir } from "./refdirs.svelte";
   import { editText } from "./edit.svelte";
   import { baseName } from "./render/asset";
@@ -115,6 +115,7 @@
       <button role="menuitem" onclick={() => ((wk.menu = null), void addRefDir())}>{t("参照フォルダ（読み取り専用）を追加…")}</button>
     {:else if m.kind === "file"}
       <button role="menuitem" onclick={() => askRename(m.path)}>{t("名前を変更…")}</button>
+      <button role="menuitem" onclick={() => void duplicateFile(m.path)}>{t("複製する")}</button>
       <button role="menuitem" class="wk-menu-danger" onclick={() => askTrash(m.path)}>{t("ゴミ箱に移す…")}</button>
     {:else}
       {#if m.kind === "dir"}<div class="wk-menu-head" title={m.path}>{baseName(m.path)}/</div>{/if}

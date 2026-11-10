@@ -19,13 +19,18 @@ pub type Map = serde_json::Map<String, Value>;
 /// 設定の値 → Map。未設定・空白は空。JSON の object でなければ Err（BadInput = 黙って空にしない。壊れた値の退避は GUI の仕事）。
 /// 値が object でない項目・鍵が空白の項目は捨てる
 pub fn parse(v: Option<&str>) -> Result<Map> {
+    parse_for(KEY, v)
+}
+
+/// parse の本体。key = エラー文に出す設定の鍵（本棚の履歴 `shelf_workspaces` も同じ形 = crate::shelf が共用する）
+pub fn parse_for(key: &str, v: Option<&str>) -> Result<Map> {
     let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(Map::new());
     };
     match serde_json::from_str::<Value>(s) {
         Ok(Value::Object(m)) => Ok(m.into_iter().filter(|(k, v)| v.is_object() && !k.trim().is_empty()).collect()),
-        Ok(_) => Err(CoreError::BadInput(format!("設定 {KEY} を解釈できません（JSON の object ではありません）"))),
-        Err(e) => Err(CoreError::BadInput(format!("設定 {KEY} を解釈できません（JSON の object ではありません）: {e}"))),
+        Ok(_) => Err(CoreError::BadInput(format!("設定 {key} を解釈できません（JSON の object ではありません）"))),
+        Err(e) => Err(CoreError::BadInput(format!("設定 {key} を解釈できません（JSON の object ではありません）: {e}"))),
     }
 }
 
@@ -169,6 +174,20 @@ mod tests {
         order(m).into_iter().map(|(r, _)| r).collect()
     }
 
+    /// parse_for: エラー文の鍵だけが違う（parse = wiki_workspaces の文のまま・共用しても wiki 側の文は変わらない）
+    #[test]
+    fn parse_for_names_the_key_in_the_error() {
+        for raw in ["not json", "[1]"] {
+            let wiki = parse(Some(raw)).unwrap_err().to_string();
+            let other = parse_for("shelf_workspaces", Some(raw)).unwrap_err().to_string();
+            assert!(wiki.contains("設定 wiki_workspaces を解釈できません"), "{wiki}");
+            assert!(other.contains("設定 shelf_workspaces を解釈できません") && !other.contains("wiki_workspaces"), "{other}");
+            assert_eq!(wiki.replace("wiki_workspaces", "shelf_workspaces"), other);
+        }
+        let raw = r#"{"/a": {"last_used": 1}, "/b": 3}"#;
+        assert_eq!(parse_for("shelf_workspaces", Some(raw)).unwrap(), parse(Some(raw)).unwrap());
+    }
+
     /// 未設定・空白は空・壊れた JSON / object でない値は Err・object でない項目と空白の鍵は捨てる
     #[test]
     fn parse_rules() {
@@ -258,9 +277,9 @@ mod tests {
         assert!(!m.contains_key("/v/kb"));
         assert_eq!(m["/v/other"], json!({"last_used": 7}), "他の root は触らない");
         // to が無い = from の中身をそのまま（last_used が大きい方 = from の値）
-        let mut m = map(json!({"/v/kb/": {"last_used": 9, "ref_dirs": ["/ref"]}}));
-        assert!(rekey(&mut m, "/v/kb/", "/v/kb"));
-        assert_eq!(m, map(json!({"/v/kb": {"last_used": 9, "ref_dirs": ["/ref"]}})));
+        let mut m = map(json!({"/v/ref/": {"last_used": 9, "ref_dirs": ["/ref"]}}));
+        assert!(rekey(&mut m, "/v/ref/", "/v/ref"));
+        assert_eq!(m, map(json!({"/v/ref": {"last_used": 9, "ref_dirs": ["/ref"]}})));
         // from の last_used の方が新しい・どちらにも ref_dirs が無い = ref_dirs を作らない
         let mut m = map(json!({"/a": {"last_used": 90}, "/b": {"last_used": 10}}));
         assert!(rekey(&mut m, "/a", "/b"));

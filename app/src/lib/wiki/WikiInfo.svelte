@@ -10,9 +10,6 @@
   import { addRefDir, removeRefDir } from "./refdirs.svelte";
   import type { WikiBacklink } from "./types";
 
-  /** embedded = 右ペインのタブ（WikiRight）の中 = 外枠の線と大きさはタブの側が持つ */
-  let { embedded = false }: { embedded?: boolean } = $props();
-
   const page = $derived(wk.page);
   /** ホームのワークスペースの節（wiki_status.workspaces・新しい順） */
   const workspaces = $derived(workspaceList());
@@ -116,7 +113,7 @@
   }
 </script>
 
-<aside class="wk-info" class:wk-info-in={embedded}>
+<aside class="wk-info">
   {#if !page}
     <div class="wk-sec">
       <h3>OpenNote</h3>
@@ -238,7 +235,6 @@
 
 <style>
   .wk-info { border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; padding: 12px 14px; min-width: 0; }
-  .wk-info.wk-info-in { border-left: 0; flex: 1; min-height: 0; }
   .wk-sec { margin-bottom: 16px; }
   .wk-sec h3 {
     margin: 0 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; color: var(--dim);

@@ -1390,7 +1390,6 @@ mod tests {
     fn test_st() -> Arc<St> {
         Arc::new(St {
             db: Mutex::new(Db::open_in_memory().unwrap()),
-            sessions: Mutex::new(Default::default()),
         })
     }
 

@@ -33,7 +33,7 @@
   import noteIconUrl from "pdfjs-dist/web/images/annotation-note.svg?url";
   import "pdfjs-dist/web/pdf_viewer.css"; // v6: textLayer は公式 CSS + --total-scale-factor が前提
   import { api, type AnnotationRow, type AnnotationPatch } from "./api";
-  import { app, toast, type TabViewer } from "./state.svelte";
+  import { app, showViewerSide, toast, toggleViewerSide, type TabViewer } from "./state.svelte";
   import { composing } from "./input";
   import Toolbar from "./viewer/Toolbar.svelte";
   import SearchPanel from "./viewer/SearchPanel.svelte";
@@ -42,8 +42,7 @@
   import OutlineTab from "./viewer/OutlineTab.svelte";
   import ThumbnailsTab from "./viewer/ThumbnailsTab.svelte";
   import AnnotationCard from "./viewer/AnnotationCard.svelte";
-  import WikiChat from "./wiki/WikiChat.svelte";
-  import { chat, chatShown, setFloat, setViewerSelection } from "./wiki/chat.svelte";
+  import { followItemSelection } from "./viewing.svelte";
   import { embeddedComments, inertMarkup, type EmbeddedComment } from "./viewer/embedded";
   import {
     normText,
@@ -81,6 +80,9 @@
   } from "./viewer/util";
 
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+  // pdf.js の補助データ（scripts/copy-pdf-assets.mjs が public/pdfjs/ へ写す）。無いと JBIG2 / CCITT の画像・埋め込みなしの CID フォントの字が黙って消える。
+  // getDocument の useWorkerFetch: false = 本番の既定（tauri:// は pdf.js が worker から読めない URL と見なす）を dev の http:// でも同じにする。false の間 ICC の色は使わない（iccUrl は読まれない）
+  const pdfAsset = (dir: string) => new URL(`/pdfjs/${dir}/`, location.href).href;
 
   /** PDF タブ: viewer = このタブの PDF・front = 前面のタブ（隠れている間はキーを取らず、描画もしない。
       名前は描画帯の Set `active` と分ける）・onClose = タブを閉じる（× / Esc。最後の 1 枚ならビューアだけ閉じる） */
@@ -113,18 +115,12 @@
   let editColor = $state("yellow");
   let editComment = $state("");
 
-  // chat = OpenNote のチャット（OpenNote とチャットが有効なときだけ）。右ペインの WikiChat と同じ会話で、文脈はこの文献（+ 選択）
-  let sideTab = $state<"search" | "annotations" | "outline" | "pages" | "chat">("annotations");
-  const chatTab = $derived(chatShown());
-  $effect(() => {
-    if (!chatTab && sideTab === "chat") sideTab = "annotations";
-  });
-  // 本文の選択（selInfo = 4 字以上・mouseup で確定）をチャットの文脈に（前面のタブだけ）。selInfo はスクロール / Esc / 注釈の保存でも
-  // 消えるので、消えても文脈は残す（外すのは × か送信か別の元へ移ったとき = ページの選択と同じ寿命）
-  $effect(() => {
-    const text = selInfo?.text ?? null;
-    if (front && chatTab && text) untrack(() => setViewerSelection(itemKey, text));
-  });
+  // 右バーのタブ。右バーそのものの開閉は app.viewerSideOpen（全 PDF タブで共通・ui_viewer_side・ツールバーの右端のボタン / ⌘⌥I）。
+  // 閉じている間もタブの選択は覚えておく。チャットはアプリ右端の柱（ChatDock）= ここには置かない
+  let sideTab = $state<"search" | "annotations" | "outline" | "pages">("annotations");
+  // 本文の選択（selInfo = 4 字以上・mouseup で確定）を見ている物の選択に（前面のタブだけ・読み手がいるときだけ = viewing.svelte の effect）。
+  // selInfo はスクロール / Esc / 注釈の保存でも消えるので、消えても選択は残す（外すのは × か送信か別の元へ移ったとき = ページの選択と同じ寿命）
+  followItemSelection(itemKey, () => front, () => selInfo?.text ?? null);
   let sideDoc = $state<any>(null); // load 後の doc をタブ（目次/ページ）へ橋渡し（反応駆動用）
   let pagesWrap = $state<HTMLDivElement | null>(null); // ポップオーバー配置の基準
 
@@ -141,6 +137,15 @@
   let searchHits = $state<SearchHit[]>([]); // サイドバー一覧（matches と同順）
   let searchPending = $state(false); // 入力中（デバウンス / prefetch 待ち）
   let searchPanel = $state<{ focusInput: () => void } | null>(null); // SearchPanel インスタンス（⌘F でフォーカス）
+  let sideEl = $state<HTMLElement | null>(null); // 右バー（aside.v-side）。閉じると null
+  // 右バーを閉じる（ボタン・⌘⌥I）とき、その中に focus があれば本文（.pages）へ移す = body へ落とさない（Space / ↑↓ のスクロールを保つ）。
+  // $effect.pre = aside が DOM から外れる前に focus の在りかを見る。前面のビューアだけ（隠れたビューアは focus を持たない）
+  $effect.pre(() => {
+    if (app.viewerSideOpen) return;
+    untrack(() => {
+      if (front && sideEl && sideEl.contains(document.activeElement)) void tick().then(() => container?.focus({ preventScroll: true }));
+    });
+  });
   let annQuery = $state(""); // 注釈タブの検索語（quote / コメントに部分一致・大小無視）
   // 絞り込みとカードの強調は同じ matchParts（util.ts）= 一致の有無と <mark> の断片が食い違わない
   const filteredAnns = $derived(anns.filter((a) => matchParts(a.quote ?? "", annQuery) || matchParts(a.comment ?? "", annQuery)));
@@ -214,7 +219,7 @@
       anns = a;
       const buf = await api.attachmentData(attachmentId); // ArrayBuffer（base64 / atob を経由しない）
       if (disposed) return; // 読込中にタブを閉じた（unmount 済み）
-      loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf), enableXfa:false }); // pdf.js は data を worker へ transfer する（この後は使わない）
+      loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf), enableXfa:false, cMapUrl: pdfAsset("cmaps"), standardFontDataUrl: pdfAsset("standard_fonts"), wasmUrl: pdfAsset("wasm"), iccUrl: pdfAsset("iccs"), useWorkerFetch: false }); // pdf.js は data を worker へ transfer する（この後は使わない）
       const d = await loadingTask.promise;
       if (disposed) return; // 開く間に閉じた（unmount の後始末が loadingTask を destroy 済み）
       doc = d;
@@ -1347,13 +1352,15 @@
     }
     void runSearch("");
   }
-  /** ⌘F / ツールバー ⌕: サイドバーの検索タブを開いて入力欄にフォーカス */
+  /** サイドバーの検索タブを開いて入力欄にフォーカス。右バーを閉じていれば開く（検索欄は右バーの中 = 目的地） */
   function openSearch() {
+    showViewerSide();
     sideTab = "search";
     void tick().then(() => searchPanel?.focusInput());
   }
+  /** ⌘F / ツールバー ⌕: 検索タブが見えていれば注釈へ戻す・見えていなければ（右バーを閉じている・別のタブ）開く。右バーが開いている間は従来どおり */
   function toggleSearch() {
-    if (sideTab === "search") sideTab = "annotations";
+    if (app.viewerSideOpen && sideTab === "search") sideTab = "annotations";
     else openSearch();
   }
 
@@ -1612,9 +1619,10 @@
         cancelSelection(); // 選択ポップオーバーを閉じる（ビューアは閉じない）
       } else if (inField) {
         el!.blur(); // 入力中の Esc はフォーカスを外すだけ（ビューアは閉じない）
-      } else if (editingKey) {
+      } else if (editingKey && app.viewerSideOpen) {
         // 注釈カード編集中（フォーカスが編集コントロール外でも）: 編集キャンセルのみ。
-        // WebKit はボタンクリックでフォーカスを与えないため、✎ 直後の Esc はここに来る
+        // WebKit はボタンクリックでフォーカスを与えないため、✎ 直後の Esc はここに来る。
+        // 右バーを閉じている間はカードが見えない = 取消に Esc を使わない（開き直せば編集の続き）
         e.preventDefault();
         cancelAnnotationEdit();
       } else {
@@ -1789,13 +1797,15 @@
         mode={zoomMode}
         page={currentPage}
         {pageCount}
-        searchOpen={sideTab === "search"}
+        searchOpen={app.viewerSideOpen && sideTab === "search"}
+        sideOpen={app.viewerSideOpen}
         onZoomIn={() => zoomStep(1)}
         onZoomOut={() => zoomStep(-1)}
         onSetMode={setMode}
         onRotate={rotate}
         onGoto={gotoPage}
         onToggleSearch={toggleSearch}
+        onToggleSide={toggleViewerSide}
       />
     {/if}
 
@@ -1832,7 +1842,8 @@
           {/if}
         {/if}
       </div>
-      <aside class="v-side">
+      {#if app.viewerSideOpen}
+      <aside class="v-side" bind:this={sideEl}>
         <div class="side-tabs">
           <button class:active={sideTab === "search"} title={t("文書内検索 (⌘F)")} onclick={openSearch}>
             {t("検索")}{#if searchHits.length} <span class="dim">{searchHits.length}</span>{/if}
@@ -1846,11 +1857,6 @@
           <button class:active={sideTab === "pages"} onclick={() => (sideTab = "pages")}>
             {t("ページ::thumbnails")}
           </button>
-          {#if chatTab}
-            <button class:active={sideTab === "chat"} onclick={() => ((sideTab = "chat"), (chat.focusPending = true))}>
-              {t("チャット")}{#if chat.status?.state === "busy"} <span class="dim">●</span>{/if}
-            </button>
-          {/if}
         </div>
 
         {#if sideTab === "search"}
@@ -1918,19 +1924,11 @@
           </div>
         {:else if sideTab === "outline"}
           <OutlineTab doc={sideDoc} onJump={gotoPage} />
-        {:else if sideTab === "chat" && chatTab}
-          {#if chat.float}
-            <div class="wk-floated">
-              <p>{t("チャットは浮かせたパネルに表示中です")}</p>
-              <button class="wk-floated-btn" onclick={() => setFloat(null)}>{t("ここに戻す")}</button>
-            </div>
-          {:else}
-            <WikiChat />
-          {/if}
         {:else}
           <ThumbnailsTab doc={sideDoc} {pageCount} {currentPage} {baseSizes} onJump={gotoPage} />
         {/if}
       </aside>
+      {/if}
     </div>
   </div>
 </div>

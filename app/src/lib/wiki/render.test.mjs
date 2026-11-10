@@ -119,9 +119,9 @@ let tests = 0;
     assert.ok(linkAllowed(ok), ok);
   }
   for (const ng of ["javascript:alert(1)", "vbscript:x", "data:text/html,x", "tel:1", "ftp://x", "chrome://x"]) assert.ok(!linkAllowed(ng), ng);
-  // KB の file:// がリンクになる（既定の validateLink は拒否する）
-  const { box } = render("[教科書](file:///Users/me/kb/raw/神経内科疾患の画像診断.pdf)");
-  assert.deepEqual(navOf(box.querySelector("a")), { t: "open", abs: "/Users/me/kb/raw/神経内科疾患の画像診断.pdf" });
+  // 参照フォルダの file:// がリンクになる（既定の validateLink は拒否する）
+  const { box } = render("[教科書](file:///Users/me/ref/raw/和文の教科書.pdf)");
+  assert.deepEqual(navOf(box.querySelector("a")), { t: "open", abs: "/Users/me/ref/raw/和文の教科書.pdf" });
   assert.deepEqual(parseOpenref("openref://open?key=K%20X"), { key: "K X", page: null, att: null });
   assert.ok(ALLOWED_TAGS.includes("details") && !ALLOWED_TAGS.includes("input"));
   tests++;
@@ -184,8 +184,8 @@ let tests = 0;
 {
   assert.equal(assetUrl("/Users/me/vault/a.png"), "asset://localhost//Users/me/vault/a.png");
   assert.equal(
-    assetUrl("/Users/me/KB コピー/画像: 1#2?3%4.png"),
-    "asset://localhost//Users/me/KB%20%E3%82%B3%E3%83%94%E3%83%BC/%E7%94%BB%E5%83%8F%3A%201%232%3F3%254.png",
+    assetUrl("/Users/me/参考 コピー/画像: 1#2?3%4.png"),
+    "asset://localhost//Users/me/%E5%8F%82%E8%80%83%20%E3%82%B3%E3%83%94%E3%83%BC/%E7%94%BB%E5%83%8F%3A%201%232%3F3%254.png",
   );
   // 区画ごとに decode すると元の絶対パスに戻る（asset.rs は先頭 1 byte を落として decode）
   const p = "/Users/me/和文 : #?%/x y.mp4";
@@ -718,7 +718,7 @@ function shadowRender(md) {
     assert.equal(el?.textContent ?? null, ok ? text.trim() : null, `anchorTarget: ${tag}`);
     if (ok) assert.equal(el.id, h.id, `着地の id: ${tag}`);
   }
-  // 監査の組そのもの: keepSection("A B") ⇔ 見出し「A: B」の節（本文が残り、次の見出しは消える）
+  // 代表的な組: keepSection("A B") ⇔ 見出し「A: B」の節（本文が残り、次の見出しは消える）
   {
     const frag = purify(win, renderMarkdown("# 表題\n\n## A: B\n\n節の本文\n\n## C\n\n別"));
     finish(frag, ctx({ nested: true }));

@@ -5,7 +5,7 @@
      リンクのクリックは shadow root で横取りして onNavigate に（WebView には遷移させない）。`![[ページ]]` は readPage で 1 段だけ埋める
      （読んだページは世代 wk.embedGen（索引の変更と GUI の保存の成功で進む）の間だけ覚える = 分割のプレビューが入力の一時停止ごとに描き直しても IPC は世代に 1 回）。
      描画の時間の計測（performance.measure "wk-render <path>"・初回の描画（次のフレーム）まで = "wk-paint <path>"）は旗 `window.__wkMeasure = true`
-     のときだけ残す（既定は切る = User Timing の項目が描画のたびに溜まり続けない。受入の計測は Inspector で旗を立ててから） */
+     のときだけ残す（既定は切る = User Timing の項目が描画のたびに溜まり続けない。計測は Inspector で旗を立ててから） */
   import { onDestroy, untrack } from "svelte";
   import type { WikiNav, WikiPageData, WikiViewProps } from "../types";
   import { t } from "../../i18n.svelte";

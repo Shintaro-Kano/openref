@@ -152,7 +152,7 @@ export interface WikiHeading {
 export type WikiNav =
   | { kind: "page"; path: string; heading?: string }   // vault 内のページ・media（新規タブは newTab）
   | { kind: "item"; key: string; page?: number; att?: string } // openref://open?key=…
-  | { kind: "external"; url: string }                    // http(s) → wiki_open_url（設定で別窓 / 外部ブラウザ）・mailto → open_external
+  | { kind: "external"; url: string }                    // http(s) → wiki_open_url（既定のブラウザ）・mailto → open_external
   | { kind: "open"; abs: string }                        // ホストの open に渡すファイル（vault 外の file:// を含む・安全の判定は wiki_open_path）
   | { kind: "ref"; abs: string };                        // 参照フォルダの中の pdf / html / 画像 / 動画 / 音声 = 内蔵の表示で開く（wiki_read_ref）
 
@@ -212,6 +212,9 @@ export interface WikiRenameResult {
   index_error?: string;
 }
 
+/** wiki_duplicate {path} → 同じフォルダに複製(`<名前> 1.<拡張子>`・あれば 2, 3 …)。フォルダは拒否 */
+export interface WikiDuplicateResult { path: string; index_error?: string }
+
 /** wiki_trash {path, dir?} → macOS のゴミ箱へ(Finder の「戻す」が効く方式)。dir = 期待する形(true = フォルダを中身ごと・false = ファイル・違えば移さない)。
     結果の dir / files(. 始まりと symlink を除く中のファイル数)はフォルダのとき */
 export interface WikiTrashResult { path: string; method?: string; dir?: boolean; files?: number; index_error?: string }
@@ -222,12 +225,12 @@ export interface WikiSaveBlobResult { path: string; embed: string }
 /** wiki_import_file {abs, page?} → OS ドロップの PDF / 動画 / 画像を vault へコピー(attachments/<YYYY-MM>/)。vault 内のファイルならコピーせずそのまま */
 export interface WikiImportResult { path: string; embed: string; copied: boolean }
 
-// ---- チャットの契約: Rust（子プロセスと GUI 専用 command）と右ペインのチャット画面の受け渡し ----
+// ---- チャットの契約: Rust（子プロセスと GUI 専用 command）とチャットの画面（画面右端の柱 ChatDock）の受け渡し ----
 // すべて GUI から invoke(name, { args: {...} })。エラーは文字列(画面に出す)。
 // 子プロセス = Claude Code CLI(stream-json)。OpenRef は LLM を呼ばず、会話本文も持たない(本文は ~/.claude/projects/)。
 
 /** wiki_chat_status {force?} → 使えるか。enabled = 設定 wiki_chat_enabled(Wiki が有効なときだけ true になりうる)。
- *  **無効なら何も調べずに返す**(claude の検出・`claude auth status` を起動しない = 原則 1)。cli / version / logged_in / mcp は null。
+ *  **無効なら何も調べずに返す**(claude の検出・`claude auth status` を起動しない)。cli / version / logged_in / mcp は null。
  *  `claude auth status` は 30 秒覚える(右ペインの mount・exit ごとに起こさない)。force: true(画面の [再確認])・login / logout・有効 / 無効の切替で捨てる */
 export interface WikiChatStatus {
   enabled: boolean;
@@ -272,7 +275,7 @@ export interface WikiChatAuth { logged_in: boolean; method: string | null; email
 export interface WikiChatStartResult { session_id: string; resumed: boolean; notice?: string }
 
 /** 発言に添える文脈(user が外せる)。path = 今開いているページ(vault 相対・参照フォルダなら絶対)・selection = 選択範囲の本文・
- *  item / title = PDF のタブ(内蔵の PDF viewer のチャット)で開いている文献の key と題名(path と排他 = 前面のタブで決まる) */
+ *  item / title = PDF のタブ(内蔵の PDF viewer のチャット)で開いている文献・一覧のタブで選んでいる文献の key と題名(path と排他 = 前面のタブで決まる) */
 export interface WikiChatContext { path?: string; selection?: string; item?: string; title?: string }
 
 /** wiki_chat_start は返る前に session_id を wiki-chat.json に保存し(以後の wiki_chat_status は必ずそれを返す)、state(idle か、失敗なら off)を出す。画面も返った後に wiki_chat_status を読み直す */

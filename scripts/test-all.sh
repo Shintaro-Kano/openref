@@ -26,6 +26,8 @@ run "svelte-check" npm --prefix app run --silent check
 # PdfViewer の純関数・PDF 埋め込み注釈の無害化(XSS の防壁)・英語辞書の網羅・参照エディタの CSL ⇄ フォーム値
 run "viewer util" node app/src/lib/viewer/util.test.mjs
 run "viewer embedded" node app/src/lib/viewer/embedded.test.mjs
+# PDF ビューアの右バーの開閉(実部品 PdfViewer + jsdom・pdf.js は偽物): ボタン / 既定は開 / 閉じた状態の ⌘F・⌕ で開いて検索欄へ / 隠れたビューアは開かない
+run "viewer side" node app/src/lib/viewer/side.test.mjs
 run "i18n" node app/src/lib/i18n.test.mjs
 # フォルダ・ラベルの名前順 / 件数順の比較関数(core の COLLATE NOCASE と同じ並び)
 run "sort" node app/src/lib/sort.test.mjs
@@ -40,8 +42,16 @@ run "wiki links" node app/src/lib/wiki/links.test.mjs
 run "wiki mediaview" node app/src/lib/wiki/mediaview.test.mjs
 # OpenNote の編集(実部品 + 実 CodeMirror + jsdom・invoke は差し替え): 自動保存の debounce・conflict の分岐・外部の書換え・caret への挿入・保存に失敗したまま閉じない・PICK_EXT = core の media_kind
 run "wiki edit" node app/src/lib/wiki/edit.test.mjs
-# OpenNote のチャット(実部品 + jsdom・invoke と event "wiki-chat" は差し替え): stream-json の reducer・送信と文脈・変更の一覧と元に戻す・診断と異常終了・OFF でタブなし
-run "wiki chat" node app/src/lib/wiki/chat.test.mjs
+# OpenNote のチャット(実部品 + jsdom・invoke と event "wiki-chat" は差し替え): stream-json の reducer・送信と文脈・変更の一覧と元に戻す・診断と異常終了・右端の柱(ChatDock)= OFF でボタンなし・幅とつまみ
+run "wiki chat" node app/src/lib/chat/chat.test.mjs
+# App の組立て(実部品 App.svelte + jsdom): 一覧の右ペインの開閉(2 列・ListToolbar のボタン・⌘⌥I の振り分け)・行の選択で開かない・reveal は行を見せる・チャットの入力欄の Esc・PDF のタブ
+run "app shell" node app/src/lib/app.test.mjs
+# 本棚: 純関数(検索 NFKC + AND・並び・dir の索引・上限つきの設定・asset の区間)と組立て(実部品 App.svelte + jsdom): 見出しのメニュー・タブの永続と復元・⌘N / ⌘A / Esc / `/` / ドロップの遮断・表紙と温め。
+# range = 読み手の読み方(偽の fetch): 1 区間の上限を Rust の MAX_LEN と結ぶ・素の GET を出さない・no-store・同時 16・閉じた後は呼ばない
+run "shelf tree" node app/src/lib/shelf/tree.test.mjs
+run "shelf" node app/src/lib/shelf/shelf.test.mjs
+run "shelf range" node app/src/lib/shelf/range.test.mjs
+run "shelf viewer" node app/src/lib/shelf/viewer.test.mjs
 # IME ガード(実部品 + jsdom): かなの確定 Enter・取消 Esc(isComposing / keyCode 229)をページ内検索・検索欄・window の Esc・モーダルが拾わない
 run "wiki ime" node app/src/lib/wiki/ime.test.mjs
 # エラーの契約(実部品 wiki.svelte.ts + jsdom): wiki_run の {"code","message"} を ipc.ts が解き、画面は code(rebuilding / bad_query)で分岐・欄と toast は message
@@ -64,6 +74,10 @@ for f in site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-
 done
 run "install desktop-mcp" /bin/bash scripts/test-install-desktop-mcp.sh   # /bin/bash 3.2 = curl | bash の利用者が使う bash
 run "licenses" python3 scripts/check-licenses.py
+# pdf.js の補助データ(cmaps / standard_fonts / wasm / iccs)を写せるか = pdfjs-dist の配置が変わったらここで止まる
+run "pdf assets" node scripts/copy-pdf-assets.mjs
+# 任意の追加検査(ファイルが無ければ飛ばす)
+if [ -f scripts/dev-checks.sh ]; then run "dev checks" bash scripts/dev-checks.sh; fi
 
 echo
 if [ ${#FAILED[@]} -gt 0 ]; then

@@ -19,8 +19,8 @@
 //   + errors ["[ede_diagnostic] …"]・user の行に tool_use_result（道具ごとの生の結果）が付く（使わない）
 // 画面の文言（日本語）はここに置かない: note は code で持ち、文は WikiChat が t() で組む
 
-import type { WikiChatChange, WikiChatContext } from "./types";
-import { wikiLinksOf } from "./render/md.ts";
+import type { WikiChatChange, WikiChatContext } from "../wiki/types";
+import { wikiLinksOf } from "../wiki/render/md.ts";
 
 export type ChatEntry =
   | { k: "user"; id: string; turn: number | null; text: string; ctx?: WikiChatContext }
@@ -512,18 +512,31 @@ export function codePoints(s: string): number {
   return n;
 }
 
-// ---- 浮かせたパネル（WikiChatFloat）の幾何 ----
+// ---- チャットの柱（ChatDock）の開閉と幅 = ui_chat_dock ----
 
-export type ChatFloat = { x: number; y: number; w: number; h: number };
-export const FLOAT_MIN_W = 320;
-export const FLOAT_MIN_H = 260;
+/** 柱の開閉と幅（px）。既定 = 閉・380 */
+export type ChatDockPref = { open: boolean; w: number };
+export const DOCK_W = 380;
+export const DOCK_MIN_W = 320;
 
-/** 浮かせたパネルを窓の中に収める（全体が窓の中 = 入力欄と右下の角が外に出ない。大きさは窓まで・最小 320×260）。
-    vw / vh = 窓の大きさ（呼び手が window.innerWidth / innerHeight を渡す = ここは window に触らない） */
-export function clampFloat(f: ChatFloat, vw: number, vh: number): ChatFloat {
-  const w = Math.max(FLOAT_MIN_W, Math.min(Math.round(f.w), vw));
-  const h = Math.max(FLOAT_MIN_H, Math.min(Math.round(f.h), vh));
-  const x = Math.max(0, Math.min(Math.round(f.x), vw - w));
-  const y = Math.max(0, Math.min(Math.round(f.y), vh - h));
-  return { x, y, w, h };
+/** 柱の幅を 320〜窓幅の半分に収める（窓が狭く半分が 320 を割るなら 320）。vw = 窓の幅（呼び手が window.innerWidth を渡す = ここは window に触らない） */
+export function clampDockW(w: number, vw: number): number {
+  const n = Number.isFinite(w) ? Math.round(w) : DOCK_W;
+  return Math.max(DOCK_MIN_W, Math.min(n, Math.floor(vw / 2)));
+}
+
+/** ui_chat_dock（JSON）を読む。形の違う値・壊れた JSON は既定（閉・380）。幅は収めない（表示のときに窓に合わせて収める = 覚えた値は残す） */
+export function parseDockPref(v: string | null): ChatDockPref {
+  const d = { open: false, w: DOCK_W };
+  if (!v) return d;
+  try {
+    const o = JSON.parse(v);
+    if (!o || typeof o !== "object") return d;
+    return {
+      open: o.open === true,
+      w: typeof o.w === "number" && Number.isFinite(o.w) && o.w > 0 ? Math.round(o.w) : DOCK_W,
+    };
+  } catch {
+    return d;
+  }
 }

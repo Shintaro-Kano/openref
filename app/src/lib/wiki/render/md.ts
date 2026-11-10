@@ -6,7 +6,7 @@
      wikiClose / splitWikiInner / scanWikiText を sanitize（HTML ブロックの文字列）と chat の chatLinks（wikiLinksOf）が共用する
    - callout `> [!type] title`（`[!type]-` / `[!type]+` = 折畳）→ <div class="wk-callout"> か <details class="wk-callout">
    - `[toc]` だけの段落 → <div class="wk-toc" data-wk-toc>（見出しの一覧は finish が id を付けた後に埋める）
-   - validateLink を差し替え（既定は file: と画像以外の data: を拒否 = KB の file:// がリンクにならない）。normalizeLink は恒等
+   - validateLink を差し替え（既定は file: と画像以外の data: を拒否 = 参照フォルダの file:// がリンクにならない）。normalizeLink は恒等
      （href に書かれたままの dest を残し、finish が core と同じ target で page.links を引く） */
 import markdownIt, { type MarkdownIt, type Token } from "markdown-it";
 import footnote from "markdown-it-footnote";

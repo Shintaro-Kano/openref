@@ -4,14 +4,17 @@
      タブ本体は div role="tab"（× を中に置くと <button> の入れ子 = Svelte 5 のコンパイルエラー・tab の子は支援技術から見えない）、
      × は兄弟の button を重ねる。tablist が持つのはタブだけ（× は aria-hidden のマウス用・キーは ⌘W、＋ は tablist の外）。
      クリック = 切替 / ← → Home End = 隣・端へ / 中クリック = 閉じる / 空きのダブルクリック・＋ = 新しいタブ（すべて）。
-     最後の 1 枚は × を出さない（PDF タブなら出す = ビューアだけ閉じる）。題名は id から引く（viewTitle）。検索語・チップは題名に
+     最後の 1 枚は × を出さない（PDF / Wiki / 本棚のタブなら出す = 中身だけ閉じる）。題名は id から引く（viewTitle）。検索語・チップは題名に
      足さず tooltip に出す。PDF タブは文書のアイコン + 論文の題名（tooltip は題名の全文）。
      並べ替え = タブを掴んで左右へドラッグ（pointer イベントで自作 = onTabDown。HTML5 の D&D は Tauri の dragDropEnabled と競合する）。
+     右端 = チャットの柱（ChatDock）の開閉ボタン（⌘⌥C と同じ・チャットが出せるときだけ・応答中は点）。空きのダブルクリックはボタンの上では効かない。
      class は tabs- 接頭辞（tb- は viewer のツールバーが使用中） */
   import { tick } from "svelte";
   import LabelBadge from "./LabelBadge.svelte";
   import { app, activateTab, closeTab, moveTab, openTabInMode, tabView, viewTitle, type Tab, type View } from "./state.svelte";
   import { wikiTabTitle, wikiTabWorkspace } from "./wiki/wiki.svelte";
+  import { chat, chatShown, toggleDock } from "./chat/chat.svelte";
+  import { shelfTabTitle } from "./shelf/shelf.svelte";
 
   let listEl = $state<HTMLDivElement | null>(null);
   /** 並べ替えで掴んでいるタブの id と、見た目のずれ（配列上の枠の左端から px。transform で指に追わせる） */
@@ -227,7 +230,15 @@
           role="tab"
           tabindex={front ? 0 : -1}
           aria-selected={front}
-          title={tab.viewer ? tab.viewer.title : tab.wiki && app.wikiOn ? wikiTip(tab.wiki) : tip(tab, v)}
+          title={tab.viewer
+            ? tab.viewer.title
+            : tab.shelfBook
+              ? `${tab.shelfBook.title}\n${tab.shelfBook.root}`
+              : tab.shelf
+                ? `${shelfTabTitle(tab.shelf)}\n${tab.shelf.root}`
+                : tab.wiki && app.wikiOn
+                  ? wikiTip(tab.wiki)
+                  : tip(tab, v)}
           onpointerdown={(e) => onTabDown(e, tab.id)}
           onclick={(e) => {
             if (e.button === 0) void activateTab(tab.id);
@@ -259,6 +270,18 @@
                   stroke-linejoin="round" /></svg>
             </span>
             <span class="tabs-title">{wikiTabTitle(tab.wiki)}</span>
+          {:else if tab.shelf || tab.shelfBook}
+            <!-- 本棚 = 本棚名（すべての本）/ フォルダ名・読み手 = 本の題名 -->
+            <span class="tabs-ico" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="13" height="13"
+                ><path
+                  d="M2.5 3h2.6v10H2.5zM6.4 3H9v10H6.4zM10.3 3.6l2.5-.7 2.4 9.6-2.5.7z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.2"
+                  stroke-linejoin="round" /></svg>
+            </span>
+            <span class="tabs-title">{tab.shelfBook ? tab.shelfBook.title : tab.shelf ? shelfTabTitle(tab.shelf) : ""}</span>
           {:else if v.kind === "tag"}
             {@const tv = v}
             <LabelBadge name={viewTitle(tv)} color={app.tags.find((x) => x.id === tv.id)?.color ?? null} />
@@ -295,7 +318,7 @@
             <span class="tabs-title">{viewTitle(v)}</span>
           {/if}
         </div>
-        {#if app.tabs.length > 1 || tab.viewer || (tab.wiki && app.wikiOn)}
+        {#if app.tabs.length > 1 || tab.viewer || tab.shelf || tab.shelfBook || (tab.wiki && app.wikiOn)}
           <button
             class="tabs-x"
             tabindex="-1"
@@ -310,4 +333,22 @@
     {/each}
   </div>
   <button class="tabs-new" title={t("新しいタブ（⌘T）")} aria-label={t("新しいタブ")} onclick={() => void openTabInMode()}>{t("＋")}</button>
+  {#if chatShown()}
+    <button
+      class="tabs-chat"
+      class:tabs-chat-on={chat.dock.open}
+      aria-pressed={chat.dock.open}
+      title={t("チャット（⌘⌥C）")}
+      aria-label={t("チャット（⌘⌥C）")}
+      onclick={toggleDock}>
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"
+        ><path
+          d="M2.5 3.6c0-.66.54-1.2 1.2-1.2h8.6c.66 0 1.2.54 1.2 1.2v6c0 .66-.54 1.2-1.2 1.2H7.2l-2.9 2.4v-2.4h-.6c-.66 0-1.2-.54-1.2-1.2z"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.2"
+          stroke-linejoin="round" /></svg>
+      {#if chat.status?.state === "busy"}<span class="tabs-chat-dot" aria-hidden="true"></span>{/if}
+    </button>
+  {/if}
 </div>

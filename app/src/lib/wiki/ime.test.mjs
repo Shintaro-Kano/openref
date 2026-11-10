@@ -215,10 +215,10 @@ handlers.wiki_search = () => ({ hits: [], total: 0 });
 // ---- ⑤ window の Esc で閉じるモーダル ----
 {
   const E = await import("./edit.svelte.ts");
-  const C = await import("./chat.svelte.ts");
+  const C = await import("../chat/chat.svelte.ts");
   const { default: WikiConflict } = await import("./WikiConflict.svelte");
   const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
-  const { default: WikiChatConsent } = await import("./WikiChatConsent.svelte");
+  const { default: WikiChatConsent } = await import("../chat/ChatConsent.svelte");
   handlers.wiki_chat_set_enabled = () => null;
   const cases = [
     // [名前, 部品, 開く, 開いているか]

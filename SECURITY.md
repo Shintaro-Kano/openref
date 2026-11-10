@@ -15,11 +15,11 @@ OpenRef は「文献データをユーザーの Mac ローカルに保持し、A
 
 ## 2. ローカル待受デーモン (`openref-connectd`) の境界
 
-ブラウザ拡張（OpenRef Capture / Zotero Connector）および OpenRef for Word（Word の Startup テンプレート `OpenRef.dotm` と `OpenRef Dialog.app`）との連携用デーモン `openref-connectd` は、**ループバックアドレス（`127.0.0.1`）のみ**にバインドします。
+ブラウザ拡張（OpenRef Capture）および OpenRef for Word（Word の Startup テンプレート `OpenRef.dotm` と `OpenRef Dialog.app`）との連携用デーモン `openref-connectd` は、**ループバックアドレス（`127.0.0.1`）のみ**にバインドします。
 
 | ポート | プロトコル | 用途 | バインド先 |
 |---|---|---|---|
-| `23119` | HTTP | Chrome 拡張（OpenRef Capture / Zotero Connector 互換）からの書誌・PDF 受領 | `127.0.0.1:23119` |
+| `23119` | HTTP | Chrome 拡張（OpenRef Capture）からの書誌・PDF 受領（`/capture/*`。Zotero Connector 互換の `/connector/*` は 3.0.0 で外し、要求には 404 を返します） | `127.0.0.1:23119` |
 | `23120` | HTTPS | OpenRef for Word（`OpenRef.dotm` / `OpenRef Dialog.app`）の引用整形・参考文献一覧・検索ダイアログの API（`/word/v2/*`） | `127.0.0.1:23120` |
 
 - LAN や外部ネットワークからは到達不能です。
@@ -108,11 +108,10 @@ AI エージェントに蔵書操作を委譲する `openref-mcp` は、誤操�
    - **ふるまいは Claude Code をターミナルで普通に使うときと同じです**: 組み込みの道具（Read / Edit / Write / Bash / Web…）を確認なしで使い（`--permission-mode bypassPermissions`）、利用者の Claude Code の設定（`~/.claude/` の settings・hooks・plugins・memory）と `CLAUDE.md`（ワークスペースの root と、その親・利用者のもの）を読みます。ワークスペースの中に限る制限はありません。MCP だけは `--strict-mcp-config` で `openref-mcp`（アプリと同じ DB・蔵書と OpenNote の全コマンド）に限ります。ページや PDF の中の指示の文に従わないことは ワークスペースの `CLAUDE.md` の規則に委ねます（無ければ OpenRef が既定の文を置き、利用者が編集します）。
    - `openref-mcp` の `call` で書くときは、初回の書込の前に DB の写し（`backup/pre-chat-<日時>.sqlite`・上の 2）を作ります。`wiki_write` / `wiki_move` で書いたページは上書き前の内容が `wiki-history/` に退避され、チャットの [元に戻す] で戻せます（その後に利用者が編集したファイル・Edit / Write / Bash で直接変えたファイルは戻しません）。
    - **会話のログ（既定 ON・Settings › OpenNote › チャットのログを chat-log/ に残す で OFF）**: 発言・Claude の応答・使った道具の要点・変えたファイルの一覧を ワークスペースの `chat-log/<日時> <最初の発言>.md` に追記します（発言に添えた選択範囲の本文も含みます）。ワークスペースの中なので OpenNote の索引に入り、以後のチャットで Claude が読めます。原本は Claude Code の `~/.claude/projects/` で、OFF にしても既に書いたファイルは残ります（不要なら削除してください）。
-   - 内蔵の PDF ビューアの [チャット] タブは同じ会話で、開いている文献の key と題名・選択した本文を発言に添えます。
-5. **OpenRef / OpenNote の参照フォルダと URL の窓（任意）**:
+   - チャットは画面右端の 1 か所（タブ列の右端のボタン・⌘⌥C）で、どのタブでも同じ会話です。前面の物（OpenNote のページの path・PDF のタブや一覧の文献の key と題名・選択した本文）を発言に添えます（× で外せます）。
+5. **OpenRef / OpenNote の参照フォルダと URL（任意）**:
    - 参照フォルダ（右ペインの home で追加・読み取り専用）の下の pdf / html / 画像 / 動画 / 音声は、ワークスペースと同じく asset protocol の配信範囲に加えて内蔵の表示で開きます（md と他の種類は OS の既定アプリ）。配信範囲の追加は OpenRef の再起動まで取り消せません（外した直後は内蔵で開くのだけ止まります）。索引・検索・MCP・編集の範囲は広がりません。
-   - 「リンク（URL）を OpenRef の窓で開く」（既定 OFF）を ON にすると、OpenNote のページの http(s) リンクを OpenRef の別窓（WKWebView）で開きます。この窓には OpenRef の API（Tauri の capabilities）を与えず、http(s) 以外への遷移とダウンロードを拒否します。ワークスペースと参照フォルダを配信する `asset://` は OpenRef 自身が配信し、要求元がメインの窓でなければ 403 を返します（別窓に読み込んだ外部ページからは読めません）。Cookie はブラウザと別で、ページの内容は通常のブラウザと同じくそのサイトへ送られます。
-   - この窓のページから**カメラ / マイクは使えません**: 利用者の Mac で実測したところ、ページの `navigator.mediaDevices` は未定義で `getUserMedia` は呼べず、OS の許可ダイアログも出ません（OpenRef はカメラ / マイクの利用目的を Info.plist に宣言していません）。将来この窓でカメラ / マイクを使えるようにする予定はなく、WebView 側で明示的に拒否する実装（Tauri 2.12 以降の許可ハンドラ）は公開後の課題として記録しています。
+   - OpenNote のページの http(s) リンクは OS の既定のブラウザで開きます（http(s) 以外は拒否します）。OpenRef の中に Web ページを表示する窓は 3.0.0 で外しました。ワークスペースと参照フォルダを配信する `asset://` は OpenRef 自身が配信し、要求元がメインの窓でなければ 403 を返します。
 
 ---
 

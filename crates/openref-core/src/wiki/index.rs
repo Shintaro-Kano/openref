@@ -13,7 +13,7 @@
 //! - `meta.root` が違えば中身を捨てる。`meta.schema` が違えば表を作り直す（版 2 = 全文検索 pages_fts を足した）
 //! - 全文検索 `pages_fts(title, body)` は FTS5 の **contentless**（`content=''`・`contentless_delete=1`）。両列とも
 //!   `model::cjk_spaced`（和文は 1 字 1 トークン・英数はそのまま）で入れ、問い合わせ側も同じ変換の phrase にする（蔵書の
-//!   items_fts / fulltext_fts と同じ方式）。本文の写しを索引に持たない（KB の wiki 93MB で 311MB → 54MB）ので、抜粋は
+//!   items_fts / fulltext_fts と同じ方式）。本文の写しを索引に持たない（93MB の wiki で 311MB → 54MB）ので、抜粋は
 //!   結果のファイルを読み直して作る（`snippet`）
 
 use super::links::{LinkKind, Resolver};
@@ -1268,16 +1268,16 @@ mod tests {
     #[test]
     fn index_path_per_workspace() {
         let app = Path::new("/app");
-        let a = index_path(app, Path::new("/Users/u/Documents/kb"));
-        assert_eq!(a, index_path(app, Path::new("/Users/u/Documents/kb")), "決定的");
+        let a = index_path(app, Path::new("/Users/u/Documents/ref"));
+        assert_eq!(a, index_path(app, Path::new("/Users/u/Documents/ref")), "決定的");
         assert_eq!(a.parent().unwrap(), Path::new("/app/wiki-index"));
         let name = a.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(name.len(), 16 + ".sqlite".len(), "{name}");
         assert!(name.ends_with(".sqlite") && name[..16].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{name}");
-        assert_eq!(name[..16], sha256_hex(b"/Users/u/Documents/kb")[..16]);
+        assert_eq!(name[..16], sha256_hex(b"/Users/u/Documents/ref")[..16]);
         let b = index_path(app, Path::new("/Users/u/Documents/blog"));
         assert_ne!(a, b, "別の root は別のファイル");
-        assert_ne!(a, index_path(app, Path::new("/Users/u/Documents/kb/")), "文字列が違えば別（root は canonical で来る）");
+        assert_ne!(a, index_path(app, Path::new("/Users/u/Documents/ref/")), "文字列が違えば別（root は canonical で来る）");
         let nfc = "/Users/u/マイドライブ/wiki";
         let nfd: String = nfc.nfd().collect();
         assert_ne!(nfd, nfc);

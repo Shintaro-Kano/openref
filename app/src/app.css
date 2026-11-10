@@ -123,11 +123,23 @@ header {
   color: var(--dim); font-size: 15px; line-height: 1;
 }
 .tabs-new:hover { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); color: var(--text); }
+/* チャットの柱の開閉（タブ列の右端・TabStrip）。応答中は右上に点 */
+.tabs-chat {
+  position: relative; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 26px; margin: 0 0 1px auto; border-radius: 6px; color: var(--dim);
+}
+.tabs-chat:hover { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); color: var(--text); }
+.tabs-chat.tabs-chat-on { background: var(--panel); color: var(--accent); }
+.tabs-chat-dot { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+/* タブの中身（.tabs-page）とチャットの柱（ChatDock = .cd）の横の並び。柱は常に全幅が窓の中 = 縮むのは .tabs-page
+   （min-width: 0・はみ出しは .tabs-page の中で切る = 窓の最小幅 900 で柱を開いても柱が右へ押し出されない。
+   clip = スクロールの箱を作らない = 中の scrollIntoView が .tabs-page をずらさない） */
+.dock-row { flex: 1; min-height: 0; display: flex; }
 /* タブの中身（ヘッダー + main + PDF ビューア）。PDF タブのビューア（.viewer-overlay）はこの全面を覆う */
-.tabs-page { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.tabs-page { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: clip; display: flex; flex-direction: column; }
 
 main { display: grid; grid-template-columns: 230px minmax(360px, 1fr) 380px; flex: 1; min-height: 0; }
-main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* OpenNote の右ペインを隠したとき */
+main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360px, 1fr); } /* 右ペインを隠したとき（OpenNote / 一覧） */
 
 /* ---------- sidebar ---------- */
 .sidebar {
@@ -180,7 +192,7 @@ main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* Open
 /* 左余白・グループ間隔: マスタ ☑ 群 left 24px・フォルダ群 74px・★群 279.2px
    （☑ の ▾ を外した分だけ左へずれている。群の間隔は +7px） */
 .listbar {
-  display: flex; align-items: center; gap: 10px; flex: none;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; flex: none; /* 狭い窓では折り返す = 右端の開閉ボタンを詳細の下に隠さない */
   padding: 6px 10px 6px 24px; border-bottom: 1px solid var(--border); background: var(--panel); font-size: 12px;
 }
 .listbar > .lb-group:nth-of-type(2) { margin-left: 7px; }
@@ -201,9 +213,18 @@ main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* Open
 .lb-star.on { color: var(--star); }
 .lb-checkbtn { padding: 0 6px; }
 .lb-checkbtn .cb { margin-top: 0; }
-.lb-spacer { flex: 1; }
-.lb-count { color: var(--dim); white-space: nowrap; }
+.lb-tail { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px 10px; margin-left: auto; }
+.lb-count { color: var(--dim); white-space: nowrap; min-width: 11em; text-align: right; } /* 「· 1 選択」の幅も取っておく = 行を選んでツールバーが折り返して行がずれない */
 .lb-count b { color: var(--accent); font-weight: 600; }
+/* 右ペインの開閉（OpenNote のヘッダーの .wk-head-pane と同じ絵） */
+.lb-pane {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 24px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--accent);
+}
+.lb-pane:hover { border-color: var(--accent); }
+.lb-pane-off { color: var(--dim); }
+.lb-pane-fill { opacity: 0.35; }
+.lb-pane-off .lb-pane-fill { opacity: 0; }
 /* クラス名は lb- 接頭辞で統一（app.css は単一グローバルで素のクラス名は他の部品と衝突する。
    ラベルのピッカーの .picker を共用すると bottom: 指定が混入し、高さ 0 の透明な箱になる） */
 .lb-pop {
@@ -237,6 +258,9 @@ main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* Open
 .lb-pop .lb-empty { color: var(--dim); padding: 6px 8px; font-size: 12px; }
 .lb-pop .lb-sep { height: 1px; background: var(--border); margin: 5px 4px; }
 .lb-pop.lb-menu kbd.lb-style-name { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 並びのメニュー: ボタンは右寄り = 左へ開く（右へ開くと一覧の列の外で切られる） */
+.lb-pop.lb-sort-pop { left: auto; right: 0; min-width: 150px; }
+.lb-pop.lb-menu .lb-sort-on, .lb-pop.lb-menu .lb-sort-on kbd { color: var(--accent); }
 .row .star { color: var(--star); }
 .row .meta { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .meta .year { font-size: 11px; }
@@ -253,6 +277,7 @@ main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* Open
 .row .ft-hl { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--text); border-radius: 2px; padding: 0 1px; }
 .row .pdf { font-size: 10px; color: var(--accent); border: 1px solid currentColor; border-radius: 4px; padding: 1px 3px; height: fit-content; justify-self: end; }
 .row .pdf:empty { border: none; }
+.row button.pdf:hover { background: var(--accent); border-color: var(--accent); color: #fff; } /* 行の hover も --accent-soft = 同じ色では見えない */
 .row .badges { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; justify-self: end; }
 .row .note {
   font-size: 10px; color: var(--star); border: 1px solid currentColor; border-radius: 4px; padding: 1px 3px;
@@ -773,6 +798,11 @@ main.wk-main-noinfo { grid-template-columns: 230px minmax(360px, 1fr); } /* Open
 }
 .tb-pagesep { color: var(--dim); }
 .tb-spacer { flex: 1; }
+/* PDF ビューアの右バーの開閉（Toolbar・一覧の右ペインの開閉 .lb-pane と同じ絵: 開 = 右の帯を塗る・閉 = 枠だけで薄く） */
+.tb-pane { color: var(--accent); }
+.tb-pane-off { color: var(--dim); }
+.tb-pane-fill { opacity: 0.35; }
+.tb-pane-off .tb-pane-fill { opacity: 0; }
 
 /* ---------- サイドバー「検索」タブ（sr-・SearchPanel.svelte・Paperpile の Search document 相当） ---------- */
 .sr-panel { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
@@ -1014,8 +1044,3 @@ body.dragging { user-select: none; -webkit-user-select: none; cursor: grabbing; 
   font-size: 18px; color: var(--accent); font-weight: 600; pointer-events: none;
 }
 
-/* OpenNote のチャットを浮かせている間の案内（右ペイン WikiRight と PDF viewer の右バーの両方で使う = ここに置く） */
-.wk-floated { padding: 16px 12px; font-size: 12.5px; color: var(--dim); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
-.wk-floated p { margin: 0; }
-.wk-floated-btn { border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; background: var(--bg); font-size: 11.5px; cursor: pointer; color: var(--text); }
-.wk-floated-btn:hover { border-color: var(--accent); }

@@ -101,6 +101,13 @@ enum Cmd {
         #[command(subcommand)]
         action: WikiAction,
     },
+    /// 本棚の登録表のコマンドを呼ぶ（shelf_status / shelf_list / shelf_set_opts。MCP の call と同じ検査・同じ関数・結果は JSON。開く / 外すは GUI だけ）
+    Call {
+        /// コマンド名（shelf_* だけ）
+        name: String,
+        /// 引数の JSON（例: '{"root": "/path", "collapse_single": true}'）。省略 = {}
+        args: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -495,7 +502,22 @@ fn main() -> anyhow::Result<()> {
         Cmd::Cutover { action } => cmd_cutover(&db, action)?,
         Cmd::Style { action } => cmd_style(&db, action)?,
         Cmd::Wiki { action } => cmd_wiki(&mut db, action)?,
+        Cmd::Call { name, args } => cmd_call(&mut db, &name, args.as_deref())?,
     }
+    Ok(())
+}
+
+/// `openref call`（本棚の設定の書込の道）。他の動詞は既存のサブコマンドが正 = `shelf_*` だけ通す
+fn cmd_call(db: &mut Db, name: &str, args: Option<&str>) -> anyhow::Result<()> {
+    if !name.starts_with("shelf_") {
+        bail!("openref call は shelf_* だけ受けます（他は各サブコマンドか MCP の call）: {name}");
+    }
+    let a: serde_json::Value = match args {
+        Some(s) => serde_json::from_str(s).with_context(|| format!("引数を JSON として読めません: {s}"))?,
+        None => serde_json::json!({}),
+    };
+    let v = openref_core::commands::call(db, name, &a)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 

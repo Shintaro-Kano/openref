@@ -48,6 +48,21 @@ pub fn detect_or_create() -> Option<PathBuf> {
     candidates.into_iter().find(|p| std::fs::create_dir_all(p.join("All Papers")).is_ok())
 }
 
+/// 今の保存先 = 新しい添付の書込先（Settings › PDF の保存先 › 保存先のフォルダを Finder で開く）。書かずに分かる範囲で
+/// `edit::attach_auto_with_md5` の mode と mount の振り分けに揃える: `mode` が `"drive"` で `mount`（`detect()` の結果）があれば mount の
+/// `All Papers`（まだ無ければ mount そのもの）、それ以外は managed の `<app_dir>/storage`（最初の PDF を書くまで無い = まだ無ければ `app_dir`）。
+/// 2 つ目の値 = degraded: drive なのに mount が無い = 新しい PDF は managed へ降格して書かれる（呼び手がその事実を見せる）。
+/// 見ないもの: 書込の失敗で降格する経路（connectd の捕獲は別プロセスの判定）・drive でも storage/ へ置く移行のコピー
+pub fn storage_folder(mode: &str, app_dir: &Path, mount: Option<&Path>) -> (PathBuf, bool) {
+    let drive = mode == "drive";
+    if let (true, Some(m)) = (drive, mount) {
+        let all_papers = m.join("All Papers");
+        return (if all_papers.is_dir() { all_papers } else { m.to_path_buf() }, false);
+    }
+    let storage = app_dir.join("storage");
+    (if storage.is_dir() { storage } else { app_dir.to_path_buf() }, drive)
+}
+
 /// `attachments` の `mode` ごとの件数（`"managed"` / `"linked"`）。
 pub fn count_attachments_by_mode(db: &Db, mode: &str) -> Result<i64> {
     Ok(db.conn.query_row("SELECT COUNT(*) FROM attachments WHERE mode = ?1", [mode], |r| r.get(0))?)
@@ -319,6 +334,46 @@ mod tests {
                 .unwrap();
         }
         db
+    }
+
+    /// managed（と不明な mode = edit の振り分けと同じ）は `<app_dir>/storage`・mount があっても見ない・storage が無い間は app_dir
+    #[test]
+    fn storage_folder_managed() {
+        let app = scratch("sf-managed");
+        let mount = scratch("sf-managed-mount");
+        assert_eq!(storage_folder("managed", &app, None), (app.clone(), false), "最初の PDF の前は app_dir");
+        std::fs::create_dir(app.join("storage")).unwrap();
+        for mode in ["managed", "", "cloud"] {
+            assert_eq!(storage_folder(mode, &app, Some(&mount)), (app.join("storage"), false), "mode = {mode:?}");
+        }
+    }
+
+    /// drive + mount = mount の `All Papers`（storage があっても見ない）
+    #[test]
+    fn storage_folder_drive() {
+        let app = scratch("sf-drive");
+        let mount = scratch("sf-drive-mount");
+        std::fs::create_dir(app.join("storage")).unwrap();
+        std::fs::create_dir(mount.join("All Papers")).unwrap();
+        assert_eq!(storage_folder("drive", &app, Some(&mount)), (mount.join("All Papers"), false));
+    }
+
+    /// drive なのに mount が無い = managed へ降格して書かれる = storage と degraded（storage が無い間は app_dir）
+    #[test]
+    fn storage_folder_drive_without_mount_is_degraded() {
+        let app = scratch("sf-degraded");
+        assert_eq!(storage_folder("drive", &app, None), (app.clone(), true));
+        std::fs::create_dir(app.join("storage")).unwrap();
+        assert_eq!(storage_folder("drive", &app, None), (app.join("storage"), true));
+    }
+
+    /// mount に `All Papers` がまだ無い = mount そのもの（読むだけ・作らない）
+    #[test]
+    fn storage_folder_mount_without_all_papers() {
+        let app = scratch("sf-noap");
+        let mount = scratch("sf-noap-mount");
+        assert_eq!(storage_folder("drive", &app, Some(&mount)), (mount.clone(), false));
+        assert!(!mount.join("All Papers").exists());
     }
 
     /// 全件 linked・各行の指す先に原本と同じ中身・Drive 側に誰も指さないファイル（孤児・一時ファイル）が無い

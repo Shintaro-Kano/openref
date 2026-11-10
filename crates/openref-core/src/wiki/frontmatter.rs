@@ -550,14 +550,14 @@ mod tests {
 
     #[test]
     fn block_lists_nested_maps_and_flow_maps() {
-        let f = p("aliases:\n  - a\n  - \"b\"\ntags:\n- x\n- y\nsources:\n  - {id: RG-0081, resource: journals/a b/04.md, layer: T}\n  - id: GZ-1\n    layer: T\ngenerated:\n  by: claude/legacy\n  at: 2026-07-04\n  deep:\n    k: [1, 2]\n");
+        let f = p("aliases:\n  - a\n  - \"b\"\ntags:\n- x\n- y\nsources:\n  - {id: SRC-0081, resource: refs/a b/04.md, layer: T}\n  - id: SRC-1\n    layer: T\ngenerated:\n  by: script/v1\n  at: 2026-07-04\n  deep:\n    k: [1, 2]\n");
         assert_eq!(f.get("aliases"), Some(&json!(["a", "b"])));
         assert_eq!(f.get("tags"), Some(&json!(["x", "y"])));
         assert_eq!(
             f.get("sources"),
-            Some(&json!([{"id": "RG-0081", "resource": "journals/a b/04.md", "layer": "T"}, {"id": "GZ-1", "layer": "T"}]))
+            Some(&json!([{"id": "SRC-0081", "resource": "refs/a b/04.md", "layer": "T"}, {"id": "SRC-1", "layer": "T"}]))
         );
-        assert_eq!(f.get("generated"), Some(&json!({"by": "claude/legacy", "at": "2026-07-04", "deep": {"k": [1, 2]}})));
+        assert_eq!(f.get("generated"), Some(&json!({"by": "script/v1", "at": "2026-07-04", "deep": {"k": [1, 2]}})));
         assert_eq!(f.raw_count(), 0);
         let keys: Vec<&str> = f.fields.iter().map(|x| x.key.as_str()).collect();
         assert_eq!(keys, ["aliases", "tags", "sources", "generated"], "原文の順");

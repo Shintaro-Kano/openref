@@ -3,7 +3,8 @@
 // wiki_chat_undo / wiki_chat_set_model / wiki_chat_auth / wiki_chat_stop（invoke(name, { args })。stop は別のワークスペースの会話を替えるときだけ）・
 // Tauri event "wiki-chat"（line / stderr / state / changes / exit）と "wiki-chat-consent"。
 // stream-json の解釈は chat.ts の reduceChat（純粋）。OpenRef は会話本文を保存しない（この画面の表示は起動の間だけ）。
-// - チャットが無効（status.enabled = false）の間は右ペインにタブを出さない（原則 1）・子プロセスも起こさない（初回の送信で起こす）
+// - 面はアプリ右端の柱 1 本（ChatDock・開閉 = タブ列右端のボタン / ⌘⌥C・ui_chat_dock）。中身は WikiChat 1 つ
+// - チャットが無効（status.enabled = false）の間は柱もボタンも出さない・子プロセスも起こさない（初回の送信で起こす）
 // - Wiki が無効の間は event を積まない・invoke しない
 // - 自動で起こし直さない（異常終了は知らせるだけ = 利用枠の嵐を作らない）
 // - ワークスペース: 子は 1 本・起こした root に縛られる（start / send に前面の root）。会話の root（chat.root）と前面の root
@@ -13,13 +14,13 @@
 //   [元に戻す] に出るのは wiki_write / wiki_move の変更だけ
 
 import { untrack } from "svelte";
-import { invoke } from "./ipc";
+import { invoke } from "../wiki/ipc";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "../i18n.svelte";
 import { api } from "../api";
-import { app, frontViewer, frontWiki, toast } from "../state.svelte";
-import { clampFloat, clipSelection, emptyConv, FLOAT_MIN_H, reduceChat, type ChatFloat, type ChatInput, type Conv } from "./chat";
-import { inPage, selectionText } from "./selection";
+import { app, toast } from "../state.svelte";
+import { clampDockW, clipSelection, DOCK_W, emptyConv, parseDockPref, reduceChat, type ChatDockPref, type ChatInput, type Conv } from "./chat";
+import { clearViewingSelection, setViewingSelection, setViewingWanted, viewing, viewingKey, viewingSource } from "../viewing.svelte";
 import type {
   WikiChatChange,
   WikiChatContext,
@@ -29,8 +30,8 @@ import type {
   WikiChatState,
   WikiChatStatus,
   WikiChatUndoResult,
-} from "./types";
-import { shownRoot, wk } from "./wiki.svelte";
+} from "../wiki/types";
+import { shownRoot } from "../wiki/wiki.svelte";
 
 /** 診断（stderr）に持つ行数・1 行の長さの上限（古い行から捨てる・長い行は切る） */
 export const STDERR_MAX = 300;
@@ -44,9 +45,9 @@ export const chat = $state({
   model: null as string | null,
   /** wiki_chat_status の呼び出し自体の失敗（画面に出す） */
   statusError: null as string | null,
-  /** 右ペインのタブ（ui_wiki_right_tab = "chat" で覚える） */
-  tab: "info" as "info" | "chat",
-  /** タブを押してチャットを開いた = 入力欄へ明示 focus する（WikiChat が mount の後でも拾う。WKWebView は autofocus が効かない） */
+  /** 柱（ChatDock）の開閉と幅（ui_chat_dock = JSON で覚える。どのタブ種でも共通） */
+  dock: { open: false, w: DOCK_W } as ChatDockPref,
+  /** 柱を開いた = 入力欄へ明示 focus する（WikiChat が mount の後でも拾う。WKWebView は autofocus が効かない） */
   focusPending: false,
   conv: emptyConv() as Conv,
   /** 今の会話の id（event の session_id と違えば別の会話 = 表示を新しくする） */
@@ -71,53 +72,44 @@ export const chat = $state({
   error: null as string | null,
   /** 起動の知らせ（resume に失敗して新しい会話にした等 = Rust の notice） */
   notice: null as string | null,
-  /** 文脈から外した元（× を押した sourceKey = ページの path か `item:<key>`。元が変われば戻る） */
+  /** 文脈から外した元（× を押した viewingKey = ページの path か `item:<key>`。元が変われば戻る）。選択範囲は viewing.sel（viewing.svelte.ts） */
   ctxOff: null as string | null,
-  /** 文脈に添える選択範囲（中央のページ / エディタ / PDF viewer で最後に選んだもの）。path = その元の sourceKey */
-  sel: null as { path: string; text: string } | null,
   /** 新しい会話の確認中 */
   confirmNew: false,
   /** Settings の [チャット] を ON にする前の説明（event wiki-chat-consent） */
   consent: false,
-  /** 浮かせたパネル（アプリの窓の中で動かせる・大きさも変えられる）。null = 右ペイン / PDF の右バーの中。ui_wiki_chat_float で覚える */
-  float: null as ChatFloat | null,
 });
 
-/** 初期の位置 = 右下寄り */
-export function defaultFloat(): ChatFloat {
-  const w = 440;
-  const h = Math.min(640, Math.max(FLOAT_MIN_H, window.innerHeight - 120));
-  return clampFloat({ x: window.innerWidth - w - 24, y: 72, w, h }, window.innerWidth, window.innerHeight);
+function saveDock() {
+  api.setUiPref("ui_chat_dock", JSON.stringify(chat.dock)).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
 }
 
-/** 浮かせる / 戻す（null）/ 動かした後の位置を覚える（ui_wiki_chat_float = JSON・戻したら ""）。focus は floatChat だけが移す
-    （動かすたびにエディタから入力欄へ focus を奪わない） */
-export function setFloat(f: ChatFloat | null) {
-  floatTouched = true;
-  chat.float = f ? clampFloat(f, window.innerWidth, window.innerHeight) : null;
-  api.setUiPref("ui_wiki_chat_float", chat.float ? JSON.stringify(chat.float) : "").catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
+/** 柱を開く / 閉じる（覚える）。開いたら入力欄へ明示 focus（focusPending = 柱の WikiChat が mount の後に受ける） */
+export function setDockOpen(open: boolean) {
+  dockOpenTouched = true;
+  chat.dock = { ...chat.dock, open };
+  if (open) chat.focusPending = true;
+  saveDock();
 }
 
-export function floatChat() {
-  setFloat(chat.float ?? defaultFloat());
-  chat.focusPending = true;
+/** 柱の開閉（タブ列右端のボタン・⌘⌥C） */
+export function toggleDock() {
+  setDockOpen(!chat.dock.open);
 }
 
-function parseFloatPref(v: string | null): ChatFloat | null {
-  if (!v) return null;
-  try {
-    const o = JSON.parse(v);
-    const n = (k: string) => (typeof o?.[k] === "number" && Number.isFinite(o[k]) ? o[k] : null);
-    const x = n("x"), y = n("y"), w = n("w"), h = n("h");
-    return x == null || y == null || w == null || h == null ? null : clampFloat({ x, y, w, h }, window.innerWidth, window.innerHeight);
-  } catch {
-    return null;
-  }
+/** 柱の幅を確定する（つまみを離したとき 1 回だけ = 動かしている間は呼ばない）。320〜窓幅の半分に収めて覚える */
+export function setDockWidth(w: number) {
+  dockWTouched = true;
+  const nw = clampDockW(w, window.innerWidth);
+  if (nw === chat.dock.w) return;
+  chat.dock = { ...chat.dock, w: nw };
+  saveDock();
 }
 
 let prefsLoaded = false;
-let tabTouched = false;
-let floatTouched = false;
+/** 読込が返る前に user が開閉 / 幅を変えた = その値は読んだ値で上書きしない（開閉と幅は別々 = 先に開いても覚えていた幅は戻す） */
+let dockOpenTouched = false;
+let dockWTouched = false;
 /** 前の子プロセスを止める新しい会話を始めた時刻（その後 EXPECT_EXIT_MS の exit は知らせない）。0 = なし */
 let expectExitAt = 0;
 /** 最後に知らせた状態の読込の失敗（同じ文を toast で繰り返さない） */
@@ -140,7 +132,7 @@ export function usable(s: WikiChatStatus | null = chat.status): boolean {
   return !!s && s.enabled && !!s.cli && s.logged_in !== false && !!s.mcp;
 }
 
-/** チャットのタブを出すか（Wiki が有効・チャットが有効） */
+/** チャットの柱とボタンを出すか（Wiki が有効・チャットが有効） */
 export function chatShown(): boolean {
   return app.wikiOn && !!chat.status?.enabled;
 }
@@ -158,7 +150,7 @@ export function chatHidden(): boolean {
   return chat.conv.entries.length > 0 || (!!chat.status && chat.status.state !== "off");
 }
 
-/** 状態を読み直す（右ペインを開いた・state / exit・wiki-state・start の後）。失敗は toast と画面に出し、無効として扱う（タブを出さない）。
+/** 状態を読み直す（柱を開いた・柱が開いたまま前面のタブが変わった・state / exit・wiki-state・start の後）。失敗は toast と画面に出し、無効として扱う（柱を出さない）。
     force = 画面の [再確認]（Rust が覚えた claude auth status を捨てて読む）。自動の読み直しは force なし = Rust は 30 秒の間 auth status を起こさない */
 export async function loadChatStatus(opts: { force?: boolean } = {}) {
   if (!app.wikiOn) {
@@ -175,7 +167,7 @@ export async function loadChatStatus(opts: { force?: boolean } = {}) {
     chat.status = stamp !== stateStamp && chat.status ? { ...s, state: chat.status.state } : s;
     chat.statusError = null;
     lastStatusError = null;
-    if (s.enabled) void loadTabPref();
+    if (s.enabled) void loadDockPref();
     // 子がいる = その root の会話（session_id は子の物）。子がいない = session_id は設定の root（= 前面）の保存済みの会話 =
     // 隠している別の root の会話とは比べない（タブの行き来で消さない = 戻れば見える）
     if (typeof s.root === "string" && s.root) chat.root = s.root;
@@ -197,27 +189,29 @@ export async function loadChatStatus(opts: { force?: boolean } = {}) {
     statusLoading--;
   }
 }
-/** 読み中の数（WikiRight の mount が起動時の読みと重ならないように。R16 = 読みの入れ替わりは statusSeq が守る） */
+/** 読み中の数（柱を開いたときの読み直しが起動時の読みと重ならないように。読みの入れ替わりは statusSeq が守る） */
 let statusLoading = 0;
 export function statusInFlight(): boolean {
   return statusLoading > 0;
 }
 
-async function loadTabPref() {
+/** 柱の開閉と幅を読む（チャットが有効と分かったとき 1 回。旧キー ui_wiki_right_tab / ui_lib_right_tab / ui_wiki_chat_float は読まない） */
+async function loadDockPref() {
   if (prefsLoaded) return;
   prefsLoaded = true;
   try {
-    const [v, f] = await Promise.all([api.getUiPref("ui_wiki_right_tab"), api.getUiPref("ui_wiki_chat_float")]);
-    if (!tabTouched) chat.tab = v === "chat" ? "chat" : "info";
-    if (!floatTouched) chat.float = parseFloatPref(f);
+    const p = parseDockPref(await api.getUiPref("ui_chat_dock"));
+    chat.dock = { open: dockOpenTouched ? chat.dock.open : p.open, w: dockWTouched ? chat.dock.w : p.w };
+    // 読みの前に触った = その時に書いた値は読んだ側（幅など）を知らない = 合わせた値を書き直す
+    if (dockOpenTouched || dockWTouched) saveDock();
   } catch (e) {
     prefsLoaded = false;
     toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
   }
 }
 
-/** 立っている focusPending を el（WikiChat の入力欄）で受ける = focus して消費する。見えていない el（隠れた PDF タブの WikiChat =
-    visibility:hidden のまま mount され続ける）は消費しない = 見えている方に残す。focus が移らなかったときも消費しない。
+/** 立っている focusPending を el（WikiChat の入力欄）で受ける = focus して消費する。見えていない el は消費しない = 見えたときに受ける
+    （面は柱 1 つだが、明示の focus は残す = WKWebView は autofocus が効かない）。focus が移らなかったときも消費しない。
     見えているが disabled（使えない = 未ログイン等）なら focus せずに消費する（残すと、使えるようになった後の mount のし直しで
     エディタ等から focus を奪う） */
 export function claimFocus(el: HTMLElement): boolean {
@@ -231,14 +225,6 @@ export function claimFocus(el: HTMLElement): boolean {
   if (document.activeElement !== el) return false;
   chat.focusPending = false;
   return true;
-}
-
-/** 右ペインのタブの切替（覚える） */
-export function setTab(tab: "info" | "chat") {
-  tabTouched = true;
-  chat.tab = tab;
-  if (tab === "chat") chat.focusPending = true;
-  api.setUiPref("ui_wiki_right_tab", tab).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
 }
 
 /** 表示を新しい会話にする（本文は Claude Code が持つ = ここでは捨てるだけ） */
@@ -274,28 +260,10 @@ async function start(fresh: boolean, root: string | null = shownRoot()): Promise
   }
 }
 
-/** 文脈の元: OpenNote のタブなら表示中のページ・PDF のタブ（内蔵の viewer のチャット）なら開いている文献 */
-export type ChatSource = { kind: "page"; path: string } | { kind: "item"; key: string; title: string };
-
-/** 今の文脈の元（前面のタブで決まる。どちらでもなければ null） */
-export function currentSource(): ChatSource | null {
-  const v = frontViewer();
-  if (v) return { kind: "item", key: v.itemKey, title: v.title };
-  // MY LIBRARY の一覧の上に浮かせたパネル: 見えていない Wiki のページを文脈にしない（文脈なし）
-  if (app.tabs.length && !frontWiki()) return null;
-  const p = wk.page?.path ?? null;
-  return p ? { kind: "page", path: p } : null;
-}
-
-/** 元の鍵（ctxOff・sel.path と比べる）: ページ = path・文献 = `item:<key>` */
-export function sourceKey(s: ChatSource | null): string | null {
-  return !s ? null : s.kind === "page" ? s.path : `item:${s.key}`;
-}
-
-/** 今の文脈（× で外したものは除く）。添えるものが無ければ undefined */
+/** 今の文脈（元と選択範囲は viewing が持つ・× で外したものは除く）。添えるものが無ければ undefined */
 export function currentContext(): WikiChatContext | undefined {
-  const s = currentSource();
-  const k = sourceKey(s);
+  const s = viewingSource();
+  const k = viewingKey(s);
   const ctx: WikiChatContext = {};
   if (s && chat.ctxOff !== k) {
     if (s.kind === "page") ctx.path = s.path;
@@ -304,17 +272,9 @@ export function currentContext(): WikiChatContext | undefined {
       if (s.title) ctx.title = s.title;
     }
   }
-  if (chat.sel && chat.sel.path === k && chat.sel.text) ctx.selection = clipSelection(chat.sel.text).text;
+  const sel = viewing.sel;
+  if (sel && sel.key === k && sel.text) ctx.selection = clipSelection(sel.text).text;
   return ctx.path || ctx.item || ctx.selection ? ctx : undefined;
-}
-
-/** PDF viewer の選択（PdfViewer の selInfo）。PdfViewer は空を渡さない（selInfo が消えても文脈は残す = 外すのは × / 送信 / 別の元）。
- *  text が空 = その文献の選択を消す（別の元の選択は触らない）は chat.test が使う */
-export function setViewerSelection(itemKey: string, text: string | null) {
-  if (!chatShown()) return;
-  const k = `item:${itemKey}`;
-  if (text && text.trim()) chat.sel = { path: k, text };
-  else if (chat.sel?.path === k) chat.sel = null;
 }
 
 /** 刈った発言より古いターンの changes / undo / stopped を捨てる */
@@ -341,7 +301,7 @@ export async function send(): Promise<boolean> {
   chat.error = null;
   let id: string | null = null;
   const draft = chat.draft;
-  const sel = chat.sel;
+  const sel = viewing.sel;
   try {
     // 文脈は Enter を押したとき（起動を待つ間にタブを切り替えても、見えていたチップのものを添える）
     const ctx = currentContext();
@@ -356,7 +316,7 @@ export async function send(): Promise<boolean> {
     apply({ t: "user", text, ctx });
     id = chat.conv.entries[chat.conv.entries.length - 1].id;
     chat.draft = "";
-    chat.sel = null; // 選択範囲はこの発言に添えた（次の発言には付けない）
+    clearViewingSelection(); // 選択範囲はこの発言に添えた（次の発言には付けない）
     const args: Record<string, unknown> = ctx ? { text, context: ctx } : { text };
     if (root) args.root = root;
     const r = await call<WikiChatSendResult>("wiki_chat_send", args);
@@ -372,7 +332,7 @@ export async function send(): Promise<boolean> {
     // 送れなかった発言は会話から外し、入力欄と選択を戻す（失敗の表示は入力欄の上の 1 か所）
     if (id) apply({ t: "drop", id });
     if (!chat.draft) chat.draft = draft;
-    if (!chat.sel && sel) chat.sel = sel;
+    if (!viewing.sel && sel) setViewingSelection(sel.key, sel.text);
     chat.error = String(e);
     void loadChatStatus();
     return false;
@@ -432,7 +392,7 @@ export async function answerConsent(ok: boolean) {
   try {
     chat.status = await call<WikiChatStatus>("wiki_chat_set_enabled", { enabled: true });
     chat.statusError = null;
-    if (chat.status.enabled) void loadTabPref();
+    if (chat.status.enabled) void loadDockPref();
   } catch (e) {
     chat.statusError = String(e);
     toast(`✗ ${t("チャットを有効にできません")}: ${String(e).slice(0, 160)}`, 8000);
@@ -512,7 +472,7 @@ export function onChatEvent(ev: WikiChatEvent) {
       if (ev.state === "idle" || ev.state === "off") apply({ t: "end" });
       return;
     case "enabled":
-      // 有効 / 無効の変化（メニュー・command・Wiki の ON/OFF・vault の切替）= 読み直す。無効は読み直しを待たずにタブを消す
+      // 有効 / 無効の変化（メニュー・command・Wiki の ON/OFF・vault の切替）= 読み直す。無効は読み直しを待たずに柱とボタンを消す
       if (!ev.enabled && chat.status) chat.status = { ...chat.status, enabled: false };
       void loadChatStatus();
       return;
@@ -536,33 +496,11 @@ export function onChatEvent(ev: WikiChatEvent) {
   }
 }
 
-// ---- 文脈の選択範囲（中央のページ = 表示の shadow DOM / エディタ） ----
-
-/** 選択の読み取り（selectionchange の後の次のタスク = CodeMirror が自分の selectionchange で選択を反映した後に読む。
-    listener ごとにマイクロタスクが処理されるのでマイクロタスクでは足りない） */
-export function readSelection() {
-  if (!chatShown()) return; // チャットが無効なら何もしない（原則 1）
-  const p = wk.page?.path;
-  const s = document.getSelection();
-  if (!p || !s) return;
-  const { text, node } = selectionText(s);
-  // チャットの入力欄など中央のページの外の選択 = 前の選択を残す（入力欄を押すと選択が移る）
-  if (!inPage(node)) return;
-  if (!text.trim()) {
-    if (s.isCollapsed) chat.sel = null;
-    return;
-  }
-  chat.sel = { path: p, text };
-}
-
-function onSelection() {
-  if (!chatShown()) return;
-  setTimeout(readSelection, 0);
-}
-
-/** event を受ける（App の onMount から。戻り値 = 解除。listen の完了前に解除しても後から外す） */
+/** event を受ける（App の onMount から。戻り値 = 解除。listen の完了前に解除しても後から外す）。
+    選択を拾う / 元が変わったら選択を捨てるのは viewing（initViewing）。ここはその読み手として chatShown を登録する */
 export function initChat(): () => void {
   let disposed = false;
+  setViewingWanted(chatShown); // チャットが出ている間だけ viewing が選択を拾う
   const offs: (() => void)[] = [];
   const on = <T>(name: string, f: (p: T) => void) =>
     listen<T>(name, (e) => f(e.payload)).then((off) => (disposed ? off() : offs.push(off)));
@@ -573,30 +511,27 @@ export function initChat(): () => void {
   void on("wiki-chat-consent", () => {
     if (app.wikiOn) chat.consent = true;
   });
-  document.addEventListener("selectionchange", onSelection);
   const stopRoot = $effect.root(() => {
-    // Wiki が有効になった（起動時の設定の読込・Settings で ON）= チャットの状態を読む。右ペイン（WikiRight）の mount を待たない:
-    // MY LIBRARY の PDF のタブの [チャット] は chat.status で出るので、起動直後に OpenNote を開かないと出なかった
+    // Wiki が有効になった（起動時の設定の読込・Settings で ON）= チャットの状態を読む。柱の mount を待たない
+    // （タブ列のボタンは chat.status で出る = 起動直後から出す）
     $effect(() => {
       if (app.wikiOn) untrack(() => void loadChatStatus());
     });
     // ワークスペース: 前面の root が変わっても会話は消さない（chatHidden が隠す・戻れば見える）
-    // 文脈の元（ページ / 文献）が変わった = 外した文脈を戻し、別の元の選択を捨てる
+    // 文脈の元（ページ / 文献）が変わった = 外した文脈を戻す（別の元の選択を捨てるのは viewing）
     $effect(() => {
-      const k = sourceKey(currentSource());
+      const k = viewingKey(viewingSource());
       untrack(() => pageChanged(k));
     });
   });
   return () => {
     disposed = true;
     stopRoot();
-    document.removeEventListener("selectionchange", onSelection);
     offs.forEach((f) => f());
   };
 }
 
-/** 文脈の元（sourceKey）が変わったら外した文脈を戻し、別の元の選択を捨てる（initChat の effect が呼ぶ） */
+/** 文脈の元（viewingKey）が変わったら外した文脈を戻す（initChat の effect が呼ぶ。別の元の選択を捨てるのは viewing の viewingChanged） */
 export function pageChanged(key: string | null) {
   if (chat.ctxOff && chat.ctxOff !== key) chat.ctxOff = null;
-  if (chat.sel && chat.sel.path !== key) chat.sel = null;
 }

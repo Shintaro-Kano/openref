@@ -21,13 +21,20 @@
   import WikiHeader from "./lib/wiki/WikiHeader.svelte";
   import WikiSidebar from "./lib/wiki/WikiSidebar.svelte";
   import WikiPage from "./lib/wiki/WikiPage.svelte";
-  import WikiRight from "./lib/wiki/WikiRight.svelte";
-  import WikiChatConsent from "./lib/wiki/WikiChatConsent.svelte";
-  import { chat, chatShown, initChat } from "./lib/wiki/chat.svelte";
-  import WikiChatFloat from "./lib/wiki/WikiChatFloat.svelte";
+  import WikiInfo from "./lib/wiki/WikiInfo.svelte";
+  import WikiChatConsent from "./lib/chat/ChatConsent.svelte";
+  import ShelfGrid from "./lib/shelf/ShelfGrid.svelte";
+  import ShelfHeader from "./lib/shelf/ShelfHeader.svelte";
+  import ShelfRight from "./lib/shelf/ShelfRight.svelte";
+  import ShelfSidebar from "./lib/shelf/ShelfSidebar.svelte";
+  import ShelfViewer from "./lib/shelf/ShelfViewer.svelte";
+  import { loadShelf, sh } from "./lib/shelf/shelf.svelte";
+  import { chat, chatShown, initChat, toggleDock } from "./lib/chat/chat.svelte";
+  import { initViewing } from "./lib/viewing.svelte";
+  import ChatDock from "./lib/chat/ChatDock.svelte";
   import WikiRescue from "./lib/wiki/WikiRescue.svelte";
   import { ed } from "./lib/wiki/edit.svelte";
-  import { infoKeyAllowed, initWiki, loadWikiEnabled, loadWikiStatus, toggleInfo, wikiDrop, wk } from "./lib/wiki/wiki.svelte";
+  import { infoKeyAllowed, initWiki, loadWikiEnabled, loadWikiStatus, togglePane, wikiDrop, wk } from "./lib/wiki/wiki.svelte";
   import {
     activateTabAt,
     app,
@@ -40,13 +47,17 @@
     closeTab,
     cycleTab,
     doSearch,
+    frontShelf,
+    frontShelfBook,
     frontViewer,
     frontWiki,
     handleDrop,
     loadCitePrefs,
     loadFolderPrefs,
+    modalOpen,
     openEditorNew,
     openImportDialog,
+    openMigration,
     openTabInMode,
     pollDataVersion,
     refreshList,
@@ -139,10 +150,19 @@
 
   function onKeydown(e: KeyboardEvent) {
     if (onTabKey(e)) return;
-    // ⌘⌥I = OpenNote の右ペインの開閉。⌥I は配列により dead key（e.key = "Dead" / "ˆ"）なので e.code で見る。モーダル中（Wiki のダイアログも）は効かせない
+    // ⌘⌥I = 前面のモードの右ペインの開閉（OpenNote = ページ情報・PDF のタブ = 右バー・一覧 / 本棚 / 本 = 詳細）。⌥I は配列により dead key（e.key = "Dead" / "ˆ"）なので
+    // e.code で見る。モーダル中（Wiki のダイアログも）・エディタ / 取込の下は効かせない（infoKeyAllowed）
     if (infoKeyAllowed() && e.metaKey && e.altKey && !e.ctrlKey && !e.shiftKey && e.code === "KeyI") {
       e.preventDefault();
-      if (!e.repeat && !composing(e)) toggleInfo();
+      if (!e.repeat && !composing(e)) togglePane();
+      return;
+    }
+    // ⌘⌥C = チャットの柱の開閉（全タブ種で有効・入力欄の中でも効く）。⌥C は配列により文字が変わる（ç 等）ので e.code で見る。
+    // チャットが出せない（OpenNote OFF / チャット OFF）・モーダル（本体・Wiki のダイアログ・参照エディタ・PDF 取込 = tabOpsAllowed と同じ
+    // 「覆われている」条件）の間は何もしない = preventDefault もしない（素通り。覆いの裏で柱を開いて入力欄の focus を奪わない）
+    if (chatShown() && !modalOpen() && !app.editorOpen && !app.importJob && e.metaKey && e.altKey && !e.ctrlKey && !e.shiftKey && e.code === "KeyC") {
+      e.preventDefault();
+      if (!e.repeat && !composing(e)) toggleDock();
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "n") {
@@ -150,11 +170,11 @@
       openEditorNew();
     } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
       e.preventDefault();
-      // PDF ビューアの下（見えない一覧のヘッダー）・Wiki（ヘッダーに QuickAdd が無い）にはフォーカスを送らない
-      if (!frontViewer() && !frontWiki()) document.getElementById("quickadd")?.focus();
+      // PDF ビューアの下（見えない一覧のヘッダー）・Wiki / 本棚（ヘッダーに QuickAdd が無い）にはフォーカスを送らない
+      if (!frontViewer() && !frontWiki() && !frontShelf() && !frontShelfBook()) document.getElementById("quickadd")?.focus();
     } else if (
       (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a" &&
-      !isEditable(e.target) && !frontViewer() && !frontWiki() && !app.editorOpen && !app.modal
+      !isEditable(e.target) && !frontViewer() && !frontWiki() && !frontShelf() && !frontShelfBook() && !app.editorOpen && !app.modal
     ) {
       // ⌘A = 一覧をすべてチェック（Paperpile 準拠）
       e.preventDefault();
@@ -167,18 +187,23 @@
       // ここで先に閉じると、ビューアの内側の Esc が効かない（App の keydown が先に走る）。ビューアの上のエディタ・取込は従来どおり
       if (app.modal) {
         /* 何もしない */
-      } else if ((frontViewer() || frontWiki()) && !app.editorOpen && !app.importJob) {
-        /* PdfViewer・Wiki に任せる（見えない一覧のチェック・メモを畳まない） */
+      } else if ((frontViewer() || frontWiki() || frontShelf() || frontShelfBook()) && !app.editorOpen && !app.importJob) {
+        /* PdfViewer・Wiki・本棚に任せる（見えない一覧のチェック・メモを畳まない） */
       } else if (app.newMenu) app.newMenu = false;
       else if (app.labelMenu) app.labelMenu = false;
       else if (app.folderMenu) app.folderMenu = null;
       else if (app.listMenu) app.listMenu = null;
       else if (app.noteEditor) closeNoteEditor(); // 未保存なら閉じない（textarea 内の Esc は自前処理）
       else if (app.importJob) closeImport();
-      else if (!app.editorOpen && !app.modal && app.checked.size) clearChecks();
-    } else if (e.key === "/" && !isEditable(e.target) && !frontViewer() && !frontWiki()) {
+      // チャットの入力欄の Esc でチェックを外さない（選んでいる文献が閉じて文脈のチップが消える）
+      else if (!app.editorOpen && !app.modal && app.checked.size && !(e.target as Element | null)?.closest?.(".wk-ch")) clearChecks();
+    } else if (e.key === "/" && !isEditable(e.target) && !frontViewer() && !frontWiki() && !frontShelf() && !frontShelfBook()) {
       e.preventDefault();
       document.getElementById("searchbox")?.focus();
+    } else if (e.key === "/" && !isEditable(e.target) && frontShelf() && !app.modal && !app.editorOpen && !composing(e)) {
+      // 本棚が前面: 本棚の検索欄（ヘッダー）へ
+      e.preventDefault();
+      document.getElementById("sh-search")?.focus();
     } else if (e.key === "/" && !isEditable(e.target) && frontWiki() && !app.modal && !app.editorOpen && !composing(e)) {
       // Wiki が前面: Wiki の検索欄（ヘッダー）へ。MY LIBRARY の検索欄とは別
       e.preventDefault();
@@ -199,6 +224,7 @@
     // OpenNote の有効 / 無効だけ（設定を読むだけ・索引に触らない。Wiki タブを戻すかを restoreTabs が見る。
     // 読めなければ無効 = 従来どおり）。状態と木は一覧の後で流す（索引の走査で MY LIBRARY を待たせない）
     await loadWikiEnabled();
+    await loadShelf(); // 履歴と ui_shelf_*（タブを戻す前 = 本棚のタブの並び）。読むのは設定だけ（走査しない）
     try {
       await refreshSidebar();
       await restoreTabs();
@@ -228,6 +254,17 @@
     });
   });
 
+  // 読み手を置いたタブ（viewerSeen と同じ = 初めて前面になったときに作り、閉じるまで生かす）
+  const bookSeen = new SvelteSet<number>();
+  $effect(() => {
+    const front = frontShelfBook() ? app.tab : null;
+    const live = app.tabs.filter((t) => t.shelfBook).map((t) => t.id);
+    untrack(() => {
+      if (front !== null) bookSeen.add(front);
+      for (const id of bookSeen) if (!live.includes(id)) bookSeen.delete(id);
+    });
+  });
+
   onMount(() => {
     void startup();
     void checkUpdate();
@@ -244,8 +281,18 @@
       toast(e.payload);
       void reloadDetail();
     }).then((fn) => (unlistenMenuToast = fn));
+    // Settings › 他の文献管理ソフトから移行…（Rust の "migration-open"）。バックグラウンドで続行中なら進行中の窓に戻る（state.svelte.ts の openMigration）
+    let unlistenMigration: (() => void) | undefined;
+    // OpenNote の木 / 本棚の見出しの浮きメニューは窓の覆いより上（z-index）= 開いたら閉じる（窓の上から別のダイアログを開かせない）
+    listen("migration-open", () => {
+      if (openMigration()) {
+        wk.menu = null;
+        sh.menu = null;
+      }
+    }).then((fn) => (unlistenMigration = fn));
     let unlisten: (() => void) | undefined;
     const stopWiki = initWiki();
+    const stopViewing = initViewing();
     const stopChat = initChat();
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -255,6 +302,11 @@
         if (frontWiki()) {
           app.dropActive = false;
           if (p.type === "drop") void wikiDrop(p.paths ?? []);
+          return;
+        }
+        // 本棚 / 読み手が前面なら捨てる（見えない一覧の取込に流さない = drive モードで Drive に書く事故）
+        if (frontShelf() || frontShelfBook()) {
+          app.dropActive = false;
           return;
         }
         if (p.type === "enter" || p.type === "over") app.dropActive = true;
@@ -272,10 +324,12 @@
       clearInterval(dataVersionTimer);
       stopWiki();
       stopChat();
+      stopViewing();
       unlisten?.();
       unlistenLang?.();
       unlistenUpdateOff?.();
       unlistenMenuToast?.();
+      unlistenMigration?.();
     };
   });
 </script>
@@ -288,13 +342,17 @@
 
 <div class="root">
   <TabStrip />
-  <!-- タブの中身（ヘッダー・一覧・PDF ビューア）。PDF タブのビューアはこの全面を覆う -->
+  <!-- タブの中身（.tabs-page）とチャットの柱（ChatDock）を横に並べる。縮むのは .tabs-page の側（app.css の .dock-row） -->
+  <div class="dock-row">
+  <!-- タブの中身（ヘッダー・一覧・PDF ビューア）。PDF タブのビューアはこの全面を覆う（柱は覆わない = 柱は .tabs-page の外） -->
   <div class="tabs-page">
     <header>
       <!-- OpenNote が前面ならアプリ名も OpenNote（user 指示 11-02） -->
       <div class="brand">{frontWiki() ? "OpenNote" : "OpenRef"}</div>
       {#if frontWiki()}
         <WikiHeader />
+      {:else if frontShelf()}
+        <ShelfHeader />
       {:else}
       <!-- 検索ボックス: チップ（著者 / 誌名。行のクリックで入る・× で外す）+ 自由語。Paperpile の search box 準拠 -->
       <div class="sb-wrap" role="search" onclick={() => document.getElementById("searchbox")?.focus()}>
@@ -341,9 +399,6 @@
             <button onclick={() => { app.newMenu = false; void openImportDialog(); }}>
               <span>{t("PDF を取り込む…")}</span>
             </button>
-            <button onclick={() => { app.newMenu = false; app.modal = "migration"; }}>
-              <span>{t("他の文献管理ソフトから移行…")}</span>
-            </button>
           </div>
         {/if}
       </div>
@@ -359,16 +414,22 @@
         <button class="ub-x" title={t("この起動の間は隠す（止めるのは Settings › 起動時に新版を確認）")} aria-label={t("この起動の間は隠す（止めるのは Settings › 起動時に新版を確認）")} onclick={() => (app.updateLatest = null)}>×</button>
       </div>
     {/if}
-    <!-- OpenNote で右ペインを隠した = 2 列（wk-main-noinfo）。MY LIBRARY は常に class なし = 3 列のまま -->
-    <main class={frontWiki() && !(wk.infoOpen && wk.prefsReady) ? "wk-main-noinfo" : undefined}>
+    <!-- 右ペインを隠した = 2 列（OpenNote は wk-main-noinfo・一覧は lib-nodetail）。PDF のタブの下の一覧も一覧の規則のまま -->
+    <main class={frontWiki() ? (wk.infoOpen && wk.prefsReady ? undefined : "wk-main-noinfo") : app.detailOpen ? undefined : "lib-nodetail"}>
       {#if frontWiki()}
         <WikiSidebar />
         <WikiPage />
-        {#if wk.infoOpen && wk.prefsReady}<WikiRight />{/if}
-      {:else}
+        {#if wk.infoOpen && wk.prefsReady}<WikiInfo />{/if}
+      {:else if frontShelf()}
+        <ShelfSidebar />
+        <!-- タブごとに作り直す = スクロール位置はそのタブの物（一覧の入替方式の外） -->
+        {#key app.tab}<ShelfGrid />{/key}
+        {#if app.detailOpen}<ShelfRight book={sh.info?.root === frontShelf()?.root ? sh.info : null} />{/if}
+      {:else if !frontShelfBook()}
+        <!-- 読み手の下には何も置かない（読み手が全面を覆う） -->
         <Sidebar />
         <ItemList />
-        <ItemDetail />
+        {#if app.detailOpen}<ItemDetail />{/if}
       {/if}
     </main>
     <!-- id 順で回す（タブの並びには依らない）: 並べ替え（moveTab）で keyed each がビューアの DOM を動かすと、動いた要素の
@@ -379,7 +440,15 @@
           <PdfViewer viewer={t.viewer} front={t.id === app.tab} onClose={() => void closeTab(t.id)} />
         {/key}
       {/if}
+      {#if t.shelfBook && (t.id === app.tab || bookSeen.has(t.id))}
+        {#key t.shelfBook?.path}
+          <ShelfViewer book={t.shelfBook} front={t.id === app.tab} onClose={() => void closeTab(t.id)} />
+        {/key}
+      {/if}
     {/each}
+  </div>
+  <!-- チャットの柱（どのタブ種でも同じ 1 つ = タブを切り替えても作り直さない。門 = OpenNote ON + チャット ON） -->
+  {#if chatShown() && chat.dock.open}<ChatDock />{/if}
   </div>
   {#if app.toast}
     <div class="toast">{app.toast}</div>
@@ -401,6 +470,4 @@
   {#if app.editorOpen}<ReferenceEditor />{/if}
   {#if ed.stranded.length}<WikiRescue />{/if}
   {#if app.wikiOn}<WikiChatConsent />{/if}
-  <!-- 浮かせたチャット（1 つだけ・どのタブの上にも出る。中身は右ペイン / PDF の右バーと同じ WikiChat） -->
-  {#if chat.float && chatShown()}<WikiChatFloat />{/if}
 </div>

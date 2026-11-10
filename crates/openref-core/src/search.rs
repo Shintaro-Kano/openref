@@ -41,7 +41,7 @@ pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<ItemRow>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// PMID → DOI の順で既存 item（ゴミ箱を除く）を探す（connector 側 dedup 用）。照合は add_item の重複判定と同じ
+/// PMID → DOI の順で既存 item（ゴミ箱を除く）を探す（connectd の `/capture/save` の dedup 用）。照合は add_item の重複判定と同じ
 /// （`ingest::find_duplicate` = DOI は接頭辞・大小・空白を、PMID は先頭の 0 を揃えて比べる）
 pub fn find_by_ids(db: &Db, pmid: Option<&str>, doi: Option<&str>) -> Result<Option<(i64, String)>> {
     let mut ids = serde_json::Map::new();
@@ -103,6 +103,11 @@ pub struct ListFilter {
     /// true = PDF 本文（fulltext_fts）を検索対象にしない（Word アドインの引用検索用: 著者名で「その著者を引用している
     /// だけの論文」が混ざると誤引用のもとになる）。GUI / CLI は false = 本文も検索。MCP は metadata_only 引数で選べる
     pub metadata_only: bool,
+    /// 並び（`added` / `published` / `journal`）。検索中もこの並びで返す（一致度の順にしない）。None・空白だけ = 呼び出し側の
+    /// 既定の順（検索なし = 追加日の新しい順・検索あり = 一致度の順）= GUI だけが常に渡し、Word の引用検索・CLI は渡さない
+    pub sort: Option<String>,
+    /// true = 降順（`sort` が無ければ見ない）
+    pub desc: bool,
 }
 
 /// 行・詳細に付くラベルの参照（id は GUI が detach_tag・ラベルビューに使う。名前だけで足りる MCP は名前を取り出す）
@@ -196,11 +201,43 @@ impl ListedItem {
     }
 }
 
+/// 出版日の年 / 月 / 日。文字列の date-parts も数に読み、読めない物（空文字・0）は無い物と同じ（NULL）
+const ISSUED_YEAR: &str = r#"NULLIF(CAST(json_extract(i.csl, '$.issued."date-parts"[0][0]') AS INTEGER), 0)"#;
+const ISSUED_MONTH: &str = r#"NULLIF(CAST(json_extract(i.csl, '$.issued."date-parts"[0][1]') AS INTEGER), 0)"#;
+const ISSUED_DAY: &str = r#"NULLIF(CAST(json_extract(i.csl, '$.issued."date-parts"[0][2]') AS INTEGER), 0)"#;
+/// 一覧に出している誌名（`ListedItem::summary` の container と同じ規則: 文字列の short があればそれ・無ければ container-title）。
+/// 前後の空白（半角・タブ・改行・NBSP・全角）は落とす = 空白だけは無い物（NULL）。SQLite の trim は既定で U+0020 しか落とさない
+const JOURNAL: &str = r#"NULLIF(trim(COALESCE(
+    CASE json_type(i.csl, '$."container-title-short"') WHEN 'text' THEN json_extract(i.csl, '$."container-title-short"') END,
+    CASE json_type(i.csl, '$."container-title"') WHEN 'text' THEN json_extract(i.csl, '$."container-title"') END),
+    char(32, 9, 10, 13, 160, 12288)), '')"#;
+
+/// `ListFilter.sort` の ORDER BY の中身（SQL 側で並べる = LIMIT の切り出しが並びに従う）。sort が無ければ None = 呼び出し側の既定の順。
+/// 無い物（出版日の年・月・日 / 誌名）は昇降どちらでも末尾。誌名の中は昇降に依らず新しい順（同じ誌の新しい論文を先に見たい）
+fn sort_order(f: &ListFilter) -> Result<Option<String>> {
+    let dir = if f.desc { "DESC" } else { "ASC" };
+    let Some(sort) = f.sort.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(match sort {
+        "added" => format!("i.date_added {dir}, i.id {dir}"),
+        "published" => format!(
+            "({ISSUED_YEAR}) IS NULL, {ISSUED_YEAR} {dir}, ({ISSUED_MONTH}) IS NULL, {ISSUED_MONTH} {dir},
+             ({ISSUED_DAY}) IS NULL, {ISSUED_DAY} {dir}, i.date_added {dir}, i.id {dir}"
+        ),
+        "journal" => format!(
+            "({JOURNAL}) IS NULL, {JOURNAL} COLLATE NOCASE {dir}, {ISSUED_YEAR} DESC, i.date_added DESC, i.id DESC"
+        ),
+        other => return Err(CoreError::BadInput(format!("並び（sort）は added / published / journal のどれかです: {other}"))),
+    }))
+}
+
 /// フィルタ付き一覧。search あり → items_fts の hit ∪ fulltext_fts の hit（添付 → item）、
 /// メタデータ hit を先（items_fts.rank 順）・本文のみ hit を後（fulltext_fts.rank 順）に並べる。
-/// なし → date_added 降順。チップ（著者/誌名）・ビュー（フォルダ/ラベル/★/ゴミ箱）とは常に AND
+/// なし → date_added 降順。`sort` があれば検索の有無に依らずその並び。チップ（著者/誌名）・ビュー（フォルダ/ラベル/★/ゴミ箱）とは常に AND
 pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
     let limit = if f.limit == 0 { 200 } else { f.limit } as i64;
+    let order = sort_order(f)?;
     let base_cols = "i.id, i.key, i.csl, i.starred, i.date_added,
         EXISTS(SELECT 1 FROM attachments a WHERE a.item_id = i.id) AS has_pdf,
         EXISTS(SELECT 1 FROM retraction_flags r WHERE r.item_id = i.id) AS retracted,
@@ -221,6 +258,7 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
     let (sql, fts_q) = match &f.search {
         Some(q) if !q.trim().is_empty() => {
             let fts_q = fts_query(q);
+            let order = order.as_deref().unwrap_or("(meta.id IS NULL), COALESCE(meta.rank, ft.rank), i.id");
             // meta = items_fts の hit、ft = fulltext_fts の hit を添付 → item に畳む（item ごとに rank 最良の 1 添付 = att）。
             // 抜粋（snippet）は全文の走査で高価なので、ここでは作らず LIMIT 後の結果行だけ後段で引く（?10 = 本文検索 off）
             (
@@ -236,19 +274,22 @@ pub fn list_items(db: &Db, f: &ListFilter) -> Result<Vec<ListedItem>> {
                      FROM items i LEFT JOIN meta ON meta.id = i.id LEFT JOIN ft ON ft.id = i.id
                      WHERE (meta.id IS NOT NULL OR ft.id IS NOT NULL)
                        AND ((?4 = 1) = (i.deleted_at IS NOT NULL)) {common}
-                     ORDER BY (meta.id IS NULL), COALESCE(meta.rank, ft.rank), i.id LIMIT ?5"
+                     ORDER BY {order} LIMIT ?5"
                 ),
                 Some(fts_q),
             )
         }
-        _ => (
-            format!(
-                "SELECT {base_cols}, NULL AS att FROM items i
-                 WHERE ?1 IS NULL AND ?10 = ?10 AND ((?4 = 1) = (i.deleted_at IS NOT NULL)) {common}
-                 ORDER BY i.date_added DESC, i.id DESC LIMIT ?5"
-            ),
-            None,
-        ),
+        _ => {
+            let order = order.as_deref().unwrap_or("i.date_added DESC, i.id DESC");
+            (
+                format!(
+                    "SELECT {base_cols}, NULL AS att FROM items i
+                     WHERE ?1 IS NULL AND ?10 = ?10 AND ((?4 = 1) = (i.deleted_at IS NOT NULL)) {common}
+                     ORDER BY {order} LIMIT ?5"
+                ),
+                None,
+            )
+        }
     };
     // 誌名チップはラベルを正規化キーに落としてから引く（空になれば未指定扱い）
     let journal_key = f

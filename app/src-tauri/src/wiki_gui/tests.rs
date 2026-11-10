@@ -341,7 +341,7 @@ fn startup_sweep_on_real_files() {
     for n in [INDEX_FILE, "wiki-index.sqlite-wal", "wiki-index.sqlite-shm", "wiki-index.sqlite.corrupt-1"] {
         touch(&app.join(n));
     }
-    let cur = "/Users/u/Documents/kb";
+    let cur = "/Users/u/Documents/ref";
     let hist = "/Users/u/Documents/blog";
     let orphan = "/Users/u/Documents/old";
     for r in [cur, hist, orphan] {
@@ -564,12 +564,8 @@ fn asset_reply_rules() {
         }
         b.body(Vec::new()).unwrap()
     };
-    // URL の別窓からは読めない（ファイルに触らない = allowed も呼ばれない）
-    let r = asset_reply(
-        WIKI_URL_LABEL,
-        &|_| panic!("scope を見た"),
-        &req(&url, None),
-    );
+    // main 以外の webview からは読めない（ファイルに触らない = allowed も呼ばれない）
+    let r = asset_reply("other", &|_| panic!("scope を見た"), &req(&url, None));
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     let r = asset_reply("main", &allowed, &req(&url, None));
     assert_eq!(r.status(), StatusCode::OK);
@@ -797,7 +793,7 @@ fn ref_dir_check_rules() {
             .unwrap_err()
             .contains("ワークスペースの中")
     );
-    // vault を含むフォルダは可（KB の root が vault = KB/wiki を含む = 主な使い方。vault の中のファイルは vault として先に判定される）
+    // vault を含むフォルダは可（root が vault = root/wiki を含む = 主な使い方。vault の中のファイルは vault として先に判定される）
     assert!(wiki_ref_dir_check(&home.join("Documents"), &canon_home, Some(&canon_vault), None, false).is_ok());
     // 文言は「参照フォルダに」
     assert!(wiki_ref_dir_check(&hidden, &canon_home, None, None, false)
@@ -882,21 +878,29 @@ fn ref_target_rules() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// URL の別窓の中は http(s) と about だけ
+/// wiki_open_url の検査: http(s) だけ通す（前後の空白は除く）・それ以外と URL でない文字列は拒む（ja / en の文言）
 #[test]
-fn url_window_navigation_is_http_only() {
-    let ok = |u: &str| wiki_url_window_nav_allowed(&tauri::Url::parse(u).unwrap());
-    assert!(ok("https://note.com/x") && ok("http://example.org/") && ok("about:blank"));
-    assert!(
-        !ok("asset://localhost//Users/u/v/a.pdf")
-            && !ok("tauri://localhost/")
-            && !ok("file:///etc/passwd")
-            && !ok("javascript:alert(1)")
-    );
-    assert_eq!(
-        wiki_url_title(&tauri::Url::parse("https://note.com/a/b").unwrap()),
-        "note.com"
-    );
+fn wiki_url_checked_is_http_only() {
+    let ok = |u: &str| wiki_url_checked(u, false).map(|u| u.to_string());
+    assert_eq!(ok("https://note.com/x").as_deref(), Ok("https://note.com/x"));
+    assert_eq!(ok("  http://example.org/a?b=1#c \n").as_deref(), Ok("http://example.org/a?b=1#c"));
+    // 全角空白・NBSP（コピーで付きやすい）は url crate が落とさない = trim が要る
+    assert_eq!(ok("\u{3000}https://note.com/x\u{a0}").as_deref(), Ok("https://note.com/x"));
+    for bad in [
+        "about:blank",
+        "asset://localhost//Users/u/v/a.pdf",
+        "tauri://localhost/",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "mailto:a@example.org",
+    ] {
+        assert_eq!(wiki_url_checked(bad, false).unwrap_err(), "http(s) のみ許可", "{bad}");
+        assert_eq!(wiki_url_checked(bad, true).unwrap_err(), "Only http(s) is allowed", "{bad}");
+    }
+    for bad in ["", "note.com/x", "//note.com/x"] {
+        assert_eq!(wiki_url_checked(bad, false).unwrap_err(), "URL ではありません", "{bad}");
+        assert_eq!(wiki_url_checked(bad, true).unwrap_err(), "Not a URL", "{bad}");
+    }
 }
 
 /// 実機のゴミ箱（Finder を操作する = 手で走らせる）: OPENREF_TRASH_TEST=<ホームの下の試験用フォルダ>

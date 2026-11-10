@@ -1,4 +1,4 @@
-// OpenNote の参照フォルダの追加 / 外す（WikiInfo・WikiDialogs）。wiki.svelte.ts から移しただけ（B-33）。
+// OpenNote の参照フォルダの追加 / 外す（WikiInfo・WikiDialogs）。wiki.svelte.ts から移しただけ。
 // 一覧の読込（loadRefDirs）と判定（isRefPath）は wiki.svelte.ts に残す = 起動・状態の読込・wiki-state が使う（ここへ移すと循環）。
 // ここは wiki.svelte.ts を読む一方向。参照フォルダは root ごと = 画面の root の物を足す / 外す（args.root）。
 // 待つ間（フォルダ選択のダイアログ）に画面の root が変わったら、返った一覧は頼んだ root の物 = 画面には入れない（戻ったときに読み直す）

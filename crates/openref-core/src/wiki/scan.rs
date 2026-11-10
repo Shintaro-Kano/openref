@@ -183,16 +183,17 @@ pub fn walk(root: &Path) -> crate::Result<Walk> {
 
 /// find(1) の結果
 #[derive(Debug, Default)]
-struct Found {
-    entries: Vec<Entry>,
+pub struct Found {
+    pub entries: Vec<Entry>,
     /// 終了状態 0 = 全体を列挙できた（読めないフォルダがあると find は残りを出して非 0 で終わる）
-    complete: bool,
+    pub complete: bool,
     /// stderr の「find: <path>: Permission denied」等のパス（vault 相対）
-    error_dirs: Vec<String>,
+    pub error_dirs: Vec<String>,
 }
 
-/// find(1) で列挙（`.` 始まりの区画は prune・通常ファイルだけ）。起動に失敗すれば空（complete = false）
-fn find(root: &Path) -> Found {
+/// find(1) で列挙（`.` 始まりの区画は prune・通常ファイルだけ）。起動に失敗すれば空（complete = false）。
+/// 本棚の走査（crate::shelf::scan）の fallback も共用する
+pub fn find(root: &Path) -> Found {
     let out = std::process::Command::new("/usr/bin/find")
         .arg(root)
         .args(["-mindepth", "1", "(", "-name", ".*", "-prune", ")", "-o", "-type", "f", "-print0"])

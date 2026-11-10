@@ -2,7 +2,7 @@
   "about": "OpenRef for Wiki のリンク抽出・解決の規則。cargo test（crates/openref-core/tests/wiki_links_fixture.rs）と描画側の node test が同じこの 1 枚を読む。links は出現順。kind = wiki（[[…]]）/ embed（![[…]]）/ md（md の相対）/ html（html の相対）/ openref / file / external。target は書かれたまま（wiki / embed は alias を除いた name#heading）。字下げ 4 の code block は CommonMark の近似 = 段落の続きでもリストの中でもない字下げ 4 以上の行（tab は 4 列）を code とみなす。完全一致しない境界: リストの終わり（空行の後の字下げ 0 の行か見出しで終わるとみなす）・引用（>）の中の字下げ・表や HTML ブロックの直後の字下げ・インラインコードの行またぎ・括弧の入れ子を含む dest が行末まで閉じない行の後続のリンク",
   "md": [
     {"name": "wikilink の基本・alias・見出し", "md": "[[a]] [[b|別名]] [[c#見出し]] [[d#h|x]]", "links": [{"kind": "wiki", "target": "a"}, {"kind": "wiki", "target": "b"}, {"kind": "wiki", "target": "c#見出し"}, {"kind": "wiki", "target": "d#h"}]},
-    {"name": "埋め込み（サイズ指定も alias と同じく除く）", "md": "![[img.jpg]] ![[notion-cases/attachments/x/case3_08.jpg|560]] ![[page]]", "links": [{"kind": "embed", "target": "img.jpg"}, {"kind": "embed", "target": "notion-cases/attachments/x/case3_08.jpg"}, {"kind": "embed", "target": "page"}]},
+    {"name": "埋め込み（サイズ指定も alias と同じく除く）", "md": "![[img.jpg]] ![[cases/attachments/x/case3_08.jpg|560]] ![[page]]", "links": [{"kind": "embed", "target": "img.jpg"}, {"kind": "embed", "target": "cases/attachments/x/case3_08.jpg"}, {"kind": "embed", "target": "page"}]},
     {"name": "表の中の \\| は | と同じ", "md": "| [[categories/general\\|general]] | x |", "links": [{"kind": "wiki", "target": "categories/general"}]},
     {"name": "同じページの見出し", "md": "[[#参照資料|REF]]", "links": [{"kind": "wiki", "target": "#参照資料"}]},
     {"name": "空の [[]] と閉じない [[ は無視", "md": "[[]] と [[x]] と [[閉じない", "links": [{"kind": "wiki", "target": "x"}]},

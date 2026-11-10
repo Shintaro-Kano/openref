@@ -33,8 +33,11 @@
     folderPath,
     labelNameTaken,
     openStyleModal,
+    pickListSort,
     styleTitle,
+    toggleDetail,
   } from "./state.svelte";
+  import type { ListSortKey } from "./api";
 
   type Menu = typeof app.listMenu;
 
@@ -153,6 +156,12 @@
     inputEl?.focus();
   }
 
+  const SORTS: ListSortKey[] = ["added", "published", "journal"];
+  const sortArrow = $derived(app.listSort.desc ? "↓" : "↑");
+  function sortLabel(k: ListSortKey) {
+    return k === "published" ? t("出版日") : k === "journal" ? t("誌名") : t("追加日");
+  }
+
   /** ピッカー検索欄の Enter: 候補が 1 件ならそれをトグル、無ければ新規作成 */
   function onPickerKey(e: KeyboardEvent, kind: "folder" | "label") {
     // IME の変換確定の Enter では作成・切替しない
@@ -169,10 +178,10 @@
   }
 </script>
 
-<!-- ツールバーの外をクリックしたらメニューを閉じる（内側は closest で除外） -->
+<!-- メニューとそのボタンの外をクリックしたら閉じる。capture = 行のチップ（stopPropagation）を押しても閉じる（並びのメニューはチェックが無くても開ける） -->
 <svelte:window
-  onclick={(e) => {
-    if (app.listMenu && !(e.target as Element | null)?.closest?.(".listbar")) close();
+  onclickcapture={(e) => {
+    if (app.listMenu && !(e.target as Element | null)?.closest?.(".lb-wrap")) close();
   }} />
 
 <div class="listbar" aria-label={t("一括操作")}>
@@ -298,6 +307,46 @@
 
   {/if}
 
-  <div class="lb-spacer"></div>
-  <div class="lb-count">{tn(total, "件")}{#if any}<b> · {n} {t("選択")}</b>{/if}</div>
+  <!-- 右の 3 つは 1 塊 = 狭い窓でも離れて折り返さず右に寄る（並びのメニューは左へ開くので、塊が左端へ行くと一覧の列の外で切られる） -->
+  <div class="lb-tail">
+    <!-- 並び（Paperpile の ↓ Date added と同じ位置）。ゴミ箱でも同じ並びなので上の分岐の外に置く -->
+    <div class="lb-wrap">
+      <button
+        class="lb-btn lb-sort"
+        title={t("並び順（選択中の項目をもう一度押すと向きが反転）")}
+        aria-haspopup="menu"
+        aria-expanded={app.listMenu === "sort"}
+        onclick={() => toggleMenu("sort")}>
+        <span aria-hidden="true">{sortArrow}</span> {sortLabel(app.listSort.key)} <span class="caret">▾</span>
+      </button>
+      {#if app.listMenu === "sort"}
+        <div class="lb-pop lb-menu lb-sort-pop" role="menu">
+          {#each SORTS as k (k)}
+            <button
+              class:lb-sort-on={app.listSort.key === k}
+              role="menuitemradio"
+              aria-checked={app.listSort.key === k}
+              onclick={() => { close(); void pickListSort(k); }}>
+              <span>{sortLabel(k)}</span>{#if app.listSort.key === k}<kbd>{sortArrow}</kbd>{/if}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+    <div class="lb-count">{tn(total, "件")}{#if any}<b> · {n} {t("選択")}</b>{/if}</div>
+    <button
+      class="lb-pane"
+      class:lb-pane-off={!app.detailOpen}
+      title={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
+      aria-label={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
+      aria-pressed={app.detailOpen}
+      onclick={toggleDetail}
+    >
+      <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
+        <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
+        <rect class="lb-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
+        <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
+      </svg>
+    </button>
+  </div>
 </div>

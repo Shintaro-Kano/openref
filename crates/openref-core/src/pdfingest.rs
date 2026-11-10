@@ -431,7 +431,7 @@ pub fn is_cjk_heavy(text: &str) -> bool {
     cjk >= 20 && cjk * 10 >= cjk + latin
 }
 
-/// 「要確認」ラベルが付いている item か（capture / 一括取込 / Connector standalone が識別子なしで作った stub）。
+/// 「要確認」ラベルが付いている item か（capture / 一括取込 / 旧 Connector standalone（3.0.0 で外した）が識別子なしで作った stub）。
 /// duplicate の案内文に使う。ラベルで判定するので、user が編集で書誌を引き直してラベルを外せば案内は消える
 /// （custom.source で判定すると修正後も案内が出続け、`/capture/save` の題名のみ document まで stub 扱いになる）
 /// 数えられなければ Err（「stub でない」= 案内なしに畳まない。呼び手が案内の代わりに理由を出す）
@@ -866,7 +866,7 @@ pub enum StubOrigin<'a> {
     /// （空ならファイル名）・添付名 = 元ファイル名・custom.source = pdf-import-unresolved・custom.import_file = 元ファイル名・
     /// URL の鍵なし・ラベルの作成 / 付与の失敗は Err
     File { name: &'a str },
-    /// connectd（`/capture/pdf` = source capture・saveStandaloneAttachment = connector-standalone）: 題名の既定 =
+    /// connectd（`/capture/pdf` = source capture。3.0.0 より前は Zotero Connector の saveStandaloneAttachment = connector-standalone も）: 題名の既定 =
     /// タブ / ページの題名から .pdf を落としたもの（空なら "Untitled PDF"）・添付名 = 題名から・URL（空なら null）・
     /// ラベルの作成 / 付与の失敗は warnings に入れて続ける（stub と添付は残る）
     Page { title: Option<&'a str>, url: Option<&'a str>, source: &'a str },

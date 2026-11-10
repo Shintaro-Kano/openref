@@ -1,4 +1,4 @@
-// OpenNote の検索の動詞（tag の切替・消す・結果を開く）。wiki.svelte.ts から移しただけ（B-33）。
+// OpenNote の検索の動詞（tag の切替・消す・結果を開く）。wiki.svelte.ts から移しただけ。
 // 検索の本体（hasQuery / searchSoon / runSearch と debounce・世代）は wiki.svelte.ts に残す = 監視の読み直し（initWiki の wiki-changed）と
 // その解除が使う（ここへ移すと wiki.svelte.ts → ここの import = 循環）。ここは wiki.svelte.ts を読む一方向
 

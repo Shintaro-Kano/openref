@@ -152,7 +152,7 @@
   function navigateRef(nav: WikiNav, newTab?: boolean) {
     if (nav.kind === "page" && external) {
       const abs = absOf(external, nav.path);
-      // 参照フォルダが vault を含むとき（KB 本体を参照フォルダにできる）: vault の中のファイルは vault のページとして開く（ref の別タブに二重に出さない）
+      // 参照フォルダが vault を含むとき（vault の親を参照フォルダにできる）: vault の中のファイルは vault のページとして開く（ref の別タブに二重に出さない）
       const ws = root ?? wk.status?.root;
       const inVault = ws ? relInRoot(ws, abs) : null;
       if (inVault) return navigate({ kind: "page", path: inVault, heading: nav.heading }, newTab);
@@ -295,7 +295,7 @@
       {#if shown}
         <button class="wk-btn" title={t("既定のアプリで開く")} onclick={() => void openPath(shown.abs_path)}>{t("外部で開く")}</button>
         {#if !external}
-          <button class="wk-btn wk-more" title={t("名前の変更・ゴミ箱")} aria-label={t("名前の変更・ゴミ箱")} onclick={openMenu}>⋯</button>
+          <button class="wk-btn wk-more" title={t("名前の変更・複製・ゴミ箱")} aria-label={t("名前の変更・複製・ゴミ箱")} onclick={openMenu}>⋯</button>
         {/if}
       {/if}
     </div>

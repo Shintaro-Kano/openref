@@ -25,8 +25,7 @@
 //!
 //! **DOI 起点の連鎖（経路 3・4）・取得物の同一性照合・3 段 API（DB の Mutex をネットワークの間に握らない）**は
 //! 本ファイル後半の `doi_fallback_download` 冒頭コメントと `fetch_pdf_prepare` / `fetch_pdf_download` / `fetch_pdf_attach` を参照。
-//! 照合結果 → 採否（添付するか・`doi_check` の印は何か）は **`verdict` 1 関数**が全経路（connectd の `/capture/attachment`・
-//! connector の保険 DL を含む）の正で、`verdict_table` テストが全組合せを固定する。
+//! 照合結果 → 採否（添付するか・`doi_check` の印は何か）は **`verdict` 1 関数**が全経路（connectd の `/capture/attachment` を含む）の正で、`verdict_table` テストが全組合せを固定する。
 
 use crate::http::{fetch_agent as agent, fetch_agent_no_redirect, text};
 use crate::{edit, model, search, CoreError, Db, Result};
@@ -401,8 +400,8 @@ fn fetch_bytes(url: &str) -> std::result::Result<Vec<u8>, String> {
 // 照合し、採否（添付するか・`doi_check` の印）は所在の種類 `LocationKind` ごとに **`verdict` 1 箇所**で決める（表はそこ・
 // 全組合せは `verdict_table` テスト）。合本 `10.11152/mu-4311` の実例（p.1 は mu-4292）= Mismatch → どの経路でも添付しない。
 // 連鎖の順序規則（`verdict` の外・この関数）: 経路 3 / 4 の宣言所在で Match が出なかった候補は保留し、後の段に Match が出ればそちらを採る。
-// `/capture/attachment`（宣言所在 = meta / self / atypon・ヒューリスティック = source=link → Mismatch 409 / Unverified 422）と
-// connector の保険 DL（translator が宣言した URL = Declared）も同じ `verdict` を通す。
+// `/capture/attachment`（宣言所在 = meta / self / atypon・ヒューリスティック = source=link → Mismatch 409 / Unverified 422）も
+// 同じ `verdict` を通す。
 //
 // **安全**: 取得先 URL は https のみ（Unpaywall が返す URL だけ http も可）・loopback / private / link-local / CGNAT /
 // localhost を `url::Url` のホスト解釈（数値形 IPv4 `2130706433` / `0x7f.0.0.1` / `127.1` も正規化される）で拒否
@@ -488,7 +487,7 @@ pub enum LocationKind {
     /// PMC AWS Open Data（PMCID + 収載 json の pmcid / doi 照合で同一性が担保済み）
     Pmc,
     /// 出版社 / 文書化 API が宣言した所在（Unpaywall・Crossref `link[]`・`citation_pdf_url` / `link[type=application/pdf]`・
-    /// `/capture/attachment` の meta / self / atypon・connector translator の宣言 URL）
+    /// `/capture/attachment` の meta / self / atypon）
     Declared,
     /// ヒューリスティックで選んだ所在（同一ホストの `.pdf` リンク 1 本規則・`/capture/attachment` の `source=link`）
     Heuristic,
@@ -849,7 +848,6 @@ fn http_get(
 
 /// 外部 URL から PDF をダウンロードして `%PDF` を検証する（`http_get` = 手動リダイレクト・各ホップに SSRF ガード `url_allowed`・
 /// 本文 200 MB 上限）。`referer` は着地ページ（出版社ホストが要求することがある）。`allow_http` は Unpaywall（文書化 API が返す URL）だけ true。
-/// connectd の connector 保険 DL（translator が宣言した URL）もこれを使う（curl 子プロセスは使わない。理由は connectd 側のコメント）
 pub fn download_pdf(url: &str, referer: Option<&str>, allow_http: bool) -> std::result::Result<Vec<u8>, String> {
     pdf_body(http_get(url, referer, "application/pdf,*/*;q=0.8", PDF_CAP, allow_http)?)
 }

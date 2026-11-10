@@ -10,24 +10,29 @@
     page,
     pageCount,
     searchOpen,
+    sideOpen,
     onZoomIn,
     onZoomOut,
     onSetMode,
     onRotate,
     onGoto,
     onToggleSearch,
+    onToggleSide,
   }: {
     zoomPct: number;
     mode: ZoomMode;
     page: number;
     pageCount: number;
     searchOpen: boolean;
+    /** 右バー（検索 / 注釈 / 目次 / ページ）が出ているか */
+    sideOpen: boolean;
     onZoomIn: () => void;
     onZoomOut: () => void;
     onSetMode: (m: ZoomMode) => void;
     onRotate: (dir: 1 | -1) => void;
     onGoto: (n: number) => void;
     onToggleSearch: () => void;
+    onToggleSide: () => void;
   } = $props();
 
   // ページ番号入力: 表示はカレントページに追従、編集中は上書きしない
@@ -102,4 +107,18 @@
     title={t("文書内検索 (⌘F)")}
     onclick={onToggleSearch}>⌕</button
   >
+  <!-- 右バーの開閉（一覧の右ペインの開閉 .lb-pane と同じ絵・⌘⌥I） -->
+  <button
+    class="tb-btn tb-pane"
+    class:tb-pane-off={!sideOpen}
+    title={sideOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
+    aria-label={sideOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
+    aria-pressed={sideOpen}
+    onclick={onToggleSide}>
+    <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
+      <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
+      <rect class="tb-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
+      <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
+    </svg>
+  </button>
 </div>

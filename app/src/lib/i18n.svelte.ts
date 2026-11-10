@@ -16,7 +16,7 @@ export function t(ja: string): string {
 /** 件数 + 単位（`${n} ${t(ja)}` と同じ）。英語で 1 のときだけ訳の最初の複数形を単数に（items → item・PDFs → PDF） */
 export function tn(n: number, ja: string): string {
   const s = t(ja);
-  return `${n} ${i18n.lang === "en" && n === 1 ? s.replace(/\b(item|folder|subfolder|label|name|hit|annotation|PDF)s\b/, "$1") : s}`;
+  return `${n} ${i18n.lang === "en" && n === 1 ? s.replace(/\b(item|folder|subfolder|label|name|hit|annotation|PDF|book)s\b/, "$1") : s}`;
 }
 
 /** 起動時の DB の値・メニューの切替（Rust の emit "ui-lang"）の両方から呼ぶ。"en" 以外は日本語 */

@@ -2,6 +2,7 @@
 /incoming
 /app/node_modules
 /app/dist
+/app/public/pdfjs
 /app/src-tauri/gen
 /app/harness/fixtures
 *.sqlite

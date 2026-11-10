@@ -1,5 +1,5 @@
 //! 編集の command: `wiki_write`（`write_agent`）`wiki_move`（登録表にもある）と GUI 専用の `wiki_save`（`write`）
-//! `wiki_create` `wiki_mkdir` `wiki_rename_preview` `wiki_rename` `wiki_trash`（ゴミ箱へ移す処理は呼び手 = app crate が渡す）
+//! `wiki_create` `wiki_mkdir` `wiki_rename_preview` `wiki_rename` `wiki_duplicate` `wiki_trash`（ゴミ箱へ移す処理は呼び手 = app crate が渡す）
 //! `wiki_save_blob` `wiki_import_file`。形は読みの command と同じ `fn(&Ctx, &Value) -> Result<Value>`（Db を要しない）。
 //!
 //! - ファイルの書込は `with_index` の f の外で行い、f の中は `refresh_paths`（冪等 = 壊れた索引のやり直しで 2 回走っても同じ）だけ。
@@ -191,7 +191,7 @@ fn tmp_name(dir: &Path) -> PathBuf {
     dir.join(format!(".openref-{}-{:016x}.tmp", std::process::id(), fastrand::u64(..)))
 }
 
-/// プロセスの中の編集（write / move / rename / create / mkdir / trash / save_blob / import_file）を直列にする
+/// プロセスの中の編集（write / move / rename / duplicate / create / mkdir / trash / save_blob / import_file）を直列にする
 static EDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn edit_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -283,6 +283,27 @@ fn copy_xattr_acl(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Finder の「ロック」（uchg・uappnd）を外す。`fs::copy` は元の flag も写し、ロックされた一時ファイルは rename も消すこともできない
+fn unlock(p: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+        let flags = std::fs::symlink_metadata(p)?.st_flags();
+        let open = flags & !(libc::UF_IMMUTABLE | libc::UF_APPEND);
+        if open != flags {
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+            // SAFETY: NUL 終端の C 文字列を渡すだけ
+            if unsafe { libc::chflags(c.as_ptr(), open) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = p;
+    Ok(())
+}
+
 /// from を to へ（to が既にあれば失敗 = 上書きしない）
 fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
     rename_excl_with(from, to, renamex_excl, |f, t| std::fs::hard_link(f, t))
@@ -353,8 +374,23 @@ fn rename_excl_with(
     Ok(())
 }
 
+/// name → (拡張子を除いた名前, `.` 付きの拡張子)。`.` が無い・先頭の `.` だけなら拡張子は空
+fn split_ext(name: &str) -> (&str, String) {
+    match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    }
+}
+
 /// dir に name（同名があれば "name 2.ext" "name 3.ext" …）で新しいファイルを置く。中身は fill が一時ファイルに書く。戻り値 = 置いた名前
 fn place_new(dir: &Path, name: &str, fill: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<String> {
+    let (stem, ext) = split_ext(name);
+    place_free(dir, name, fill, |n| if n == 1 { name.to_string() } else { format!("{stem} {n}{ext}") })
+}
+
+/// dir に新しいファイルを置く。名前は cand(1), cand(2), … のうち空いている最初のもの（name はエラーの文に出すだけ）。
+/// 中身は fill が一時ファイルに書く。戻り値 = 置いた名前
+fn place_free(dir: &Path, name: &str, fill: impl FnOnce(&Path) -> std::io::Result<()>, cand: impl Fn(u32) -> String) -> Result<String> {
     std::fs::create_dir_all(dir)?;
     let tmp = tmp_name(dir);
     if let Err(e) = fill(&tmp) {
@@ -362,12 +398,8 @@ fn place_new(dir: &Path, name: &str, fill: impl FnOnce(&Path) -> std::io::Result
         return Err(e.into());
     }
     let _g = edit_lock(); // 中身を書き終えてから（大きなコピーの間に他の編集を止めない）
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
-        _ => (name, String::new()),
-    };
     for n in 1..=999 {
-        let cand = if n == 1 { name.to_string() } else { format!("{stem} {n}{ext}") };
+        let cand = cand(n);
         match rename_excl(&tmp, &dir.join(&cand)) {
             Ok(()) => return Ok(cand),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -999,6 +1031,46 @@ pub fn rename(ctx: &Ctx, a: &Value) -> Result<Value> {
     let ie = reindex_move(&ip, &root, case_only, &plan.from_rel, &touched);
     let out = json!({"path": plan.to.rel, "from": plan.from_rel, "rewritten": rewritten, "links": links, "skipped": skipped, "other": other_json(&plan.other)});
     Ok(with_index_error(out, ie))
+}
+
+/// `wiki_duplicate {path}`: ファイルを同じフォルダに複製する（GUI の右クリック「複製する」）。名前は `<名前> 1.<拡張子>`・あれば `2` `3` …
+/// （言語に依らない = Obsidian の流儀）。中身はバイト列のまま（frontmatter も変えない）・リンクは書き換えない（同じフォルダ = 複製の中の相対リンクは有効）。
+/// 検査は改名と同じ（ワークスペースの外・`.` 始まり・symlink・フォルダ・リンクが壊れる字の名前は拒否）。コピーは一時名へ（`fs::copy` = 読み込まない・
+/// APFS は clone）→ 無ければ置く（place_free = 上書きしない）。edit_lock は置くときだけ取る（import_file と同じ = 動画のコピーの間も保存を止めない。
+/// RENAME_EXCL の無い exFAT は置くときに写し直す = その間だけ保存が待つ）。
+/// mode と時刻は `fs::copy` のまま（読み取り専用のファイルの複製は読み取り専用）・ロックは外す。新規なので退避はしない
+pub fn duplicate(ctx: &Ctx, a: &Value) -> Result<Value> {
+    duplicate_with(ctx, a, copy_xattr_acl)
+}
+
+/// duplicate の本体。attrs = 拡張属性と ACL を写す処理（注入点 = 写せなかったときの試験）
+fn duplicate_with(ctx: &Ctx, a: &Value, attrs: impl FnOnce(&Path, &Path) -> std::io::Result<()>) -> Result<Value> {
+    let path = req_str(a, "path", "wiki_duplicate")?;
+    let (ip, root) = ctx.ready()?;
+    reject_symlink(&root, &path)?;
+    let (from_rel, from_abs) = resolve_path(&root, &path)?;
+    let t = target_path(&root, &from_rel)?;
+    t.check_new(true)?; // 足すのは空白と数字だけ = 元の名前を見れば足りる
+    if !writable(&t.parent) {
+        return Err(bad(format!("書込権がありません（読み取り専用のフォルダ）: {}", t.parent.display())));
+    }
+    let (stem, ext) = split_ext(&t.name);
+    let copy = |tmp: &Path| std::fs::copy(&from_abs, tmp).and_then(|_| unlock(tmp));
+    let placed = place_free(&t.parent, &t.name, copy, |n| format!("{stem} {n}{ext}"))?;
+    // 拡張属性と ACL は置いてから（`deny delete` の ACL が付いた一時ファイルは rename も消すこともできない）。写せなければ複製を残さない。
+    // それでも一時ファイルに `deny delete` が付く場合（clone できない HFS+ は fs::copy が元の ACL も写す・親フォルダの継承）はここへ来る前に
+    // 失敗して一時ファイルが残る（実測・直さない = 稀。親フォルダの ACL は保存の一時ファイルも同じ）
+    let abs = t.parent.join(&placed);
+    if let Err(e) = attrs(&from_abs, &abs) {
+        let _ = std::fs::remove_file(&abs);
+        return Err(e.into());
+    }
+    let rel = match t.rel.rsplit_once('/') {
+        Some((d, _)) => format!("{d}/{placed}"),
+        None => placed,
+    };
+    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    Ok(with_index_error(json!({"path": rel}), ie))
 }
 
 /// `wiki_trash {path, dir?}`: ワークスペースの中のファイルかフォルダ（中身ごと）を mover（app crate = macOS のゴミ箱 = ワークスペースの外）へ渡し、
@@ -1907,6 +1979,213 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.png")).unwrap(), b"png");
     }
 
+    fn tmp_left(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|d| d.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect()
+    }
+    fn dup(e: &Env, p: &str) -> String {
+        duplicate(&e.ctx, &json!({"path": p})).unwrap()["path"].as_str().unwrap().to_string()
+    }
+
+    /// 複製の名前: `<名前> 1.<拡張子>`・あれば繰り上げ（ファイル・フォルダ・symlink・隙間）。中身はバイト列のまま・元は触らない・退避しない
+    #[test]
+    fn duplicate_numbers_and_bytes() {
+        let e = env("dup");
+        let body = "---\ntitle: 題\ntags: [a]\n---\n# 見出し\n[[他]] ![[画像.png]]\r\n末尾に改行なし";
+        put(&e.root, "d/メモ.md", body);
+        let before = seen(&e.root.join("d/メモ.md"));
+        assert_eq!(dup(&e, "d/メモ.md"), "d/メモ 1.md");
+        assert_eq!(dup(&e, "d/メモ.md"), "d/メモ 2.md");
+        assert_eq!(read(&e.root, "d/メモ 1.md"), body);
+        assert_eq!(read(&e.root, "d/メモ 2.md"), body);
+        assert_eq!(seen(&e.root.join("d/メモ.md")), before, "元のファイルを触った");
+        let mtime = |p: &str| std::fs::metadata(e.root.join(p)).unwrap().modified().unwrap();
+        assert_eq!(mtime("d/メモ 1.md"), mtime("d/メモ.md"), "時刻は fs::copy のまま");
+        // 空いた番号から使い直す（Obsidian と同じ）
+        std::fs::remove_file(e.root.join("d/メモ 1.md")).unwrap();
+        assert_eq!(dup(&e, "d/メモ.md"), "d/メモ 1.md");
+        // 既にあるのがファイルでなくても上書きせず繰り上げる（同じ名前のフォルダ・symlink）
+        std::fs::create_dir(e.root.join("d/メモ 3.md")).unwrap();
+        std::os::unix::fs::symlink(e.root.join("外.md"), e.root.join("d/メモ 4.md")).unwrap();
+        put(&e.root, "d/メモ 5.md", "別のファイル");
+        assert_eq!(dup(&e, "d/メモ.md"), "d/メモ 6.md");
+        assert_eq!(read(&e.root, "d/メモ 5.md"), "別のファイル");
+        assert!(std::fs::symlink_metadata(e.root.join("d/メモ 4.md")).unwrap().file_type().is_symlink());
+        // 複製の複製は名前に足す・直下も・拡張子は最後の 1 つだけ・拡張子なし・絶対パスでも渡せる
+        assert_eq!(dup(&e, "d/メモ 1.md"), "d/メモ 1 1.md");
+        put(&e.root, "a.tar.gz", "x");
+        assert_eq!(dup(&e, "a.tar.gz"), "a.tar 1.gz");
+        put(&e.root, "LICENSE", "x");
+        assert_eq!(dup(&e, "LICENSE"), "LICENSE 1");
+        assert_eq!(dup(&e, &e.root.join("LICENSE").to_string_lossy()), "LICENSE 2");
+        // バイナリ（UTF-8 でない）も同じバイト列
+        let png = [0x89, b'P', b'N', b'G', 0, 0xff, 0xfe, 0x0d, 0x0a];
+        std::fs::create_dir_all(e.root.join("img")).unwrap();
+        std::fs::write(e.root.join("img/図.png"), png).unwrap();
+        assert_eq!(dup(&e, "img/図.png"), "img/図 1.png");
+        assert_eq!(std::fs::read(e.root.join("img/図 1.png")).unwrap(), png);
+        assert!(hist(&e, "d/メモ.md").is_empty() && hist(&e, "d/メモ 1.md").is_empty(), "新規なのに退避した");
+        assert!(tmp_left(&e.root.join("d")).is_empty() && tmp_left(&e.root).is_empty());
+    }
+
+    /// 複製は同期で索引へ（5 秒の鮮度を待たない）: 読める・検索で両方 hit・件数が 1 増える・media も木に載る
+    #[test]
+    fn duplicate_is_indexed_at_once() {
+        let e = env("dupix");
+        put(&e.root, "n.md", "# 題\n誰も書かない語 zzqx\n[[x]]");
+        put(&e.root, "p.html", "<title>ページ</title><p>zzqy</p>");
+        std::fs::write(e.root.join("図.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let n0 = commands::status(&e.ctx, &json!({})).unwrap()["pages"].as_i64().unwrap();
+        let p = dup(&e, "n.md");
+        assert_eq!(commands::status(&e.ctx, &json!({})).unwrap()["pages"].as_i64().unwrap(), n0 + 1);
+        let rd = commands::read(&e.ctx, &json!({"path": p})).unwrap();
+        assert_eq!(rd["title"], "題");
+        let hits = commands::search(&e.ctx, &json!({"query": "zzqx"})).unwrap();
+        let paths: Vec<&str> = hits["pages"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+        assert!(paths.contains(&"n.md") && paths.contains(&"n 1.md"), "{hits}");
+        assert_eq!(dup(&e, "p.html"), "p 1.html");
+        assert_eq!(dup(&e, "図.png"), "図 1.png");
+        let ls = commands::list(&e.ctx, &json!({"limit": 100})).unwrap();
+        let all: Vec<&str> = ls["pages"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+        assert!(all.contains(&"p 1.html") && all.contains(&"図 1.png"), "{all:?}");
+    }
+
+    /// 拒否: フォルダ・外・`.` 始まり・symlink・無いファイル・リンクが壊れる字の名前・読み取り専用のフォルダ。どれも何も置かない
+    #[test]
+    fn duplicate_rejects() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env("duprej");
+        put(&e.root, "d/a.md", "a");
+        put(&e.root, ".hid/x.md", "x");
+        std::fs::write(e.base.join("外.md"), "外").unwrap();
+        std::os::unix::fs::symlink(e.root.join("d/a.md"), e.root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(e.base.join("外.md"), e.root.join("out.md")).unwrap();
+        std::os::unix::fs::symlink(&e.base, e.root.join("outdir")).unwrap();
+        put(&e.root, "x[1].pdf", "x");
+        let err = |p: &str| duplicate(&e.ctx, &json!({"path": p})).unwrap_err().to_string();
+        assert!(err("d").contains("ファイルではありません"), "{}", err("d"));
+        assert!(err("d/").contains("ファイルではありません"));
+        assert!(err("../外.md").contains("`..`"), "{}", err("../外.md"));
+        assert!(err(&e.base.join("外.md").to_string_lossy()).contains("外"));
+        assert!(err(".hid/x.md").contains("`.` 始まり"));
+        assert!(err("link.md").contains("symlink"), "ワークスペースの中を指す symlink も拒否");
+        assert!(err("out.md").contains("symlink"));
+        assert!(err("outdir/外.md").contains("外を指して"), "{}", err("outdir/外.md"));
+        assert!(err("無い.md").contains("見つかりません") || err("無い.md").contains("無い.md"), "{}", err("無い.md"));
+        assert!(err("x[1].pdf").contains("使えません"), "{}", err("x[1].pdf"));
+        assert!(duplicate(&e.ctx, &json!({})).unwrap_err().to_string().contains("必須"));
+        // 読み取り専用のフォルダ = 理由を出す・一時ファイルも残さない
+        let d = e.root.join("d");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let m = err("d/a.md");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(m.contains("読み取り専用"), "{m}");
+        let names: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|x| x.file_name()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(!e.base.join("外 1.md").exists());
+    }
+
+    /// コピーの間は edit_lock を持たない（他の編集を止めない）。置くときだけ lock を取り、その間に同じ名前が現れても上書きしない
+    #[test]
+    fn duplicate_copies_outside_lock_and_never_overwrites() {
+        let e = env("duplock");
+        put(&e.root, "a.md", "元");
+        let hold = edit_lock(); // 他の編集が走っている間
+        let ctx = e.ctx.clone();
+        let th = std::thread::spawn(move || duplicate(&ctx, &json!({"path": "a.md"})));
+        // lock を持ったままでも一時名へのコピーは済む（lock の中でコピーしていれば現れない）
+        let copied = (0..1000).any(|_| !tmp_left(&e.root).is_empty() || { std::thread::sleep(std::time::Duration::from_millis(5)); false });
+        assert!(copied, "lock を持っている間にコピーが進まない");
+        assert!(!e.root.join("a 1.md").exists(), "lock を待たずに置いた");
+        // 置く前に外部が同じ名前を作った = 上書きせず次の番号
+        put(&e.root, "a 1.md", "外部が先に作った");
+        drop(hold);
+        assert_eq!(th.join().unwrap().unwrap()["path"], "a 2.md");
+        assert_eq!(read(&e.root, "a 1.md"), "外部が先に作った");
+        assert_eq!(read(&e.root, "a 2.md"), "元");
+        assert!(tmp_left(&e.root).is_empty());
+    }
+
+    /// 拡張属性と ACL を写せなければ複製を残さない（失敗を返す・元は残る）
+    #[test]
+    fn duplicate_keeps_nothing_when_attrs_fail() {
+        let e = env("dupattr");
+        put(&e.root, "a.md", "元");
+        let r = duplicate_with(&e.ctx, &json!({"path": "a.md"}), |_, to| {
+            assert!(to.exists(), "置く前に写そうとした");
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert!(r.is_err());
+        assert!(!e.root.join("a 1.md").exists(), "写せなかった複製が残った");
+        assert_eq!(read(&e.root, "a.md"), "元");
+        assert!(tmp_left(&e.root).is_empty());
+    }
+
+    /// 置けなかったら一時ファイルを残さない: 中身を書く途中の失敗・空きの番号が無い
+    #[test]
+    fn place_free_leaves_no_tmp_when_it_fails() {
+        let e = env("placefail");
+        let half = |tmp: &Path| std::fs::write(tmp, b"half").and_then(|()| Err(std::io::Error::other("途中で失敗")));
+        assert!(place_free(&e.root, "a.md", half, |n| format!("a {n}.md")).is_err());
+        assert!(tmp_left(&e.root).is_empty(), "書く途中で失敗した一時ファイルが残った");
+        put(&e.root, "a.md", "先に居る");
+        let r = place_free(&e.root, "a.md", |tmp| std::fs::write(tmp, b"x"), |_| "a.md".to_string());
+        assert!(matches!(r, Err(CoreError::Conflict(_))), "{r:?}");
+        assert_eq!(read(&e.root, "a.md"), "先に居る");
+        assert!(tmp_left(&e.root).is_empty(), "番号が尽きたのに一時ファイルが残った");
+    }
+
+    /// 拡張属性（Finder のタグ等）・ACL・mode を写す。読み取り専用のファイルも複製できる（複製も読み取り専用 = cp と同じ）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_keeps_xattr_acl_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env("dupx");
+        put(&e.root, "a.pdf", "%PDF");
+        let f = e.root.join("a.pdf");
+        xattr_set(&f, "dev.openref.test", b"tag");
+        xattr_set(&f, "com.apple.metadata:_kMDItemUserTags", b"bplist");
+        assert!(std::process::Command::new("/bin/chmod").args(["+a", "everyone deny delete"]).arg(&f).status().unwrap().success());
+        let acl = |p: &Path| String::from_utf8_lossy(&std::process::Command::new("/bin/ls").arg("-le").arg(p).output().unwrap().stdout).lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(acl(&f).contains("deny delete"), "{}", acl(&f));
+        assert_eq!(dup(&e, "a.pdf"), "a 1.pdf");
+        let c = e.root.join("a 1.pdf");
+        assert_eq!(xattr_get(&c, "dev.openref.test").as_deref(), Some(&b"tag"[..]));
+        assert_eq!(xattr_get(&c, "com.apple.metadata:_kMDItemUserTags").as_deref(), Some(&b"bplist"[..]));
+        assert_eq!(acl(&c), acl(&f));
+        // 読み取り専用のファイル
+        put(&e.root, "r.md", "読み取り専用");
+        let r = e.root.join("r.md");
+        xattr_set(&r, "dev.openref.test", b"ro");
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(dup(&e, "r.md"), "r 1.md");
+        let c = e.root.join("r 1.md");
+        assert_eq!(read(&e.root, "r 1.md"), "読み取り専用");
+        assert_eq!(std::fs::metadata(&c).unwrap().permissions().mode() & 0o777, 0o444);
+        assert_eq!(xattr_get(&c, "dev.openref.test").as_deref(), Some(&b"ro"[..]));
+        // Finder の「ロック」（uchg）: 複製は外れている（一時ファイルがロックされたままだと置けない・消せない）・元はロックのまま
+        use std::os::macos::fs::MetadataExt;
+        put(&e.root, "l.pdf", "%PDF");
+        let l = e.root.join("l.pdf");
+        xattr_set(&l, "dev.openref.test", b"locked");
+        let chflags = |f: &str, p: &Path| assert!(std::process::Command::new("/usr/bin/chflags").arg(f).arg(p).status().unwrap().success());
+        let lock = libc::UF_IMMUTABLE | libc::UF_APPEND;
+        for (on, off, bit, want) in [("uchg", "nouchg", libc::UF_IMMUTABLE, "l 1.pdf"), ("uappnd", "nouappnd", libc::UF_APPEND, "l 2.pdf")] {
+            chflags(on, &l);
+            let r = duplicate(&e.ctx, &json!({"path": "l.pdf"}));
+            let kept = std::fs::metadata(&l).unwrap().st_flags() & bit != 0;
+            chflags(off, &l);
+            assert_eq!(r.unwrap()["path"], want);
+            assert!(kept, "元の {on} を外した");
+            let c = e.root.join(want);
+            assert_eq!(std::fs::metadata(&c).unwrap().st_flags() & lock, 0, "{on}");
+            assert_eq!(xattr_get(&c, "dev.openref.test").as_deref(), Some(&b"locked"[..]));
+        }
+        assert!(tmp_left(&e.root).is_empty());
+        for p in [e.root.join("a.pdf"), e.root.join("a 1.pdf")] {
+            assert!(std::process::Command::new("/bin/chmod").arg("-N").arg(p).status().unwrap().success());
+        }
+    }
+
     #[test]
     fn rename_excl_falls_back_when_unsupported() {
         let e = env("excl");
@@ -2110,6 +2389,16 @@ mod tests {
         eprintln!("write_atomic 上書き = {r:?}");
         assert_eq!(r.unwrap(), Wrote::Ok);
         assert_eq!(read(&root, "新規/ページ.md"), "# 2");
+        // duplicate（fs::copy → 一時名 → 置く・拡張属性）
+        #[cfg(target_os = "macos")]
+        xattr_set(&abs, "dev.openref.test", b"tag");
+        let r = duplicate(&ctx, &json!({"path": "新規/ページ.md"}));
+        eprintln!("duplicate = {r:?}");
+        assert_eq!(r.unwrap()["path"], "新規/ページ 1.md");
+        assert_eq!(read(&root, "新規/ページ 1.md"), "# 2");
+        #[cfg(target_os = "macos")]
+        assert_eq!(xattr_get(&root.join("新規/ページ 1.md"), "dev.openref.test").as_deref(), Some(&b"tag"[..]));
+        assert_eq!(duplicate(&ctx, &json!({"path": "新規/ページ.md"})).unwrap()["path"], "新規/ページ 2.md");
         // create（place_new・同名は連番）
         let r = create(&ctx, &json!({}));
         eprintln!("create = {r:?}");

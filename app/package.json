@@ -1,11 +1,13 @@
 {
   "name": "openref-ui",
   "private": true,
-  "version": "2.0.1",
+  "version": "3.0.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "predev": "node ../scripts/copy-pdf-assets.mjs",
     "dev": "vite",
+    "prebuild": "node ../scripts/copy-pdf-assets.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --threshold error",

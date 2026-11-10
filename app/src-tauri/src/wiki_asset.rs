@@ -53,7 +53,7 @@ thread_local! {
 }
 
 /// asset:// の 1 要求への応答（register_asynchronous_uri_scheme_protocol の中身・ファイル IO はこの関数の中）。
-/// label = 要求した webview（"main" 以外 = URL の別窓 → 403・ファイルに触らない）。パスは Tauri の asset と同じ形
+/// label = 要求した webview（"main" 以外 → 403・ファイルに触らない = 窓を足しても外部ページに vault を読ませない）。パスは Tauri の asset と同じ形
 /// （`asset://localhost//Users/…` = 先頭の `/` を 1 つ落として %xx を解く）。`.` / `..` の区画は拒否 → scope（allow_directory したフォルダ）→
 /// 読む。Range は単一区間だけ（複数は全体を 200 で返す）。CORS = 要求の Origin をそのまま返す（main は OpenRef 自身のページ）
 pub(crate) fn asset_reply(

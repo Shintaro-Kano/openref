@@ -1,5 +1,5 @@
 // OpenNote のチャットの文脈に添える選択の読み取り（DOM だけ = 状態を持たない）。中央のページの表示（shadow DOM）とエディタ（CodeMirror）。
-// chat.svelte.ts から移しただけ（B-34）。選択を chat.sel に入れる判断（readSelection）は chat.svelte.ts
+// chat.svelte.ts から移しただけ。選択を viewing.sel に入れる判断（readViewingSelection）は viewing.svelte.ts
 
 interface EditorLike {
   view: { dom: HTMLElement; state: { selection: { main: { from: number; to: number } }; sliceDoc(a: number, b: number): string } };

@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CARGO = Path.home() / ".cargo" / "bin" / "cargo"
 
-FORBIDDEN_TOKENS = ("GPL", "LGPL", "AGPL")
+FORBIDDEN_TOKENS = ("GPL", "LGPL", "AGPL", "GENERAL PUBLIC LICENSE")  # 本物の LICENSE の見出しは略称を含まない
 
 
 def check_cargo() -> list[str]:
@@ -63,8 +63,27 @@ def check_npm() -> list[str]:
     return violations
 
 
+def check_pdfjs_assets() -> list[str]:
+    """scripts/copy-pdf-assets.mjs が .app へ同梱する pdf.js の補助データ。pdfjs-dist の license(Apache-2.0)は
+    中の部品(PDFium・OpenJPEG・qcms・Liberation・Foxit・Adobe の CMap・ICC プロファイル)を語らないので LICENSE を読む"""
+    base = ROOT / "app/node_modules/pdfjs-dist"
+    violations: list[str] = []
+    files = 0
+    for d in ("cmaps", "standard_fonts", "wasm", "iccs"):
+        licenses = sorted((base / d).glob("LICENSE*"))
+        if not licenses:
+            violations.append(f"pdfjs-dist/{d}: LICENSE が無い")
+        for p in licenses:
+            files += 1
+            text = p.read_text(encoding="utf-8", errors="replace").upper()
+            if any(tok in text for tok in FORBIDDEN_TOKENS):
+                violations.append(f"pdfjs-dist/{d}/{p.name} -> GPL 系の表記")
+    print(f"[pdfjs assets] checked {files} license files")
+    return violations
+
+
 def main() -> int:
-    violations = check_cargo() + check_npm()
+    violations = check_cargo() + check_npm() + check_pdfjs_assets()
     if violations:
         print("\nLICENSE CHECK FAILED:", file=sys.stderr)
         for v in violations:

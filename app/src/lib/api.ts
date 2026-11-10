@@ -192,7 +192,13 @@ export interface ListFilter {
   journal?: string | null;
   /** true = PDF 本文を検索しない（Word アドイン用。GUI は使わない = 本文も検索） */
   metadataOnly?: boolean;
+  /** 並び（検索中もこの並び）。GUI は常に渡す。無ければ core の既定の順（検索なし = 追加日の新しい順・検索あり = 一致度の順） */
+  sort?: ListSortKey | null;
+  /** true = 降順（sort が無ければ見ない） */
+  desc?: boolean;
 }
+
+export type ListSortKey = "added" | "published" | "journal";
 
 /** = core types::FieldDef */
 export interface FieldDef {

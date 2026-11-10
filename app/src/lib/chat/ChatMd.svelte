@@ -2,10 +2,10 @@
   /* チャットの応答 1 ブロックの md（確定した本文だけ）。描画は既存の MdView（markdown-it + DOMPurify + shadow DOM）を通す =
      独自の innerHTML を持たない。`[[名前]]` は vault のページ一覧で引き当て（chat.ts の chatLinks）、リンクの遷移は Wiki の navigate */
   import { untrack } from "svelte";
-  import MdView from "./MdView.svelte";
+  import MdView from "../wiki/MdView.svelte";
   import { chatLinks } from "./chat";
-  import type { WikiPageData } from "./types";
-  import { navigate, readPage, wk } from "./wiki.svelte";
+  import type { WikiPageData } from "../wiki/types";
+  import { navigate, readPage, wk } from "../wiki/wiki.svelte";
 
   let { text }: { text: string } = $props();
 

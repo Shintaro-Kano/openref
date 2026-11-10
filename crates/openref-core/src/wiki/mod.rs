@@ -257,8 +257,8 @@ mod tests {
         let prefs = mk(&h.join("Library/Preferences")).to_path_buf();
         assert!(rejected(&prefs, &h, None).contains("~/Library"));
         // ~/Library の外の兄弟（scratch DB の隣に vault を置く試験の形）は可
-        let scratch_app = mk(&h.join("openref-scratch/app")).to_path_buf();
-        let vault = mk(&h.join("openref-scratch/wiki-vault")).to_path_buf();
+        let scratch_app = mk(&h.join("scratch/app")).to_path_buf();
+        let vault = mk(&h.join("scratch/wiki-vault")).to_path_buf();
         assert!(check_root(&vault, &h, Some(&scratch_app)).is_ok());
     }
 

@@ -1,11 +1,11 @@
-// OpenNote のファイル操作 = 新規ページ / 新規フォルダ / 改名 / ゴミ箱と、そのメニュー・ダイアログ（WikiDialogs）の流れ。
-// wiki.svelte.ts から移しただけ（B-33）。状態（wk）と骨組みの動詞は wiki.svelte.ts を読む一方向（wiki.svelte.ts はここを読まない = 循環しない）。
+// OpenNote のファイル操作 = 新規ページ / 新規フォルダ / 改名 / 複製 / ゴミ箱と、そのメニュー・ダイアログ（WikiDialogs）の流れ。
+// wiki.svelte.ts から移しただけ。状態（wk）と骨組みの動詞は wiki.svelte.ts を読む一方向（wiki.svelte.ts はここを読まない = 循環しない）。
 // 操作は画面の root（wikiArgs が args.root を足す）= 追随させるタブも画面の root のタブだけ（onShown = 別のワークスペースの同じ相対パスは別のファイル）
 
 import { t } from "../i18n.svelte";
 import { app, closeTab, frontWiki, toast } from "../state.svelte";
-import { dirOf } from "./render/asset.ts";
-import type { WikiCreateResult, WikiMkdirResult, WikiRenamePreview, WikiRenameResult, WikiTrashResult } from "./types";
+import { baseName, dirOf } from "./render/asset.ts";
+import type { WikiCreateResult, WikiDuplicateResult, WikiMkdirResult, WikiRenamePreview, WikiRenameResult, WikiTrashResult } from "./types";
 import { dirty, discardEdit, ed, holdAutosave, renamed, resumeAutosave } from "./edit.svelte";
 import { canLeave, isRefPath, loadAll, onShown, openWikiPage, shownRoot, wikiArgs, wk } from "./wiki.svelte";
 
@@ -171,6 +171,26 @@ export async function doRename(from: string, to: string, rewrite: boolean) {
     void loadAll();
   } catch (e) {
     toast(`✗ ${t("名前を変えられません")}: ${String(e).slice(0, 200)}`);
+  }
+}
+
+/** 複製して同じタブで開く（wiki_duplicate・ダイアログなし = 名前を変えたければ複製の後に「名前を変更…」）。
+    編集中なら先に保存（複製に未保存の変更を入れる・保存できなければ複製しない。「変更を破棄して移る」を選べば保存済みの内容を写す）。
+    開くのは押したときの画面のままなら（大きなファイルのコピーを待つ間にタブ・ワークスペース・ページが変わったら開かない = 読み始めた画面を奪わない） */
+export async function duplicateFile(path: string) {
+  wk.menu = null;
+  const tabId = app.tab;
+  const root = shownRoot();
+  const page = frontWiki()?.path;
+  if (ed.path && !(await canLeave())) return;
+  try {
+    const r = await wikiArgs("wiki_duplicate", { path }) as WikiDuplicateResult;
+    if (r.index_error) toast(`⚠ ${t("複製しましたが、索引を更新できませんでした")}: ${baseName(r.path)} · ${r.index_error.slice(0, 160)}`, 8000);
+    else toast(`${t("複製しました")}: ${baseName(r.path)}`);
+    void loadAll();
+    if (app.tab === tabId && shownRoot() === root && frontWiki()?.path === page) await openWikiPage(r.path);
+  } catch (e) {
+    toast(`✗ ${t("複製できません")}: ${String(e).slice(0, 200)}`);
   }
 }
 

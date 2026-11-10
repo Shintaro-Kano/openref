@@ -1,14 +1,16 @@
-/* OpenNote のチャットの試験（node app/src/lib/wiki/chat.test.mjs・Svelte 5 の実部品 + jsdom）。
+/* OpenNote のチャットの試験（node app/src/lib/chat/chat.test.mjs・Svelte 5 の実部品 + jsdom）。
    invoke は差し替え・event "wiki-chat" は listen の差し替えで直接流す（契約 = types.ts の「チャットの契約」）。実物の行は chat-fixtures/。確かめること:
    ① reducer（chat.ts）: stream-json の逐次（text_delta）→ 確定の assistant で置き換え・1 ブロックずつ / 全ブロックの両方の形・
       道具の要約（tool_use + input_json_delta）と結果（tool_result）・result で確定・system / 未知 / 壊れた行は無視・下位の agent は出さない
    ② 送信: 未起動なら wiki_chat_start → wiki_chat_send {text, context}・IME の変換中の Enter は送らない・文脈のチップの × で外す
    ③ changes の表示（種類・[開く]）と [元に戻す]（wiki_chat_undo {turn, index}・ok:false の reason を出す）
    ④ stderr は診断に畳む・異常終了は知らせる（自動で起こし直さない）・停止 = wiki_chat_interrupt
-   ⑤ チャットが無効なら右ペインにタブを出さない（原則 1）・有効ならタブ */
+   ⑤ 面はアプリ右端の柱 1 本（ChatDock）: チャットが無効ならタブ列のボタンを出さない・押すと開く・ui_chat_dock に覚える・
+      幅はつまみを離したときに 1 回だけ確定する・開いた / 前面のタブが変わったときに状態を読み直す（柱の門と ⌘⌥C は App の配線 = app.test）
+   ⑥ 一覧の右ペイン: 開閉は ui_detail・⌘⌥I は前面のモードの右ペインだけ（チャットとは別）・一覧が前面のときの柱の文脈 = 選んでいる文献 */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { setupHarness } from "./test-harness.mjs";
+import { setupHarness } from "../wiki/test-harness.mjs";
 
 // 土台（test-harness.mjs）: loader・jsdom の global 化・Tauri の偽物（invoke = handlers / event = emit で流す）
 const { calls, handlers, emit, listeners, sleep, waitFor } = setupHarness();
@@ -332,11 +334,13 @@ const C = await import("./chat.ts");
 // ---------- ②〜⑤ 実部品 ----------
 const { mount, unmount, flushSync } = await import("svelte");
 const S = await import("../state.svelte.ts");
-const W = await import("./wiki.svelte.ts");
+const W = await import("../wiki/wiki.svelte.ts");
 const CH = await import("./chat.svelte.ts");
-const SE = await import("./selection.ts"); // 選択の読み取り（B-34 で chat.svelte.ts から分けた）
-const { default: WikiChat } = await import("./WikiChat.svelte");
-const { default: WikiRight } = await import("./WikiRight.svelte");
+const V = await import("../viewing.svelte.ts"); // 見ている物と選択範囲（chat.svelte.ts から分けた）
+const SE = await import("../wiki/selection.ts"); // 選択の読み取り（chat.svelte.ts から分けた）
+const { default: WikiChat } = await import("./ChatPanel.svelte");
+const { default: ChatDock } = await import("./ChatDock.svelte");
+const { default: TabStrip } = await import("../TabStrip.svelte");
 
 // Rust の擬似: 子プロセスの状態と会話の id を持ち、wiki_chat_status はそれを返す。start は返る前に state を出す（契約）
 const mock = { enabled: true, state: "off", session: null, over: {} };
@@ -353,7 +357,7 @@ const startOk = (a) => {
   return { session_id: sid, resumed: false };
 };
 startOk.n = 0;
-const prefs = {};
+const prefs = { ui_chat_dock: JSON.stringify({ open: true, w: 420 }) }; // 起動時の読みで柱の開閉と幅が戻る（下の起動の節）
 handlers.get_ui_pref = (a) => prefs[a.key] ?? null;
 handlers.set_ui_pref = (a) => {
   prefs[a.key] = a.value;
@@ -362,7 +366,7 @@ handlers.set_ui_pref = (a) => {
 handlers.wiki_backlinks = () => ({ total: 0, pages: [] });
 W.wk.status = { enabled: true, root: "/v" };
 W.wk.page = { path: "notes/a.md", abs_path: "/v/notes/a.md", kind: "md", title: "A", size: 1, mtime: 0, content: "本文", sha256: "s", truncated: false };
-// 前面のタブ = Wiki のページ（右ペインが出るのは Wiki のタブだけ。一覧が前面なら文脈は無し = 下の浮かせるブロックで確認）
+// 前面のタブ = Wiki のページ（文脈 = ページ。一覧が前面なら文脈は選んでいる文献 = 下の柱の節で確認）
 {
   const t0 = S.app.tabs.find((t) => t.id === S.app.tab);
   if (t0) t0.wiki = { path: "notes/a.md", scrollTop: 0, editing: false };
@@ -370,57 +374,82 @@ W.wk.page = { path: "notes/a.md", abs_path: "/v/notes/a.md", kind: "md", title: 
 // 本番の起動順: initChat（onMount）→ wiki_settings が返って app.wikiOn = true
 S.app.wikiOn = false;
 calls.length = 0;
+const stopViewing = V.initViewing(); // App の onMount と同じ順（initViewing → initChat）
 const stop = CH.initChat();
 await sleep(10);
 assert.equal(calls.filter((c) => c.name === "wiki_chat_status").length, 0, "Wiki OFF で状態を読んだ");
 S.app.wikiOn = true;
 
-// 起動時: 右ペイン（WikiRight）の mount を待たずに状態を読む（MY LIBRARY の PDF のタブの [チャット] が起動直後から出る）・1 回だけ
-assert.ok(await waitFor(() => CH.chat.status != null), "起動時（右ペインの前）に状態を読まない");
-assert.ok(CH.chatShown(), "有効なのに [チャット] を出す判定が false");
+// 起動時: 柱（ChatDock）の mount を待たずに状態を読む（タブ列のボタンが起動直後から出る）・1 回だけ・柱の開閉と幅（ui_chat_dock）が戻る
+assert.ok(await waitFor(() => CH.chat.status != null), "起動時（柱の前）に状態を読まない");
+assert.ok(CH.chatShown(), "有効なのに柱を出す判定が false");
 assert.equal(calls.filter((c) => c.name === "wiki_chat_status").length, 1, "起動時の読みが 1 回でない");
+assert.ok(await waitFor(() => CH.chat.dock.open === true), "柱の開閉（ui_chat_dock）が戻らない");
+assert.equal(CH.chat.dock.w, 420, "柱の幅（ui_chat_dock）が戻らない");
+CH.chat.dock = { open: false, w: C.DOCK_W };
+delete prefs.ui_chat_dock;
 tests++;
 
-// ⑤ 無効 = タブなし（WikiInfo だけ）・有効 = タブ・Settings で OFF（enabled event） = タブが消える・state event では status を読まない・タブを押すと入力欄へ focus
+// ⑤ 柱の入口（タブ列の右端のボタン）: 無効 = ボタンなし・有効 = ボタン・押すと開いて覚える（ui_chat_dock）・開いた柱の入力欄へ focus・
+// もう一度で閉じる・Settings で OFF（enabled event）= ボタンが消える・state event では status を読まない・応答中は点。
+// 柱そのものの門（chatShown() && chat.dock.open で mount）と ⌘⌥C は App の配線 = app.test。ここでは App と同じ条件で ChatDock を mount する
 {
   mock.enabled = false;
   const target = document.createElement("div");
   document.body.append(target);
-  const cmp = mount(WikiRight, { target }); // 右ペインの mount = 読み直す（読み中でなければ）
+  const strip = mount(TabStrip, { target });
+  emit("wiki-state", null); // 有効 / 無効の変化（Rust の wiki-state）= 読み直す
   await waitFor(() => CH.chat.status?.enabled === false);
   flushSync();
-  assert.equal(target.querySelector(".wk-rtabs"), null, "チャットが無効なのにタブを出した");
-  assert.ok(target.querySelector(".wk-info"), "ページ情報が出ない");
+  assert.equal(target.querySelector(".tabs-chat"), null, "チャットが無効なのに柱のボタンを出した");
+  assert.equal(CH.chatShown(), false, "チャットが無効なのに柱を出す判定が true");
   mock.enabled = true;
   emit("wiki-state", null);
-  assert.ok(await waitFor(() => !!target.querySelector(".wk-rtabs")), "有効になってもタブが出ない");
-  const tabs = () => [...target.querySelectorAll(".wk-rtab")];
-  tabs()[1].click(); // チャット（mount の順: setTab の後に WikiChat が mount される）
+  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat"))), "有効になってもボタンが出ない");
+  const btn = () => target.querySelector(".tabs-chat");
+  assert.equal(btn().getAttribute("aria-pressed"), "false", "閉じているのに押された絵");
+  btn().click(); // 開く（App は chatShown() && chat.dock.open で ChatDock を mount する = 下で同じ条件で mount）
+  flushSync();
+  assert.deepEqual([CH.chat.dock.open, JSON.parse(prefs.ui_chat_dock)], [true, { open: true, w: C.DOCK_W }], "ボタンで開かない / 開閉を覚えない");
+  const dockAt = document.createElement("div");
+  document.body.append(dockAt);
+  let dock = mount(ChatDock, { target: dockAt });
   flushSync();
   await sleep(10);
-  assert.equal(document.activeElement?.tagName, "TEXTAREA", "タブを押しても入力欄へ focus しない");
-  assert.equal(prefs.ui_wiki_right_tab, "chat", "タブの選択を覚えない");
-  tabs()[0].click();
+  assert.equal(document.activeElement, dockAt.querySelector(".wk-ch textarea"), "柱を開いても入力欄へ focus しない");
+  assert.equal(btn().getAttribute("aria-pressed"), "true", "開いているのに押された絵にならない");
+  btn().click(); // 閉じる
   flushSync();
-  assert.ok(target.querySelector(".wk-info.wk-info-in"));
-  assert.equal(prefs.ui_wiki_right_tab, "info");
-  // 子の状態の event（state: busy / idle）では status を読み直さない（claude --version / auth status を毎ターン起こさない）
+  unmount(dock);
+  assert.deepEqual([CH.chat.dock.open, JSON.parse(prefs.ui_chat_dock).open], [false, false], "もう一度押しても閉じない / 閉じたことを覚えない");
+  // 子の状態の event（state: busy / idle）では status を読み直さない（claude --version / auth status を毎ターン起こさない）・応答中はボタンに点
   calls.length = 0;
   stateEv("busy");
+  flushSync();
+  assert.ok(target.querySelector(".tabs-chat .tabs-chat-dot"), "応答中の点がボタンに出ない");
   stateEv("idle");
+  flushSync();
+  assert.equal(target.querySelector(".tabs-chat-dot"), null, "応答が終わっても点が残った");
   await sleep(20);
   assert.ok(!calls.some((c) => c.name === "wiki_chat_status"), "state event で status を読み直した");
-  // Settings で OFF = Rust は wiki-chat {type: enabled, enabled: false} を出す → タブを消して読み直す
+  // Settings で OFF = Rust は wiki-chat {type: enabled, enabled: false} を出す → ボタンを消して読み直す
   mock.enabled = false;
   emit("wiki-chat", { type: "enabled", enabled: false });
   flushSync();
-  assert.equal(target.querySelector(".wk-rtabs"), null, "enabled:false でタブが消えない");
+  assert.equal(target.querySelector(".tabs-chat"), null, "enabled:false でボタンが消えない");
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_status")), "enabled event で読み直さない");
   mock.enabled = true;
   emit("wiki-chat", { type: "enabled", enabled: true });
-  assert.ok(await waitFor(() => !!target.querySelector(".wk-rtabs")), "enabled:true でタブが戻らない");
-  unmount(cmp);
+  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat"))), "enabled:true でボタンが戻らない");
+  // 空きのダブルクリック = 新しいタブ（TabStrip の dblclickNew）はボタンの上では効かない
+  const nTabs = S.app.tabs.length;
+  btn().dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  await sleep(10);
+  assert.equal(S.app.tabs.length, nTabs, "ボタンのダブルクリックで新しいタブを開いた");
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  unmount(strip);
   target.remove();
+  dockAt.remove();
   tests++;
 }
 
@@ -470,7 +499,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   handlers.wiki_chat_start = startOk;
   let turn = 0;
   handlers.wiki_chat_send = () => ({ turn: ++turn });
-  CH.chat.sel = { path: "notes/a.md", text: "選んだ文" };
+  V.viewing.sel = { key: "notes/a.md", text: "選んだ文" };
   flushSync();
   assert.deepEqual($$(".wk-ch-ctx .wk-ch-chip-text").map((e) => e.textContent), ["notes/a.md", "選択範囲 4 字"], "文脈のチップ");
   typeDraft("このページを要約して");
@@ -493,7 +522,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   flushSync();
   assert.equal(ta().value, "", "送った後に入力欄を空にしない");
   assert.equal($(".wk-ch-user-text").textContent, "このページを要約して");
-  assert.equal(CH.chat.sel, null, "選択範囲を次の発言にも付ける");
+  assert.equal(V.viewing.sel, null, "選択範囲を次の発言にも付ける");
   // × でページを外す → 文脈なしで送る
   stateEv("idle");
   flushSync();
@@ -506,7 +535,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_send")));
   assert.deepEqual(calls.filter((c) => c.name !== "wiki_chat_status").map((c) => c.name), ["wiki_chat_send"], "起動済みなのに起こし直した");
   assert.deepEqual(calls.find((c) => c.name === "wiki_chat_send").args, { text: "次", root: "/v" }, "外した文脈を添えた");
-  assert.ok(await waitFor(() => !CH.chat.sending), "送信が終わらない"); // invoke の後の後始末（ipc.ts の包みの分だけ遅れる）を待つ
+  assert.ok(await waitFor(() => !CH.chat.sending), "送信が終わらない"); // invoke の後の後始末（wiki/ipc.ts の包みの分だけ遅れる）を待つ
   CH.pageChanged("other.md");
   assert.equal(CH.chat.ctxOff, null, "ページが変わっても外したまま");
   // 送れなかった = 入力欄の文章と選択のチップを戻す・発言は会話に残さない・失敗の表示は 1 か所
@@ -514,12 +543,12 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
     throw new Error("boom");
   };
   const n = CH.chat.conv.entries.length;
-  CH.chat.sel = { path: "notes/a.md", text: "残す選択" };
+  V.viewing.sel = { key: "notes/a.md", text: "残す選択" };
   typeDraft("長い依頼文");
   assert.equal(await CH.send(), false);
   flushSync();
   assert.equal(CH.chat.draft, "長い依頼文", "送れなかった文章を捨てた");
-  assert.deepEqual(CH.chat.sel, { path: "notes/a.md", text: "残す選択" }, "送れなかった選択を捨てた");
+  assert.deepEqual(V.viewing.sel, { key: "notes/a.md", text: "残す選択" }, "送れなかった選択を捨てた");
   assert.equal(CH.chat.conv.entries.length, n, "送れなかった発言を会話に残した");
   assert.equal($$(".wk-ch-err").filter((e) => e.textContent.includes("boom")).length, 1, "失敗を 2 か所に出した");
   // 送信中・応答中は送らない
@@ -533,7 +562,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   assert.ok(!calls.some((c) => c.name === "wiki_chat_send"));
   stateEv("idle");
   CH.chat.draft = "";
-  CH.chat.sel = null;
+  V.viewing.sel = null;
   CH.chat.error = null;
   tests++;
 }
@@ -791,17 +820,17 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
     sel.addRange(r);
     document.dispatchEvent(new Event("selectionchange"));
   };
-  CH.chat.sel = null;
+  V.viewing.sel = null;
   pick(pageEl.querySelector("p").firstChild, 0, 2);
   await sleep(0);
-  assert.deepEqual(CH.chat.sel, { path: "notes/a.md", text: "中央" }, "ページの選択を拾わない");
+  assert.deepEqual(V.viewing.sel, { key: "notes/a.md", text: "中央" }, "ページの選択を拾わない");
   pick(out.firstChild, 0, 2);
   await sleep(0);
-  assert.equal(CH.chat.sel?.text, "中央", "ページの外の選択で前の選択を捨てた・外の選択を拾った");
+  assert.equal(V.viewing.sel?.text, "中央", "ページの外の選択で前の選択を捨てた・外の選択を拾った");
   sel.collapse(pageEl.querySelector("p").firstChild, 1);
   document.dispatchEvent(new Event("selectionchange"));
   await sleep(0);
-  assert.equal(CH.chat.sel, null, "ページの中で畳んでも残した");
+  assert.equal(V.viewing.sel, null, "ページの中で畳んでも残した");
   assert.equal(SE.inPage(pageEl.querySelector("p").firstChild), true, "テキストノードを判定できない");
   assert.equal(SE.inPage(out), false);
   // shadow DOM の中 = host の祖先で判定
@@ -814,34 +843,46 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   out.append(host2);
   assert.equal(SE.inPage(host2.attachShadow({ mode: "open" })), false);
   // 20000 字を超える選択 = 切って送る・チップは切った後の長さと印
-  CH.chat.sel = { path: "notes/a.md", text: "あ".repeat(20005) };
+  V.viewing.sel = { key: "notes/a.md", text: "あ".repeat(20005) };
   flushSync();
   assert.equal($(".wk-ch-ctx .wk-ch-chip:last-child .wk-ch-chip-text").textContent, "選択範囲 20000 字 (先頭だけ)", "切ったことをチップに出さない");
   assert.equal(CH.currentContext().selection.length, 20000, "選択を切らずに送る");
-  CH.chat.sel = null;
+  // 別の元の選択（effect を待たずに置いた = タブを替えた直後と同じ）はチップにも文脈にも出さない
+  V.viewing.sel = { key: "item:K9", text: "別の元の選択" };
+  flushSync();
+  assert.deepEqual($$(".wk-ch-ctx .wk-ch-chip-text").map((e) => e.textContent), ["notes/a.md"], "別の元の選択をチップに出した");
+  assert.deepEqual(CH.currentContext(), { path: "notes/a.md" }, "別の元の選択を文脈に添えた");
+  // 選択のチップの × = 選択だけ外す（ページは残る）
+  V.viewing.sel = { key: "notes/a.md", text: "外す選択" };
+  flushSync();
+  $(".wk-ch-ctx .wk-ch-chip:last-child .wk-ch-x").click();
+  flushSync();
+  assert.equal(V.viewing.sel, null, "選択のチップの × で外れない");
+  assert.deepEqual(CH.currentContext(), { path: "notes/a.md" }, "選択の × でページまで外した");
+  V.viewing.sel = null;
   pageEl.remove();
   out.remove();
   tests++;
 }
 
-// PDF のタブが前面 = 文脈は文献（item / title）・選択は PdfViewer の setViewerSelection・× で外す・OpenNote のタブへ戻ると元に戻る
+// PDF のタブが前面 = 文脈は文献（item / title）・選択は PdfViewer が viewing の setViewingSelection へ書く・× で外す・OpenNote のタブへ戻ると元に戻る
 {
   const wikiTab = S.app.tab;
   const base = S.app.tabs.find((t) => t.id === wikiTab);
   S.app.tabs.push({ ...base, id: 9001, wiki: null, viewer: { itemKey: "K1", attachmentId: 1, title: "題名 T" } });
   S.app.tab = 9001;
   flushSync();
-  assert.deepEqual(CH.currentSource(), { kind: "item", key: "K1", title: "題名 T" });
+  assert.deepEqual(V.viewingSource(), { kind: "item", key: "K1", title: "題名 T" });
   assert.deepEqual(CH.currentContext(), { item: "K1", title: "題名 T" }, "PDF のタブでページを添えた");
   assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "題名 T", "文献のチップが題名でない");
-  CH.setViewerSelection("K1", "PDF の選択");
+  V.setViewingSelection("item:K1", "PDF の選択");
   flushSync();
   assert.deepEqual(CH.currentContext(), { item: "K1", title: "題名 T", selection: "PDF の選択" });
   assert.equal($(".wk-ch-ctx .wk-ch-chip:last-child .wk-ch-chip-text").textContent, "選択範囲 7 字");
-  CH.setViewerSelection("K9", null);
-  assert.ok(CH.chat.sel, "別の文献の選択解除で消した");
-  CH.setViewerSelection("K1", null);
-  assert.equal(CH.chat.sel, null, "選択解除で消えない");
+  V.setViewingSelection("item:K9", null);
+  assert.ok(V.viewing.sel, "別の文献の選択解除で消した");
+  V.setViewingSelection("item:K1", null);
+  assert.equal(V.viewing.sel, null, "選択解除で消えない");
   // 送ると item / title が context に（path は無い）
   stateEv("idle");
   flushSync();
@@ -867,14 +908,199 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   assert.equal(CH.chat.ctxOff, null, "タブが変わっても外したまま");
   assert.deepEqual(CH.currentContext(), { path: "notes/a.md" });
   // Wiki のタブの選択は PDF のタブへ移ると捨てる
-  CH.chat.sel = { path: "notes/a.md", text: "ページの選択" };
+  V.viewing.sel = { key: "notes/a.md", text: "ページの選択" };
   S.app.tab = 9001;
   flushSync();
-  assert.equal(CH.chat.sel, null, "別の元の選択を残した");
+  assert.equal(V.viewing.sel, null, "別の元の選択を残した");
   S.app.tab = wikiTab;
   S.app.tabs.pop();
   flushSync();
   CH.chat.draft = "";
+  tests++;
+}
+
+// 本棚のタブ・本のタブが前面 = 見ている物なし（一覧で選んでいた文献を添えない = 取り違えない）・チップも送信の context の item も無い
+{
+  const wikiTab = S.app.tab;
+  const base = S.app.tabs.find((t) => t.id === wikiTab);
+  // 一覧で文献を選んでいた（本棚へ移る前の状態）。一覧のタブなら文脈になる物
+  S.app.selected = "K5";
+  S.app.detail = { key: "K5", csl: { title: "題名 5" }, attachments: [], collections: [], tags: [], notes: [], dateAdded: "2026-01-01" };
+  stateEv("idle");
+  let sent = null;
+  handlers.wiki_chat_send = (a) => {
+    sent = a;
+    return { turn: 88 };
+  };
+  for (const [label, over] of [
+    ["本棚", { shelf: { root: "/books", dir: null, query: "", sort: "name", scrollTop: 0 } }],
+    ["本", { shelfBook: { root: "/books", id: "b1", path: "/books/b1.pdf", title: "本 1", size: 1, mtime: 0 } }],
+  ]) {
+    S.app.tabs.push({ ...base, id: 9101, wiki: null, viewer: null, shelf: null, shelfBook: null, ...over });
+    S.app.tab = 9101;
+    flushSync();
+    assert.equal(V.viewingSource(), null, `${label}のタブで見ている物があった（一覧の選択を返した）`);
+    assert.equal($(".wk-ch-ctx"), null, `${label}のタブで文脈のチップが出た`);
+    assert.equal(CH.currentContext(), undefined, `${label}のタブで文脈を組んだ`);
+    sent = null;
+    CH.chat.draft = `${label}で`;
+    assert.equal(await CH.send(), true, `${label}のタブから送れない`);
+    assert.equal(sent.context, undefined, `${label}のタブの送信に文脈（item）が入った`);
+    stateEv("idle");
+    S.app.tab = wikiTab;
+    S.app.tabs.pop();
+    flushSync();
+  }
+  // 戻した一覧のタブでは今までどおり選んでいる文献（本棚の分岐が一覧を壊していない）
+  S.app.tabs.push({ ...base, id: 9102, wiki: null, viewer: null, shelf: null, shelfBook: null });
+  S.app.tab = 9102;
+  flushSync();
+  assert.deepEqual(V.viewingSource(), { kind: "item", key: "K5", title: "題名 5" }, "一覧のタブで選んでいる文献が見ている物にならない");
+  S.app.tab = wikiTab;
+  S.app.tabs.pop();
+  S.app.selected = null;
+  S.app.detail = null;
+  flushSync();
+  tests++;
+}
+
+// 読み手の登録（wanted）は関数 = チャットが有効になった直後の最初の選択も拾う（状態の写しの遅れが無い）・読み手がいなければ拾わない
+{
+  const pageEl = document.createElement("section");
+  pageEl.className = "wk-page";
+  pageEl.innerHTML = "<p>有効化の直後</p>";
+  document.body.append(pageEl);
+  const sel = document.getSelection();
+  const pick = () => {
+    const r = document.createRange();
+    r.setStart(pageEl.querySelector("p").firstChild, 0);
+    r.setEnd(pageEl.querySelector("p").firstChild, 3);
+    sel.removeAllRanges();
+    sel.addRange(r);
+    document.dispatchEvent(new Event("selectionchange"));
+  };
+  const saved = CH.chat.status;
+  V.viewing.sel = null;
+  CH.chat.status = { ...saved, enabled: false };
+  pick();
+  await sleep(0);
+  assert.equal(V.viewing.sel, null, "チャットが無効なのにページの選択を拾った");
+  V.setViewingSelection("item:K1", "無効の間");
+  assert.equal(V.viewing.sel, null, "チャットが無効なのに PDF の選択を書いた");
+  // 有効にした直後（flushSync も effect も挟まない）の最初の選択
+  CH.chat.status = { ...saved, enabled: true };
+  pick();
+  await sleep(0);
+  assert.deepEqual(V.viewing.sel, { key: "notes/a.md", text: "有効化" }, "有効にした直後の最初の選択を取りこぼした");
+  V.viewing.sel = null;
+  V.setViewingSelection("item:K1", "直後");
+  assert.deepEqual(V.viewing.sel, { key: "item:K1", text: "直後" }, "有効にした直後の PDF の選択を取りこぼした");
+  // 読み手を外す = 拾わない（登録が無ければ viewing は何も集めない）・登録し直すと拾う
+  V.viewing.sel = null;
+  V.setViewingWanted(null);
+  pick();
+  await sleep(0);
+  V.setViewingSelection("item:K1", "外した後");
+  assert.equal(V.viewing.sel, null, "読み手がいないのに拾った");
+  V.setViewingWanted(CH.chatShown);
+  pick();
+  await sleep(0);
+  assert.equal(V.viewing.sel?.text, "有効化", "登録し直しても拾わない");
+  V.viewing.sel = null;
+  sel.removeAllRanges();
+  CH.chat.status = saved;
+  pageEl.remove();
+  tests++;
+}
+
+// viewing.svelte.ts はチャットもホストの部品も import しない・module の評価時に wk / app に触らない（chat → viewing → wiki.svelte → chat の環）
+{
+  const src = readFileSync(new URL("../viewing.svelte.ts", import.meta.url), "utf8");
+  const imports = [...src.matchAll(/^import [^;]* from "([^"]+)";/gm)].map((m) => m[1]);
+  assert.deepEqual(imports.sort(), ["./state.svelte", "./wiki/selection", "./wiki/wiki.svelte", "svelte"], `viewing の import が想定外: ${imports}`);
+  // top-level（字下げなし）の文で wk / app に触れる行が無い（宣言・コメント・関数の見出しだけ）
+  const top = src.split("\n").filter((l) => /^[^\s/}]/.test(l) && !l.startsWith("import ") && !l.startsWith("export function ") && !l.startsWith("function ") && !l.startsWith("export type "));
+  assert.deepEqual(top.filter((l) => /\b(wk|app)\b/.test(l)), [], "viewing が module の評価時に wk / app に触れる");
+  tests++;
+}
+
+// ホストの書き手（PdfViewer が使う followItemSelection・偽ホスト = chat-fixtures/host.svelte.ts）: 前面で選択があるときだけ `item:<key>` へ書く・
+// 子の state event（busy / idle = chat.status の置き換え）で書き戻さない = 送信 / × で消した選択を蘇らせない・
+// 前面でないホストは書かない・読み手が無効の間は書かず、有効になったら選び直す（従来の chatTab = 真偽値の derived と同じ依存）
+{
+  const { host, startHost, startRawWriter } = await import("./chat-fixtures/host.svelte.ts");
+  const wikiTab = S.app.tab;
+  const base = S.app.tabs.find((t) => t.id === wikiTab);
+  S.app.tabs.push({ ...base, id: 9201, wiki: null, viewer: { itemKey: "K1", attachmentId: 1, title: "題名 T" } });
+  S.app.tab = 9201;
+  flushSync();
+  V.viewing.sel = null;
+  host.front = true;
+  host.text = null;
+  const stopHost = startHost("K1");
+  flushSync();
+  host.text = "PDF で選んだ一節";
+  flushSync();
+  assert.deepEqual(V.viewing.sel, { key: "item:K1", text: "PDF で選んだ一節" }, "ホストの選択を item:<key> で書かない");
+  assert.equal(CH.currentContext()?.selection, "PDF で選んだ一節", "ホストの選択が文脈に乗らない");
+  // 送る = 添えて消す → 子の state event（busy / idle）が来ても書き戻さない → 次の発言には付かない
+  stateEv("idle");
+  const sent = [];
+  handlers.wiki_chat_send = (a) => {
+    sent.push(a.context);
+    return { turn: 300 + sent.length };
+  };
+  CH.chat.draft = "この一節を説明して";
+  assert.equal(await CH.send(), true, "送れない");
+  stateEv("busy");
+  stateEv("idle");
+  flushSync();
+  assert.equal(V.viewing.sel, null, "送った選択が state event で戻った");
+  CH.chat.draft = "別の質問";
+  assert.equal(await CH.send(), true, "送れない");
+  assert.deepEqual(sent, [{ item: "K1", title: "題名 T", selection: "PDF で選んだ一節" }, { item: "K1", title: "題名 T" }], "送った選択が次の発言にも付いた");
+  // × で外す → state event でも戻らない
+  stateEv("idle");
+  host.text = "二つ目の一節";
+  flushSync();
+  assert.equal(V.viewing.sel?.text, "二つ目の一節", "ホストの新しい選択を書かない");
+  $(".wk-ch-ctx .wk-ch-chip:last-child .wk-ch-x").click();
+  flushSync();
+  stateEv("busy");
+  stateEv("idle");
+  flushSync();
+  assert.equal(V.viewing.sel, null, "× で外した選択が state event で戻った");
+  // 前面でないホストは書かない
+  host.front = false;
+  host.text = "裏の選択";
+  flushSync();
+  assert.equal(V.viewing.sel, null, "前面でないホストが書いた");
+  // 読み手が無効の間は書かない・有効になったら選び直す
+  const saved = CH.chat.status;
+  host.front = true;
+  CH.chat.status = { ...saved, enabled: false };
+  host.text = "無効の間の選択";
+  flushSync();
+  assert.equal(V.viewing.sel, null, "読み手が無効なのにホストの選択を書いた");
+  CH.chat.status = { ...saved, enabled: true };
+  flushSync();
+  assert.deepEqual(V.viewing.sel, { key: "item:K1", text: "無効の間の選択" }, "読み手が有効になってもホストの選択を選び直さない");
+  stopHost();
+  // setViewingSelection を effect から直に呼んでも、その effect に chat.status を追わせない（state event のたびに走らない）
+  const raw = startRawWriter("item:K1", "直に書く");
+  flushSync();
+  const runs0 = raw.runs();
+  CH.chat.status = { ...CH.chat.status, state: "busy" };
+  flushSync();
+  CH.chat.status = { ...CH.chat.status, state: "idle" };
+  flushSync();
+  assert.equal(raw.runs(), runs0, "setViewingSelection が呼び手の effect に chat.status を追わせた");
+  raw.stop();
+  V.viewing.sel = null;
+  CH.chat.draft = "";
+  S.app.tab = wikiTab;
+  S.app.tabs.pop();
+  flushSync();
   tests++;
 }
 
@@ -898,7 +1124,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
 }
 
 // Major A: 状態の session_id が null でも、子がいる・送信中なら表示を消さない（消すのは off・送信中でない・null のときだけ）
-// R16: 状態の読みが入れ替わって返っても、古い応答で上書きしない / R11: 刈ったターンの changes・undo・stopped を捨てる
+// 状態の読みが入れ替わって返っても、古い応答で上書きしない / 刈ったターンの changes・undo・stopped を捨てる
 {
   const mockStatus = handlers.wiki_chat_status;
   const { emptyConv, MAX_TURNS } = await import("./chat.ts");
@@ -925,7 +1151,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   mock.state = "off";
   await CH.loadChatStatus();
   assert.equal(CH.chat.conv.entries.length, 0, "off・session_id null で表示を消さない");
-  // R16
+  // 読みの入れ替わり
   let release;
   let n = 0;
   handlers.wiki_chat_status = () => (++n === 1 ? new Promise((r) => (release = r)) : status({ enabled: true, state: "idle", session_id: "S9" }));
@@ -935,7 +1161,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   await p1;
   assert.equal(CH.chat.status.enabled, true, "古い状態の応答で新しい状態を上書きした");
   handlers.wiki_chat_status = mockStatus;
-  // R11
+  // 刈ったターン
   mock.session = "S9";
   mock.state = "idle";
   await CH.loadChatStatus();
@@ -978,7 +1204,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
 
 // 失敗を toast に出す（状態の読込・有効化）・consent は Wiki が有効なときだけ・初期 focus は [キャンセル]
 {
-  const { default: Consent } = await import("./WikiChatConsent.svelte");
+  const { default: Consent } = await import("./ChatConsent.svelte");
   const t2 = document.createElement("div");
   document.body.append(t2);
   const c2 = mount(Consent, { target: t2 });
@@ -1023,7 +1249,8 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   tests++;
 }
 
-// 浮かせたパネル: 位置と大きさを覚える（ui_wiki_chat_float・窓の中に収める）・右ペインは案内と [ここに戻す] だけ・戻すと ""
+// 柱の幅: 320〜窓幅の半分（clampDockW）・ui_chat_dock の読み（壊れた値は既定）・確定（setDockWidth）だけが覚える・表示は窓に合わせて収める
+// （覚えた値は書き換えない）・見出しの × で閉じる・一覧が前面なら見えていない Wiki のページを文脈にしない
 {
   mock.enabled = true;
   mock.state = "idle";
@@ -1031,75 +1258,327 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   handlers.wiki_chat_status = () => status({ enabled: mock.enabled, state: mock.state, session_id: mock.session, ...mock.over });
   S.app.wikiOn = true;
   CH.chat.status = status({ enabled: true, state: "idle", session_id: null });
-  CH.chat.tab = "chat";
+  // 純関数（chat.ts）
+  assert.deepEqual([C.clampDockW(100, 1200), C.clampDockW(500, 1200), C.clampDockW(900, 1200), C.clampDockW(500, 600), C.clampDockW(NaN, 1200)], [320, 500, 600, 320, 380], "幅を 320〜窓幅の半分に収めない");
+  assert.deepEqual(
+    [null, "", "x", "[]", "null", '{"open":true}', '{"open":"yes","w":500}', '{"open":true,"w":-5}', '{"open":false,"w":444.4}'].map(C.parseDockPref),
+    [{ open: false, w: 380 }, { open: false, w: 380 }, { open: false, w: 380 }, { open: false, w: 380 }, { open: false, w: 380 }, { open: true, w: 380 }, { open: false, w: 500 }, { open: true, w: 380 }, { open: false, w: 444 }],
+    "ui_chat_dock の読みが既定に倒れない"
+  );
+  CH.chat.dock = { open: true, w: C.DOCK_W };
   const target = document.createElement("div");
   document.body.append(target);
-  const cmp = mount(WikiRight, { target }); // mount = 状態を読み直す（mock は有効）
-  assert.ok(await waitFor(() => !!target.querySelector(".wk-ch")), "右ペインにチャットが出ない");
-  CH.setFloat({ x: -50, y: 20, w: 100, h: 100 });
+  const cmp = mount(ChatDock, { target }); // mount = 状態を読み直す（mock は有効）
+  assert.ok(await waitFor(() => !!target.querySelector(".cd .wk-ch")), "柱にチャットが出ない");
+  const aside = () => target.querySelector("aside.cd");
+  assert.equal(aside().style.width, "380px", "既定の幅が 380 でない");
+  // 確定 = 収めて覚える（窓幅 1024 の半分 = 512 まで）
+  delete prefs.ui_chat_dock;
+  CH.setDockWidth(900);
   await sleep(5);
   flushSync();
-  const saved = JSON.parse(prefs.ui_wiki_chat_float);
-  assert.deepEqual([saved.x, saved.y, saved.w >= C.FLOAT_MIN_W, saved.h >= C.FLOAT_MIN_H], [0, 20, true, true], "窓の中に収めて覚えない");
-  assert.equal(target.querySelector(".wk-ch"), null, "浮いているのに右ペインにもチャットを出した（二重）");
-  assert.ok(target.querySelector(".wk-floated"), "右ペインに案内が出ない");
-  target.querySelector(".wk-floated-btn").click();
+  assert.deepEqual(JSON.parse(prefs.ui_chat_dock), { open: true, w: 512 }, "確定した幅を窓幅の半分に収めて覚えない");
+  assert.equal(aside().style.width, "512px");
+  const kept = prefs.ui_chat_dock;
+  delete prefs.ui_chat_dock;
+  CH.setDockWidth(600); // 収めると同じ 512 = 覚え直さない
   await sleep(5);
+  assert.equal(prefs.ui_chat_dock, undefined, "同じ幅で覚え直した");
+  prefs.ui_chat_dock = kept;
+  // 窓が狭くなった = 表示だけ収める（覚えた値は書き換えない）・広がれば戻る
+  const iw = window.innerWidth;
+  window.innerWidth = 700;
+  window.dispatchEvent(new Event("resize"));
   flushSync();
-  assert.equal(CH.chat.float, null);
-  assert.equal(prefs.ui_wiki_chat_float, "", "戻したのに覚えたまま");
-  assert.ok(target.querySelector(".wk-ch"), "戻したのに右ペインにチャットが出ない");
-  // MY LIBRARY の一覧の上に浮かせたとき = 見えていない Wiki のページを文脈にしない
+  assert.deepEqual([aside().style.width, JSON.parse(prefs.ui_chat_dock).w], ["350px", 512], "窓に合わせて収めない / 収めただけで覚え直した");
+  window.innerWidth = iw;
+  window.dispatchEvent(new Event("resize"));
+  flushSync();
+  assert.equal(aside().style.width, "512px", "窓が広がっても覚えた幅に戻らない");
+  // 一覧の上に柱を開いたとき = 見えていない Wiki のページを文脈にしない
   {
     const wikiTab = S.app.tab;
     const base = S.app.tabs.find((t) => t.id === wikiTab);
     S.app.tabs.push({ ...base, id: 9002, wiki: null, viewer: null });
     S.app.tab = 9002;
     flushSync();
-    assert.equal(CH.currentSource(), null, "一覧が前面なのに Wiki のページを文脈にした");
+    assert.equal(V.viewingSource(), null, "一覧が前面なのに Wiki のページを文脈にした");
     S.app.tab = wikiTab;
     S.app.tabs.pop();
     flushSync();
-    assert.deepEqual(CH.currentSource(), { kind: "page", path: "notes/a.md" });
+    assert.deepEqual(V.viewingSource(), { kind: "page", path: "notes/a.md" });
   }
+  // 見出しの × = 柱を閉じる（覚える）
+  target.querySelector(".wk-ch-close").click();
+  await sleep(5);
+  assert.deepEqual([CH.chat.dock.open, JSON.parse(prefs.ui_chat_dock).open], [false, false], "× で柱が閉じない / 覚えない");
   unmount(cmp);
   target.remove();
+  CH.chat.dock = { open: false, w: C.DOCK_W };
   tests++;
 }
 
-// 浮かせたパネルそのもの: 出たときに窓の中に収める（覚えた値は触らない）・[戻す] で null と ""・掴んで動かしても focus を奪わない
+// 柱のつまみ: 動かしている間は線だけ動かし柱の幅（= レイアウト）は変えない・覚えない（読み手が描き直さない）・離したときに 1 回だけ確定して覚える・
+// 掴んで動かしても入力欄やエディタの focus を奪わない・つまみの最中に柱が消えても後始末する
 {
-  const WikiChatFloat = (await import("./WikiChatFloat.svelte")).default;
-  prefs.ui_wiki_chat_float = "x";
-  CH.chat.float = { x: 5000, y: 5000, w: 400, h: 300 }; // 復元の値が窓より外（setFloat を通らない = pref の読込と同じ）
+  CH.chat.dock = { open: true, w: C.DOCK_W };
   const target = document.createElement("div");
   document.body.append(target);
-  const cmp = mount(WikiChatFloat, { target });
+  const cmp = mount(ChatDock, { target });
   flushSync();
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  assert.deepEqual([CH.chat.float.x <= vw - 400, CH.chat.float.y <= vh - 300], [true, true], "出たときに窓の中に収めない");
-  assert.equal(prefs.ui_wiki_chat_float, "x", "収めただけで覚え直した");
-  assert.ok(target.querySelector(".wk-float .wk-ch"), "浮いたパネルにチャットが無い");
+  const aside = target.querySelector("aside.cd");
+  aside.getBoundingClientRect = () => ({ left: 644, right: 1024, top: 0, bottom: 700, width: 380, height: 700 });
   const outside = document.createElement("input");
   document.body.append(outside);
   outside.focus();
-  const bar = target.querySelector(".wk-float-bar");
-  const down = new window.PointerEvent("pointerdown", { bubbles: true, button: 0, buttons: 1, clientX: 100, clientY: 100, pointerId: 1 });
-  bar.dispatchEvent(down);
-  bar.dispatchEvent(new window.PointerEvent("pointermove", { bubbles: true, buttons: 1, clientX: 60, clientY: 80, pointerId: 1 }));
-  bar.dispatchEvent(new window.PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: 60, clientY: 80, pointerId: 1 }));
+  let writes = 0;
+  const setPref = handlers.set_ui_pref;
+  handlers.set_ui_pref = (a) => {
+    if (a.key === "ui_chat_dock") writes++;
+    return setPref(a);
+  };
+  const grip = target.querySelector(".cd-grip");
+  const pe = (type, x, buttons) => grip.dispatchEvent(new window.PointerEvent(type, { bubbles: true, cancelable: true, button: 0, buttons, clientX: x, clientY: 100, pointerId: 7 }));
+  pe("pointerdown", 644, 1);
+  pe("pointermove", 600, 1);
+  pe("pointermove", 520, 1);
+  flushSync();
+  assert.equal(aside.style.width, "380px", "動かしている間に柱の幅（レイアウト）を変えた");
+  assert.equal(document.querySelector(".cd-guide")?.style.left, "520px", "動かしている間に線が指に追わない");
+  assert.ok(document.body.classList.contains("dragging"), "動かしている間に選択を止めない");
   await sleep(5);
-  assert.notEqual(prefs.ui_wiki_chat_float, "x", "動かした後の位置を覚えない");
-  assert.equal(document.activeElement, outside, "動かしたら入力欄へ focus を奪った");
-  outside.remove();
-  target.querySelector(".wk-float-btn").click();
+  assert.equal(writes, 0, "動かしている間に幅を覚えた");
+  pe("pointerup", 520, 0);
   await sleep(5);
   flushSync();
-  assert.equal(CH.chat.float, null, "[戻す] で戻らない");
-  assert.equal(prefs.ui_wiki_chat_float, "", "戻したのに覚えたまま");
+  assert.deepEqual([aside.style.width, writes, JSON.parse(prefs.ui_chat_dock).w], ["504px", 1, 504], "離したときに 1 回だけ確定しない");
+  assert.equal(document.querySelector(".cd-guide"), null, "離しても線が残った");
+  assert.equal(document.body.classList.contains("dragging"), false, "離しても選択を止めたまま");
+  assert.equal(document.activeElement, outside, "つまみで入力欄から focus を奪った");
+  // 動かさずに離した = 覚え直さない
+  pe("pointerdown", 520, 1);
+  pe("pointerup", 520, 0);
+  await sleep(5);
+  assert.equal(writes, 1, "動かさずに離しただけで覚え直した");
+  // つまみの最中に柱が消えた（⌘⌥C・チャット OFF）= リスナーと body の印を残さない
+  pe("pointerdown", 520, 1);
+  pe("pointermove", 480, 1);
+  flushSync();
   unmount(cmp);
+  flushSync();
+  assert.equal(document.body.classList.contains("dragging"), false, "柱が消えても選択を止めたまま");
+  await sleep(5);
+  assert.equal(writes, 1, "柱が消えたときに途中の幅を確定した");
+  handlers.set_ui_pref = setPref;
+  outside.remove();
   target.remove();
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  tests++;
+}
+
+// ⑥ 一覧の右ペイン: 開閉の永続と ⌘⌥I の振り分け（前面のモードの右ペインだけ）・行の選択で開かない・閉じても詳細は読む
+{
+  const wikiTab = S.app.tab;
+  const base = S.app.tabs.find((t) => t.id === wikiTab);
+  S.app.tabs.push({ ...base, id: 9003, wiki: null, viewer: null });
+  S.app.tab = 9003;
+  flushSync();
+  const info = W.wk.infoOpen;
+  const side0 = S.app.viewerSideOpen;
+  assert.equal(S.app.detailOpen, true, "既定は開く");
+  W.togglePane(); // 一覧が前面
+  await sleep(5);
+  assert.deepEqual([S.app.viewerSideOpen, prefs.ui_viewer_side], [side0, undefined], "一覧で ⌘⌥I が PDF の右バーを変えた");
+  assert.deepEqual([S.app.detailOpen, prefs.ui_detail], [false, "0"], "一覧で ⌘⌥I が一覧の右ペインを閉じない");
+  assert.equal(W.wk.infoOpen, info, "一覧で ⌘⌥I が OpenNote の右ペインを変えた");
+  assert.equal(prefs.ui_wiki_info, undefined, "一覧で ⌘⌥I が ui_wiki_info を書いた");
+  // 閉じたまま行を選ぶ = 開かない・詳細は読む（reveal / ★ / メモ・チャットの文脈が app.detail を読む）
+  const items = S.app.items;
+  S.app.items = [{ key: "K7" }];
+  handlers.get_item = (a) => ({ key: a.key, csl: { title: "題名 7" }, attachments: [], collections: [], tags: [], notes: [], dateAdded: "2026-01-01" });
+  await S.select("K7");
+  assert.equal(S.app.detailOpen, false, "行の選択で右ペインが開いた");
+  assert.equal(S.app.detail?.key, "K7", "閉じたら詳細を読まなくなった");
+  assert.deepEqual(V.viewingSource(), { kind: "item", key: "K7", title: "題名 7" }, "閉じていても柱の文脈は選んでいる文献");
+  S.app.selected = null;
+  S.app.detail = null;
+  S.app.checked.clear();
+  S.app.items = items;
+  S.toggleDetail();
+  await sleep(5);
+  assert.deepEqual([S.app.detailOpen, prefs.ui_detail], [true, "1"], "ボタンで開かない");
+  // OpenNote が前面 = 従来どおり OpenNote の右ペイン
+  S.app.tab = wikiTab;
+  flushSync();
+  W.togglePane();
+  await sleep(5);
+  assert.deepEqual([W.wk.infoOpen, prefs.ui_wiki_info], [!info, info ? "0" : "1"], "OpenNote で ⌘⌥I が OpenNote の右ペインを開閉しない");
+  assert.deepEqual([S.app.viewerSideOpen, prefs.ui_viewer_side], [side0, undefined], "OpenNote で ⌘⌥I が PDF の右バーを変えた");
+  assert.deepEqual([S.app.detailOpen, prefs.ui_detail], [true, "1"], "OpenNote で ⌘⌥I が一覧の右ペインを変えた");
+  W.togglePane();
+  await sleep(5);
+  S.app.tabs.pop();
+  flushSync();
+  // 起動時の読み（main.ts が mount の前に待つ）: "0" だけが閉じる・無ければ開く・読めなければ既定のまま知らせる
+  for (const [v, open] of [["0", false], ["1", true], [undefined, true]]) {
+    if (v === undefined) delete prefs.ui_detail;
+    else prefs.ui_detail = v;
+    S.app.detailOpen = !open;
+    await S.loadDetailPref();
+    assert.equal(S.app.detailOpen, open, `ui_detail = ${v}`);
+  }
+  const getPref = handlers.get_ui_pref;
+  handlers.get_ui_pref = () => {
+    throw new Error("読めない");
+  };
+  await S.loadDetailPref();
+  assert.equal(S.app.detailOpen, true, "読めないのに既定でない");
+  assert.match(S.app.toast, /表示設定を読めません/, "読めないことを知らせない");
+  handlers.get_ui_pref = getPref;
+  tests++;
+}
+
+// ⑥ 一覧が前面のときの柱: 門が閉じていればボタンなし・invoke なし（右ペインは ItemDetail のまま = チャットと無関係）・開いていればボタン →
+// 柱を開くと状態を読む・選んだ文献が文脈のチップに出て送れる（× で外す・別の文献で戻る）・同じ会話・PDF のタブへ移っても同じ柱（作り直さない）でチップは
+// その文献・応答中の点・Settings で OFF = ボタンが消える
+{
+  const wikiTab = S.app.tab;
+  const base = S.app.tabs.find((t) => t.id === wikiTab);
+  S.app.tabs.push({ ...base, id: 9004, wiki: null, viewer: null });
+  S.app.tab = 9004;
+  const detail = (key, title) => ({ key, csl: { title }, attachments: [], collections: [], tags: [], notes: [], dateAdded: "2026-01-01" });
+  const stripAt = document.createElement("div");
+  const target = document.createElement("div");
+  document.body.append(stripAt, target);
+  const $ = (q) => target.querySelector(q);
+  const btn = () => stripAt.querySelector(".tabs-chat");
+
+  // OpenNote OFF: invoke しない・ボタンなし（覚えた開閉が「開」でも出さない = 柱の門は App が同じ chatShown() を見る）
+  S.app.wikiOn = false;
+  CH.chat.status = null;
+  CH.chat.dock = { open: true, w: C.DOCK_W };
+  calls.length = 0;
+  const strip = mount(TabStrip, { target: stripAt });
+  flushSync();
+  await sleep(10);
+  assert.deepEqual([btn(), CH.chatShown()], [null, false], "OpenNote OFF でボタンが出た / 柱を出す判定が true");
+  assert.deepEqual(calls.filter((c) => c.name.startsWith("wiki_chat")).map((c) => c.name), [], "OpenNote OFF で invoke した");
+  // OpenNote ON・チャット OFF も同じ
+  S.app.wikiOn = true;
+  mock.enabled = false;
+  CH.chat.status = status({ enabled: false });
+  await sleep(5);
+  flushSync();
+  assert.deepEqual([btn(), CH.chatShown()], [null, false], "チャット OFF でボタンが出た / 柱を出す判定が true");
+  await sleep(10);
+  calls.length = 0;
+  {
+    // タブ列が出ただけでは読まない（読むのは柱を開いたとき。上の読みは initChat = OpenNote が ON になった分）
+    const again = document.createElement("div");
+    document.body.append(again);
+    const s2 = mount(TabStrip, { target: again });
+    flushSync();
+    await sleep(10);
+    assert.deepEqual(calls.filter((c) => c.name.startsWith("wiki_chat")).map((c) => c.name), [], "チャット OFF で invoke した");
+    unmount(s2);
+    again.remove();
+  }
+  // Settings で ON = ボタンが出る・柱を開くと状態を読む・入力欄へ focus
+  mock.enabled = true;
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  emit("wiki-chat", { type: "enabled", enabled: true });
+  assert.ok(await waitFor(() => (flushSync(), !!btn())), "チャット ON でボタンが出ない");
+  calls.length = 0;
+  btn().click();
+  flushSync();
+  const dock = mount(ChatDock, { target }); // App と同じ条件（chatShown() && chat.dock.open）
+  flushSync();
+  await sleep(10);
+  assert.ok($(".cd .wk-ch"), "柱に WikiChat が出ない");
+  assert.equal(document.activeElement?.tagName, "TEXTAREA", "柱を開いても入力欄へ focus しない");
+  assert.ok(calls.some((c) => c.name === "wiki_chat_status"), "柱を開いても状態を読まない");
+  const box = $(".cd .wk-ch textarea"); // 作り直されないことを下で見る
+
+  // 文脈: 選んでいる文献がチップに出る・読込の途中（app.detail が前の行）は添えない・× で外す・別の文献で戻る
+  assert.equal(V.viewingSource(), null, "選んでいないのに文脈があった（Wiki のページを添えない）");
+  S.app.selected = "K1";
+  S.app.detail = detail("K1", "題名 1");
+  flushSync();
+  assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "題名 1", "選んだ文献がチップに出ない");
+  assert.deepEqual(CH.currentContext(), { item: "K1", title: "題名 1" });
+  S.app.selected = "K2";
+  flushSync();
+  assert.equal(V.viewingSource(), null, "読込の途中で前の文献を文脈にした");
+  S.app.detail = detail("K2", "題名 2");
+  flushSync();
+  assert.deepEqual(CH.currentContext(), { item: "K2", title: "題名 2" });
+  $(".wk-ch-ctx .wk-ch-x").click();
+  flushSync();
+  assert.equal(CH.currentContext(), undefined, "× で外れない");
+  assert.equal($(".wk-ch-ctx"), null, "× の後もチップが残った");
+  S.app.detail = detail("K2", "題名 2（再読込）"); // reloadDetail = 同じ元 = 外したまま
+  flushSync();
+  assert.equal(CH.currentContext(), undefined, "再読込で外した文脈が戻った");
+  S.app.selected = "K3";
+  S.app.detail = detail("K3", "");
+  await sleep(5);
+  flushSync();
+  assert.deepEqual(CH.currentContext(), { item: "K3" }, "別の文献で文脈が戻らない（題名なしは item だけ）");
+  assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "K3", "題名なしのチップが key でない");
+  S.app.detail = detail("K3", "題名 3");
+  flushSync();
+  // 送る = Rust の契約は PDF のタブと同じ {item, title}（path は無い）
+  mock.state = "idle";
+  CH.chat.status = status({ enabled: true, state: "idle", session_id: "S1" });
+  let sent = null;
+  handlers.wiki_chat_send = (a) => {
+    sent = a;
+    return { turn: 501 };
+  };
+  CH.chat.draft = "要約して";
+  assert.equal(await CH.send(), true, "一覧のタブから送れない");
+  assert.deepEqual(sent.context, { item: "K3", title: "題名 3" }, "選んだ文献が context に乗らない");
+  flushSync();
+
+  // 同じ会話: 柱は同じ chat を映す
+  assert.ok(target.textContent.includes("要約して"), "送った発言が出ない");
+
+  // PDF のタブが前面 = 同じ柱（入力欄の DOM が同じ = 作り直さない）・チップは PDF の文献・戻れば一覧の文献
+  S.app.tabs.push({ ...base, id: 9005, wiki: null, viewer: { itemKey: "K1", attachmentId: 1, title: "T" } });
+  S.app.tab = 9005;
+  flushSync();
+  assert.equal($(".cd .wk-ch textarea"), box, "PDF のタブへ移ると柱を作り直した");
+  assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "T", "PDF のタブで柱のチップがその文献でない");
+  S.app.tabs.pop();
+  S.app.tab = 9004;
+  flushSync();
+  assert.equal($(".cd .wk-ch textarea"), box, "一覧へ戻ると柱を作り直した");
+  assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "題名 3", "一覧へ戻ってもチップが選んでいる文献に戻らない");
+
+  // 応答中の点・Settings で OFF = ボタンが消える（柱は App が chatShown() で外す）
+  stateEv("busy");
+  flushSync();
+  assert.ok(stripAt.querySelector(".tabs-chat-dot"), "応答中の点が出ない");
+  stateEv("idle");
+  mock.enabled = false;
+  emit("wiki-chat", { type: "enabled", enabled: false });
+  flushSync();
+  assert.deepEqual([btn(), CH.chatShown()], [null, false], "OFF でボタンが消えない / 柱を出す判定が残った");
+  await sleep(10);
+  mock.enabled = true;
+  emit("wiki-chat", { type: "enabled", enabled: true });
+  assert.ok(await waitFor(() => (flushSync(), !!btn())), "ON でボタンが戻らない");
+  unmount(dock);
+  unmount(strip);
+  target.remove();
+  stripAt.remove();
+  S.app.selected = null;
+  S.app.detail = null;
+  S.app.tabs.pop();
+  S.app.tab = wikiTab;
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  CH.chat.conv = (await import("./chat.ts")).emptyConv();
+  flushSync();
   tests++;
 }
 
@@ -1113,28 +1592,46 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
 unmount(cmp);
 target.remove();
 
-// 状態の読み直し: 自動（右ペインの mount のし直し）は force なし = Rust が claude auth status を 30 秒覚えて省く（wiki_chat.rs の
-// auth_status_is_cached_for_ttl）・[再確認]（アカウントの行・claude が無いときの案内）は force: true
+// 状態の読み直し: 自動（柱を開いた = mount・開いたまま前面のタブが変わった）は force なし = Rust が claude auth status を 30 秒覚えて省く（wiki_chat.rs の
+// auth_status_is_cached_for_ttl）・読み中とは重ねない・[再確認]（アカウントの行・claude が無いときの案内）は force: true
 {
   mock.enabled = true;
   mock.state = "off";
   mock.over = {};
   handlers.wiki_chat_status = () => status({ enabled: mock.enabled, state: mock.state, session_id: mock.session, ...mock.over });
-  CH.chat.float = null;
-  CH.chat.tab = "chat";
+  CH.chat.dock = { open: true, w: C.DOCK_W };
   await waitFor(() => !CH.statusInFlight());
   const reads = () => calls.filter((c) => c.name === "wiki_chat_status");
   calls.length = 0;
   const t1 = document.createElement("div");
   document.body.append(t1);
   const began = Date.now();
-  let c = mount(WikiRight, { target: t1 });
-  assert.ok(await waitFor(() => reads().length === 1 && !CH.statusInFlight()), "mount で読み直さない");
+  let c = mount(ChatDock, { target: t1 });
+  assert.ok(await waitFor(() => reads().length === 1 && !CH.statusInFlight()), "柱を開いても読み直さない");
   unmount(c);
-  c = mount(WikiRight, { target: t1 });
-  assert.ok(await waitFor(() => reads().length === 2 && !CH.statusInFlight()), "mount のし直しで読み直さない");
+  c = mount(ChatDock, { target: t1 });
+  assert.ok(await waitFor(() => reads().length === 2 && !CH.statusInFlight()), "柱を開き直しても読み直さない");
+  // 開いたまま前面のタブが変わった = 読み直す
+  const wikiTab = S.app.tab;
+  const base = S.app.tabs.find((t) => t.id === wikiTab);
+  S.app.tabs.push({ ...base, id: 9006, wiki: null, viewer: null });
+  S.app.tab = 9006;
+  flushSync();
+  assert.ok(await waitFor(() => reads().length === 3 && !CH.statusInFlight()), "柱を開いたまま前面のタブが変わっても読み直さない");
+  // 読み中に前面のタブが変わった = 重ねない
+  let release;
+  handlers.wiki_chat_status = () => new Promise((r) => (release = r));
+  const slow = CH.loadChatStatus();
+  S.app.tab = wikiTab;
+  flushSync();
+  await sleep(10);
+  assert.equal(reads().length, 4, "読み中に前面のタブが変わって読みを重ねた");
+  release(status({ enabled: true, state: "off" }));
+  await slow;
+  handlers.wiki_chat_status = () => status({ enabled: mock.enabled, state: mock.state, session_id: mock.session, ...mock.over });
+  S.app.tabs.pop();
   assert.ok(Date.now() - began < 10_000, "時間待ちで読み直している");
-  assert.deepEqual(reads().map((r) => r.args), [{}, {}], "自動の読み直しに force を付けた（Rust の覚えを捨てる）");
+  assert.deepEqual(reads().map((r) => r.args), [{}, {}, {}, {}], "自動の読み直しに force を付けた（Rust の覚えを捨てる）");
   flushSync();
   calls.length = 0;
   const again = t1.querySelector('.wk-ch-acct .wk-ch-btn[title="ログイン状態を読み直します"]');
@@ -1155,11 +1652,12 @@ target.remove();
   await CH.loadChatStatus();
   unmount(c);
   t1.remove();
+  CH.chat.dock = { open: false, w: C.DOCK_W };
   tests++;
 }
 
-// 入力欄への focus（focusPending）: 見えている入力欄が focus できたときだけ消費する。隠れた PDF タブ（visibility:hidden のまま
-// mount され続ける）の WikiChat が先に消費しない・disabled（使えない）なら消費だけする。jsdom に配置は無い = checkVisibility を差し替えて判定だけを見る（実機の確認は別）
+// 入力欄への focus（focusPending）: 見えている入力欄が focus できたときだけ消費する（面は柱 1 つになったが、見えない入力欄が
+// 先に消費しない規則と明示の focus は残す = WKWebView は autofocus が効かない）・disabled（使えない）なら消費だけする。jsdom に配置は無い = checkVisibility を差し替えて判定だけを見る（実機の確認は別）
 {
   const el = document.createElement("textarea");
   document.body.append(el);
@@ -1192,7 +1690,7 @@ target.remove();
   el.disabled = false;
   el.remove();
 
-  // 部品: 使えない（未ログイン = 入力欄が disabled）で [チャット] → login → 使える → 右ペインを開き直す（mount のし直し）で、
+  // 部品: 使えない（未ログイン = 入力欄が disabled）で柱を開く → login → 使える → 柱を開き直す（mount のし直し）で、
   // 別の入力欄で作業中の focus を奪わない
   {
     const saved = CH.chat.status;
@@ -1409,7 +1907,7 @@ target.remove();
   tests++;
 }
 
-// ---- initWiki / initChat: 解除が listen の完了より先でも off を取りこぼさない（B-29。解除の後に届いた off はその場で呼ぶ）----
+// ---- initWiki / initChat: 解除が listen の完了より先でも off を取りこぼさない（解除の後に届いた off はその場で呼ぶ）----
 {
   const total = () => Object.values(listeners).reduce((n, a) => n + a.length, 0);
   for (const [name, init] of [["initWiki", W.initWiki], ["initChat", CH.initChat]]) {
@@ -1424,5 +1922,6 @@ target.remove();
 }
 
 stop();
+stopViewing();
 console.log(`wiki chat: ok (${tests} tests)`);
 process.exit(0);

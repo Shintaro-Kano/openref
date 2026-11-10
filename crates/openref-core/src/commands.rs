@@ -7,7 +7,7 @@
 
 use crate::{
     annotate, bibtex, citestyle, collections, edit, fulltext, kbmanifest, model, pdffetch, pdfingest, resolver,
-    search, tags, types, wiki, CoreError, Db, Result,
+    search, shelf, tags, types, wiki, CoreError, Db, Result,
 };
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
@@ -338,6 +338,11 @@ fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
         None => opt_str(a, "search")?,
     };
     let limit = opt_int(a, "limit")?.unwrap_or(50).max(1) as usize;
+    let sort = opt_str(a, "sort")?.filter(|s| !s.trim().is_empty());
+    let desc = opt_bool(a, "desc")?;
+    if sort.is_none() && desc.is_some() {
+        return Err(bad("desc は sort と一緒に渡してください（sort を省くと今の並びのまま = desc は効かない）".to_string()));
+    }
     // 空白だけの query / author / journal は core（search::list_items）が未指定として扱う
     let f = search::ListFilter {
         search: query,
@@ -350,6 +355,9 @@ fn list_items(db: &mut Db, a: &Value) -> Result<Value> {
         author_initial: opt_str(a, "author_initial")?,
         journal: opt_str(a, "journal")?,
         metadata_only: opt_bool(a, "metadata_only")?.unwrap_or(false),
+        // desc の省略は GUI のメニューで別の項目へ移ったときと同じ向き（誌名 = A→Z・日付 = 新しい順）
+        desc: desc.unwrap_or(sort.as_deref().map(str::trim) != Some("journal")),
+        sort,
     };
     let rows = search::list_items(db, &f)?;
     Ok(json!({"count": rows.len(), "limit": limit, "items": rows.iter().map(item_summary).collect::<Vec<_>>()}))
@@ -953,9 +961,25 @@ fn wiki_move(db: &mut Db, a: &Value) -> Result<Value> {
     wiki::edit::move_(&wiki::Ctx::from_db_pinned(db, a)?, a)
 }
 
+// ---------------- 本棚（コマンドは shelf_*。root は履歴にある物だけ = 開く / 外すは GUI だけ） ----------------
+
+fn shelf_status(db: &mut Db, a: &Value) -> Result<Value> {
+    shelf::commands::status(&shelf::Ctx::from_db(db)?, a)
+}
+
+fn shelf_list(db: &mut Db, a: &Value) -> Result<Value> {
+    shelf::commands::list(&shelf::Ctx::from_db(db)?, a)
+}
+
+fn shelf_set_opts(db: &mut Db, a: &Value) -> Result<Value> {
+    shelf::commands::set_opts(db, a)
+}
+
 // ---------------- 表 ----------------
 
 const KEY: (&str, &str, &str) = ("key", "string", "item の key（8 桁）");
+/// shelf_* の必須の引数 root（履歴にある root だけ・shelf::Ctx::known）
+const SHELF_ROOT: (&str, &str, &str) = ("root", "string", "履歴にある本棚（shelf_status の root をそのまま渡す。他はエラー）");
 /// wiki_* の任意の引数 root（履歴にある root だけ・Ctx::pin）
 const WIKI_ROOT: (&str, &str, &str) = (
     "root",
@@ -979,7 +1003,7 @@ fn build() -> Vec<Command> {
     vec![
         // ---- 読み ----
         c("list_items", false, &["search_library"],
-          "蔵書の一覧・検索（GUI の一覧と同じ）。query は書誌 + 添付 PDF の本文の全文検索（和文可）で、本文だけの一致は fulltext_snippet に抜粋（一致箇所は [ ]）。count が limit と同じなら続きがある。並びは query 省略時 = 追加日（date_added）の新しい順（年の順ではない）・query ありは一致度順。戻り値の journal は誌名の短縮表示（container-title-short があればそれ）。正式な誌名・著者全員・抄録・巻号頁は返さない = get_item か sql の csl で取る（まとめて取るなら sql の json_object）",
+          "蔵書の一覧・検索（GUI の一覧と同じ）。query は書誌 + 添付 PDF の本文の全文検索（和文可）で、本文だけの一致は fulltext_snippet に抜粋（一致箇所は [ ]）。count が limit と同じなら続きがある。並びは query 省略時 = 追加日（date_added）の新しい順（年の順ではない）・query ありは一致度順。sort を渡すと query の有無に依らずその並び（GUI の一覧の並びと同じ規則）。戻り値の journal は誌名の短縮表示（container-title-short があればそれ）。正式な誌名・著者全員・抄録・巻号頁は返さない = get_item か sql の csl で取る（まとめて取るなら sql の json_object）",
           schema(&[
               ("query", "string", "全文検索語（英・和）。省略で追加日の新しい順"),
               ("search", "string", "query と同じ（GUI の名前）"),
@@ -991,6 +1015,8 @@ fn build() -> Vec<Command> {
               ("author_initial", "string", "著者の名の頭文字（author と併用）"),
               ("journal", "string", "誌名（略称でも可・表記ゆれを束ねる）"),
               ("metadata_only", "boolean", "true = PDF 本文を検索しない"),
+              ("sort", "string", "並び: added（追加日）/ published（出版日 = 年 → 月 → 日。無い物は昇降どちらでも末尾）/ journal（表示の誌名・大小無視。無い物は末尾・同じ誌の中は年の新しい順）"),
+              ("desc", "boolean", "true = 降順（sort と併用）。省略 = added / published は true（新しい順）・journal は false（A→Z）"),
               ("limit", "integer", "既定 50"),
           ], &[]),
           list_items),
@@ -1104,6 +1130,16 @@ fn build() -> Vec<Command> {
         c("wiki_inbox", false, &[],
           "inbox = ワークスペースの ingest/（未処理の素材）にあるファイル（下位フォルダも・`.` 始まりは除く）: path（ワークスペース相対）・name・kind・media（image / video / audio / pdf）・size・mtime。フォルダが無ければ空。OpenRef は素材を動かさない（記事にしたら skill が sources/ へ移す）。dir = chat-log でチャットの記録（chat-log/・新しい順）の一覧",
           schema(&[("limit", "integer", "既定 1000"), ("dir", "string", "ingest（既定）か chat-log"), WIKI_ROOT], &[]), wiki_inbox),
+        // ---- 読み: 本棚（コマンドは shelf_*。本棚 = user が GUI で開いた PDF のフォルダ 1 つ。正はディスクのフォルダ・索引なし・root に何も書かない） ----
+        c("shelf_status", false, &[],
+          "本棚の履歴（user が GUI で開いたフォルダ・新しい順・上限 10）: `shelves` = [{root, name, last_used, exists, collapse_single, issue_titles, aliases}]。exists = フォルダが今もある。開く / 切替 / 履歴から外すは GUI だけ",
+          schema(&[], &[]), shelf_status),
+        c("shelf_list", false, &[],
+          "本棚の本の木（毎回走査）: tree = フォルダ {id, name, path, children, books, totalBooks}・books = [{id, title, path, size, mtime, folder}]（path は絶対パス・中身を読むのはホストの道具）・unreadable = 読めず飛ばしたフォルダの数・used_find = readdir が拒否され find(1) で列挙した。`.` / `_` 始まりと PDF を含まないフォルダは出ない。冊数が多ければ dir で絞る",
+          schema(&[
+              SHELF_ROOT,
+              ("dir", "string", "root 相対のフォルダ（tree の path から root を除いた物）。省略 = 全体"),
+          ], &["root"]), shelf_list),
         // ---- 書込: OpenNote（ワークスペースのファイルだけ・DB は変えない = DB のスナップショットは取らない） ----
         c("wiki_write", true, &[],
           "ワークスペースに md / html のページを書く（新規はフォルダも作る・戻り値 created）。既存を上書きするときは必ず上書き前を <app_dir>/wiki-history/ に退避して backup（退避先のパス）を返す。sha256 = 書いた後の内容。if_sha256（wiki_read の sha256）が今のファイルと違えば書かずに {ok: false, conflict: true, sha256: 今の値} = 読み直してから書き直す。ワークスペースの外・`..`・`.` 始まり・symlink・md / html 以外の拡張子・新しく作る名前の `[ ] | # ^ \\ :` は拒否。item へのリンクは `[題名](openref://open?key=KEY)`（KEY は get_item / list_items で確かめた実在の key だけ）。frontmatter の items / sources / tags は任意。用例: 「ingest/ の素材を記事に」= wiki_inbox → wiki_read（素材）→ wiki_write（記事）→ wiki_move（素材を ingest/ の外へ）・「選んだ論文の要約ページを作る」= get_item・get_fulltext → wiki_write（openref:// のリンク付き）→ wiki_backlinks {key} で確かめる",
@@ -1120,6 +1156,16 @@ fn build() -> Vec<Command> {
               ("to", "string", "ワークスペース相対のパス（移動先・途中のフォルダは作る）"),
               WIKI_ROOT,
           ], &["from", "to"]), wiki_move),
+        // ---- 書込: 本棚（表示の設定だけ = settings の shelf_workspaces。root に何も書かない） ----
+        c("shelf_set_opts", true, &[],
+          "本棚の表示の設定を書く（渡した項目だけ変える）。戻り値 = 書いた後の {root, name, collapse_single, issue_titles, aliases}",
+          schema(&[
+              SHELF_ROOT,
+              ("collapse_single", "boolean", "PDF が 1 つだけのフォルダを 1 冊として表示（記事フォルダ/original.pdf の形）"),
+              ("aliases", "object", "フォルダ名の表示の置換 {\"フォルダ名\": \"表示名\"}（全部置き換える・{} = 消す）"),
+              ("issue_titles", "boolean", "号フォルダ（YYYY-MM）の表示名に子の「特集_◯◯」の題名を足す"),
+              ("name", "string", "本棚の表示名（空 = フォルダ名に戻す）"),
+          ], &["root"]), shelf_set_opts),
         // ---- 書込: item ----
         c("set_star", true, &[],
           "★ を付ける / 外す",
@@ -1287,6 +1333,55 @@ mod tests {
         assert_eq!(edit::HISTORY_DIR, "wiki-history");
         let doc = find("wiki_write").unwrap().doc;
         assert!(doc.contains(&format!("<app_dir>/{}/", edit::HISTORY_DIR)), "{doc}");
+    }
+
+    /// 本棚の設定の鍵と表紙の置き場の名前は契約（settings と app_dir に実物が残る）= const の値を固定する
+    #[test]
+    fn shelf_names_are_fixed() {
+        assert_eq!(shelf::KEY, "shelf_workspaces");
+        assert_eq!(shelf::MAX, 10);
+        assert_eq!(shelf::thumbs::DIR, "shelf-thumbs");
+    }
+
+    /// shelf_*: 読み 2 本 + 書き 1 本・書きは DB を変える（MCP の写しの対象）・root は必須・開く / 外すの口は登録表に無い
+    #[test]
+    fn shelf_commands_are_registered() {
+        let names: Vec<(&str, bool)> = registry().iter().filter(|c| c.name.starts_with("shelf_")).map(|c| (c.name, c.writes)).collect();
+        assert_eq!(names, [("shelf_status", false), ("shelf_list", false), ("shelf_set_opts", true)]);
+        assert!(writes_db(find("shelf_set_opts").unwrap()) && !is_wiki(find("shelf_set_opts").unwrap()));
+        for n in ["shelf_list", "shelf_set_opts"] {
+            assert_eq!(find(n).unwrap().args["required"], json!(["root"]), "{n}");
+            assert!(find(n).unwrap().args["properties"]["root"]["description"].as_str().unwrap().contains("shelf_status の root"), "{n}");
+        }
+        for n in ["shelf_open_root", "shelf_switch_root", "shelf_forget_root"] {
+            assert!(find(n).is_none(), "{n} は GUI だけ");
+        }
+    }
+
+    /// 履歴の検査は登録表を通っても効く: 空の履歴・履歴に無い root は BadInput（走査しない）・未知の引数は validate が止める
+    #[test]
+    fn shelf_root_must_be_in_history() {
+        let (mut db, _) = seeded_db();
+        assert_eq!(call_ok(&mut db, "shelf_status", json!({})), json!({"shelves": []}));
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        for (name, args) in [("shelf_list", json!({"root": tmp})), ("shelf_set_opts", json!({"root": tmp, "collapse_single": true}))] {
+            let e = call(&mut db, name, &args).unwrap_err();
+            assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains("履歴に無い本棚"), "{name}: {e}");
+        }
+        assert!(db.setting(shelf::KEY).unwrap().is_none(), "拒否は設定を作らない");
+        assert!(call_err(&mut db, "shelf_list", json!({})).contains("引数 root は必須"));
+        assert!(call_err(&mut db, "shelf_list", json!({"root": "/a", "path": "x"})).contains("未知の引数 path"));
+        assert!(call_err(&mut db, "shelf_status", json!({"root": "/a"})).contains("未知の引数 root"));
+        // 履歴にある root は受ける（設定だけ = 実在は問わない）・list はその先の検査へ進む
+        db.set_setting(shelf::KEY, r#"{"/nope/教科書": {"last_used": 3}}"#).unwrap();
+        let v = call_ok(&mut db, "shelf_set_opts", json!({"root": "/nope/教科書", "collapse_single": true}));
+        assert_eq!(v["collapse_single"], true);
+        let e = call_err(&mut db, "shelf_list", json!({"root": "/nope/教科書"}));
+        assert!(e.contains("本棚のフォルダに") && !e.contains("履歴に無い"), "{e}");
+        assert_eq!(call_ok(&mut db, "shelf_status", json!({}))["shelves"][0]["exists"], false);
+        // 壊れた設定は黙って空にしない
+        db.set_setting(shelf::KEY, "not json").unwrap();
+        assert!(call_err(&mut db, "shelf_status", json!({})).contains("設定 shelf_workspaces を解釈できません"));
     }
 
     /// OpenNote の分類 = 名前が `wiki_` で始まるものだけ（`wiki` で始まるだけ・途中に `wiki_` は外）。writes_db はそれを写しから外す
@@ -1485,6 +1580,35 @@ mod tests {
         // 頭文字だけが空白 = 姓だけで絞る
         let by_family = count(&mut db, json!({"author": "Kano"}));
         assert_eq!(count(&mut db, json!({"author": "Kano", "author_initial": " "})), by_family);
+    }
+
+    /// sort / desc: GUI と同じ core の並び。desc の省略 = GUI のメニューで別の項目へ移ったときと同じ向き。効かない引数・不明な値は黙って捨てない
+    #[test]
+    fn list_items_sort_args() {
+        let (mut db, _key) = seeded_db();
+        for (title, journal, year, added) in [("Older paper", "Alpha", 2020, "2026-01-01 00:00:00"), ("Newer paper", "Zeta", 2024, "2026-01-02 00:00:00")] {
+            let csl = json!({"type": "article-journal", "title": title, "container-title": journal, "issued": {"date-parts": [[year]]}});
+            let key = crate::ingest::add_item(&mut db, &Resolved { csl, retracted: None, source: "test", warnings: vec![] }).unwrap().key;
+            db.conn.execute("UPDATE items SET date_added = ?1 WHERE key = ?2", [added, key.as_str()]).unwrap();
+        }
+        let journals = |db: &mut Db, args: Value| -> Vec<String> {
+            call_ok(db, "list_items", args)["items"].as_array().unwrap().iter().map(|i| i["journal"].as_str().unwrap().to_string()).collect()
+        };
+        // seed = Test Journal・2026
+        assert_eq!(journals(&mut db, json!({"sort": "published"})), ["Test Journal", "Zeta", "Alpha"], "省略 = 新しい順");
+        assert_eq!(journals(&mut db, json!({"sort": "published", "desc": false})), ["Alpha", "Zeta", "Test Journal"]);
+        assert_eq!(journals(&mut db, json!({"sort": "journal"})), ["Alpha", "Test Journal", "Zeta"], "省略 = A→Z");
+        assert_eq!(journals(&mut db, json!({"sort": "journal", "desc": false})), ["Alpha", "Test Journal", "Zeta"]);
+        assert_eq!(journals(&mut db, json!({"sort": "journal", "desc": true})), ["Zeta", "Test Journal", "Alpha"]);
+        assert_eq!(journals(&mut db, json!({"sort": " journal "})), ["Alpha", "Test Journal", "Zeta"], "前後の空白は core と同じく落とす");
+        assert_eq!(journals(&mut db, json!({"sort": "added", "desc": false})).last().unwrap(), "Test Journal", "seed の追加日は今 = 最新");
+        assert_eq!(journals(&mut db, json!({"query": "paper", "sort": "journal"})), ["Alpha", "Zeta"], "query ありも同じ並び");
+        assert_eq!(call_ok(&mut db, "search_library", json!({"sort": "journal"}))["items"][0]["journal"], "Alpha", "別名も同じ");
+        assert!(call_err(&mut db, "list_items", json!({"sort": "title"})).contains("published"));
+        assert!(call_err(&mut db, "list_items", json!({"sort": 1})).contains("文字列"));
+        assert!(call_err(&mut db, "list_items", json!({"sort": "added", "desc": "yes"})).contains("true / false"));
+        assert!(call_err(&mut db, "list_items", json!({"desc": false})).contains("sort"), "sort の無い desc は効かない = 黙って捨てない");
+        assert!(call_err(&mut db, "list_items", json!({"sort": " ", "desc": false})).contains("sort"));
     }
 
     /// 旧 MCP の tool_roundtrip（旧名・旧引数の形のまま call から通る）

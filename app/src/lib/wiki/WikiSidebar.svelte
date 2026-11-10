@@ -105,7 +105,7 @@
     wk.menu = { kind: "vault", path: wk.status?.root ?? "", x: Math.min(r.left, window.innerWidth - 280), y: Math.max(4, Math.min(r.bottom + 2, window.innerHeight - h)) };
   }
 
-  /** 右クリック: ページ = 名前の変更・ゴミ箱 / フォルダ = その中に新規ページ・新規フォルダ・フォルダをゴミ箱（WikiDialogs が出す）。
+  /** 右クリック: ページ = 名前の変更・複製・ゴミ箱 / フォルダ = その中に新規ページ・新規フォルダ・フォルダをゴミ箱（WikiDialogs が出す）。
       y の上限 = メニューの高さの見積もり（フォルダは見出し + 3 項目） */
   function menu(e: MouseEvent, kind: "file" | "dir", path: string) {
     e.preventDefault();

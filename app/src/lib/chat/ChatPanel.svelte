@@ -1,18 +1,19 @@
 <script lang="ts">
-  /* OpenNote の右ペインの [チャット]。状態と動詞は chat.svelte.ts、行の解釈は chat.ts。
+  /* チャットの中身（柱 ChatDock の中に 1 つだけ）。状態と動詞は chat.svelte.ts、行の解釈は chat.ts。
      上から: 状態と [新しい会話] / アカウント（ログイン・ログアウト）とモデルの選択 / 使えないときの案内 / 会話（発言・応答の逐次・道具の要約・ターンごとの変更の一覧）/ 診断（stderr）/
-     文脈のチップ（今のページ、または PDF のタブなら開いている文献・選択範囲 = × で外す）と入力欄（Enter で送信・Shift+Enter で改行・IME の変換中は送らない）。
-     右ペイン（WikiRight）と内蔵の PDF viewer の右バー（PdfViewer）の両方から同じ会話を出す。
+     文脈のチップ（見ている物 = viewing: 今のページ、または PDF のタブなら開いている文献・一覧のタブなら選んでいる文献・選択範囲 = × で外す。本棚と本はなし）と
+     入力欄（Enter で送信・Shift+Enter で改行・IME の変換中は送らない）。見出しの右端の × は柱を閉じる（⌘⌥C と同じ）。
      スクロールは末尾に追従し、user が上へ戻したら追従しない */
   import { tick } from "svelte";
   import { t } from "../i18n.svelte";
   import { composing } from "../input";
   import { reveal } from "../state.svelte";
-  import WikiChatMd from "./WikiChatMd.svelte";
+  import WikiChatMd from "./ChatMd.svelte";
   import { changeView, clipSelection, codePoints, groupByTurn, toolName, type ChatEntry } from "./chat";
-  import { authAction, busy, chat, chatHidden, claimFocus, currentSource, floatChat, interrupt, loadChatStatus, newConversation, send, setModel, sourceKey, undoChange, usable } from "./chat.svelte";
-  import type { WikiChatChange } from "./types";
-  import { openWikiPage, workspaceName } from "./wiki.svelte";
+  import { authAction, busy, chat, chatHidden, claimFocus, interrupt, loadChatStatus, newConversation, send, setDockOpen, setModel, undoChange, usable } from "./chat.svelte";
+  import { clearViewingSelection, viewing, viewingKey, viewingSource } from "../viewing.svelte";
+  import type { WikiChatChange } from "../wiki/types";
+  import { openWikiPage, workspaceName } from "../wiki/wiki.svelte";
 
   let list: HTMLDivElement | undefined = $state();
   let input: HTMLTextAreaElement | undefined = $state();
@@ -24,11 +25,11 @@
   const ok = $derived(usable(st));
   /** 会話が別のワークスペースの物 = 隠して 1 行（送ると前面の root で新しい会話） */
   const hidden = $derived(chatHidden());
-  // 文脈の元 = 前面のタブ（Wiki のページ / PDF のタブの文献）。チップの文 = ページは path・文献は題名（無ければ key）
-  const src = $derived(currentSource());
-  const srcKey = $derived(sourceKey(src));
+  // 文脈の元 = 見ている物（viewing = Wiki のページ / PDF のタブの文献 / 一覧で選んでいる文献・本棚と本はなし）。チップの文 = ページは path・文献は題名（無ければ key）
+  const src = $derived(viewingSource());
+  const srcKey = $derived(viewingKey(src));
   const srcLabel = $derived(!src ? "" : src.kind === "page" ? src.path : src.title || src.key);
-  const selText = $derived(chat.sel && chat.sel.path === srcKey ? chat.sel.text : "");
+  const selText = $derived(viewing.sel && viewing.sel.key === srcKey ? viewing.sel.text : "");
   const selClip = $derived(selText ? clipSelection(selText) : null);
 
   const stateLabel = $derived(
@@ -39,9 +40,8 @@
     : t("未起動")
   );
 
-  // タブを押して開いた = 入力欄へ明示 focus（WKWebView は autofocus が効かない）。
-  // タブの切替で mount された直後でも拾う（setTab が立てた focusPending を mount の後に読む）。消費は見えている入力欄が focus できたときだけ
-  // （隠れた PDF タブの WikiChat が先に消費すると見えている方に来ない = claimFocus）
+  // 柱を開いた = 入力欄へ明示 focus（WKWebView は autofocus が効かない）。
+  // 柱が mount された直後でも拾う（setDockOpen が立てた focusPending を mount の後に読む）。消費は見えている入力欄が focus できたときだけ（claimFocus）
   $effect(() => {
     if (!chat.focusPending || !input) return;
     const el = input;
@@ -137,9 +137,7 @@
         title={t("今の会話を閉じて新しい会話を始める（会話記録は Claude Code に残ります）")}
         onclick={() => (chat.conv.entries.length ? (chat.confirmNew = true) : void newConversation())}>{t("新しい会話")}</button>
     {/if}
-    {#if !chat.float}
-      <button class="wk-ch-btn wk-ch-float" title={t("チャットを浮かせる（アプリの窓の中で動かせます）")} aria-label={t("チャットを浮かせる（アプリの窓の中で動かせます）")} onclick={floatChat}>⧉</button>
-    {/if}
+    <button class="wk-ch-btn wk-ch-close" title={t("チャットを閉じる（⌘⌥C）")} aria-label={t("チャットを閉じる（⌘⌥C）")} onclick={() => setDockOpen(false)}>×</button>
   </div>
 
   {#if st?.enabled && st.cli}
@@ -292,7 +290,7 @@
         {#if selText && selClip}
           <span class="wk-ch-chip" title={clipText(selText, 400)}>
             <span class="wk-ch-chip-text">{t("選択範囲")} {selClip.length} {t("字")}{selClip.cut ? ` (${t("先頭だけ")})` : ""}</span>
-            <button class="wk-ch-x" aria-label={t("選択範囲を添えない")} title={t("選択範囲を添えない")} onclick={() => (chat.sel = null)}>×</button>
+            <button class="wk-ch-x" aria-label={t("選択範囲を添えない")} title={t("選択範囲を添えない")} onclick={clearViewingSelection}>×</button>
           </span>
         {/if}
       </div>
@@ -335,7 +333,7 @@
   .wk-ch-btn:disabled { opacity: 0.45; cursor: default; }
   .wk-ch-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .wk-ch-stop { color: var(--danger); }
-  .wk-ch-float { padding: 1px 7px; font-size: 13px; line-height: 1.2; }
+  .wk-ch-close { padding: 1px 7px; font-size: 13px; line-height: 1.2; }
   .wk-ch-pad { padding: 0 12px; }
   .wk-ch-dim { margin: 2px 0; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   .wk-ch-err { margin: 4px 0; color: var(--danger); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }

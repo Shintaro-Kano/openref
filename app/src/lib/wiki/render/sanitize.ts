@@ -11,7 +11,7 @@ import { cleanStyleAttr, cleanStyleSheet } from "./css.ts";
 import { buildMedia, type MediaLabels } from "./media.ts";
 import { scanWikiText, wikiLabel } from "./md.ts";
 
-/** 許可する要素（markdown-it が出す em strong del section + KB が使う small） */
+/** 許可する要素（markdown-it が出す em strong del section + 既存のページが使う small） */
 export const ALLOWED_TAGS = [
   "img", "details", "summary", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "video", "audio", "source",
   "a", "span", "div", "p", "b", "i", "u", "s", "sub", "sup", "br", "hr", "code", "pre", "kbd", "mark", "ul", "ol", "li",

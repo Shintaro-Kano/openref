@@ -1,5 +1,5 @@
 //! OpenNote の GUI の本体（Tauri の AppHandle に依存する段取り）: 有効化と root の選択・監視（WikiLive・wiki_fs_plan / wiki_fs_ingest）・
-//! 最近のワークスペース（切替・履歴・root ごとの参照フォルダ・索引の掃除）・参照フォルダ・URL の窓・終了の保留・チャットの設定と status・
+//! 最近のワークスペース（切替・履歴・root ごとの参照フォルダ・索引の掃除）・参照フォルダ・URL の検査・終了の保留・チャットの設定と status・
 //! Settings の OpenNote のメニュー。
 //! Tauri command の包みと generate_handler!・setup は main.rs（parity test が main.rs だけを走査する）。ここは包みが呼ぶ本体
 
@@ -2057,17 +2057,15 @@ fn wiki_chores(app: &tauri::AppHandle, root: Option<&str>, touch: Option<bool>) 
     }
 }
 
-// ---------- OpenNote: 参照フォルダと URL の別窓 ----------
+// ---------- OpenNote: 参照フォルダと URL ----------
 // 参照フォルダ = vault の外の読み取り専用のルート（ワークスペースごと = 設定 wiki_workspaces[現在の root].ref_dirs。GUI 専用の
 // command で足す / 外す。旧キー wiki_ref_dirs = 1 本の JSON の文字列の配列は、読むときに現在の root の分として取り込んで消す）。
 // その下の pdf / html / 画像 / 動画 / 音声への file:// リンクは、vault の中のファイルと同じ内蔵の表示で開く（wiki_read_ref）。
 // root と同じく asset scope に足すだけ（allow_directory は取り消せない = 外しても再起動まで配信される）で、索引・MCP の範囲は広げない。
-// URL（http(s)）は設定 wiki_url_window なら OpenRef の別窓（WKWebView・capabilities に無い = IPC を呼べない）で、でなければ既定のブラウザで開く
+// URL（http(s)）は既定のブラウザで開く（wiki_url_checked で検査してから。OpenRef の別窓で開く設定は 3.0.0 で外した）
 
 /// 旧キー wiki_ref_dirs（JSON の文字列の配列・以前の形 = root を問わず 1 本）。読むのは取り込み（wiki_ref_dirs_migrate）だけ
 pub(crate) const WIKI_REF_DIRS_KEY: &str = "wiki_ref_dirs";
-/// URL の別窓の label（1 枚を使い回す）
-pub(crate) const WIKI_URL_LABEL: &str = "wiki-url";
 
 /// 旧キー wiki_ref_dirs の値 → 参照フォルダ。未設定・空は空。JSON の文字列の配列として読めなければ Err（黙って空にしない = 退避して
 /// から消す = wiki_ref_dirs_migrate）
@@ -2368,44 +2366,14 @@ pub(crate) fn wiki_ref_html_fields(
     out["links"] = serde_json::json!([]);
 }
 
-fn wiki_url_title(u: &tauri::Url) -> String {
-    u.host_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| "OpenRef".into())
-}
-
-/// 別窓の中の遷移: http(s) と about だけ（asset / tauri / file は通さない = 外部のページからアプリの中身に触れない）
-pub(crate) fn wiki_url_window_nav_allowed(url: &tauri::Url) -> bool {
-    matches!(url.scheme(), "http" | "https" | "about")
-}
-
-/// 既にあれば遷移して前面に・無ければ作る。この窓は capabilities に無い = IPC（Tauri の command）を呼べない。
-/// 別窓を開く要求（target=_blank・window.open）は同じ窓で開く。ダウンロードは受けない（保存先を決める UI が無い = 外部ブラウザで）
-pub(crate) fn wiki_url_window_show(app: &tauri::AppHandle, url: tauri::Url) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window(WIKI_URL_LABEL) {
-        w.navigate(url).map_err(err)?;
-        // 最小化中は set_focus が効かない（tao）= 先に戻す
-        let _ = w.unminimize().and(w.show()).and(w.set_focus());
-        return Ok(());
+/// wiki_open_url の検査: 前後の空白を除いて URL として読め、scheme が http(s) のときだけ Ok（file / asset / tauri / javascript /
+/// mailto 等は拒む = mailto は画面が open_external へ回す）
+pub(crate) fn wiki_url_checked(url: &str, en: bool) -> Result<tauri::Url, String> {
+    let u = tauri::Url::parse(url.trim()).map_err(|_| tr(en, "URL ではありません", "Not a URL"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(tr(en, "http(s) のみ許可", "Only http(s) is allowed"));
     }
-    let h = app.clone();
-    let title = wiki_url_title(&url);
-    tauri::WebviewWindowBuilder::new(app, WIKI_URL_LABEL, tauri::WebviewUrl::External(url))
-        .title(&title)
-        .inner_size(1100.0, 820.0)
-        .on_new_window(move |u, _| {
-            if let Some(w) = h.get_webview_window(WIKI_URL_LABEL) {
-                let _ = w.navigate(u);
-            }
-            tauri::webview::NewWindowResponse::Deny
-        })
-        .on_page_load(|w, p| {
-            let _ = w.set_title(&wiki_url_title(p.url()));
-        })
-        .on_download(|_, _| false)
-        .build()
-        .map_err(err)?;
-    Ok(())
+    Ok(u)
 }
 
 // ---------- OpenNote（チャット = Claude Code CLI の子プロセス） ----------
@@ -2462,7 +2430,7 @@ pub(crate) fn wiki_chat_settings(
     Ok((ctx, on, db.path.clone()))
 }
 
-/// メニューの [チャット] を設定に揃える（押せるのは Wiki が有効なときだけ）。[リンクを OpenRef の窓で開く] [チャットのログ] も同じ条件で押せる
+/// メニューの [チャット] を設定に揃える（押せるのは Wiki が有効なときだけ）。[チャットのログ] も同じ条件で押せる
 fn wiki_chat_sync_menu(app: &tauri::AppHandle) {
     let wiki_on = WIKI_ON.load(std::sync::atomic::Ordering::Relaxed);
     let on = wiki_chat_settings(app)
@@ -2473,27 +2441,13 @@ fn wiki_chat_sync_menu(app: &tauri::AppHandle) {
             .wiki_chat
             .set_enabled(wiki_on)
             .and(items.wiki_chat.set_checked(on));
-        let _ = items
-            .wiki_url_window
-            .set_enabled(wiki_on)
-            .and(items.wiki_chat_log.set_enabled(wiki_on));
+        let _ = items.wiki_chat_log.set_enabled(wiki_on);
     }
 }
 
-pub(crate) const WIKI_URL_WINDOW_ID: &str = "wiki_url_window";
-/// 設定: "1" = ページの http(s) リンクを OpenRef の別窓（WKWebView）で開く。既定 = 外部ブラウザ
-pub(crate) const WIKI_URL_WINDOW_KEY: &str = "wiki_url_window";
 pub(crate) const WIKI_CHAT_LOG_ID: &str = "wiki_chat_log";
 /// 設定: "0" のときだけチャットのログ（ワークスペースの chat-log/）を残さない。既定 ON
 pub(crate) const WIKI_CHAT_LOG_KEY: &str = "wiki_chat_log";
-
-pub(crate) fn wiki_url_window_text(en: bool) -> &'static str {
-    if en {
-        "Open web links in an OpenRef window"
-    } else {
-        "リンク（URL）を OpenRef の窓で開く"
-    }
-}
 
 pub(crate) fn wiki_chat_log_text(en: bool) -> &'static str {
     if en {

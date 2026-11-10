@@ -23,6 +23,14 @@ OpenRef 本体のソースコード（`crates/*`, `app/src/*`, `app/src-tauri/*`
 - **所在**: `app/` フロントエンドバンドル（`pdfjs-dist` v6.1.200）
 - **著作権**: Copyright Mozilla Foundation and contributors
 - **ライセンス**: **Apache-2.0** (<https://www.apache.org/licenses/LICENSE-2.0>)
+- **補助データ**: `pdfjs-dist` の中の部品をビルド時に `app/public/pdfjs/` へ写して同梱しています（`scripts/copy-pdf-assets.mjs`。各部品の LICENSE も同じフォルダに同梱）。
+  - `cmaps/`（CMap）: BSD-3-Clause — Copyright 1990-2009 Adobe Systems Incorporated
+  - `standard_fonts/`（Liberation フォント）: SIL Open Font License 1.1 — Copyright (c) 2010 Google Corporation, Copyright (c) 2012 Red Hat, Inc.
+  - `standard_fonts/`（Foxit フォント）: BSD-3-Clause — Copyright 2014 PDFium Authors
+  - `wasm/`（JBIG2 / CCITT の復号）: BSD-3-Clause および Apache-2.0 — Copyright 2014 The PDFium Authors / Apache-2.0 — Copyright 2026 Mozilla Foundation
+  - `wasm/`（OpenJPEG）: BSD-2-Clause — Copyright (c) 2002-2014, Universite catholique de Louvain (UCL), Belgium ほか / BSD-2-Clause — Copyright (c) 2024, Mozilla Foundation
+  - `wasm/`（qcms）: MIT License — Copyright (C) 2009-2024 Mozilla Corporation, Copyright (C) 1998-2007 Marti Maria / BSD-2-Clause — Copyright (c) 2025, Mozilla Foundation
+  - `iccs/`（ICC プロファイル）: CC0 1.0 Universal
 
 ### 1.4 Svelte / Tauri フロントエンドパッケージ
 - **所在**: `app/` フロントエンドバンドル

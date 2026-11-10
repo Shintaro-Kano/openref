@@ -597,7 +597,7 @@ fn schema_text(db: &Db, allow: &Allow) -> String {
     out.push_str("\n## 3. call のコマンド一覧\n\n");
     out.push_str("`call(name, args)`。item は key・フォルダは key かパス・ラベルは名前。DB を変える書込のコマンドはこのプロセスで最初の 1 回の前に DB のスナップショットを取る（`wiki_*` の書込は DB を変えない = 上書き前のファイルを wiki-history/ に退避）。\n\n");
     if allow.restricted() {
-        out.push_str("**このセッションで使えるのは下の一覧のコマンドだけ**（許可一覧 = 起動時の OPENREF_MCP_ALLOW）。ホストのファイルのパスを受けるコマンドはワークスペースの中のファイルだけ受ける。\n\n");
+        out.push_str("**このセッションで使えるのは下の一覧のコマンドだけ**（許可一覧 = 起動時の OPENREF_MCP_ALLOW）。ホストのファイルのパスを受けるコマンドはワークスペースの中のファイルだけ受ける。本棚の root は履歴にある物だけ。\n\n");
     }
     out.push_str(&commands::markdown_where(|c| allow.allows(c)));
     out.push_str("\n## 4. 環境\n\n");
@@ -970,6 +970,15 @@ mod tests {
         let s = text(&tool(&mut srv, "schema", json!({})));
         assert!(s.contains("`list_items`") && s.contains("`wiki_write`") && s.contains("`import_pdf`") && s.contains("このセッションで使えるのは"));
         assert!(!s.contains("`purge_item`") && !s.contains("`add_tag`") && !s.contains("`fetch_pdf`"));
+        // 本棚: 読みの分類に入る・書き（shelf_set_opts）は名指しが要る・root は履歴にある物だけ（schema の文と実際の拒否）
+        assert!(s.contains("ホストのファイルのパスを受けるコマンドはワークスペースの中のファイルだけ受ける。本棚の root は履歴にある物だけ。"));
+        assert!(s.contains("`shelf_list`") && s.contains("`shelf_status`") && !s.contains("`shelf_set_opts`"));
+        let r = tool(&mut srv, "call", json!({"name": "shelf_set_opts", "args": {"root": dir.to_string_lossy(), "name": "x"}}));
+        assert!(text(&r).contains("このセッションでは許可されていません"), "{}", text(&r));
+        let r = tool(&mut srv, "call", json!({"name": "shelf_list", "args": {"root": dir.to_string_lossy()}}));
+        assert_eq!(r["isError"], true);
+        assert!(text(&r).contains("履歴に無い本棚"), "{}", text(&r));
+        assert_eq!(tool(&mut srv, "call", json!({"name": "shelf_status", "args": {}}))["isError"], false);
         for r in [
             tool(&mut srv, "call", json!({"name": "purge_item", "args": {"key": key}})),
             tool(&mut srv, "purge_item", json!({"key": key})),

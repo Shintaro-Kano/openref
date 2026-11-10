@@ -75,7 +75,7 @@ fn wiki_resolution_matches_fixture() {
     }
 }
 
-/// 実 vault の計測（受入 a・c）。OPENREF_WIKI_VAULT=<vault> OPENREF_WIKI_INDEX=<vault の外の索引パス>
+/// 実 vault の計測。OPENREF_WIKI_VAULT=<vault> OPENREF_WIKI_INDEX=<vault の外の索引パス>
 /// cargo test -p openref-core --release --test wiki_links_fixture -- --ignored --nocapture real_vault
 #[test]
 #[ignore]
