@@ -1238,6 +1238,7 @@ export async function switchMode(to: "library" | "wiki") {
 /** ページを開く。newTab = 新しい Wiki タブ（⌘クリック・ItemDetail の Wiki 節）・それ以外は前面の Wiki タブの中で遷移 */
 export async function openWikiPage(path: string | null, newTab = false, heading?: string, edit = false) {
   if (!app.wikiOn) return;
+  if (!newTab) navSeq++; // 保存を待っている戻る / 進むを取り消す（後から押した遷移が勝つ）
   // 遷移は呼んだときのタブに対して（保存を待つ間に別のタブへ切り替わっても、そのタブの中身を変えない）
   const tabId = app.tab;
   // 同じタブの中で別のページへ = 編集中の未保存を保存してから（保存できなければ移らない）
@@ -1256,9 +1257,77 @@ export async function openWikiPage(path: string | null, newTab = false, heading?
     if (edit) front.editing = true;
     return;
   }
+  // 離れるページを「戻る」に積む・「進む」は捨てる（ブラウザと同じ）。
+  // 配列は proxy の側を読み直して積む（`x.back ??= []` の値は proxy に入れる前の生の配列 = そこへの push は state に映らない）
+  front.back ??= [];
+  const back = front.back;
+  back.push({ path: front.path, scrollTop: front.scrollTop });
+  if (back.length > HIST_MAX) back.splice(0, back.length - HIST_MAX);
+  front.fwd = [];
   front.path = path;
   front.scrollTop = 0;
   front.editing = edit; // 別のページは表示で開く（新規ページだけ編集で）
+}
+
+/** タブごとの履歴の上限（古い方から捨てる） */
+const HIST_MAX = 100;
+/** 同じタブの中の遷移の世代（openWikiPage・goHistory が進める）。保存を待つ間に後の遷移が来た戻る / 進むは何もしない */
+let navSeq = 0;
+
+/** 前面の OpenNote タブで戻れる（dir = -1）/ 進める（1）か */
+export function canGo(dir: -1 | 1): boolean {
+  const w = frontWiki();
+  return !!(dir < 0 ? w?.back : w?.fwd)?.length;
+}
+
+/** 戻る（-1）/ 進む（1）= 前面の OpenNote タブの中の履歴（⌘[ / ⌘]・ヘッダーの ‹ ›）。編集中の未保存は保存してから（保存できなければ移らない）。
+    着地は離れたときのスクロール位置・表示で（編集には戻さない）。検索の結果一覧を出していれば畳む（行き先のページを見せる） */
+export async function goHistory(dir: -1 | 1) {
+  if (!app.wikiOn) return;
+  const tabId = app.tab;
+  const w = frontWiki();
+  if (!w || !canGo(dir)) return;
+  const my = ++navSeq;
+  if (!(await canLeave())) return;
+  // 保存を待つ間に別のタブへ移った・タブの中身が置き換わった（ワークスペースの切替）・後から別の遷移（リンク・もう一度の戻る）が来たなら何もしない
+  if (app.tab !== tabId || frontWiki() !== w || my !== navSeq) return;
+  w.back ??= [];
+  w.fwd ??= [];
+  const from = dir < 0 ? w.back : w.fwd; // proxy の側（openWikiPage と同じ）
+  const to = dir < 0 ? w.fwd : w.back;
+  // 今と同じページの項目（改名・ゴミ箱で詰めた結果）は飛ばす
+  let next = from.pop();
+  while (next && next.path === w.path) next = from.pop();
+  if (!next) return;
+  to.push({ path: w.path, scrollTop: w.scrollTop });
+  pendingHeading = null;
+  wk.scrollTo = null;
+  wk.showResults = false;
+  w.path = next.path;
+  w.scrollTop = next.scrollTop;
+  w.editing = false;
+}
+
+/** 改名・ゴミ箱を履歴にも映す（画面の root のタブだけ = 別のワークスペースの同じ相対パスは別のファイル）。
+    f = 新しい path（null = 捨てる）。詰めて隣り合った同じページは 1 つに・端（次に戻る / 進む先）が今のページなら捨てる（押せるのに動かない ‹ › を作らない） */
+export function rewriteHistory(f: (path: string) => string | null) {
+  for (const tab of app.tabs) {
+    const w = tab.wiki;
+    if (!onShown(w)) continue;
+    for (const k of ["back", "fwd"] as const) {
+      const list = w[k];
+      if (!list?.length) continue;
+      const out: { path: string | null; scrollTop: number }[] = [];
+      for (const h of list) {
+        const p = h.path === null ? null : f(h.path);
+        if (h.path !== null && p === null) continue;
+        if (out.length && out[out.length - 1].path === p) continue;
+        out.push({ path: p, scrollTop: h.scrollTop });
+      }
+      while (out.length && out[out.length - 1].path === w.path) out.pop();
+      w[k] = out;
+    }
+  }
 }
 
 /** `[[name#heading]]` の着地を待つ見出し（ページの読込 → onHeadings で解く） */
@@ -1280,7 +1349,7 @@ export function jumpToHeading(idOrText: string): boolean {
   return true;
 }
 
-/** md 以外（pdf / html / 画像 / 動画 等）へのリンクは常に新しいタブで開く（user: 読んでいるページを離れない）。
+/** md 以外（pdf / html / 画像 / 動画 等）へのリンクは常に新しいタブで開く（読んでいるページを離れない）。
     同じファイルのタブが既にあればそれへ切り替える（同じ PDF を何枚も開かない） */
 export function opensInNewTab(path: string): boolean {
   return viewKindOf(path) !== "page" || /\.html?$/i.test(path);

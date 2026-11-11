@@ -7,7 +7,7 @@ import { app, closeTab, frontWiki, toast } from "../state.svelte";
 import { baseName, dirOf } from "./render/asset.ts";
 import type { WikiCreateResult, WikiDuplicateResult, WikiMkdirResult, WikiRenamePreview, WikiRenameResult, WikiTrashResult } from "./types";
 import { dirty, discardEdit, ed, holdAutosave, renamed, resumeAutosave } from "./edit.svelte";
-import { canLeave, isRefPath, loadAll, onShown, openWikiPage, shownRoot, wikiArgs, wk } from "./wiki.svelte";
+import { canLeave, isRefPath, loadAll, onShown, openWikiPage, rewriteHistory, shownRoot, wikiArgs, wk } from "./wiki.svelte";
 
 /** 今のフォルダ（前面のページのフォルダ・ホームなら vault の直下 = ""・参照フォルダのページを見ているときも vault の直下） */
 export function currentDir(): string {
@@ -162,6 +162,7 @@ export async function doRename(from: string, to: string, rewrite: boolean) {
     wk.dialog = null;
     renamed(from, r.path, shownRoot());
     for (const tab of app.tabs) if (onShown(tab.wiki) && tab.wiki.path === from) tab.wiki.path = r.path;
+    rewriteHistory((p) => (p === from ? r.path : p)); // 戻る / 進むの行き先も新しい名前へ
     // skipped = 確認の後に書き換わったので触らなかったファイル（core の任意の欄）
     const skipped = r.skipped ?? [];
     if (skipped.length) {
@@ -234,6 +235,7 @@ export async function doTrash(path: string, dir = false) {
   if (dir) {
     for (const d of [...wk.newDirs]) if (underPath(d, path, true)) wk.newDirs.delete(d);
   }
+  rewriteHistory((p) => (underPath(p, path, dir) ? null : p)); // 戻る / 進むで消えたページへ行かない
   if (r.index_error) toast(`${t("ゴミ箱に移しましたが、索引を更新できませんでした")}: ${r.index_error.slice(0, 160)}`, 8000);
   else toast(t("ゴミ箱に移しました（Finder の「戻す」で戻せます）"));
   try {
@@ -244,7 +246,12 @@ export async function doTrash(path: string, dir = false) {
     const front = app.tabs.find((x) => x.id === app.tab);
     if (front && onShown(front.wiki) && underPath(front.wiki.path, path, dir)) {
       if (app.tabs.length > 1) await closeTab(front.id);
-      else front.wiki = { path: null, root: front.wiki.root ?? null, scrollTop: 0, editing: false };
+      else {
+        // 最後の 1 枚 = ホームへ。中身は置き換えない = 戻る / 進むを残す（ゴミ箱のページは上の rewriteHistory で外した）
+        front.wiki.path = null;
+        front.wiki.scrollTop = 0;
+        front.wiki.editing = false;
+      }
     }
   } catch (e) {
     toast(`✗ ${t("タブを閉じられません")}: ${String(e).slice(0, 200)}`);

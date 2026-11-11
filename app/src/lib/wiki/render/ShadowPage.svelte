@@ -2,17 +2,19 @@
   /* OpenNote: md / html ページを shadow DOM に描く共通の部品（MdView / HtmlView の中身）。
      閉じ込めは 2 重: 外箱 .wk-md-box（contain: layout paint）+ host（.wk-md・同じ contain）。体裁は adoptedStyleSheets。
      描画 = md: markdown-it / html: prepareHtml → purify（DOMPurify・inert な文書）→ finish（URL の書換え・リンクの分類）→ shadow へ。
-     リンクのクリックは shadow root で横取りして onNavigate に（WebView には遷移させない）。`![[ページ]]` は readPage で 1 段だけ埋める
+     リンクのクリックは shadow root で横取りして onNavigate に（WebView には遷移させない・⌘クリック / 中クリック = 新しいタブ）。
+     リンクの右クリックは WebView の既定のメニュー（押しても何も起きない）の代わりに OpenNote のメニュー（linkmenu.svelte.ts）。`![[ページ]]` は readPage で 1 段だけ埋める
      （読んだページは世代 wk.embedGen（索引の変更と GUI の保存の成功で進む）の間だけ覚える = 分割のプレビューが入力の一時停止ごとに描き直しても IPC は世代に 1 回）。
      描画の時間の計測（performance.measure "wk-render <path>"・初回の描画（次のフレーム）まで = "wk-paint <path>"）は旗 `window.__wkMeasure = true`
      のときだけ残す（既定は切る = User Timing の項目が描画のたびに溜まり続けない。計測は Inspector で旗を立ててから） */
   import { onDestroy, untrack } from "svelte";
-  import type { WikiNav, WikiPageData, WikiViewProps } from "../types";
+  import type { WikiPageData, WikiViewProps } from "../types";
   import { t } from "../../i18n.svelte";
   import { composing } from "../../input";
   import { wk } from "../wiki.svelte";
   import { renderMarkdown } from "./md";
-  import { anchorTarget, finish, keepSection, navOf, purify, type FinishResult, type Labels, type Nav } from "./sanitize";
+  import { anchorTarget, finish, keepSection, navOf, purify, type FinishResult, type Labels } from "./sanitize";
+  import { linkItems, openLinkMenu, toWikiNav, withSelection } from "../linkmenu.svelte";
   import { prepareHtml } from "./html";
   import { sheets } from "./styles";
   import { Finder } from "./find";
@@ -54,27 +56,6 @@
     };
   }
 
-  function toWikiNav(n: Nav): WikiNav | null {
-    switch (n.t) {
-      case "page":
-        return n.heading ? { kind: "page", path: n.path, heading: n.heading } : { kind: "page", path: n.path };
-      case "item": {
-        const v: WikiNav = { kind: "item", key: n.key };
-        if (n.page != null) v.page = n.page;
-        if (n.att) v.att = n.att;
-        return v;
-      }
-      case "ext":
-        return { kind: "external", url: n.url };
-      case "open":
-        return { kind: "open", abs: n.abs };
-      case "ref":
-        return { kind: "ref", abs: n.abs };
-      default:
-        return null;
-    }
-  }
-
   function scrollToAnchor(id: string) {
     if (!shadow) return;
     const el = anchorTarget(shadow, id);
@@ -86,11 +67,29 @@
     const el = (me.target as Element | null)?.closest?.("a, button[data-wk-open]");
     if (!el) return;
     me.preventDefault();
-    if (me.type === "auxclick") return;
+    // auxclick = 左以外のボタン。中ボタン = 新しいタブ（一覧・サイドバーと同じ）・右ボタンは contextmenu が扱う
+    const middle = me.type === "auxclick";
+    if (middle && me.button !== 1) return;
     const n = navOf(el);
     if (n.t === "anchor") return scrollToAnchor(n.id);
     const w = toWikiNav(n);
-    if (w) onNavigate(w, me.metaKey || me.ctrlKey);
+    if (w) onNavigate(w, middle || me.metaKey || me.ctrlKey);
+  }
+
+  /** リンクの右クリック = OpenNote のメニュー（リンクの外 = WebView の既定のメニュー = 選択のコピー・調べる 等のまま）。
+      文字を選んでいれば頭に「コピー」（既定のメニューを止めた分を戻す） */
+  function onContext(e: Event) {
+    const me = e as MouseEvent;
+    const a = (me.target as Element | null)?.closest?.("a");
+    if (!a) return;
+    const n = navOf(a);
+    const written = a.getAttribute("data-wk-href") ?? "";
+    const items = linkItems(n, written, { go: onNavigate, anchor: scrollToAnchor, root });
+    if (!items.length) return;
+    me.preventDefault();
+    const head = n.t === "unresolved" ? `${t("未解決のリンク")}: ${written}` : written;
+    const selected = window.getSelection()?.toString() ?? "";
+    openLinkMenu({ x: me.clientX, y: me.clientY, head, items: withSelection(items, selected), origin: host });
   }
 
   function ensureShadow(): ShadowRoot {
@@ -99,6 +98,7 @@
     shadow.adoptedStyleSheets = sheets(document, mode);
     shadow.addEventListener("click", onClick);
     shadow.addEventListener("auxclick", onClick);
+    shadow.addEventListener("contextmenu", onContext);
     finder = new Finder(shadow);
     return shadow;
   }

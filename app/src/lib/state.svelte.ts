@@ -64,6 +64,16 @@ export interface TabWiki {
   root: string | null;
   scrollTop: number;
   editing: boolean;
+  /** このタブの中の遷移の履歴（戻る / 進む = wiki.svelte の goHistory）。無い = 空。永続しない（ui_tabs は path と root だけ）。
+      ワークスペースが変わる（tab.wiki の置き換え）と一緒に消える */
+  back?: WikiHist[];
+  fwd?: WikiHist[];
+}
+
+/** 履歴の 1 件 = 離れたときのページ（null = ホーム）とスクロール位置 */
+export interface WikiHist {
+  path: string | null;
+  scrollTop: number;
 }
 
 /** タブ 1 枚 = 一覧の状態一式。不活性のタブはここに snapshot（値の複製）で眠る。

@@ -9,7 +9,7 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { composing } from "../input";
-  import { app, frontWiki } from "../state.svelte";
+  import { app, frontWiki, tabOpsAllowed } from "../state.svelte";
   import HtmlView from "./HtmlView.svelte";
   import MdView from "./MdView.svelte";
   import MediaView from "./MediaView.svelte";
@@ -21,6 +21,7 @@
   import type { WikiLink, WikiNav, WikiPageData } from "./types";
   import { absOf, baseName, refViewable, relInRoot } from "./render/asset";
   import {
+    goHistory,
     hasQuery,
     navigate,
     noteTitle,
@@ -48,8 +49,37 @@
   let body = $state<HTMLDivElement | null>(null);
   let seq = 0;
 
+  /** スクロール位置を戻す。後から伸びる中身（html の読込・`![[埋め込み]]`・画像）で届かなければ、伸びるたびに追う
+      （利用者の操作・別のページ・見出しへの移動（still が false）・3 秒で止める）。追う間の onScroll は途中の値を書くが、届けば最後の値になる */
+  let chase: (() => void) | null = null;
+  function restoreScroll(el: HTMLDivElement, target: number, still: () => boolean) {
+    chase?.();
+    el.scrollTop = target;
+    if (target <= 0 || el.scrollTop >= target - 1 || typeof ResizeObserver === "undefined") return;
+    const stop = () => {
+      ro.disconnect();
+      clearTimeout(timer);
+      el.removeEventListener("wheel", stop);
+      el.removeEventListener("pointerdown", stop);
+      window.removeEventListener("keydown", stop, true);
+      if (chase === stop) chase = null;
+    };
+    const ro = new ResizeObserver(() => {
+      if (!still()) return stop();
+      el.scrollTop = target;
+      if (el.scrollTop >= target - 1) stop();
+    });
+    const timer = setTimeout(stop, 3000);
+    for (const c of Array.from(el.children)) ro.observe(c);
+    el.addEventListener("wheel", stop, { passive: true });
+    el.addEventListener("pointerdown", stop);
+    window.addEventListener("keydown", stop, true);
+    chase = stop;
+  }
+
   async function load(p: string | null, r: string | null, keepScroll: boolean) {
     const my = ++seq;
+    chase?.();
     const jump = wk.scrollTo?.nonce;
     wk.headings = [];
     if (!p) {
@@ -74,7 +104,9 @@
     await tick();
     if (wk.scrollTo?.nonce !== jump) return;
     const want = frontWiki();
-    if (body && want && want.path === p) body.scrollTop = keepScroll ? want.scrollTop : 0;
+    if (body && want && want.path === p) {
+      restoreScroll(body, keepScroll ? want.scrollTop : 0, () => my === seq && frontWiki() === want && want.path === p && wk.scrollTo?.nonce === jump);
+    }
   }
 
   // 前面の path か root が変わった（タブの切替・遷移・明示の切替）
@@ -113,6 +145,12 @@
 
   const searching = $derived(wk.showResults && hasQuery());
 
+  /** 入力欄・テキストエリア・contenteditable（CodeMirror）の中か */
+  function typing(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+  }
+
   function onKey(e: KeyboardEvent) {
     if (!frontWiki()) return;
     const cmd = e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
@@ -123,6 +161,14 @@
       return;
     }
     if (wk.dialog || ed.dialog || app.modal) return;
+    // ⌘[ / ⌘] = 戻る / 進む（このタブの中の履歴・ホームと検索の結果一覧からも）。入力欄・エディタの中では奪わない
+    // （CodeMirror の字下げ = 同じキー・チャットの入力欄・html ページの中の入力欄 = shadow の中なので composedPath の頭で見る）。
+    // 覆い（参照エディタ・チャットの説明・救出・取込）の下でも動かさない = タブの操作と同じ門。⌘⇧[ ] はタブの巡回（App）
+    if (cmd && (e.key === "[" || e.key === "]") && !typing(e.composedPath()[0] ?? e.target) && tabOpsAllowed()) {
+      e.preventDefault();
+      if (!e.repeat && !composing(e)) void goHistory(e.key === "[" ? -1 : 1);
+      return;
+    }
     // 結果一覧の Esc = 検索を消して木（ページ）に戻る（検索欄の中の Esc は検索欄が先に扱う）。
     // IME の取消 Esc は入力欄が stopPropagation しない = ここで弾く（App.svelte の Esc と同じ形・欄ごとの手当てに頼らない）
     if (searching && e.key === "Escape" && !composing(e) && !app.editorOpen) {
@@ -200,6 +246,7 @@
     });
   });
   onDestroy(() => {
+    chase?.();
     stopEdit();
     setChatEditor(null);
   });

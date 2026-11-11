@@ -58,6 +58,8 @@ run "wiki ime" node app/src/lib/wiki/ime.test.mjs
 run "wiki ipc" node app/src/lib/wiki/ipc.test.mjs
 # ワークスペースの切替(実部品 wiki.svelte.ts + jsdom・invoke は差し替え): 一覧(新しい順・現在は ✓)・切替は先に保存してからタブをホームへ・履歴から外す・仮の状態からの最初の読みは変化と見ない
 run "wiki workspaces" node app/src/lib/wiki/workspaces.test.mjs
+# 遷移(実部品 wiki.svelte.ts / WikiHeader / WikiPage / MdView / WikiLinkMenu + jsdom): タブの中の戻る / 進む(位置ごと・保存してから・改名とゴミ箱の追随・‹ ›・⌘[ ⌘])・リンクの右クリックのメニュー・中クリック = 新しいタブ
+run "wiki nav" node app/src/lib/wiki/nav.test.mjs
 # Word: citeproc 実整形(同梱スタイル・型・誌名スタイル)・OpenRef.dotm の整形とダイアログ・dotm の生成器
 run "word cite" node word/test-cite.cjs
 run "word types" node word/test-types.cjs

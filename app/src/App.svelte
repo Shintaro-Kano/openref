@@ -33,6 +33,7 @@
   import { initViewing } from "./lib/viewing.svelte";
   import ChatDock from "./lib/chat/ChatDock.svelte";
   import WikiRescue from "./lib/wiki/WikiRescue.svelte";
+  import WikiLinkMenu from "./lib/wiki/WikiLinkMenu.svelte";
   import { ed } from "./lib/wiki/edit.svelte";
   import { infoKeyAllowed, initWiki, loadWikiEnabled, loadWikiStatus, togglePane, wikiDrop, wk } from "./lib/wiki/wiki.svelte";
   import {
@@ -347,7 +348,7 @@
   <!-- タブの中身（ヘッダー・一覧・PDF ビューア）。PDF タブのビューアはこの全面を覆う（柱は覆わない = 柱は .tabs-page の外） -->
   <div class="tabs-page">
     <header>
-      <!-- OpenNote が前面ならアプリ名も OpenNote（user 指示 11-02） -->
+      <!-- OpenNote が前面ならアプリ名も OpenNote -->
       <div class="brand">{frontWiki() ? "OpenNote" : "OpenRef"}</div>
       {#if frontWiki()}
         <WikiHeader />
@@ -470,4 +471,6 @@
   {#if app.editorOpen}<ReferenceEditor />{/if}
   {#if ed.stranded.length}<WikiRescue />{/if}
   {#if app.wikiOn}<WikiChatConsent />{/if}
+  <!-- OpenNote のリンクの右クリックのメニュー（ページ・分割のプレビュー・チャットの応答で共通 = 1 つ） -->
+  {#if app.wikiOn}<WikiLinkMenu />{/if}
 </div>
