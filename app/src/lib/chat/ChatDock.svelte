@@ -1,16 +1,17 @@
 <script lang="ts">
-  /* チャットの面 = アプリ右端の柱 1 本。中身は WikiChat 1 つ = どのタブが前面でも同じ場所・同じ会話。
+  /* チャットの面 = アプリ右端の柱 1 本。中身は ChatPanel 1 つ = どのタブが前面でも同じ場所・同じ会話。
      App が .tabs-page の外（右）に置き、chatShown() && chat.dock.open のときだけ mount する（開閉 = タブ列右端のボタン / ⌘⌥C）。
      .tabs-page の {#if} の枝の外 = タブの種類を切り替えても作り直されない。
      幅 = 左端のつまみ。動かしている間は線（.cd-guide = position: fixed）だけ動かしてレイアウトを変えない = 読み手（PDF / 本）は
      動かしている間に描き直さない。離したときに 1 回だけ幅を確定する（setDockWidth = 320〜窓幅の半分・ui_chat_dock）。
      表示の幅は窓に合わせて収める（覚えた値は書き換えない）。
      状態の読み直し = 柱を開いた（mount）とき・開いたまま前面のタブが変わったとき（Terminal での claude auth login を拾う）。読み中とは重ねない。
-     pointer は自作（Tauri の dragDropEnabled と HTML5 DnD が競合する = 行ドラッグと同じ）。class は cd- 接頭辞 */
+     ドラッグの骨格は左の列のつまみ（SidebarGrip）と共通 = dragGuide.ts（Esc の取り消しは柱には付けない = 今までどおり）。class は cd- 接頭辞 */
   import { untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { app } from "../state.svelte";
-  import WikiChat from "./ChatPanel.svelte";
+  import ChatPanel from "./ChatPanel.svelte";
+  import { startGuideDrag } from "../dragGuide";
   import { clampDockW } from "./chat";
   import { chat, loadChatStatus, setDockWidth, statusInFlight } from "./chat.svelte";
 
@@ -35,45 +36,16 @@
   function grip(e: PointerEvent) {
     if (e.button !== 0) return;
     e.preventDefault(); // 入力欄・エディタの focus と選択を動かさない
-    const el = e.currentTarget as HTMLElement;
-    const right = (el.parentElement as HTMLElement).getBoundingClientRect().right;
-    let next: number | null = null;
-    const onMove = (ev: PointerEvent) => {
-      if (!(ev.buttons & 1)) return finish();
-      next = clampDockW(right - ev.clientX, window.innerWidth);
-      guide = right - next;
-    };
-    /** commit = 離した（pointerup・取りこぼし）。柱が消えた（abort）ときは確定しない */
-    const end = (commit: boolean) => {
-      abort = null;
-      el.removeEventListener("pointermove", onMove);
-      el.removeEventListener("pointerup", finish);
-      el.removeEventListener("pointercancel", finish);
-      el.removeEventListener("lostpointercapture", finish);
-      window.removeEventListener("blur", finish);
-      try {
-        el.releasePointerCapture(e.pointerId);
-      } catch {
-        /* 既に離れている */
-      }
-      document.body.classList.remove("dragging");
-      guide = null;
-      if (commit && next != null) setDockWidth(next); // 幅が変わるのはここ 1 回だけ
-    };
-    const finish = () => end(true);
+    const right = ((e.currentTarget as HTMLElement).parentElement as HTMLElement).getBoundingClientRect().right;
     abort?.();
-    abort = () => end(false);
-    try {
-      el.setPointerCapture(e.pointerId);
-    } catch {
-      /* jsdom 等 */
-    }
-    document.body.classList.add("dragging");
-    el.addEventListener("pointermove", onMove);
-    el.addEventListener("pointerup", finish);
-    el.addEventListener("pointercancel", finish);
-    el.addEventListener("lostpointercapture", finish);
-    window.addEventListener("blur", finish);
+    abort = startGuideDrag(e, {
+      at: (x) => {
+        const w = clampDockW(right - x, window.innerWidth);
+        return { value: w, guide: right - w };
+      },
+      guide: (x) => (guide = x),
+      commit: setDockWidth,
+    });
   }
 </script>
 
@@ -81,7 +53,7 @@
 
 <aside class="cd" style:width="{w}px" aria-label={t("チャット")}>
   <div class="cd-grip" role="presentation" title={t("ドラッグで幅を変える")} onpointerdown={grip}></div>
-  <WikiChat />
+  <ChatPanel />
 </aside>
 {#if guide != null}<div class="cd-guide" style:left="{guide}px" aria-hidden="true"></div>{/if}
 

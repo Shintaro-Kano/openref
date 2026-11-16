@@ -1,7 +1,7 @@
 /* OpenNote: md → HTML 文字列。DOM に依存しない（node test が直接読む）。
    markdown-it + footnote + task-lists + 自作の wikilink / embed / callout。出力は必ず sanitize.ts の purify → finish を通す。
    - `[[name|alias]]` `[[name#h]]` → <a data-wk-wiki="name#h">（解決は finish が page.links で行う = 索引の解決に従う）
-   - `![[x|560]]` → <span data-wk-embed="x" data-wk-size="560">（画像・動画・音声・ページ・PDF の展開は finish / MdView）
+   - `![[x|560]]` → <span data-wk-embed="x" data-wk-size="560">（画像・動画・音声・ページ・PDF の展開は finish / ShadowPage）
    - target の切り出しは core parse_md.rs の wikilinks と同じ（最初の `|` の前・末尾の `\` を落とす・trim・同じ行の中・中に `[[` があれば外側は閉じない）。
      wikiClose / splitWikiInner / scanWikiText を sanitize（HTML ブロックの文字列）と chat の chatLinks（wikiLinksOf）が共用する
    - callout `> [!type] title`（`[!type]-` / `[!type]+` = 折畳）→ <div class="wk-callout"> か <details class="wk-callout">

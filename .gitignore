@@ -16,7 +16,7 @@
 # Python のキャッシュ(word/dotm/test-build.py が scripts/build-word-dotm.py を import する)
 __pycache__/
 
-# Local library migration QA: generated PDFs, screenshots and machine paths
+# Local library migration checks: generated PDFs, screenshots and machine paths
 /scratchpad/migration-qa/
 
 # エディタの設定・repo 直下の一時置き場

@@ -11,7 +11,7 @@ mod tests {
             "The Peritoneum: Anatomy, Pathologic Findings, and Patterns of Disease Spread",
             "The peritoneum - anatomy, pathologic findings and patterns of disease spread"
         ));
-        // 部分タイトル（connector が副題を落とす例）
+        // 部分タイトル（誌面から取った題名が副題を落とす例 = 旧 Zotero Connector の保存で実際にあった）
         assert!(titles_match(
             "Imaging Spectrum of Cavernous Sinus Lesions",
             "Imaging Spectrum of Cavernous Sinus Lesions with Histopathologic Correlation"
@@ -72,7 +72,7 @@ pub fn add_item(db: &mut Db, resolved: &Resolved) -> Result<Added> {
 /// 失敗は `Resolved.warnings` と stderr に残る）に Crossref / 医書.jp へ落ちる
 /// （どちらも撤回を返さない = 常に None）ので、None が「撤回を見ていない」を意味しうる。
 /// → None では既存の印を消さない（撤回の警告を黙って外す方が危ない）。**印は自動では一度も消えない。消えるのは item を
-/// 削除したときの ON DELETE CASCADE だけ**。印を付けるのは取込（add_item）と enrich（merge_enrichment = refresh・connector の補完）
+/// 削除したときの ON DELETE CASCADE だけ**。印を付けるのは取込（add_item）と enrich（merge_enrichment = refresh・Capture の保存が既存と重複したときの補完）
 fn upsert_retraction(
     conn: &rusqlite::Connection,
     id: i64,
@@ -142,7 +142,7 @@ pub(crate) fn index_fts(
     id: i64,
     csl: &serde_json::Value,
 ) -> rusqlite::Result<()> {
-    crate::import::plan::index_descriptive(conn, id, csl)?;
+    crate::identity::index_descriptive(conn, id, csl)?;
     let creators_txt = model::authors(csl).join("; ");
     let mut kw: Vec<String> = Vec::new();
     if let Some(k) = model::s(csl, "keyword") {
@@ -186,7 +186,7 @@ pub enum RefreshOutcome {
     Rejected(String),
 }
 
-/// 既存 item の書誌を PubMed / doi.org で引き直して是正する（connector 由来の壊れた著者などの修復）。
+/// 既存 item の書誌を PubMed / doi.org で引き直して是正する（旧 Zotero Connector で保存した item の壊れた著者などの修復）。
 pub fn refresh_item(db: &mut Db, key: &str) -> Result<RefreshOutcome> {
     use rusqlite::OptionalExtension;
     let row: Option<(i64, String)> = db
@@ -283,7 +283,7 @@ pub fn replace_csl(
 }
 
 /// レジストリ（PubMed / Crossref）が権威を持つフィールド。
-/// connector 由来のデータは誌面 HTML のスクレイピングなので、著者の姓名分割が壊れる
+/// 誌面 HTML のスクレイピングで作ったデータ（旧 Zotero Connector で保存した item）は、著者の姓名分割が壊れる
 /// （例: "Houshmand S" → family="S", given="Houshmand"／そもそも著者ゼロ）。
 /// 構造化レジストリの値が取れたなら、それで**置き換える**のが正しい。
 const AUTHORITATIVE_FIELDS: &[&str] = &[
@@ -303,12 +303,12 @@ const AUTHORITATIVE_FIELDS: &[&str] = &[
     "language",
 ];
 
-/// 既存 item を resolver（PubMed / doi.org）の権威データで是正する（connector 保存後の非同期 enrich・`openref refresh`）。
+/// 既存 item を resolver（PubMed / doi.org）の権威データで是正する（Capture の保存が既存と重複したときの補完・`openref refresh`）。
 /// 権威フィールドは上書き、それ以外（title・URL 等）は既存を保持。変更時は `replace_csl` で 4 索引（creators_index / journal_keys / FTS / 取込照合の import_match_keys）をすべて貼り替える。
 /// resolver が撤回を返していれば撤回の印も書く（`upsert_retraction`。撤回の照会のために要求を増やさない = 同じ応答を使う）。
 /// 戻り値 = CSL か撤回の印のどちらかが変わった。
 ///
-/// **同一性ガード（必須）**: connector が渡す DOI/PMID が誤っていると、別論文の書誌が
+/// **同一性ガード（必須）**: ページや既存 item の DOI/PMID が誤っていると、別論文の書誌が
 /// 混入した「キメラレコード」が黙って生まれる（live 検証で実際に発生）。title 類似度で照合し、
 /// 一致しない場合は enrich を拒否する（捏造データを作らない = 誠実性ポリシー）。
 pub fn merge_enrichment(db: &mut Db, id: i64, resolved: &Resolved) -> Result<bool> {
@@ -322,7 +322,7 @@ pub fn merge_enrichment(db: &mut Db, id: i64, resolved: &Resolved) -> Result<boo
     let richer_title = model::s(richer, "title").unwrap_or("");
     if !titles_match(existing_title, richer_title) {
         return Err(CoreError::BadInput(format!(
-            "enrich 中止: 識別子の指す論文が一致しません（既存「{}」/ 取得「{}」）。connector 由来の DOI/PMID が誤っている可能性があります",
+            "enrich 中止: 識別子の指す論文が一致しません（既存「{}」/ 取得「{}」）。識別子（DOI/PMID）が別の論文を指している可能性があります",
             model::truncate_chars(existing_title, 50),
             model::truncate_chars(richer_title, 50)
         )));
@@ -343,7 +343,7 @@ pub fn merge_enrichment(db: &mut Db, id: i64, resolved: &Resolved) -> Result<boo
                 changed = true;
             }
         }
-        // type もレジストリに従う: connector 由来の type は誌面の着地ページの種別を写しただけ（RSNA の epdf ページ →
+        // type もレジストリに従う: 誌面から取った type（旧 Zotero Connector で保存した item）は誌面の着地ページの種別を写しただけ（RSNA の epdf ページ →
         // webpage）で書誌の種類ではない（PubMed で補完された後も webpage のまま残さない）。PubMed は常に article-journal、Crossref は journal-article → article-journal に正規化済み。
         // Crossref のそれ以外は生の Crossref 名（book-chapter 等）のまま来るので、types の既知の id だけ受ける
         if let Some(t) = richer.get("type").and_then(|t| t.as_str()) {
@@ -384,17 +384,17 @@ pub(crate) fn find_duplicate(
     conn: &rusqlite::Connection,
     csl: &serde_json::Value,
 ) -> Result<Option<(String, &'static str)>> {
-    let candidates = crate::import::plan::identifier_candidates(conn, csl, None)?;
-    let pmid = crate::import::plan::pmid(csl);
-    let doi = crate::import::plan::doi(csl);
+    let candidates = crate::identity::identifier_candidates(conn, csl, None)?;
+    let pmid = crate::identity::pmid(csl);
+    let doi = crate::identity::doi(csl);
     for (field, value) in [("PMID", pmid), ("DOI", doi)] {
         if let Some(value) = value {
             if let Some((key, _, _)) = candidates.iter().find(|(_, csl, deleted)| {
                 !*deleted
                     && (if field == "PMID" {
-                        crate::import::plan::pmid(csl)
+                        crate::identity::pmid(csl)
                     } else {
-                        crate::import::plan::doi(csl)
+                        crate::identity::doi(csl)
                     })
                     .as_deref()
                         == Some(&value)

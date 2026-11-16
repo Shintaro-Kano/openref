@@ -1,7 +1,8 @@
 /* 呼び手が catch しない reject（onclick から呼ぶ IPC・onMount の読込など）を握りつぶさず toast へ。
-   main.ts（と一覧ハーネス）が起動時に 1 回だけ呼ぶ。console への既定の出力（preventDefault しない）は残す */
+   main.ts が起動時に 1 回だけ呼ぶ。console への既定の出力（preventDefault しない）は残す */
 import { toast } from "./state.svelte";
 import { t } from "./i18n.svelte";
+import { errText } from "./err";
 
 /** 意図的な中断の reject（toast に出さない）: pdf.js の描画取消（RenderingCancelledException = PdfViewer の
     invalidateAll / 解放 / unmount）・ストリーム中断（AbortException。worker 終了の "Worker was terminated." もこの型）・
@@ -17,6 +18,6 @@ export function intentionalAbort(r: unknown): boolean {
 export function toastUnhandledRejections() {
   window.addEventListener("unhandledrejection", (e) => {
     if (intentionalAbort(e.reason)) return;
-    toast(`✗ ${t("処理に失敗しました")}: ${String(e.reason).slice(0, 200)}`);
+    toast(`✗ ${t("処理に失敗しました")}: ${errText(e.reason, 200)}`);
   });
 }

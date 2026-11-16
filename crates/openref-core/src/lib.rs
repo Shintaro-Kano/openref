@@ -11,6 +11,7 @@ pub mod edit;
 pub mod error;
 pub mod fulltext;
 mod http;
+mod identity;
 pub mod import;
 pub mod ingest;
 pub mod kbmanifest;

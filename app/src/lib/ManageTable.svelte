@@ -36,12 +36,12 @@
     <span class="ml-c-cb">
       <button class="cb" class:on={m.allOn} class:some={m.someOn && !m.allOn} aria-label={t("すべて選択")} onclick={() => m.toggleAll()}></button>
     </span>
-    {#if colorCell}<span class="ml-c-color">Color</span>{/if}
+    {#if colorCell}<span class="ml-c-color">{t("色")}</span>{/if}
     <button class="ml-c-name ml-sort" onclick={() => m.sortBy("name")}>
-      Name {#if m.sortKey === "name"}<span class="ml-arrow">{m.asc ? "↓" : "↑"}</span>{/if}
+      {t("名前")} {#if m.sortKey === "name"}<span class="ml-arrow">{m.asc ? "↓" : "↑"}</span>{/if}
     </button>
     <button class="ml-c-n ml-sort" onclick={() => m.sortBy("count")}>
-      Number of references {#if m.sortKey === "count"}<span class="ml-arrow">{m.asc ? "↑" : "↓"}</span>{/if}
+      {t("件数")} {#if m.sortKey === "count"}<span class="ml-arrow">{m.asc ? "↑" : "↓"}</span>{/if}
     </button>
     <span class="ml-c-del"></span>
   </div>

@@ -3,18 +3,18 @@
      すべての本（dir = null）= 最近開いた本 + 直下のフォルダ + 全部の本。App が {#key app.tab} で作り直す = スクロール位置は mount で戻す */
   import { tick, untrack } from "svelte";
   import { t, tn } from "../i18n.svelte";
-  import { app, frontShelf, toggleDetail } from "../state.svelte";
+  import { frontShelf } from "../state.svelte";
   import ShelfBookCard from "./ShelfBookCard.svelte";
   import ShelfFolderCard from "./ShelfFolderCard.svelte";
   import { crumbs, currentFolder, folderDir, gotoDir, setSort, sh, shelfIndex, switchShelf } from "./shelf.svelte";
-  import { filterBooks, searchTerms, sortBooks, type ShelfBook, type ShelfFolder, type ShelfSortKey } from "./tree";
+  import { filterBooks, hideRootParents, searchTerms, sortBooks, type ShelfBook, type ShelfFolder, type ShelfSortKey } from "./tree";
 
   const s = $derived(frontShelf());
   const root = $derived(s?.root ?? "");
   const ix = $derived(shelfIndex(s?.root));
   const err = $derived.by(() => {
     const e = s ? sh.trees[s.root] : undefined;
-    return e && "error" in e ? e.error : null;
+    return e && "error" in e ? hideRootParents(e.error, s!.root) : null; // 画面にフルパスを出さない（名前まで）
   });
   const searching = $derived(!!s && searchTerms(s.query).length > 0);
   const folder = $derived(s && ix ? currentFolder(s, ix) : null);
@@ -111,19 +111,7 @@
         {/if}
       </div>
       <div class="lb-count">{tn(books.length, "冊")}</div>
-      <button
-        class="lb-pane"
-        class:lb-pane-off={!app.detailOpen}
-        title={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-        aria-label={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-        aria-pressed={app.detailOpen}
-        onclick={toggleDetail}>
-        <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
-          <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
-          <rect class="lb-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
-          <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
-        </svg>
-      </button>
+      <!-- 右ペインの開閉（▣）はアプリのヘッダーの右端（PaneToggle = 3 モードで同じ場所） -->
     </div>
   </div>
 
@@ -133,6 +121,7 @@
         <p class="sh-err">{t("本棚を読めません")}</p>
         <p>{err}</p>
         <button class="sh-retry" onclick={() => void switchShelf(root)}>{t("読み直す")}</button>
+        <p class="sh-err-hint">{t("ほかの本棚へ切り替える・別のフォルダを本棚として開く・この本棚を履歴から外すのは、左の見出し（📚 本棚の名前）のメニューから")}</p>
       </div>
     {:else if !ix}
       <div class="sh-state"><p>{t("読込中…")}</p></div>
@@ -184,6 +173,7 @@
   .sh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 24px 20px; }
   .sh-state { padding: 48px 20px; text-align: center; color: var(--dim); display: flex; flex-direction: column; gap: 8px; align-items: center; }
   .sh-err { color: var(--danger); }
+  .sh-err-hint { max-width: 420px; font-size: 12px; }
   .sh-retry { padding: 4px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); }
   .sh-retry:hover { border-color: var(--accent); }
 </style>

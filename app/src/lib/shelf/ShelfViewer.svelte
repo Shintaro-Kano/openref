@@ -8,19 +8,16 @@
        page.render に canvas を渡すと canvasContext が無視される = canvasContext を渡す */
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import * as pdfjs from "pdfjs-dist";
-  import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import PaneToggle from "../PaneToggle.svelte";
   import { t } from "../i18n.svelte";
   import { composing } from "../input";
   import { app, modalOpen, toggleDetail } from "../state.svelte";
+  import { openPdf } from "../viewer/pdfdoc";
   import { AssetRangeTransport, CHUNK, probeLength } from "./rangeTransport";
   import ShelfRight from "./ShelfRight.svelte";
   import { bookPos, openExternal, revealBook, saveBookPos } from "./shelf.svelte";
   import type { ShelfBookTab } from "./tree";
-
-  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
-  // PdfViewer と同じ（useWorkerFetch: false = tauri:// は pdf.js が worker から読めない URL と見なす）
-  const pdfAsset = (dir: string) => new URL(`/pdfjs/${dir}/`, location.href).href;
 
   let { book, front, onClose }: { book: ShelfBookTab; front: boolean; onClose: () => void } = $props();
   const b = untrack(() => $state.snapshot(book)) as ShelfBookTab;
@@ -83,18 +80,8 @@
       const length = await probeLength(url, ac.signal);
       if (disposed) return;
       const range = new AssetRangeTransport(url, length, fail);
-      loadingTask = pdfjs.getDocument({
-        range,
-        rangeChunkSize: CHUNK,
-        disableAutoFetch: true,
-        disableStream: true,
-        enableXfa: false,
-        cMapUrl: pdfAsset("cmaps"),
-        standardFontDataUrl: pdfAsset("standard_fonts"),
-        wasmUrl: pdfAsset("wasm"),
-        iccUrl: pdfAsset("iccs"),
-        useWorkerFetch: false,
-      });
+      // worker・補助データ・useWorkerFetch: false は viewer/pdfdoc.ts（PdfViewer と共通）。読み方（range）はこの読み手の物
+      loadingTask = openPdf({ range, rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true });
       const d = await loadingTask.promise;
       if (disposed) return;
       doc = d;
@@ -412,19 +399,7 @@
     {/if}
     <button class="sh-v-btn" onclick={() => revealBook(b.root, b.id)}>{t("Finder で表示")}</button>
     <button class="sh-v-btn" onclick={() => openExternal(b.root, b.id)}>{t("外部で開く")}</button>
-    <button
-      class="lb-pane"
-      class:lb-pane-off={!app.detailOpen}
-      title={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-      aria-label={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-      aria-pressed={app.detailOpen}
-      onclick={toggleDetail}>
-      <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
-        <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
-        <rect class="lb-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
-        <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
-      </svg>
-    </button>
+    <PaneToggle open={app.detailOpen} ontoggle={toggleDetail} />
   </div>
   <div class="sh-v-main" class:sh-v-noinfo={!app.detailOpen}>
     <div class="sh-v-body" tabindex="-1" bind:this={scroller} onscroll={onScroll} use:watchSize>

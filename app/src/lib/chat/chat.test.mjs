@@ -338,7 +338,7 @@ const W = await import("../wiki/wiki.svelte.ts");
 const CH = await import("./chat.svelte.ts");
 const V = await import("../viewing.svelte.ts"); // 見ている物と選択範囲（chat.svelte.ts から分けた）
 const SE = await import("../wiki/selection.ts"); // 選択の読み取り（chat.svelte.ts から分けた）
-const { default: WikiChat } = await import("./ChatPanel.svelte");
+const { default: ChatPanel } = await import("./ChatPanel.svelte");
 const { default: ChatDock } = await import("./ChatDock.svelte");
 const { default: TabStrip } = await import("../TabStrip.svelte");
 
@@ -401,11 +401,14 @@ tests++;
   emit("wiki-state", null); // 有効 / 無効の変化（Rust の wiki-state）= 読み直す
   await waitFor(() => CH.chat.status?.enabled === false);
   flushSync();
-  assert.equal(target.querySelector(".tabs-chat"), null, "チャットが無効なのに柱のボタンを出した");
+  // チャットが無効でもボタンは出す（薄い絵・title が違う）。柱を出す判定は false のまま
+  assert.deepEqual([!!target.querySelector(".tabs-chat"), target.querySelector(".tabs-chat")?.classList.contains("tabs-chat-off"), target.querySelector(".tabs-chat")?.title],
+    [true, true, "チャット（無効・押すと有効にする説明を開きます）"], "チャットが無効のときのボタン");
   assert.equal(CH.chatShown(), false, "チャットが無効なのに柱を出す判定が true");
   mock.enabled = true;
   emit("wiki-state", null);
-  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat"))), "有効になってもボタンが出ない");
+  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat") && !target.querySelector(".tabs-chat-off"))), "有効になってもボタンが有効の絵にならない");
+  assert.equal(target.querySelector(".tabs-chat").title, "チャット（⌘⌥C）");
   const btn = () => target.querySelector(".tabs-chat");
   assert.equal(btn().getAttribute("aria-pressed"), "false", "閉じているのに押された絵");
   btn().click(); // 開く（App は chatShown() && chat.dock.open で ChatDock を mount する = 下で同じ条件で mount）
@@ -436,11 +439,11 @@ tests++;
   mock.enabled = false;
   emit("wiki-chat", { type: "enabled", enabled: false });
   flushSync();
-  assert.equal(target.querySelector(".tabs-chat"), null, "enabled:false でボタンが消えない");
+  assert.ok(target.querySelector(".tabs-chat.tabs-chat-off"), "enabled:false でボタンが無効の絵にならない");
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_chat_status")), "enabled event で読み直さない");
   mock.enabled = true;
   emit("wiki-chat", { type: "enabled", enabled: true });
-  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat"))), "enabled:true でボタンが戻らない");
+  assert.ok(await waitFor(() => (flushSync(), !!target.querySelector(".tabs-chat") && !target.querySelector(".tabs-chat-off"))), "enabled:true でボタンが有効の絵に戻らない");
   // 空きのダブルクリック = 新しいタブ（TabStrip の dblclickNew）はボタンの上では効かない
   const nTabs = S.app.tabs.length;
   btn().dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
@@ -455,7 +458,7 @@ tests++;
 
 const target = document.createElement("div");
 document.body.append(target);
-const cmp = mount(WikiChat, { target });
+const cmp = mount(ChatPanel, { target });
 flushSync();
 const $ = (s) => target.querySelector(s);
 const $$ = (s) => [...target.querySelectorAll(s)];
@@ -567,7 +570,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   tests++;
 }
 
-// 応答の逐次 → 確定の md は MdView（shadow DOM）で描く・道具は畳む・停止
+// 応答の逐次 → 確定の md は ShadowPage（shadow DOM）で描く・道具は畳む・停止
 {
   stateEv("busy");
   const line = (o) => emit("wiki-chat", { type: "line", session_id: mock.session, turn: 2, line: L(o) });
@@ -585,7 +588,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   flushSync();
   assert.equal($(".wk-ch-stream"), null);
   const host = (await waitFor(() => $(".wk-ch-md .wk-md")?.shadowRoot?.querySelector("strong"))) && $(".wk-ch-md .wk-md");
-  assert.ok(host, "確定の本文を MdView で描かない");
+  assert.ok(host, "確定の本文を ShadowPage で描かない");
   assert.equal(host.shadowRoot.querySelector("img[onerror]"), null, "sanitize を通っていない");
   assert.equal($(".wk-ch-tool summary .wk-ch-tool-name").textContent, "Read");
   assert.equal($(".wk-ch-tool").open, false, "道具の結果を畳まない");
@@ -683,7 +686,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   mock.state = "off";
   emit("wiki-chat", { type: "exit", code: 1, signal: null });
   flushSync();
-  assert.ok($$(".wk-ch-note.wk-ch-err").some((e) => e.textContent.includes("Claude Code が終了しました (code 1)")), "異常終了を知らせない");
+  assert.ok($$(".wk-ch-note.wk-ch-err").some((e) => e.textContent.includes("Claude Code が終了しました (終了コード 1)")), "異常終了を知らせない"); // 詳細も日本語
   assert.equal(CH.chat.status.state, "off");
   await sleep(20);
   assert.ok(!calls.some((c) => c.name === "wiki_chat_start"), "自動で起こし直した");
@@ -1360,6 +1363,23 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   pe("pointerup", 520, 0);
   await sleep(5);
   assert.equal(writes, 1, "動かさずに離しただけで覚え直した");
+  // 柱のつまみには Esc の取り消しが無い（左の列のつまみとの差 = dragGuide の escape で残す）= Esc は背後へ流れ、線は残る・
+  // ボタンを離したまま動いた（pointerup の取りこぼし）= その前の位置で確定
+  let behind = 0;
+  const onEsc = (e) => e.key === "Escape" && behind++;
+  window.addEventListener("keydown", onEsc);
+  pe("pointerdown", 520, 1);
+  pe("pointermove", 530, 1);
+  window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  flushSync();
+  window.removeEventListener("keydown", onEsc);
+  assert.equal(behind, 1, "柱のつまみが Esc を止めた");
+  assert.equal(document.querySelector(".cd-guide")?.style.left, "530px", "柱のつまみが Esc で取り消した");
+  pe("pointermove", 700, 0);
+  await sleep(5);
+  flushSync();
+  assert.deepEqual([aside.style.width, writes], ["494px", 2], "ボタンを離したまま動いても確定しない / 離した後の位置で確定した");
+  assert.equal(document.querySelector(".cd-guide"), null, "取りこぼしの後に線が残った");
   // つまみの最中に柱が消えた（⌘⌥C・チャット OFF）= リスナーと body の印を残さない
   pe("pointerdown", 520, 1);
   pe("pointermove", 480, 1);
@@ -1368,7 +1388,9 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   flushSync();
   assert.equal(document.body.classList.contains("dragging"), false, "柱が消えても選択を止めたまま");
   await sleep(5);
-  assert.equal(writes, 1, "柱が消えたときに途中の幅を確定した");
+  window.dispatchEvent(new window.Event("blur"));
+  await sleep(5);
+  assert.equal(writes, 2, "柱が消えたときに途中の幅を確定した");
   handlers.set_ui_pref = setPref;
   outside.remove();
   target.remove();
@@ -1463,13 +1485,13 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   await sleep(10);
   assert.deepEqual([btn(), CH.chatShown()], [null, false], "OpenNote OFF でボタンが出た / 柱を出す判定が true");
   assert.deepEqual(calls.filter((c) => c.name.startsWith("wiki_chat")).map((c) => c.name), [], "OpenNote OFF で invoke した");
-  // OpenNote ON・チャット OFF も同じ
+  // OpenNote ON・チャット OFF = 柱は出さない・ボタンは薄い絵で出す（押すと有効にする説明 = 下の「チャットが無効のときのタブ列のボタン」の節）
   S.app.wikiOn = true;
   mock.enabled = false;
   CH.chat.status = status({ enabled: false });
   await sleep(5);
   flushSync();
-  assert.deepEqual([btn(), CH.chatShown()], [null, false], "チャット OFF でボタンが出た / 柱を出す判定が true");
+  assert.deepEqual([!!btn(), btn()?.classList.contains("tabs-chat-off"), CH.chatShown()], [true, true, false], "チャット OFF でボタンが出ない / 柱を出す判定が true");
   await sleep(10);
   calls.length = 0;
   {
@@ -1487,14 +1509,14 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   mock.enabled = true;
   CH.chat.dock = { open: false, w: C.DOCK_W };
   emit("wiki-chat", { type: "enabled", enabled: true });
-  assert.ok(await waitFor(() => (flushSync(), !!btn())), "チャット ON でボタンが出ない");
+  assert.ok(await waitFor(() => (flushSync(), !!btn() && !btn().classList.contains("tabs-chat-off"))), "チャット ON でボタンが有効の絵にならない");
   calls.length = 0;
   btn().click();
   flushSync();
   const dock = mount(ChatDock, { target }); // App と同じ条件（chatShown() && chat.dock.open）
   flushSync();
   await sleep(10);
-  assert.ok($(".cd .wk-ch"), "柱に WikiChat が出ない");
+  assert.ok($(".cd .wk-ch"), "柱に ChatPanel が出ない");
   assert.equal(document.activeElement?.tagName, "TEXTAREA", "柱を開いても入力欄へ focus しない");
   assert.ok(calls.some((c) => c.name === "wiki_chat_status"), "柱を開いても状態を読まない");
   const box = $(".cd .wk-ch textarea"); // 作り直されないことを下で見る
@@ -1555,7 +1577,7 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   assert.equal($(".cd .wk-ch textarea"), box, "一覧へ戻ると柱を作り直した");
   assert.equal($(".wk-ch-ctx .wk-ch-chip-item .wk-ch-chip-text")?.textContent, "題名 3", "一覧へ戻ってもチップが選んでいる文献に戻らない");
 
-  // 応答中の点・Settings で OFF = ボタンが消える（柱は App が chatShown() で外す）
+  // 応答中の点・Settings で OFF = ボタンは無効の絵になる（柱は App が chatShown() で外す）
   stateEv("busy");
   flushSync();
   assert.ok(stripAt.querySelector(".tabs-chat-dot"), "応答中の点が出ない");
@@ -1563,11 +1585,11 @@ const enter = (o = {}) => ta().dispatchEvent(new KeyboardEvent("keydown", { key:
   mock.enabled = false;
   emit("wiki-chat", { type: "enabled", enabled: false });
   flushSync();
-  assert.deepEqual([btn(), CH.chatShown()], [null, false], "OFF でボタンが消えない / 柱を出す判定が残った");
+  assert.deepEqual([btn()?.classList.contains("tabs-chat-off"), CH.chatShown()], [true, false], "OFF でボタンが無効の絵にならない / 柱を出す判定が残った");
   await sleep(10);
   mock.enabled = true;
   emit("wiki-chat", { type: "enabled", enabled: true });
-  assert.ok(await waitFor(() => (flushSync(), !!btn())), "ON でボタンが戻らない");
+  assert.ok(await waitFor(() => (flushSync(), !!btn() && !btn().classList.contains("tabs-chat-off"))), "ON でボタンが有効の絵に戻らない");
   unmount(dock);
   unmount(strip);
   target.remove();
@@ -1634,8 +1656,12 @@ target.remove();
   assert.deepEqual(reads().map((r) => r.args), [{}, {}, {}, {}], "自動の読み直しに force を付けた（Rust の覚えを捨てる）");
   flushSync();
   calls.length = 0;
-  const again = t1.querySelector('.wk-ch-acct .wk-ch-btn[title="ログイン状態を読み直します"]');
-  assert.ok(again, "アカウントの行に [再確認] が無い");
+  // ログイン済みの [再確認] は ⋯ の中（行には モデル ▾ と ⋯ だけ）
+  assert.equal(t1.querySelector('.wk-ch-acct > .wk-ch-btn[title="ログイン状態を読み直します"]'), null, "ログイン済みの行に [再確認] が出たまま");
+  t1.querySelector(".wk-ch-acct .wk-ch-more").click();
+  flushSync();
+  const again = t1.querySelector('.wk-ch-acct .wk-ch-menu .wk-ch-btn[title="ログイン状態を読み直します"]');
+  assert.ok(again, "⋯ の中に [再確認] が無い");
   again.click();
   assert.ok(await waitFor(() => reads().length === 1 && !CH.statusInFlight()));
   assert.deepEqual(reads().map((r) => r.args), [{ force: true }], "[再確認] が force: true で読まない");
@@ -1697,7 +1723,7 @@ target.remove();
     CH.chat.status = status({ enabled: true, state: "off", logged_in: false });
     const box = document.createElement("div");
     document.body.append(box);
-    let w = mount(WikiChat, { target: box });
+    let w = mount(ChatPanel, { target: box });
     flushSync();
     assert.ok(box.querySelector("textarea").disabled, "未ログインなのに入力欄が使える");
     CH.chat.focusPending = true;
@@ -1709,7 +1735,7 @@ target.remove();
     const other = document.createElement("input");
     document.body.append(other);
     other.focus();
-    w = mount(WikiChat, { target: box });
+    w = mount(ChatPanel, { target: box });
     flushSync();
     await sleep(10);
     assert.equal(document.activeElement, other, "mount のし直しで別の入力欄から focus を奪った");
@@ -1720,7 +1746,7 @@ target.remove();
   }
   tests++;
 
-  // 部品: 隠れた方（DOM 順が先）と見えている方の WikiChat が両方 mount されている → 見えている方の入力欄に来る
+  // 部品: 隠れた方（DOM 順が先）と見えている方の ChatPanel が両方 mount されている → 見えている方の入力欄に来る
   const proto = window.HTMLTextAreaElement.prototype;
   proto.checkVisibility = function () {
     return !this.closest(".v-hidden");
@@ -1729,13 +1755,13 @@ target.remove();
   hid.className = "v-hidden";
   const vis = document.createElement("div");
   document.body.append(hid, vis);
-  const a = mount(WikiChat, { target: hid });
-  const b = mount(WikiChat, { target: vis });
+  const a = mount(ChatPanel, { target: hid });
+  const b = mount(ChatPanel, { target: vis });
   flushSync();
   CH.chat.focusPending = true;
   flushSync();
   await sleep(10);
-  assert.equal(document.activeElement, vis.querySelector("textarea"), "隠れた WikiChat が focusPending を消費した（見えている方に来ない）");
+  assert.equal(document.activeElement, vis.querySelector("textarea"), "隠れた ChatPanel が focusPending を消費した（見えている方に来ない）");
   assert.equal(CH.chat.focusPending, false, "見えている方が受けたのに残った");
   unmount(a);
   unmount(b);
@@ -1918,6 +1944,372 @@ target.remove();
     await sleep(10);
     assert.equal(total(), before, `${name}: listen の完了前に解除すると受け口が残る`);
   }
+  tests++;
+}
+
+// 同意の窓は外へドラッグしても閉じない: 本文で押して外で離す = 開いたまま（同意しない扱いにならない）・覆いで押して中で離す = 開いたまま・
+// 覆いで押したまま閉じて開き直した直後の離し = 開いたまま・覆いで押して覆いで離す = 今までどおり閉じる = 同意しない（有効化を呼ばない）・窓の形は前のまま
+{
+  const { default: Consent } = await import("./ChatConsent.svelte");
+  const target = document.createElement("div");
+  document.body.append(target);
+  const cmp = mount(Consent, { target });
+  let enables = 0;
+  const setEnabled = handlers.wiki_chat_set_enabled;
+  handlers.wiki_chat_set_enabled = () => {
+    enables++;
+    return null;
+  };
+  const ov = () => target.querySelector(".overlay");
+  const press = (down, up) => {
+    down?.dispatchEvent(new window.PointerEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 }));
+    up?.dispatchEvent(new window.PointerEvent("pointerup", { bubbles: true, cancelable: true, button: 0 }));
+    ov()?.dispatchEvent(new window.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+    flushSync();
+  };
+  const open = () => {
+    CH.chat.consent = true;
+    flushSync();
+  };
+  open();
+  const frame = ov()?.querySelector(":scope > .modal");
+  assert.ok(ov() && frame, "同意の窓が .overlay > .modal でない");
+  assert.equal(ov().parentElement, target, "同意の窓の置き場が変わった");
+  assert.deepEqual([ov().getAttribute("role"), frame.getAttribute("role"), frame.getAttribute("aria-labelledby"), frame.className], ["presentation", "dialog", "wk-cc-h", "modal"], "同意の窓の属性が変わった");
+  press(frame.querySelector(".wk-cc-list li"), ov());
+  assert.equal(CH.chat.consent, true, "本文で押して外で離すと閉じた（同意しない扱いになった）");
+  press(ov(), frame.querySelector(".modal-head h3"));
+  assert.equal(CH.chat.consent, true, "覆いで押して中で離すと閉じた");
+  ov().dispatchEvent(new window.PointerEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 }));
+  window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  flushSync();
+  assert.equal(CH.chat.consent, false, "Esc で閉じない");
+  open();
+  press(null, ov());
+  assert.equal(CH.chat.consent, true, "開き直した直後の離しで閉じた");
+  press(ov(), ov());
+  await sleep(0);
+  assert.deepEqual([CH.chat.consent, enables], [false, 0], "覆いを押して離しても閉じない / 同意したことになった");
+  handlers.wiki_chat_set_enabled = setEnabled;
+  unmount(cmp);
+  target.remove();
+  tests++;
+}
+
+// 柱の見出しの 2 行目: ログイン済み = モデル ▾ と ⋯ だけ（⋯ の中 = アカウント・版・[再確認]・ログアウトの案内）・[ログアウト] は無い・
+// 未ログイン / 確かめられない = 今までの行（[ログイン] ほか）・異常（claude が無い・openref-mcp が無い・未ログイン）は ⋯ に隠れない・
+// ⋯ は外を押す / Esc（覆いの下では効かない・柱の Esc の連鎖へ渡さない）で閉じる・覆いの下では ⋯ を開かない
+{
+  S.app.wikiOn = true;
+  mock.enabled = true;
+  mock.over = { auth: { email: "user@example.com", method: "claude.ai", subscription: "pro" } };
+  await CH.loadChatStatus();
+  CH.chat.model = null;
+  const target = document.createElement("div");
+  document.body.append(target);
+  const cmp = mount(ChatPanel, { target });
+  flushSync();
+  const row = () => target.querySelector(".wk-ch-acct");
+  const kids = () => [...row().children].map((e) => e.className.split(" ").find((c) => c.startsWith("wk-ch-")));
+  assert.deepEqual(kids(), ["wk-ch-model", "wk-ch-sp", "wk-ch-morewrap"], "ログイン済みの行が モデル ▾ と ⋯ だけでない");
+  assert.ok(!/ログアウト/.test(target.textContent), "柱に [ログアウト] が残った");
+  assert.equal(target.querySelector(".wk-ch-menu"), null, "⋯ が最初から開いている");
+  const more = () => target.querySelector(".wk-ch-more");
+  assert.deepEqual([more().textContent, more().getAttribute("aria-expanded"), more().title], ["⋯", "false", "アカウントと Claude Code"]);
+  // 今の会話で動いているモデル（chat.model）はログイン済みの行にも出す
+  CH.chat.model = "claude-opus-x";
+  flushSync();
+  assert.deepEqual(kids(), ["wk-ch-model", "wk-ch-dim", "wk-ch-sp", "wk-ch-morewrap"], "動いているモデルが行に出ない");
+  assert.equal(row().querySelector(".wk-ch-model-now").textContent, "claude-opus-x");
+  CH.chat.model = null;
+  more().click();
+  flushSync();
+  const menu = () => target.querySelector(".wk-ch-menu");
+  assert.ok(menu(), "⋯ を押しても開かない");
+  assert.equal(more().getAttribute("aria-expanded"), "true");
+  assert.deepEqual([...menu().children].map((e) => e.textContent.trim()),
+    ["ログイン済み: user@example.com · claude.ai · pro", "Claude Code 2.1.197", "再確認", "ログアウトはターミナルで claude auth logout を実行します"], "⋯ の中身");
+  assert.equal(menu().querySelector(".wk-ch-cli").title, "/usr/local/bin/claude", "版の title に claude の場所が無い");
+  // 外を押す = 閉じる・中を押す = 閉じない
+  menu().dispatchEvent(new window.PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+  flushSync();
+  assert.ok(menu(), "⋯ の中を押して閉じた");
+  document.body.dispatchEvent(new window.PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+  flushSync();
+  assert.equal(menu(), null, "外を押しても閉じない");
+  // Esc = ⋯ だけ閉じる（後ろの Esc の連鎖 = 柱を閉じる等へ渡さない）
+  more().click();
+  flushSync();
+  let behind = 0;
+  const bubble = () => behind++;
+  window.addEventListener("keydown", bubble);
+  const esc = new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  window.dispatchEvent(esc);
+  flushSync();
+  assert.deepEqual([menu(), esc.defaultPrevented, behind], [null, true, 0], "Esc で ⋯ が閉じない / 後ろへ渡した");
+  // 覆いの下: ⋯ を開かない。覆いを出して描き終えてから押す（覆いの effect が後から閉じる順では、押す関数の確かめを外しても通ってしまう）。
+  // ブラウザの Enter / Space はボタンの click になる = click で見る
+  S.app.editorOpen = true;
+  flushSync();
+  await sleep(1);
+  more().click();
+  flushSync();
+  await sleep(1);
+  assert.equal(menu(), null, "覆いの下で ⋯ が開いた");
+  S.app.editorOpen = false;
+  more().click();
+  flushSync();
+  // 覆いが出た = ⋯ は閉じる。覆いの下の Esc は ⋯ が吸わない（覆いの Esc へ渡す）
+  S.app.editorOpen = true;
+  flushSync();
+  assert.equal(menu(), null, "覆いが出ても ⋯ が開いたまま");
+  behind = 0;
+  const escUnder = new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  window.dispatchEvent(escUnder);
+  assert.deepEqual([escUnder.defaultPrevented, behind], [false, 1], "覆いの下の Esc を ⋯ が吸った");
+  S.app.editorOpen = false;
+  flushSync();
+  // 前面のタブが替わった（キー・メニューからの切替 = ポインタを使わない）= ⋯ は閉じる
+  more().click();
+  flushSync();
+  assert.ok(menu());
+  // 同じ種類のタブどうし（一覧 → 一覧など）で切り替える = frontKind は変わらない = app.tab の変化だけで閉じる事を見る
+  // （無いタブの id へ切り替えると frontKind が "" に変わり、app.tab を読まなくても閉じてしまっていた）
+  const tab0 = S.app.tab;
+  const twin = { ...S.app.tabs.find((x) => x.id === tab0), id: 9201 };
+  S.app.tabs.push(twin);
+  flushSync();
+  assert.ok(menu(), "前提: 同じ種類のタブを足しただけでは ⋯ は開いたまま");
+  S.app.tab = twin.id;
+  flushSync();
+  assert.equal(menu(), null, "同じ種類のタブへ切り替えても ⋯ が開いたまま");
+  S.app.tab = tab0;
+  S.app.tabs.pop();
+  flushSync();
+  // 同じタブの中で前面の画面の種類が替わった（セグメントをキーで押した = switchMode は app.tab を変えない）= ⋯ を閉じる（L-C）
+  {
+    const tb = S.app.tabs.find((x) => x.id === S.app.tab);
+    const [wiki0, shelf0] = [tb.wiki, tb.shelf];
+    more().click();
+    flushSync();
+    assert.ok(menu());
+    // OpenNote のタブなら一覧へ（tab.wiki = null）・一覧なら本棚へ（tab.shelf を付ける）= switchMode が同じタブで書き換える欄
+    if (tb.wiki) tb.wiki = null;
+    else tb.shelf = { root: "/harness/shelf", path: "", scrollTop: 0 };
+    flushSync();
+    assert.equal(menu(), null, "同じタブで画面の種類が替わっても ⋯ が開いたまま");
+    tb.wiki = wiki0;
+    tb.shelf = shelf0;
+    flushSync();
+  }
+  window.removeEventListener("keydown", bubble);
+  more().click(); // 開いたまま未ログインにする（下で「ログアウト → ログインの後に開いたまま」でない事を見る）
+  flushSync();
+  assert.ok(menu());
+  // 未ログイン = 今までの行（⋯ なし）・案内が見える・開いていた ⋯ は消える
+  mock.over = { logged_in: false, auth: null };
+  await CH.loadChatStatus();
+  flushSync();
+  assert.deepEqual(kids(), ["wk-ch-acct-out", "wk-ch-btn", "wk-ch-btn", "wk-ch-dim", "wk-ch-sp", "wk-ch-model"], "未ログインの行が今までの形でない");
+  assert.deepEqual([...row().querySelectorAll(":scope > .wk-ch-btn")].map((b) => b.textContent), ["ログイン", "再確認"]);
+  assert.deepEqual([row().querySelector(".wk-ch-acct-out").textContent, !!target.querySelector(".wk-ch-more"), !!menu()], ["未ログイン", false, false]);
+  assert.match(target.querySelector(".wk-ch-guide").textContent, /Claude Code にログインしていません。/, "未ログインの案内が見えない");
+  // 確かめられない（logged_in: null）= 今までの行
+  mock.over = { logged_in: null, auth: null };
+  await CH.loadChatStatus();
+  flushSync();
+  assert.equal(row().querySelector(".wk-ch-acct-out").textContent, "ログイン状態を確認できません");
+  assert.equal(target.querySelector(".wk-ch-more"), null);
+  // ログイン済みでも openref-mcp が無い = 案内は ⋯ に隠れず見える
+  mock.over = { mcp: null };
+  await CH.loadChatStatus();
+  flushSync();
+  assert.ok(target.querySelector(".wk-ch-more"), "ログイン済みの行でない");
+  assert.equal(menu(), null, "ログアウト → ログインの後に、前に開いていた ⋯ が開いたまま");
+  assert.match(target.querySelector(".wk-ch-guide").textContent, /openref-mcp が見つからないか、古い版です/, "openref-mcp の異常が見えない");
+  // claude が無い = 行は出さず、案内（[再確認] つき）
+  mock.over = { cli: null, version: null, logged_in: null };
+  await CH.loadChatStatus();
+  flushSync();
+  assert.equal(row(), null, "claude が無いのに行が出た");
+  assert.match(target.querySelector(".wk-ch-guide").textContent, /Claude Code（CLI）が見つかりません。/);
+  mock.over = {};
+  await CH.loadChatStatus();
+  unmount(cmp);
+  target.remove();
+  tests++;
+}
+
+// チャットが無効のときのタブ列のボタン: 押す = 有効にする説明（ChatConsent）・同意 = 有効にして柱を開く・断る = 何も変えない・
+// Settings のメニューから開いた説明は同意しても柱を開かない（前と同じ）・覆いの下では押しても何もしない・OpenNote OFF = ボタンなし
+{
+  const { default: Consent } = await import("./ChatConsent.svelte");
+  S.app.wikiOn = true;
+  mock.enabled = false;
+  await CH.loadChatStatus();
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  const target = document.createElement("div");
+  document.body.append(target);
+  const strip = mount(TabStrip, { target });
+  const consentAt = document.createElement("div");
+  document.body.append(consentAt);
+  const consent = mount(Consent, { target: consentAt });
+  flushSync();
+  const btn = () => target.querySelector(".tabs-chat");
+  const sets = () => calls.filter((c) => c.name === "wiki_chat_set_enabled");
+  const setEnabled = handlers.wiki_chat_set_enabled;
+  handlers.wiki_chat_set_enabled = (a) => {
+    mock.enabled = a.enabled;
+    return status({ enabled: mock.enabled });
+  };
+  assert.ok(btn()?.classList.contains("tabs-chat-off"), "無効のボタンが無い");
+  // 断る
+  calls.length = 0;
+  btn().click();
+  flushSync();
+  assert.deepEqual([CH.chat.consent, !!consentAt.querySelector(".modal")], [true, true], "押しても説明が開かない");
+  [...consentAt.querySelectorAll(".modal-foot button")].find((b) => b.textContent === "キャンセル").click();
+  await sleep(5);
+  flushSync();
+  assert.deepEqual([CH.chat.consent, CH.chat.dock.open, sets().length, CH.chatShown()], [false, false, 0, false], "断ったのに何かが変わった");
+  // 覆いの下では押しても説明を開かない
+  S.app.editorOpen = true;
+  flushSync();
+  btn().click();
+  flushSync();
+  assert.deepEqual([CH.chat.consent, sets().length], [false, 0], "覆いの下で説明が開いた / 有効にした");
+  S.app.editorOpen = false;
+  // 同意 = 有効にして柱を開く
+  btn().click();
+  flushSync();
+  [...consentAt.querySelectorAll(".modal-foot button")].find((b) => b.textContent === "有効にする").click();
+  assert.ok(await waitFor(() => (flushSync(), CH.chatShown() && CH.chat.dock.open)), "同意しても柱が開かない");
+  assert.deepEqual([sets().length, sets()[0].args, CH.chat.consentOpensDock, btn().classList.contains("tabs-chat-off")], [1, { enabled: true }, false, false], "同意の後の形");
+  // Settings のメニューから（event wiki-chat-consent）= 同意しても柱は開かない（前と同じ）
+  mock.enabled = false;
+  await CH.loadChatStatus();
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  CH.chat.consentOpensDock = true; // 前の押下の残り（メニューの説明では消える）
+  emit("wiki-chat-consent", null);
+  flushSync();
+  assert.deepEqual([CH.chat.consent, CH.chat.consentOpensDock], [true, false], "メニューの説明が柱を開く印を残した");
+  await CH.answerConsent(true);
+  flushSync();
+  assert.deepEqual([CH.chatShown(), CH.chat.dock.open], [true, false], "メニューから同意して柱が開いた");
+  // OpenNote OFF = ボタンなし（門は変えない）
+  S.app.wikiOn = false;
+  flushSync();
+  assert.equal(btn(), null, "OpenNote OFF でボタンが出た");
+  S.app.wikiOn = true;
+  handlers.wiki_chat_set_enabled = setEnabled;
+  mock.enabled = true;
+  await CH.loadChatStatus();
+  unmount(consent);
+  unmount(strip);
+  target.remove();
+  consentAt.remove();
+  tests++;
+}
+
+// 状態を読めていない間（null = 読込中・読込の失敗）はボタンを出さない = 「分からない」を「無効」と見せない・押しても説明を開かない。
+// 遅れて有効と分かる → 有効の絵（その間に無効の絵は 1 回も出ない）・遅れて無効と分かる → 無効の絵・説明が開いている間に有効と分かる → 閉じる
+{
+  S.app.wikiOn = true;
+  CH.chat.consent = false;
+  CH.chat.dock = { open: false, w: C.DOCK_W };
+  const target = document.createElement("div");
+  document.body.append(target);
+  const btn = () => target.querySelector(".tabs-chat");
+  const look = () => (btn() ? (btn().classList.contains("tabs-chat-off") ? "off" : "on") : "none");
+  const real = handlers.wiki_chat_status;
+  // 読込中（null）
+  let release;
+  handlers.wiki_chat_status = () => new Promise((r) => (release = r));
+  CH.chat.status = null;
+  CH.chat.statusError = null;
+  const strip = mount(TabStrip, { target });
+  flushSync();
+  const seen = [];
+  const mo = new MutationObserver(() => seen.push(look()));
+  mo.observe(target, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
+  const enables = () => calls.filter((c) => c.name === "wiki_chat_set_enabled").length;
+  const en0 = enables();
+  const reading = CH.loadChatStatus();
+  await sleep(5);
+  flushSync();
+  assert.equal(look(), "none", "状態を読めていない間にボタンが出た");
+  CH.openChatEntry();
+  flushSync();
+  assert.deepEqual([CH.chat.consent, enables() - en0], [false, 0], "状態を読めていない間に説明が開いた / 有効にした");
+  // 遅れて有効と分かる
+  release(status({ enabled: true }));
+  await reading;
+  flushSync();
+  await sleep(5);
+  mo.disconnect();
+  assert.equal(look(), "on", "有効と分かってもボタンが有効の絵でない");
+  assert.ok(seen.length > 0, "ボタンの変化を記録できていない");
+  assert.deepEqual(seen.filter((x) => x === "off"), [], "有効の利用者に無効の絵が出た: " + JSON.stringify(seen));
+  // 遅れて無効と分かる
+  CH.chat.status = null;
+  flushSync();
+  assert.equal(look(), "none");
+  const r2 = CH.loadChatStatus();
+  await sleep(5);
+  release(status({ enabled: false }));
+  await r2;
+  flushSync();
+  assert.equal(look(), "off", "無効と分かってもボタンが無効の絵でない");
+  // 状態の読込に失敗 = ボタンなし（前と同じ = 知らせは toast と柱の赤い行）・押しても説明を開かない
+  handlers.wiki_chat_status = () => { throw new Error("harness: 状態を読めない"); };
+  await CH.loadChatStatus();
+  flushSync();
+  assert.deepEqual([look(), !!CH.chat.statusError], ["none", true], "状態を読めないのにボタンが出た");
+  CH.openChatEntry();
+  assert.deepEqual([CH.chat.consent, enables() - en0], [false, 0], "状態を読めないのに説明が開いた / 有効にした");
+  // 説明（メニューから）が開いている間に、読込が終わって有効と分かった = 説明を閉じる
+  handlers.wiki_chat_status = () => new Promise((r) => (release = r));
+  CH.chat.status = null;
+  CH.chat.statusError = null;
+  emit("wiki-chat-consent", null);
+  flushSync();
+  assert.equal(CH.chat.consent, true);
+  const r3 = CH.loadChatStatus();
+  await sleep(5);
+  release(status({ enabled: true }));
+  await r3;
+  flushSync();
+  await sleep(5);
+  // 閉じるだけ = 有効にしない（set_enabled 0 回）・柱を開かない・印を残さない
+  assert.deepEqual([CH.chat.consent, enables() - en0, CH.chat.dock.open, CH.chat.consentOpensDock], [false, 0, false, false], "有効と分かったときに説明を閉じる以外のことをした");
+  // ボタンから開いた説明（無効と分かっている）でも、別の道で有効と分かったら閉じるだけ（有効にしない・柱を開かない）
+  handlers.wiki_chat_status = real;
+  mock.enabled = false;
+  await CH.loadChatStatus();
+  flushSync();
+  assert.equal(look(), "off");
+  CH.openChatEntry();
+  flushSync();
+  assert.deepEqual([CH.chat.consent, CH.chat.consentOpensDock], [true, true]);
+  mock.enabled = true; // Settings のメニュー・別の窓で有効にした
+  await CH.loadChatStatus();
+  flushSync();
+  await sleep(5);
+  assert.deepEqual([CH.chat.consent, enables() - en0, CH.chat.dock.open, CH.chat.consentOpensDock], [false, 0, false, false], "ボタンの説明が、有効と分かったときに有効化 / 柱を開いた");
+  // 開いた時点で既に有効 = 閉じない（変わったときだけ）。状態を読み直しても（force = status の差し替え）閉じない（L-B）
+  emit("wiki-chat-consent", null);
+  flushSync();
+  await sleep(5);
+  assert.equal(CH.chat.consent, true, "既に有効のときの説明をすぐ閉じた");
+  await CH.loadChatStatus({ force: true });
+  flushSync();
+  await sleep(5);
+  assert.deepEqual([CH.chat.consent, enables() - en0], [true, 0], "既に有効の説明が、状態の読み直しで閉じた / 有効にした");
+  CH.chat.consent = false;
+  handlers.wiki_chat_status = real;
+  await CH.loadChatStatus();
+  unmount(strip);
+  target.remove();
   tests++;
 }
 

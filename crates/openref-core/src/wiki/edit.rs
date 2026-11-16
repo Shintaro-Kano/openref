@@ -9,10 +9,11 @@
 //! - 退避: `<app_dir>/wiki-history/<vault の root と相対パスの sha256 先頭 16>/<unix 秒>.<ext>`・ファイルごとに新しい 10 世代。
 //!   同じフォルダの `path.txt` に元のファイルの絶対パス（復元の手掛かり）。退避するのは「照合なしの上書き（if_sha256 なし）・force・
 //!   改名のリンク書換え・登録表（MCP / CLI）経由の上書き全部（`write_agent`）」。if_sha256 が一致した GUI の通常の保存（自動保存）は退避しない
-//! - 拒否: ワークスペースの外・`..`・`.` 始まりの区画・symlink（そのものへの書込・ワークスペースの外へ出る親）・write は md / html 以外
+//! - 拒否: ワークスペースの外・`..`・`.` 始まりの区画・symlink（そのものへの書込・ワークスペースの外へ出る親）・除外フォルダの配下（`write_target`）・
+//!   write は md / html 以外
 
 use super::commands::{bad, index_path_for, opt_str, rebuilding, resolve_path, Ctx};
-use super::index::{sha256_hex, with_index, Fresh, BODY_MAX};
+use super::index::{sha256_hex, with_index, Fresh, Ready, BODY_MAX};
 use super::links::{normalize_rel, LinkKind, Resolver};
 use super::parse_md;
 use super::scan::{self, Kind};
@@ -45,8 +46,8 @@ fn opt_bool(a: &Value, k: &str) -> Result<Option<bool>> {
 }
 
 /// 書込・取込の後に索引へ取り込む（失敗してもファイル操作は済んでいる = エラー文を返して結果に載せる）
-fn reindex(ip: &Path, root: &Path, rels: &[&str]) -> Option<String> {
-    with_index(ip, root, |ix| ix.refresh_paths(rels)).err().map(|e| e.to_string())
+fn reindex(at: &Ready, rels: &[&str]) -> Option<String> {
+    with_index(at, |ix| ix.refresh_paths(rels)).err().map(|e| e.to_string())
 }
 
 fn with_index_error(mut v: Value, e: Option<String>) -> Value {
@@ -143,8 +144,8 @@ pub fn target_path(root: &Path, p: &str) -> Result<Target> {
             missing.push(seg.clone());
         }
     }
-    let canon = std::fs::canonicalize(&anc).map_err(|_| bad(format!("フォルダを辿れません（壊れた symlink 等）: {p}")))?;
-    let rel_anc = super::strip_root(root, &canon).ok_or_else(|| bad(format!("ワークスペースの外を指しています（symlink）: {p}")))?;
+    let canon = std::fs::canonicalize(&anc).map_err(|_| bad(format!("フォルダを辿れません（壊れたシンボリックリンク等）: {p}")))?;
+    let rel_anc = super::strip_root(root, &canon).ok_or_else(|| bad(format!("ワークスペースの外を指しています（シンボリックリンク）: {p}")))?;
     if scan::hidden(&rel_anc) {
         return Err(bad(format!("このフォルダには書けません: {p}")));
     }
@@ -160,7 +161,7 @@ pub fn target_path(root: &Path, p: &str) -> Result<Target> {
     let abs = parent.join(&name);
     let rel = if rel_parent.is_empty() { name.clone() } else { format!("{rel_parent}/{name}") };
     let existing = match std::fs::symlink_metadata(&abs) {
-        Ok(m) if m.file_type().is_symlink() => return Err(bad(format!("symlink には書けません: {p}"))),
+        Ok(m) if m.file_type().is_symlink() => return Err(bad(format!("シンボリックリンクには書けません: {p}"))),
         Ok(m) if m.is_dir() => return Err(bad(format!("同じ名前のフォルダがあります: {p}"))),
         Ok(_) => {
             let c = std::fs::canonicalize(&abs)?;
@@ -173,6 +174,18 @@ pub fn target_path(root: &Path, p: &str) -> Result<Target> {
     Ok(Target { rel, abs, parent, existing, missing, name })
 }
 
+/// 書く / 作る / 移す先の検査 = `target_path` + 除外フォルダ。書けても索引に入らず
+/// 「作ったのに見えない」になるので、除外フォルダの配下（self_is_dir = 作るフォルダそのものも）を拒否する。判定は実在する親を
+/// canonicalize した後の vault 相対（symlink 越しに除外フォルダへ入らない）。編集の command はすべてこれを通す
+pub fn write_target(at: &Ready, p: &str, self_is_dir: bool) -> Result<Target> {
+    let t = target_path(&at.root, p)?;
+    let mut judge = scan::Judge::new(&at.root, &at.rules);
+    if let Some(d) = judge.excluded_at(&t.rel, self_is_dir) {
+        return Err(bad(format!("除外したフォルダ（{d}）の中には書けません（木で右クリック → 索引に入れる）: {p}")));
+    }
+    Ok(t)
+}
+
 /// 渡されたパスそのもの（vault 相対の表記）が symlink なら拒否（resolve_path は symlink の先を返す = 先を消す・移すことになる）
 pub(super) fn reject_symlink(root: &Path, given: &str) -> Result<()> {
     let g: String = given.trim().nfc().collect();
@@ -180,7 +193,7 @@ pub(super) fn reject_symlink(root: &Path, given: &str) -> Result<()> {
     // 末尾の `/` は落として lstat する（`alias/` だと lstat が symlink を辿り、先の本物のフォルダを返す）
     let rel = rel.trim_start_matches('/').trim_end_matches('/');
     if std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(bad(format!("symlink は扱えません: {given}")));
+        return Err(bad(format!("シンボリックリンクは扱えません: {given}")));
     }
     Ok(())
 }
@@ -532,10 +545,11 @@ fn write_with(ctx: &Ctx, a: &Value, always_backup: bool) -> Result<Value> {
     };
     let if_sha = sha_arg(a)?;
     let force = opt_bool(a, "force")?.unwrap_or(false);
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     let app = app_dir(ctx)?;
     let _g = edit_lock();
-    let t = target_path(&root, &path)?;
+    let t = write_target(&at, &path, false)?;
     t.check_new(t.existing.is_none())?;
     let (rel, abs) = t.existing.clone().unwrap_or_else(|| (t.rel.clone(), t.abs.clone()));
     if !Kind::of(&rel).has_body() {
@@ -603,7 +617,7 @@ fn write_with(ctx: &Ctx, a: &Value, always_backup: bool) -> Result<Value> {
             }
         }
     }
-    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    let ie = reindex(&at, &[rel.as_str()]);
     let (mtime_ns, size) = scan::stat(&abs).unwrap_or((0, content.len() as i64));
     let mut out = json!({
         "ok": true, "path": rel, "sha256": sha256_hex(content.as_bytes()), "size": size,
@@ -627,10 +641,10 @@ pub fn create(ctx: &Ctx, a: &Value) -> Result<Value> {
     }
     let kind = Kind::of(&name);
     let name = if kind.has_body() { name } else { format!("{name}.md") };
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
     let dir = dir.trim().trim_end_matches('/').to_string();
     let joined = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
-    let t = target_path(&root, &joined)?;
+    let t = write_target(&at, &joined, false)?;
     t.check_new(true)?;
     // md は空・html は最小の骨格（<title> は書かない = 題名はファイル名から・GUI は作った後に改名することがある）
     let body: &[u8] = if kind == Kind::Html { HTML_SKELETON.as_bytes() } else { b"" };
@@ -639,7 +653,7 @@ pub fn create(ctx: &Ctx, a: &Value) -> Result<Value> {
         Some((d, _)) => format!("{d}/{placed}"),
         None => placed,
     };
-    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    let ie = reindex(&at, &[rel.as_str()]);
     Ok(with_index_error(json!({"path": rel}), ie))
 }
 
@@ -657,10 +671,10 @@ pub fn mkdir(ctx: &Ctx, a: &Value) -> Result<Value> {
     if name.contains('/') || name.starts_with('.') || name.chars().any(char::is_control) {
         return Err(bad(format!("wiki_mkdir: name に `/`・`.` 始まり・制御文字は使えません: {name}")));
     }
-    let (_ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
     let dir = dir.trim().trim_end_matches('/').to_string();
     let joined = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
-    let t = target_path(&root, &joined)?; // 同じ名前のフォルダ・symlink・ワークスペースの外はここで拒否
+    let t = write_target(&at, &joined, true)?; // 同じ名前のフォルダ・symlink・ワークスペースの外・除外フォルダはここで拒否
     if let Some((r, _)) = &t.existing {
         return Err(CoreError::Conflict(format!("同じ名前のファイルがあります: {r}")));
     }
@@ -698,25 +712,26 @@ fn do_move(from_abs: &Path, t: &Target) -> Result<bool> {
 
 /// 移動の後の索引: 大小だけの改名は stat 走査（旧い表記の行を外す）+ from 以外の触ったパス
 /// （旧い表記も大小無視の stat が通る = refresh_paths に渡すと旧い表記の行を入れ直してしまう）。それ以外は from を含む触ったパスだけ
-fn reindex_move(ip: &Path, root: &Path, case_only: bool, from: &str, rels: &[&str]) -> Option<String> {
+fn reindex_move(at: &Ready, case_only: bool, from: &str, rels: &[&str]) -> Option<String> {
     if !case_only {
         let mut all = vec![from];
         all.extend_from_slice(rels);
-        return reindex(ip, root, &all);
+        return reindex(at, &all);
     }
     let rest: Vec<&str> = rels.iter().copied().filter(|r| *r != from).collect();
-    with_index(ip, root, |ix| ix.refresh().map(|_| ()).and_then(|()| ix.refresh_paths(&rest).map(|_| ()))).err().map(|e| e.to_string())
+    with_index(at, |ix| ix.refresh().map(|_| ()).and_then(|()| ix.refresh_paths(&rest).map(|_| ()))).err().map(|e| e.to_string())
 }
 
 /// `wiki_move {from, to}`: ワークスペースの中の移動 / 改名（移動先が既にあれば拒否・リンクは書き換えない = skill の責任）
 pub fn move_(ctx: &Ctx, a: &Value) -> Result<Value> {
     let from = req_str(a, "from", "wiki_move")?;
     let to = req_str(a, "to", "wiki_move")?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     let _g = edit_lock();
     reject_symlink(&root, &from)?;
     let (from_rel, from_abs) = resolve_path(&root, &from)?;
-    let t = target_path(&root, &to)?;
+    let t = write_target(&at, &to, false)?;
     // 拡張子（大小無視）を変える移動は拒否（md ↔ html・ページ ↔ 画像等 = 種類が変わる。GUI の改名 wiki_rename は別の経路）
     if ext_of(&from_rel) != ext_of(&t.rel) {
         return Err(bad(format!("wiki_move では拡張子を変えられません: {from_rel} → {}", t.rel)));
@@ -725,7 +740,7 @@ pub fn move_(ctx: &Ctx, a: &Value) -> Result<Value> {
     let same_name = from_abs.file_name().map(|n| n.to_string_lossy().nfc().collect::<String>()) == Some(t.name.clone());
     t.check_new(!same_name)?;
     let case_only = do_move(&from_abs, &t)?;
-    let ie = reindex_move(&ip, &root, case_only, &from_rel, &[t.rel.as_str()]);
+    let ie = reindex_move(&at, case_only, &from_rel, &[t.rel.as_str()]);
     // path = 移動後（GUI の形）・to = 同じ値（from と対で移動の記録 = 逆の move で戻せる）
     Ok(with_index_error(json!({"from": from_rel, "to": t.rel, "path": t.rel}), ie))
 }
@@ -866,13 +881,14 @@ fn new_link_text(new: &Resolver, src_new: &str, span: &parse_md::Span, text: &st
     }
 }
 
-fn plan_rename(ctx: &Ctx, a: &Value, cmd: &str) -> Result<(PathBuf, PathBuf, RenamePlan)> {
+fn plan_rename(ctx: &Ctx, a: &Value, cmd: &str) -> Result<(Ready, RenamePlan)> {
     let from = req_str(a, "from", cmd)?;
     let to = req_str(a, "to", cmd)?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     reject_symlink(&root, &from)?;
     let (from_rel, from_abs) = resolve_path(&root, &from)?;
-    let t = target_path(&root, &to)?;
+    let t = write_target(&at, &to, false)?;
     t.check_new(true)?;
     if let Some((_, canon)) = &t.existing {
         if canon != &from_abs {
@@ -882,7 +898,7 @@ fn plan_rename(ctx: &Ctx, a: &Value, cmd: &str) -> Result<(PathBuf, PathBuf, Ren
     if t.rel == from_rel {
         return Err(bad("移動元と移動先が同じです"));
     }
-    let (from_ix, paths, links) = with_index(&ip, &root, |ix| {
+    let (from_ix, paths, links) = with_index(&at, |ix| {
         // 鮮度規則（5 秒）を待たずに必ず stat 走査 = 直前に外部が書いたリンクも数える
         if let Fresh::Rebuilding(p) = ix.refresh()? {
             return Err(rebuilding(p));
@@ -964,7 +980,7 @@ fn plan_rename(ctx: &Ctx, a: &Value, cmd: &str) -> Result<(PathBuf, PathBuf, Ren
         }
         rewrites.push(Rewrite { src: src.clone(), src_new, before_sha: sha256_hex(text.as_bytes()), after: after.into_bytes(), links: edits.len() });
     }
-    Ok((ip, root, RenamePlan { from_rel, from_abs, to: t, rewrites, other }))
+    Ok((at, RenamePlan { from_rel, from_abs, to: t, rewrites, other }))
 }
 
 /// チャットのログ（app crate の wiki_chat_log が `chat-log/` に追記だけする）。改名のリンク書換えの対象にしない
@@ -980,7 +996,7 @@ fn other_json(other: &[(String, String)]) -> Value {
 /// （from を指す `[[…]]` `![[…]]` 相対リンク + フォルダが変わるときの改名するページ自身の相対リンク）。
 /// other = 書き換えない参照（html のページ・file:// の絶対リンク・読めないページ・チャットのログ = kind "chat-log"）
 pub fn rename_preview(ctx: &Ctx, a: &Value) -> Result<Value> {
-    let (_, _, plan) = plan_rename(ctx, a, "wiki_rename_preview")?;
+    let (_, plan) = plan_rename(ctx, a, "wiki_rename_preview")?;
     Ok(json!({
         "from": plan.from_rel,
         "to": plan.to.rel,
@@ -996,7 +1012,8 @@ pub fn rename(ctx: &Ctx, a: &Value) -> Result<Value> {
     let rewrite = opt_bool(a, "rewrite")?.unwrap_or(false);
     let app = app_dir(ctx)?.to_path_buf();
     let _g = edit_lock();
-    let (ip, root, plan) = plan_rename(ctx, a, "wiki_rename")?;
+    let (at, plan) = plan_rename(ctx, a, "wiki_rename")?;
+    let root = at.root.clone();
     let case_only = do_move(&plan.from_abs, &plan.to)?;
     let mut rewritten: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
@@ -1028,7 +1045,7 @@ pub fn rename(ctx: &Ctx, a: &Value) -> Result<Value> {
     }
     let mut touched: Vec<&str> = vec![plan.to.rel.as_str()];
     touched.extend(rewritten.iter().map(String::as_str));
-    let ie = reindex_move(&ip, &root, case_only, &plan.from_rel, &touched);
+    let ie = reindex_move(&at, case_only, &plan.from_rel, &touched);
     let out = json!({"path": plan.to.rel, "from": plan.from_rel, "rewritten": rewritten, "links": links, "skipped": skipped, "other": other_json(&plan.other)});
     Ok(with_index_error(out, ie))
 }
@@ -1046,10 +1063,11 @@ pub fn duplicate(ctx: &Ctx, a: &Value) -> Result<Value> {
 /// duplicate の本体。attrs = 拡張属性と ACL を写す処理（注入点 = 写せなかったときの試験）
 fn duplicate_with(ctx: &Ctx, a: &Value, attrs: impl FnOnce(&Path, &Path) -> std::io::Result<()>) -> Result<Value> {
     let path = req_str(a, "path", "wiki_duplicate")?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     reject_symlink(&root, &path)?;
     let (from_rel, from_abs) = resolve_path(&root, &path)?;
-    let t = target_path(&root, &from_rel)?;
+    let t = write_target(&at, &from_rel, false)?;
     t.check_new(true)?; // 足すのは空白と数字だけ = 元の名前を見れば足りる
     if !writable(&t.parent) {
         return Err(bad(format!("書込権がありません（読み取り専用のフォルダ）: {}", t.parent.display())));
@@ -1069,7 +1087,7 @@ fn duplicate_with(ctx: &Ctx, a: &Value, attrs: impl FnOnce(&Path, &Path) -> std:
         Some((d, _)) => format!("{d}/{placed}"),
         None => placed,
     };
-    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    let ie = reindex(&at, &[rel.as_str()]);
     Ok(with_index_error(json!({"path": rel}), ie))
 }
 
@@ -1081,7 +1099,8 @@ fn duplicate_with(ctx: &Ctx, a: &Value, attrs: impl FnOnce(&Path, &Path) -> std:
 pub fn trash_with(ctx: &Ctx, a: &Value, mover: impl FnOnce(&Path) -> std::result::Result<String, String>) -> Result<Value> {
     let path = req_str(a, "path", "wiki_trash")?;
     let expect_dir = opt_bool(a, "dir")?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     let _g = edit_lock();
     reject_symlink(&root, &path)?;
     let (rel, abs) = super::commands::resolve_entry(&root, &path, true)?;
@@ -1096,7 +1115,7 @@ pub fn trash_with(ctx: &Ctx, a: &Value, mover: impl FnOnce(&Path) -> std::result
     }
     let method = mover(&abs).map_err(|m| CoreError::wiki(super::codes::FS, m))?;
     let prefix = format!("{rel}/");
-    let ie = with_index(&ip, &root, |ix| {
+    let ie = with_index(&at, |ix| {
         let mut rels: Vec<String> = inside.clone();
         rels.push(rel.clone());
         if is_dir {
@@ -1231,8 +1250,8 @@ fn embed_of(rel: &str) -> String {
 
 /// attachments/<YYYY-MM>/ に name で置く（同名は連番）。fill（中身を一時ファイルに書く = 大きなコピー）は edit_lock の外、
 /// 置く（RENAME_EXCL）ところだけ lock を取る。戻り値 = vault 相対
-fn put_attachment(root: &Path, name: &str, fill: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<String> {
-    let t = target_path(root, &format!("{ATTACH_DIR}/{}/{name}", year_month()))?;
+fn put_attachment(at: &Ready, name: &str, fill: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<String> {
+    let t = write_target(at, &format!("{ATTACH_DIR}/{}/{name}", year_month()), false)?;
     let placed = place_new(&t.parent, name, fill)?;
     Ok(match t.rel.rsplit_once('/') {
         Some((d, _)) => format!("{d}/{placed}"),
@@ -1270,7 +1289,7 @@ pub fn save_blob(ctx: &Ctx, a: &Value) -> Result<Value> {
     let name = req_str(a, "name", "wiki_save_blob")?;
     let data = req_str(a, "data_base64", "wiki_save_blob")?;
     let _page = opt_str(a, "page")?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
     let bytes = blob_bytes(&data, BLOB_MAX)?;
     let mut name = sanitize_name(&name).unwrap_or_else(|| "pasted".into());
     if Kind::of(&name) != Kind::Media {
@@ -1281,8 +1300,8 @@ pub fn save_blob(ctx: &Ctx, a: &Value) -> Result<Value> {
     if Kind::of(&name) != Kind::Media {
         return Err(bad(format!("wiki_save_blob は画像・PDF・動画・音声だけ置けます: {name}")));
     }
-    let rel = put_attachment(&root, &name, |tmp| std::fs::write(tmp, &bytes))?;
-    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    let rel = put_attachment(&at, &name, |tmp| std::fs::write(tmp, &bytes))?;
+    let ie = reindex(&at, &[rel.as_str()]);
     Ok(with_index_error(json!({"path": rel, "embed": embed_of(&rel)}), ie))
 }
 
@@ -1291,7 +1310,8 @@ pub fn save_blob(ctx: &Ctx, a: &Value) -> Result<Value> {
 pub fn import_file(ctx: &Ctx, a: &Value) -> Result<Value> {
     let abs = req_str(a, "abs", "wiki_import_file")?;
     let _page = opt_str(a, "page")?;
-    let (ip, root) = ctx.ready()?;
+    let at = ctx.ready()?;
+    let root = at.root.clone();
     let p = Path::new(abs.trim());
     if !p.is_absolute() {
         return Err(bad(format!("wiki_import_file: abs は絶対パスで渡してください: {abs}")));
@@ -1308,8 +1328,8 @@ pub fn import_file(ctx: &Ctx, a: &Value) -> Result<Value> {
     if Kind::of(&name) != Kind::Media {
         return Err(bad(format!("ワークスペースの外から取り込めるのは画像・PDF・動画・音声だけです: {name}")));
     }
-    let rel = put_attachment(&root, &name, |tmp| std::fs::copy(&canon, tmp).map(|_| ()))?;
-    let ie = reindex(&ip, &root, &[rel.as_str()]);
+    let rel = put_attachment(&at, &name, |tmp| std::fs::copy(&canon, tmp).map(|_| ()))?;
+    let ie = reindex(&at, &[rel.as_str()]);
     Ok(with_index_error(json!({"path": rel, "embed": embed_of(&rel), "copied": true}), ie))
 }
 
@@ -1369,6 +1389,59 @@ mod tests {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
     }
+    /// 除外フォルダの配下への書込は拒否: write・create・mkdir（作るフォルダそのものも）・move・
+    /// rename の移動先・save_blob（attachments を除いたとき）。symlink 越しも拒否。除外の外は今どおり書ける。
+    /// 読み（wiki_read）は明示のパスなら読めるが索引には入らない
+    #[test]
+    fn writes_into_excluded_folders_are_refused() {
+        let mut e = env("excl-write");
+        put(&e.root, "notes/a.md", "# A\n");
+        put(&e.root, "app/node_modules/pkg/readme.md", "# pkg\n");
+        put(&e.root, "build/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n");
+        put(&e.root, "build/out.md", "# out\n");
+        put(&e.root, "proj/testdata/x.md", "# x\n");
+        std::os::unix::fs::symlink(e.root.join("app/node_modules"), e.root.join("nm-link")).unwrap();
+        let root_s = e.ctx.root.clone().unwrap();
+        let canon = std::fs::canonicalize(&root_s).unwrap().to_string_lossy().to_string();
+        e.ctx.workspaces = crate::wiki::workspaces::parse(Some(&json!({canon.clone(): {"exclude": ["proj/testdata"]}}).to_string())).unwrap();
+        let refused = |r: Result<Value>| {
+            let m = r.unwrap_err().to_string();
+            assert!(m.contains("除外したフォルダ") && m.contains("索引に入れる"), "{m}");
+        };
+        refused(write(&e.ctx, &json!({"path": "app/node_modules/pkg/new.md", "content": "x"})));
+        refused(write(&e.ctx, &json!({"path": "build/out.md", "content": "x"})));
+        refused(write(&e.ctx, &json!({"path": "proj/testdata/new.md", "content": "x"})));
+        refused(write(&e.ctx, &json!({"path": "proj/testdata/deep/new.md", "content": "x"})));
+        refused(write(&e.ctx, &json!({"path": "new/node_modules/x.md", "content": "x"})));
+        refused(write(&e.ctx, &json!({"path": "nm-link/pkg/new.md", "content": "x"})));
+        refused(create(&e.ctx, &json!({"dir": "proj/testdata", "name": "n.md"})));
+        refused(mkdir(&e.ctx, &json!({"dir": "build", "name": "sub"})));
+        refused(mkdir(&e.ctx, &json!({"dir": "notes", "name": "node_modules"})));
+        refused(move_(&e.ctx, &json!({"from": "notes/a.md", "to": "proj/testdata/a.md"})));
+        refused(rename(&e.ctx, &json!({"from": "notes/a.md", "to": "app/node_modules/a.md"})));
+        assert!(!e.root.join("proj/testdata/new.md").exists() && !e.root.join("notes/node_modules").exists());
+        assert!(e.root.join("notes/a.md").exists(), "拒否した移動は元のまま");
+        // 除外の外は今どおり（名前が target のフォルダ・node_modules という名のファイル）
+        assert_eq!(write(&e.ctx, &json!({"path": "site/target/p.md", "content": "x"})).unwrap()["ok"], true);
+        assert_eq!(write(&e.ctx, &json!({"path": "proj/notes.md", "content": "x"})).unwrap()["ok"], true);
+        assert_eq!(mkdir(&e.ctx, &json!({"dir": "notes", "name": "sub"})).unwrap()["path"], "notes/sub");
+        // attachments を除いたら貼付も拒否（作ったのに見えない、を作らない）
+        e.ctx.workspaces = crate::wiki::workspaces::parse(Some(&json!({canon: {"exclude": ["attachments"]}}).to_string())).unwrap();
+        std::fs::create_dir_all(e.root.join("attachments")).unwrap();
+        refused(save_blob(&e.ctx, &json!({"name": "p.png", "data_base64": "iVBORw0KGgo="})));
+        // 読み: 明示のパスなら読める（除外は安全の境界ではない）・索引には入らない
+        let r = commands::read(&e.ctx, &json!({"path": "app/node_modules/pkg/readme.md"})).unwrap();
+        assert_eq!(r["content"], "# pkg\n");
+        assert_eq!(r["title"], "readme", "索引に無い = 既定の題（ファイル名）");
+        let l = commands::list(&e.ctx, &json!({"limit": 100})).unwrap();
+        let paths: Vec<&str> = l["pages"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap()).collect();
+        assert!(!paths.iter().any(|p| p.contains("node_modules") || p.starts_with("build/")), "{paths:?}");
+        assert_eq!(l["excluded"], json!(["app/node_modules", "attachments", "build"]));
+        // prefix の配下だけ
+        assert_eq!(commands::list(&e.ctx, &json!({"prefix": "app/"})).unwrap()["excluded"], json!(["app/node_modules"]));
+        assert_eq!(commands::status(&e.ctx, &json!({})).unwrap()["excluded"], 3);
+    }
+
     fn read(root: &Path, rel: &str) -> String {
         std::fs::read_to_string(root.join(rel)).unwrap()
     }
@@ -1416,12 +1489,12 @@ mod tests {
         assert!(g["sha256"].is_null());
         assert!(!e.root.join("新しい/ページ.md").exists());
         // 監視が同じ書込を拾って取り込み直しても索引は同じ（refresh_paths は冪等）
-        let (ip, root) = e.ctx.ready().unwrap();
-        let snap = || with_index(&ip, &root, |ix| Ok((ix.stats()?, ix.page("新しい/ページ.md")?.map(|p| p.to_json())))).unwrap();
+        let at = e.ctx.ready().unwrap();
+        let snap = || with_index(&at, |ix| Ok((ix.stats()?, ix.page("新しい/ページ.md")?.map(|p| p.to_json())))).unwrap();
         write(&e.ctx, &json!({"path": "新しい/ページ.md", "content": "# 題 2\n[[b]] [[c]]"})).unwrap();
         let s1 = snap();
         for _ in 0..2 {
-            with_index(&ip, &root, |ix| ix.refresh_paths(&[e.root.join("新しい/ページ.md")])).unwrap();
+            with_index(&at, |ix| ix.refresh_paths(&[e.root.join("新しい/ページ.md")])).unwrap();
         }
         assert_eq!(snap(), s1);
         assert_eq!(s1.0["unresolved"], 2);
@@ -1522,9 +1595,12 @@ mod tests {
         assert!(err("../x.md").contains(".."));
         assert!(err(".obsidian/x.md").contains("`.`"));
         assert!(err("a/.hidden.md").contains("`.`"));
-        assert!(err("ext/x.md").contains("ワークスペースの外"), "外を指す symlink のフォルダ");
-        assert!(err("ext/new/x.md").contains("ワークスペースの外"));
-        assert!(err("link.md").contains("symlink"));
+        assert!(err("ext/x.md").contains("ワークスペースの外を指しています（シンボリックリンク）: ext/x.md"), "外を指す symlink のフォルダ");
+        assert!(err("ext/new/x.md").contains("ワークスペースの外を指しています（シンボリックリンク）"));
+        // 壊れた symlink のフォルダ = 辿れない
+        std::os::unix::fs::symlink(e.base.join("home/none"), e.root.join("broken")).unwrap();
+        assert!(err("broken/x.md").contains("フォルダを辿れません（壊れたシンボリックリンク等）: broken/x.md"), "壊れた symlink のフォルダ");
+        assert!(err("link.md").contains("シンボリックリンク"));
         assert!(err(&outside.join("t.md").to_string_lossy()).contains("ワークスペースの外"));
         assert!(err("bad\u{7}.md").contains("制御文字"));
         assert_eq!(std::fs::read_to_string(outside.join("t.md")).unwrap(), "o");
@@ -1689,7 +1765,7 @@ mod tests {
         assert!(e.root.join("c.md").exists());
     }
 
-    /// save_blob の上限（A-11・縮尺 = 上限 3000 バイト）: 76 字で折り返した（CRLF）base64 は、空白を除いた長さで判定する =
+    /// save_blob の上限（縮尺 = 上限 3000 バイト）: 76 字で折り返した（CRLF）base64 は、空白を除いた長さで判定する =
     /// ちょうど上限のデータは通る（除く前の長さでは上限の base64 長を超える）。上限 + 1 バイト・空白を除いても長いもの・空白だけで
     /// 2 倍を超えるものは「大きすぎ」。`data:…;base64,` 付きも同じ
     #[test]
@@ -1777,7 +1853,7 @@ mod tests {
         assert_eq!(commands::status(&e.ctx, &json!({})).unwrap()["unresolved"], 1);
         assert!(trash_with(&e.ctx, &json!({"path": "../x"}), |_| Ok("x".into())).is_err());
         std::os::unix::fs::symlink(e.root.join("b.md"), e.root.join("l.md")).unwrap();
-        assert!(trash_with(&e.ctx, &json!({"path": "l.md"}), |_| panic!("symlink は渡さない")).unwrap_err().to_string().contains("symlink"));
+        assert!(trash_with(&e.ctx, &json!({"path": "l.md"}), |_| panic!("symlink は渡さない")).unwrap_err().to_string().contains("シンボリックリンク"));
         assert!(trash_with(&e.ctx, &json!({"path": "b.md"}), |_| Err("拒否".into())).unwrap_err().to_string().contains("拒否"));
         assert!(e.root.join("b.md").exists());
     }
@@ -1814,7 +1890,7 @@ mod tests {
         put(&e.root, "real/r.md", "r");
         std::os::unix::fs::symlink(e.root.join("real"), e.root.join("alias")).unwrap();
         for p in ["alias", "alias/", "alias//"] {
-            assert!(trash_with(&e.ctx, &json!({"path": p}), |_| panic!("渡さない: {p}")).unwrap_err().to_string().contains("symlink"), "{p}");
+            assert!(trash_with(&e.ctx, &json!({"path": p}), |_| panic!("渡さない: {p}")).unwrap_err().to_string().contains("シンボリックリンク"), "{p}");
         }
         assert!(e.root.join("real/r.md").is_file());
     }
@@ -2067,8 +2143,8 @@ mod tests {
         assert!(err("../外.md").contains("`..`"), "{}", err("../外.md"));
         assert!(err(&e.base.join("外.md").to_string_lossy()).contains("外"));
         assert!(err(".hid/x.md").contains("`.` 始まり"));
-        assert!(err("link.md").contains("symlink"), "ワークスペースの中を指す symlink も拒否");
-        assert!(err("out.md").contains("symlink"));
+        assert!(err("link.md").contains("シンボリックリンク"), "ワークスペースの中を指す symlink も拒否");
+        assert!(err("out.md").contains("シンボリックリンク"));
         assert!(err("outdir/外.md").contains("外を指して"), "{}", err("outdir/外.md"));
         assert!(err("無い.md").contains("見つかりません") || err("無い.md").contains("無い.md"), "{}", err("無い.md"));
         assert!(err("x[1].pdf").contains("使えません"), "{}", err("x[1].pdf"));

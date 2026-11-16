@@ -17,13 +17,14 @@
     setView,
     toast,
   } from "./state.svelte";
+  import { errText } from "./err";
 
   /** 「外部で開く」・DOI / PMID / PMCID のリンク（失敗を無言にしない） */
   async function openOutside(open: () => Promise<unknown>) {
     try {
       await open();
     } catch (e) {
-      toast(`✗ ${t("外部で開けません")}: ${String(e).slice(0, 200)}`);
+      toast(`✗ ${t("外部で開けません")}: ${errText(e, 200)}`);
     }
   }
 
@@ -57,18 +58,21 @@
     if (app.view.kind === "collection" && app.view.id === id) return;
     void setView({ kind: "collection", id, name });
   }
+  /** 添付の置き方（attachments.mode = managed / linked = core の CHECK）の表示の語。値は変えない・知らない値はそのまま。
+      英語の表示は今までどおり値そのもの（managed / linked） */
+  const modeLabel = (m: string) => (m === "linked" ? t("リンク") : m === "managed" ? t("OpenRef 管理") : m);
 </script>
 
 <aside class="detail">
   {#if !d}
-    <div class="empty">{t("アイテムを選択してください")}</div>
+    <div class="empty">{t("文献を選択してください")}</div>
   {:else}
     {#if d.retraction}
-      <div class="banner">{t("⚠ 撤回論文の可能性:")} {d.retraction}</div>
+      <div class="banner">{t("⚠ 撤回された可能性:")} {d.retraction}</div>
     {/if}
     {#if d.deleted}
       <div class="banner trash">
-        {t("ゴミ箱内のアイテムです")}
+        {t("ゴミ箱内の文献です")}
         <button onclick={restoreSelected}>{t("↩ 復元")}</button>
         <button class="danger" title={t("ライブラリから完全に削除（取り消せません）")} onclick={askPurgeSelected}>{t("✕ 完全に削除")}</button>
       </div>
@@ -154,14 +158,14 @@
 
     {#if c.abstract}
       <div class="section">
-        <h3>Abstract</h3>
+        <h3>{t("抄録")}</h3>
         <p class="abstract">{c.abstract}</p>
       </div>
     {/if}
 
     {#if c.keyword || mesh.length}
       <div class="section">
-        <h3>Keywords / MeSH</h3>
+        <h3>{t("キーワード / MeSH")}</h3>
         <p class="kw">{[c.keyword, mesh.join("; ")].filter(Boolean).join(" · ")}</p>
       </div>
     {/if}
@@ -173,11 +177,12 @@
       {/if}
       {#each d.attachments as a (a.id)}
         <p class="att" class:missing={!a.exists}>
-          <span class="mode">{a.mode}</span>
+          <span class="mode">{modeLabel(a.mode)}</span>
           <span class="path" title={a.path}>{a.path.split("/").pop()}</span>
-          {#if a.exists}<button class="link" onclick={() => void openViewer(d.key, a.id, `${c.title ?? ""} — ${a.path.split("/").pop()}`)}>{t("この添付を読む")}</button>{/if}
+          <!-- 主 PDF（実在する最初の添付）は上の「PDF を読む」と同じ = 2 本目以降だけ -->
+          {#if a.exists && a.id !== primaryPdf?.id}<button class="link" onclick={() => void openViewer(d.key, a.id, `${c.title ?? ""} — ${a.path.split("/").pop()}`)}>{t("この添付を読む")}</button>{/if}
           {#if !a.exists}<span class="warn">{t("（実体なし）")}</span>{/if}
-          {#if a.doiCheck === "unknown"}<span class="warn" title={t("自動取得した PDF の冒頭 2 頁に、この文献の DOI が見つからなかった（別論文の可能性。中身を確認してください）")}>{t("（DOI 未確認）")}</span>{/if}
+          {#if a.doiCheck === "unknown"}<span class="warn" title={t("自動取得した PDF の冒頭 2 頁に、この文献の DOI が見つからなかった（別の文献の可能性。中身を確認してください）")}>{t("（DOI 未確認）")}</span>{/if}
         </p>
       {/each}
     </div>
@@ -185,7 +190,7 @@
     <WikiItemSection itemKey={d.key} />
 
     <p class="footer dim">
-      {d.key} {t("· 追加")} {d.dateAdded} · source: {c.custom?.source ?? "?"}
+      {d.key} {t("· 追加")} {d.dateAdded} {t("· 取得元:")} {c.custom?.source ?? "?"}
     </p>
   {/if}
 </aside>

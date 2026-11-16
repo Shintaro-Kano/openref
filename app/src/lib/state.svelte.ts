@@ -33,7 +33,11 @@ export interface ImportJob {
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tick } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
-import { i18n, setLang, t, tn } from "./i18n.svelte";
+import { i18n, t, tn } from "./i18n.svelte";
+import { saveCollapsed, setListSort } from "./prefs.svelte";
+import { errText } from "./err";
+// 表示設定の読み書きは prefs.svelte.ts。範囲の外（main.ts・wiki / shelf / chat / viewer）が state から import している物だけ再輸出する
+export { loadDetailPref, loadLangPref, loadListSortPref, loadViewerSidePref, toggleDetail, toggleViewerSide } from "./prefs.svelte";
 
 export type View =
   | { kind: "all" }
@@ -99,11 +103,15 @@ export interface Tab {
   shelf: ShelfTab | null;
   /** 本棚の読み手のタブ（viewer と同じ = 読み手のインスタンスがタブに付いて生きている） */
   shelfBook: ShelfBookTab | null;
+  /** セグメントで本棚（SHELF）から NOTE / LIBRARY へ切り替えたときに見せていた本棚（shelf が無いときだけ・SHELF へ戻すとこれに戻る =
+      mode.svelte の switchMode）。一覧の状態（view・検索語・絞り込み）は wiki / 本棚の間も上の欄 / app.* に持ったままなので、覚えるのは本棚だけ。
+      ui_tabs に書くのは Wiki のタブの物だけ（一覧のタブの戻る先はその起動の間だけ） */
+  shelfAway: ShelfTab | null;
 }
 
 let nextTabId = 1;
 function blankTab(view: View = { kind: "all" }, search = "", filters: Filters = { author: null, journal: null }): Tab {
-  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null, wiki: null, shelf: null, shelfBook: null };
+  return { id: nextTabId++, view, search, filters, items: [], checked: [], checkAnchor: null, selected: null, detail: null, scrollTop: 0, viewer: null, wiki: null, shelf: null, shelfBook: null, shelfAway: null };
 }
 const firstTab = blankTab();
 
@@ -143,7 +151,7 @@ export const app = $state({
   folderSort: "alpha" as "alpha" | "count",
   /** 折り畳んだフォルダの key（ui_folders_collapsed に永続。id は削除後に再利用されうるので key で持つ） */
   foldersCollapsed: new SvelteSet<string>(),
-  /** サイドバーの LABELS。tagSort の順に並べて持つ（refreshSidebar / setTagSort がフロントで並べる） */
+  /** サイドバーの LABELS。tagSort の順に並べて持つ（refreshSidebar・prefs.svelte の setTagSort / loadFolderPrefs がフロントで並べる） */
   tags: [] as TagRow[],
   /** ラベルの並び（Sort labels）。ui_tag_sort に永続 */
   tagSort: "alpha" as "alpha" | "count",
@@ -172,9 +180,9 @@ export const app = $state({
   purgeKeys: [] as string[],
   /** 行下のインラインメモ編集。複数メモは noteKey で選択。saved = 保存済み本文・text = 編集中 */
   noteEditor: null as null | { key: string; noteKey: string | null; text: string; saved: string },
-  /** 「＋ 新規 ▾」メニューの開閉 */
+  /** 「＋ 追加 ▾」（AddMenu = 識別子の欄・PDF を取り込む…・手動で作成…）の開閉 */
   newMenu: false,
-  /** サイドバー見出しの「…」メニュー（LABELS = Sort labels / Manage labels…、MY LIBRARY = Sort folders / Manage folders…）。
+  /** サイドバー見出しの「…」メニュー（LABELS = Sort labels / Manage labels…、LIBRARY = Sort folders / Manage folders…）。
       Esc の優先順位制御のため state に置く */
   labelMenu: false as false | "labels" | "folders",
   /** PDF 一括取込（non-null の間モーダル表示） */
@@ -307,7 +315,7 @@ async function loadDetail(key: string) {
     return;
   }
   closeDetail();
-  toast(`✗ ${t("詳細を読めません")}: ${err.slice(0, 200) || t("item が見つかりません")}`);
+  toast(`✗ ${t("詳細を読めません")}: ${err.slice(0, 200) || t("文献が見つかりません")}`);
 }
 
 /** 新しく作った / 取り込んだ item を開く（quickAdd・手動作成・取込結果の行）。今の一覧に無ければ、ゴミ箱内の item
@@ -321,14 +329,14 @@ export async function reveal(key: string) {
   try {
     await revealNow(key);
   } catch (e) {
-    toast(`✗ ${t("一覧に表示できませんでした")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("一覧に表示できませんでした")}: ${errText(e, 200)}`);
   }
 }
 
 async function revealNow(key: string) {
-  if (frontViewer() || frontWiki() || frontShelf() || frontShelfBook()) {
+  if (frontKind() !== "list") {
     await openTab();
-    if (frontViewer() || frontWiki() || frontShelf() || frontShelfBook()) {
+    if (frontKind() !== "list") {
       toast(t("✗ 一覧に表示できませんでした（新しいタブを開けません。処理中・取込の実行中は後で開いてください）"));
       return;
     }
@@ -339,7 +347,7 @@ async function revealNow(key: string) {
     const d = await api.getItem(key);
     if (app.tab !== tab) return;
     if (!d) {
-      toast(t("✗ 一覧に表示できませんでした（item が見つかりません）"));
+      toast(t("✗ 一覧に表示できませんでした（文献が見つかりません）"));
       return;
     }
     app.search = "";
@@ -380,6 +388,34 @@ function viewLive(v: View): boolean {
   return true;
 }
 
+/** セグメントで一覧（LIBRARY）から NOTE / SHELF へ切り替える前（t = 前面のタブ）。タブの切替と同じ扱い: 開いているメモは保存して閉じ（保存できず開いたまま・
+    待つ間に前面が変わった = false = 切り替えない）、見えている一覧のスクロール位置を t に覚える（OpenNote の間は一覧の部品が外れる） */
+export async function leaveListForNote(t: Tab): Promise<boolean> {
+  await autoSaveAndCloseNote();
+  if (app.noteEditor || app.tab !== t.id) return false;
+  const el = rowsEl();
+  if (el) t.scrollTop = el.scrollTop;
+  return true;
+}
+
+/** NOTE / SHELF から LIBRARY へ戻した前面のタブ t の一覧を、見せていたビュー（フォルダ・ラベル・検索語・絞り込み）のまま戻す:
+    メモは保存して閉じ（前の setView の経路と同じ）、覚えた位置へスクロールしてから読み直し、詳細も読み直す（タブの切替と同じ）。
+    その間にフォルダ / ラベルが消えていたら「すべて」へ。待つ間に前面が変わったら何もしない */
+export async function resumeList(t: Tab) {
+  await autoSaveAndCloseNote();
+  if (app.tab !== t.id) return;
+  if (!viewLive(app.view)) {
+    await setView({ kind: "all" });
+    return;
+  }
+  // 戻した一覧の描画を待ってスクロール位置を戻す（app.items は OpenNote の間も持ったまま = 同じ行が並ぶ）
+  await tick();
+  const el = rowsEl();
+  if (el && app.tab === t.id) el.scrollTop = t.scrollTop;
+  await refreshList();
+  if (app.tab === t.id && app.selected) await reloadDetail();
+}
+
 export async function setView(v: View) {
   const tab = app.tab;
   const live = viewLive(v);
@@ -414,7 +450,7 @@ export function viewTitle(v: View): string {
     case "all":
       return t("すべて");
     case "starred":
-      return "★ Starred";
+      return t("★ スター付き");
     case "trash":
       return t("ゴミ箱");
     case "collection":
@@ -422,6 +458,26 @@ export function viewTitle(v: View): string {
     case "tag":
       return app.tags.find((t) => t.id === v.id)?.name ?? v.name;
   }
+}
+
+/** 前面のタブの種類。タブの中身（viewer / wiki / shelfBook / shelf）は常に 1 つ（openTab・restoreTabs・本棚の enter が守る）。
+    Wiki のタブは OpenNote が無効なら一覧（frontWiki と同じ）。種類だけを見る所はこれ 1 つで書く（4 つの front* を並べない =
+    タブの種類を足したときに直す所が 1 か所）。中身（itemKey・root 等）が要る所は front* を使う */
+export type FrontKind = "list" | "viewer" | "wiki" | "shelf" | "book";
+export function frontKind(): FrontKind {
+  const t = app.tabs.find((t) => t.id === app.tab);
+  if (t?.viewer) return "viewer";
+  if (t?.wiki && app.wikiOn) return "wiki";
+  if (t?.shelfBook) return "book";
+  if (t?.shelf) return "shelf";
+  return "list";
+}
+
+/** 前面のタブの上に何か載っているか = モーダル（modalOpen = 本体の app.modal と OpenNote / チャットの窓）・参照エディタ・PDF の取込。
+    覆いの下ではキーも操作も裏（前面のタブ）に効かせない。「覆われているか」はこれ 1 つで書く（app.modal だけを見ると、どのタブの上にも
+    出るチャットの同意の窓・救出の窓の下で Esc が PDF のタブを閉じる） */
+export function covered(): boolean {
+  return modalOpen() || app.editorOpen || !!app.importJob;
 }
 
 /** 前面のタブの PDF ビューア（無ければ null = 一覧が見えている） */
@@ -461,16 +517,16 @@ export function openTabInMode() {
     purge モーダル中に切り替わると PurgeModal が新しいタブの一覧から題名を引けない等）。PDF ビューアの中では受け付ける。
     モーダルは本体の app.modal と Wiki のダイアログ（modalOpen）の両方 */
 export function tabOpsAllowed(): boolean {
-  return !app.busy && !app.editorOpen && !modalOpen() && !app.importJob;
+  return !app.busy && !covered();
 }
 
 /** Settings › 他の文献管理ソフトから移行…（Rust の event "migration-open"）= MigrationModal を開く。
     参照エディタ・モーダル（Wiki のダイアログを含む）・PDF 取込の間は開かない（その窓の上に重ねない = 押しても何もしない）。
     MigrationModal は App と一緒に mount されたまま進行中の job を読み続ける = 「バックグラウンドで続行」して閉じた後に押すと進行中の窓に戻る。
-    メニューバーのクリックは DOM のクリックにならない = 開いていたメニューは閉じず、フォーカスも裏に残る → 「＋ 新規 ▾」を閉じ、
+    メニューバーのクリックは DOM のクリックにならない = 開いていたメニューは閉じず、フォーカスも裏に残る → 「＋ 追加 ▾」を閉じ、
     フォーカスを外す（裏のエディタ・入力欄に打鍵が入らない）。OpenNote / 本棚の浮きメニューは App の受け口が閉じる。戻り値 = 開いたか */
 export function openMigration(): boolean {
-  if (app.editorOpen || modalOpen() || app.importJob) return false;
+  if (covered()) return false;
   app.newMenu = false;
   (document.activeElement as HTMLElement | null)?.blur?.();
   app.modal = "migration";
@@ -524,7 +580,8 @@ function snapshotInto(t: Tab) {
   t.checkAnchor = app.checkAnchor;
   t.selected = app.selected;
   t.detail = app.detail && app.detail.key === app.selected ? ($state.snapshot(app.detail) as ItemDetail) : null;
-  t.scrollTop = rowsEl()?.scrollTop ?? 0;
+  // 一覧が見えていない（OpenNote・本棚が前面）= 覚えていた位置のまま（NOTE へ切り替えたときに覚えた位置を 0 で消さない）
+  t.scrollTop = rowsEl()?.scrollTop ?? t.scrollTop;
 }
 
 /** t の snapshot を app.* へ複製して戻す。前面の間は t の一覧と詳細を使わないので空にする（二重に持たない） */
@@ -577,7 +634,7 @@ async function switchTab(id: number, closeFront: boolean): Promise<boolean> {
   const top = target.scrollTop;
   restoreFrom(target);
   app.tab = id;
-  // OpenNote のタブ = そのワークスペースの写しへ（root が違えば。MY LIBRARY / PDF のタブでは変えない = 最後の OpenNote の root のまま）
+  // OpenNote のタブ = そのワークスペースの写しへ（root が違えば。LIBRARY / PDF のタブでは変えない = 最後の OpenNote の root のまま）
   if (target.wiki && app.wikiOn) rootGuard?.(target.wiki);
   app.searchReset++; // 検索欄の文字を戻したタブの検索語に（待ち中の検索は捨てる）
   // 戻した一覧の描画を待ってスクロール位置を戻す（tick は microtask なので、ここに別の切替は割り込めない）
@@ -646,6 +703,7 @@ export async function closeTab(id: number) {
     only.viewer = null;
     only.wiki = null; // Wiki タブ・本棚も中身を外して一覧に戻す
     only.shelf = null;
+    only.shelfAway = null;
     only.shelfBook = null;
     return;
   }
@@ -765,7 +823,7 @@ export async function pollDataVersion() {
     dataVersion = v;
     dataVersionFailed = false;
   } catch (e) {
-    if (!dataVersionFailed) toast(`✗ ${t("外部の変更を読み込めません")}: ${String(e).slice(0, 160)}`);
+    if (!dataVersionFailed) toast(`✗ ${t("外部の変更を読み込めません")}: ${errText(e, 160)}`);
     dataVersionFailed = true;
   } finally {
     dataVersionPolling = false;
@@ -809,6 +867,8 @@ export function tabsPref(): string {
         // 本棚 = root + dir（検索語・スクロールは戻さない）/ 読み手 = パス（走査なしで戻す = 題名と大きさも持つ）
         ...(t.shelf ? { shelf: { root: t.shelf.root, dir: t.shelf.dir } } : {}),
         ...(t.shelfBook ? { shelfBook: t.shelfBook } : {}),
+        // NOTE へ切り替える前の本棚（Wiki タブだけ・本棚と同じく root + dir）= 再起動の後も SHELF へ戻すとその本棚
+        ...(t.wiki && t.shelfAway ? { shelfAway: { root: t.shelfAway.root, dir: t.shelfAway.dir } } : {}),
       };
     }),
   });
@@ -820,7 +880,7 @@ export async function saveTabsPref(json: string): Promise<boolean> {
     await api.setUiPref("ui_tabs", json);
     return true;
   } catch (e) {
-    toast(`✗ ${t("タブを保存できません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("タブを保存できません")}: ${errText(e, 160)}`);
     return false;
   }
 }
@@ -903,7 +963,7 @@ async function checkShelfRoots(roots: string[]): Promise<Set<string> | null> {
     if (!Array.isArray(r?.shelves)) return null; // 形が違う = 分からない（全部の本棚のタブを消さない）
     known = new Set(r.shelves.map((s) => s.root));
   } catch (e) {
-    toast(`✗ ${t("本棚の履歴を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("本棚の履歴を読めません")}: ${errText(e, 160)}`);
     return null;
   }
   await Promise.all([...new Set(roots)].filter((r) => known.has(r)).map((r) => shelfIpc.frontRoot(r).catch(() => null)));
@@ -933,7 +993,7 @@ export async function restoreTabs() {
   try {
     raw = await api.getUiPref("ui_tabs");
   } catch (e) {
-    toast(t("✗ タブの読込に失敗: ") + String(e).slice(0, 160));
+    toast(t("✗ タブの読込に失敗: ") + errText(e, 160));
     return;
   }
   let saved: any = null;
@@ -944,7 +1004,7 @@ export async function restoreTabs() {
   }
   const list: any[] = Array.isArray(saved?.tabs) ? saved.tabs : [];
   const activeAt = Number.isInteger(saved?.active) ? (saved.active as number) : 0;
-  const found: { at: number; tab: Tab; viewer: TabViewer | null; wiki: TabWiki | null; shelf: ShelfTab | null; shelfBook: ShelfBookTab | null; orphan: boolean }[] = [];
+  const found: { at: number; tab: Tab; viewer: TabViewer | null; wiki: TabWiki | null; shelf: ShelfTab | null; shelfBook: ShelfBookTab | null; shelfAway: ShelfTab | null; orphan: boolean }[] = [];
   let lost = 0; // 開けない PDF タブ（値が壊れている・item / 添付が無い）
   let shelfLost = 0; // 開けない本棚 / 読み手のタブ（値が壊れている・root が履歴に無い）
   list.forEach((s, at) => {
@@ -959,9 +1019,11 @@ export async function restoreTabs() {
     if (!view && !viewer && !wiki && !shelfBook && !shelf) return;
     const tab = blankTab(view ?? { kind: "all" }, typeof s.search === "string" ? s.search : "", parseFilters(s.filters));
     tab.wiki = wiki;
-    found.push({ at, tab, viewer, wiki, shelf, shelfBook, orphan: !view });
+    // Wiki タブの「戻る先の本棚」（壊れた値・Wiki でないタブの物は黙って捨てる = 見えている物ではない）
+    const shelfAway = wiki ? parseShelf(s?.shelfAway) : null;
+    found.push({ at, tab, viewer, wiki, shelf, shelfBook, shelfAway, orphan: !view });
   });
-  const shelfRoots = await checkShelfRoots(found.flatMap((f) => f.shelf?.root ?? f.shelfBook?.root ?? []));
+  const shelfRoots = await checkShelfRoots(found.flatMap((f) => f.shelf?.root ?? f.shelfBook?.root ?? f.shelfAway?.root ?? []));
   const checked = await Promise.all(found.map((f) => (f.viewer ? checkViewer(f.viewer) : null)));
   const tabs: Tab[] = [];
   const seen = new Set<string>(); // 確かめた PDF（key + 添付 id）。同じ PDF のタブは 1 枚 = openViewer と同じ（後の方を捨てる）
@@ -988,6 +1050,8 @@ export async function restoreTabs() {
       seenBook.add(id);
       f.tab.shelfBook = f.shelfBook;
     } else if (f.shelf) f.tab.shelf = f.shelf;
+    // 履歴に無い本棚は戻す先にしない（戻すと「すべて」= 知らせない）。履歴を読めなければそのまま
+    if (f.shelfAway && (!shelfRoots || shelfRoots.has(f.shelfAway.root))) f.tab.shelfAway = f.shelfAway;
     if (f.orphan && !v && !f.wiki && !f.tab.shelf && !f.tab.shelfBook) return;
     if (v) {
       const id = `${v.itemKey}\u0000${v.attachmentId}`;
@@ -1002,7 +1066,7 @@ export async function restoreTabs() {
     tabs.push(f.tab);
   });
   const notes: string[] = [];
-  if (lost) notes.push(`${t("PDF タブ")} ${lost} ${t("枚を開けません（item か PDF が見つからない・保存値が壊れている）")}`);
+  if (lost) notes.push(`${t("PDF タブ")} ${lost} ${t("枚を開けません（文献か PDF が見つからない・保存値が壊れている）")}`);
   if (failed) notes.push(`${t("PDF タブ")} ${failed} ${t("枚を確かめられません（そのまま開きます）")}: ${err.slice(0, 120)}`);
   if (shelfLost) notes.push(`${t("本棚のタブ")} ${shelfLost} ${t("枚を開けません（履歴に無い本棚・保存値が壊れている）")}`);
   if (notes.length) toast("✗ " + notes.join(" / "));
@@ -1084,8 +1148,9 @@ async function forKeys(keys: string[], fn: (key: string) => Promise<unknown>): P
   return { ok, fail, keys };
 }
 
-function bulkToast(verb: string, r: { ok: number; fail: number }) {
-  toast(r.fail ? `${verb}: ${r.ok} ${t("件成功・")}${r.fail} ${t("件失敗")}` : `✓ ${tn(r.ok, "件を")}${verb}`);
+/** 一括の操作の結果。成功 =「✓ N 件を<verb>」（count で「N 件に」等へ替えられる）・失敗あり =「<label>: N 件成功・M 件失敗」（label の既定 = verb） */
+function bulkToast(verb: string, r: { ok: number; fail: number }, count = (n: number) => tn(n, "件を"), label = verb) {
+  toast(r.fail ? `${label}: ${r.ok} ${t("件成功・")}${r.fail} ${t("件失敗")}` : `✓ ${count(r.ok)}${verb}`);
 }
 
 /** 詳細パネルの item が keys（操作した item）に含まれていたら詳細も更新 */
@@ -1120,7 +1185,7 @@ export async function createCollectionAndAdd(name: string) {
     await refreshSidebar();
     await bulkAddToCollection(id, keys);
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    toast(`✗ ${errText(e, 200)}`);
   }
 }
 
@@ -1242,7 +1307,7 @@ export async function openNoteEditor(key: string, noteKey?: string | null) {
     if (noteKey && !mine) throw new Error(t("指定したメモが見つかりません"));
     app.noteEditor = { key, noteKey: mine?.key ?? null, text: mine?.contentMd ?? "", saved: mine?.contentMd ?? "" };
   } catch (e) {
-    toast(`✗ ${t("メモの読込に失敗")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("メモの読込に失敗")}: ${errText(e, 200)}`);
   }
 }
 
@@ -1301,7 +1366,7 @@ async function saveNoteNow(close: boolean) {
       toast(t("✓ メモを保存しました"));
     }
   } catch (e) {
-    toast(`✗ ${t("メモの保存に失敗")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("メモの保存に失敗")}: ${errText(e, 200)}`);
     return;
   } finally {
     busyEnd();
@@ -1326,7 +1391,9 @@ export function closeNoteEditor(force = false) {
 
 export async function bulkStar(starred: boolean) {
   const r = await forChecked((k) => api.setStar(k, starred));
-  bulkToast(starred ? t("★ Star") : t("★ 解除"), r);
+  // 「✓ N 件に ★ を付けました」/「✓ N 件の ★ を外しました」（英語は前と同じ「✓ N items starred / unstarred」）
+  if (starred) bulkToast(t("に ★ を付けました"), r, (n) => tn(n, "件::bulk"), t("★ を付ける"));
+  else bulkToast(t("の ★ を外しました"), r, (n) => tn(n, "件::bulk"), t("★ を外す"));
   await Promise.all([refreshList(), refreshSidebar(), reloadDetailIfAmong(r.keys)]);
 }
 
@@ -1366,14 +1433,14 @@ export async function bulkCopy(kind: CopyKind) {
       }
     }
     if (!text) {
-      toast(kind === "doi" ? t("DOI のある item がありません") : t("引用を生成できませんでした"));
+      toast(kind === "doi" ? t("DOI のある文献がありません") : t("引用を生成できませんでした"));
       return;
     }
     await navigator.clipboard.writeText(text);
     const what = { citation: t("引用::copied"), bibtex: "BibTeX", citekey: t("引用キー::copied"), latex: t("LaTeX 引用::copied"), doi: "DOI" }[kind];
     toast(`✓ ${tn(n, "件の")}${what}${t("をコピー")}${note ? `${t("（")}${note}${t("）")}` : ""}`);
   } catch (e) {
-    toast("✗ " + String(e).slice(0, 200));
+    toast("✗ " + errText(e, 200));
   } finally {
     busyEnd();
   }
@@ -1429,10 +1496,16 @@ export async function quickAdd(input: string) {
     await refreshAll();
     await reveal(item.key);
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 300)}`);
+    toast(`✗ ${errText(e, 300)}`);
   } finally {
     busyEnd();
   }
+}
+
+/** ドロップ（PDF の取込）を受けない間 = 窓（本体のモーダル・OpenNote のダイアログ = modalOpen）・参照エディタが開いている。
+    covered() のうち取込の窓（importJob）だけが開いているときは受ける = 今の挙動（実行中なら末尾に足す・終わった後なら新しい取込）のまま */
+export function dropBlocked(): boolean {
+  return modalOpen() || app.editorOpen;
 }
 
 export async function handleDrop(paths: string[]) {
@@ -1444,7 +1517,7 @@ export async function handleDrop(paths: string[]) {
   await startImport(pdfs);
 }
 
-// ---------- PDF 一括取込（ドロップ / ＋新規メニュー） ----------
+// ---------- PDF 一括取込（ドロップ / ＋ 追加 メニュー） ----------
 
 /** PDF ファイルの選択ダイアログ（複数選択）から取込を開始 */
 export async function openImportDialog() {
@@ -1500,7 +1573,7 @@ async function runImport() {
         f.key = r.key;
       } catch (e) {
         f.status = "error";
-        f.message = String(e).slice(0, 300);
+        f.message = errText(e, 300);
       }
     }
   } finally {
@@ -1541,7 +1614,7 @@ export async function restoreSelected() {
   try {
     await api.restoreItem(d.key);
   } catch (e) {
-    toast(`✗ ${t("復元できません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("復元できません")}: ${errText(e, 200)}`);
     return;
   }
   toast(t("復元しました"));
@@ -1606,7 +1679,7 @@ export async function openPrimaryPdf(key: string) {
   try {
     d = app.detail?.key === key ? app.detail : await api.getItem(key);
   } catch (e) {
-    toast(`✗ ${t("詳細を読めません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("詳細を読めません")}: ${errText(e, 200)}`);
     return;
   }
   if (app.tab !== tab) return;
@@ -1634,7 +1707,7 @@ export async function loadCitePrefs() {
     app.cite.doiAlways = p.doi_always;
     app.cite.installed = installed;
   } catch (e) {
-    toast(t("✗ 引用スタイル設定の読込に失敗: ") + String(e).slice(0, 160));
+    toast(t("✗ 引用スタイル設定の読込に失敗: ") + errText(e, 160));
   }
 }
 
@@ -1655,7 +1728,7 @@ export function openStyleModal() {
   app.modal = "citeStyle";
 }
 
-// ---------- フォルダ（Paperpile の folders。MY LIBRARY） ----------
+// ---------- フォルダ（Paperpile の folders。LIBRARY） ----------
 
 export interface FolderRow {
   c: CollectionRow;
@@ -1746,97 +1819,9 @@ export function folderNameError(name: string, parentId: number | null, except?: 
   }
 }
 
-function saveUiPref(key: string, value: string) {
-  api.setUiPref(key, value).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
-}
-
-function saveCollapsed() {
-  saveUiPref("ui_folders_collapsed", JSON.stringify([...app.foldersCollapsed]));
-}
-
-/** 起動時: フォルダ・ラベルの並び順とフォルダの折畳を読む（App.svelte の onMount・loadCitePrefs と同じ場所） */
-export async function loadFolderPrefs() {
-  try {
-    const [sort, tagSort, collapsed] = await Promise.all([
-      api.getUiPref("ui_folder_sort"),
-      api.getUiPref("ui_tag_sort"),
-      api.getUiPref("ui_folders_collapsed"),
-    ]);
-    if (sort === "alpha" || sort === "count") app.folderSort = sort;
-    if (tagSort === "alpha" || tagSort === "count") {
-      app.tagSort = tagSort;
-      app.tags = app.tags.slice().sort(cmpFor(tagSort)); // refreshSidebar が先に終わっていた場合の並べ直し
-    }
-    if (collapsed) {
-      const keys: unknown = JSON.parse(collapsed);
-      if (Array.isArray(keys)) for (const k of keys) if (typeof k === "string") app.foldersCollapsed.add(k);
-    }
-  } catch (e) {
-    toast(t("✗ フォルダ・ラベルの表示設定の読込に失敗: ") + String(e).slice(0, 160));
-  }
-}
-
-/** 起動時: 表記の言語（Settings › Language = ui_lang）。main.ts が mount の前に待つ。切替は Rust の emit "ui-lang" を App.svelte が受けて setLang */
-export async function loadLangPref() {
-  try {
-    setLang(await api.getUiPref("ui_lang"));
-  } catch (e) {
-    toast(t("✗ 言語の設定の読込に失敗: ") + String(e).slice(0, 160));
-  }
-}
-
-/** 起動時: 一覧の右ペインの開閉（ui_detail）。main.ts が mount の前に待つ（mount の後に閉じると最初の 1 フレームに出て消える）。読めなければ既定（開く） */
-export async function loadDetailPref() {
-  try {
-    app.detailOpen = (await api.getUiPref("ui_detail")) !== "0";
-  } catch (e) {
-    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
-  }
-}
-
-/** 一覧の右ペインの開閉（ListToolbar のボタン・⌘⌥I） */
-export function toggleDetail() {
-  app.detailOpen = !app.detailOpen;
-  saveUiPref("ui_detail", app.detailOpen ? "1" : "0");
-}
-
-/** 起動時: PDF ビューアの右バーの開閉（ui_viewer_side）。main.ts が mount の前に待つ（ui_detail と同じ = 最初の描画で出て消えない）。
-    読めなければ既定（開く） */
-export async function loadViewerSidePref() {
-  try {
-    app.viewerSideOpen = (await api.getUiPref("ui_viewer_side")) !== "0";
-  } catch (e) {
-    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
-  }
-}
-
-/** PDF ビューアの右バーの開閉（ツールバーの右端のボタン・PDF のタブが前面のときの ⌘⌥I） */
-export function toggleViewerSide() {
-  app.viewerSideOpen = !app.viewerSideOpen;
-  saveUiPref("ui_viewer_side", app.viewerSideOpen ? "1" : "0");
-}
-
-/** 右バーの中身が目的地の操作（⌘F・ツールバーの ⌕）の前に: 閉じていれば開く（開いていれば何もしない = 書かない） */
-export function showViewerSide() {
-  if (!app.viewerSideOpen) toggleViewerSide();
-}
-
-/** 起動時: 一覧の並び（ui_list_sort = `added:desc` の形）。main.ts が mount の前に待つ（最初の一覧から選んだ並び）。読めない・形が違えば既定（追加日・降順） */
-export async function loadListSortPref() {
-  try {
-    const m = /^(added|published|journal):(asc|desc)$/.exec((await api.getUiPref("ui_list_sort")) ?? "");
-    if (m) app.listSort = { key: m[1] as ListSortKey, desc: m[2] === "desc" };
-  } catch (e) {
-    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
-  }
-}
-
-/** ListToolbar の並びのメニュー: 選択中の項目 = 向きを反転・別の項目 = その項目の自然な向き（誌名 = A→Z・日付 = 新しい順）。登録表の list_items の desc の省略と同じ */
+/** ListToolbar の並びのメニュー: 並びを決めて覚え（prefs の setListSort = 選択中の項目は向きを反転・別の項目は自然な向き）、一覧を取り直して先頭から見せる */
 export async function pickListSort(key: ListSortKey) {
-  const cur = app.listSort;
-  const desc = cur.key === key ? !cur.desc : key !== "journal";
-  app.listSort = { key, desc };
-  saveUiPref("ui_list_sort", `${key}:${desc ? "desc" : "asc"}`);
+  setListSort(key);
   const tab = app.tab;
   await refreshList();
   // 並べ替えたら先頭から見せる（途中の位置に残すと、どこを見ているか分からなくなる）
@@ -1853,17 +1838,6 @@ export async function checkUpdate() {
   } catch (e) {
     console.warn("check_update failed:", e);
   }
-}
-
-export function setFolderSort(sort: "alpha" | "count") {
-  app.folderSort = sort;
-  saveUiPref("ui_folder_sort", sort);
-}
-
-export function toggleFolderCollapsed(key: string) {
-  if (app.foldersCollapsed.has(key)) app.foldersCollapsed.delete(key);
-  else app.foldersCollapsed.add(key);
-  saveCollapsed();
 }
 
 /** id とその祖先を展開する（作ったサブフォルダを見せる） */
@@ -1900,7 +1874,7 @@ export async function createFolder(name: string, parentId: number | null): Promi
     toast(parent ? `✓ ${t("「::create-in")}${parent.name}${t("」にフォルダ「")}${n}${t("」を作成::in")}` : `✓ ${t("フォルダ「")}${n}${t("」を作成")}`);
     return id;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    toast(`✗ ${errText(e, 200)}`);
     return null;
   }
 }
@@ -1914,7 +1888,7 @@ export async function renameFolder(id: number, name: string): Promise<boolean> {
     await Promise.all([refreshSidebar(), reloadDetail()]); // 詳細のフォルダチップも新しい名前に
     return true;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    toast(`✗ ${errText(e, 200)}`);
     return false;
   }
 }
@@ -1944,16 +1918,16 @@ export async function deleteFolders(ids: number[]) {
       ok++;
       for (const f of subtree) gone.add(f);
     } catch (e) {
-      firstErr ||= `${t("「")}${names.get(id)}${t("」")}: ${String(e).slice(0, 160)}`;
+      firstErr ||= `${t("「")}${names.get(id)}${t("」")}: ${errText(e, 160)}`;
       console.error("delete folder failed", id, e);
     }
   }
   const fail = roots.length - ok;
   let msg: string;
   if (fail) msg = `${t("⚠ フォルダ")} ${removed} ${t("個を削除・")}${fail} ${t("個は失敗")} — ${firstErr}`;
-  else if (removed === 1) msg = `✓ ${t("フォルダ「")}${names.get(roots[0])}${t("」を削除（論文はそのまま）")}`;
-  else if (ok === 1) msg = `✓ ${t("フォルダ「")}${names.get(roots[0])}${t("」とサブフォルダ")} ${removed - 1} ${t("個を削除（論文はそのまま）")}`;
-  else msg = `${t("✓ フォルダ")} ${removed} ${t("個を削除（サブフォルダを含む・論文はそのまま）")}`;
+  else if (removed === 1) msg = `✓ ${t("フォルダ「")}${names.get(roots[0])}${t("」を削除（文献はそのまま）")}`;
+  else if (ok === 1) msg = `✓ ${t("フォルダ「")}${names.get(roots[0])}${t("」とサブフォルダ")} ${removed - 1} ${t("個を削除（文献はそのまま）")}`;
+  else msg = `${t("✓ フォルダ")} ${removed} ${t("個を削除（サブフォルダを含む・文献はそのまま）")}`;
   let reloaded = false;
   try {
     await refreshSidebar();
@@ -1963,7 +1937,7 @@ export async function deleteFolders(ids: number[]) {
     for (const k of [...app.foldersCollapsed]) if (!live.has(k) && app.foldersCollapsed.delete(k)) pruned = true;
     if (pruned) saveCollapsed();
   } catch (e) {
-    msg += ` — ✗ ${t("一覧の再読込に失敗")}: ${String(e).slice(0, 160)}`;
+    msg += ` — ✗ ${t("一覧の再読込に失敗")}: ${errText(e, 160)}`;
   }
   toast(msg);
   const isGone = (id: number) => (reloaded ? !app.collections.some((c) => c.id === id) : gone.has(id));
@@ -1971,23 +1945,32 @@ export async function deleteFolders(ids: number[]) {
     await patchViews((v) => (v.kind === "collection" && isGone(v.id) ? null : v));
     await reloadDetail(); // 詳細のフォルダチップから消したフォルダを外す
   } catch (e) {
-    toast(`${msg} — ✗ ${t("再読込に失敗")}: ${String(e).slice(0, 160)}`);
+    toast(`${msg} — ✗ ${t("再読込に失敗")}: ${errText(e, 160)}`);
   }
 }
 
 /** Find and replace（フォルダ名の検索置換）。兄弟に同名・空・「/」を含む結果は飛ばす */
 export async function findReplaceFolders(find: string, replace: string) {
+  let msg: string;
   try {
     const out = await api.findReplaceCollections(find, replace, false);
     const done = out.filter((o) => o.status === "renamed" && o.old !== o.new).length;
     const skipped = out.length - done;
     const renamed = new Map(out.filter((o) => o.status === "renamed").map((o) => [o.id, o.new]));
     await patchViews((v) => (v.kind === "collection" && renamed.has(v.id) ? { ...v, name: renamed.get(v.id)! } : v));
-    toast(`✓ ${done} ${t("個を改名")}${skipped ? `${t("・")}${skipped} ${t("個は対象外（同じ階層に同名・「/」を含む等）")}` : ""}`);
+    msg = `✓ ${done} ${t("個の名前を変更")}${skipped ? `${t("・")}${skipped} ${t("個は対象外（同じ階層に同名・「/」を含む等）")}` : ""}`;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    msg = `✗ ${errText(e, 200)}`;
   }
-  await Promise.all([refreshSidebar(), reloadDetail()]).catch((e) => toast(`✗ ${t("再読込に失敗")}: ${String(e).slice(0, 200)}`));
+  // 本体の結果は読み直しの前に出す（読み直しの中の個別の知らせ = 詳細を読めず閉じた等が、後から残る）。読み直しが投げたときだけ、
+  // 本体の結果の文に「— ✗ 再読込に失敗」を連ねて出し直す（成功の件数を消さない = deleteLabels / mergeLabels と同じ文）
+  toast(msg);
+  // 読み直しの失敗は呼び手へ漏らさない（漏らすとパネルが閉じず、未捕捉の reject になる）
+  try {
+    await Promise.all([refreshSidebar(), reloadDetail()]);
+  } catch (e) {
+    toast(`${msg} — ✗ ${t("再読込に失敗")}: ${errText(e, 200)}`);
+  }
 }
 
 // ---------- ラベル（Paperpile の LABELS） ----------
@@ -1995,13 +1978,6 @@ export async function findReplaceFolders(find: string, replace: string) {
 /** ラベル名の重複（規則は folders.ts の labelTaken = DB の UNIQUE COLLATE NOCASE と同じ = ASCII だけ大小無視）。except = 改名時の自分 */
 export function labelNameTaken(name: string, except?: number): boolean {
   return labelTaken(app.tags, name, except);
-}
-
-/** ラベルの並びを変える。永続して（ui_tag_sort）app.tags をフロントで並べ直すだけ（IPC で取り直さない） */
-export function setTagSort(sort: "alpha" | "count") {
-  app.tagSort = sort;
-  saveUiPref("ui_tag_sort", sort);
-  app.tags = app.tags.slice().sort(cmpFor(sort));
 }
 
 /** 新規ラベル（既定色 = 灰）。戻り値 = id（失敗は toast して null） */
@@ -2018,7 +1994,7 @@ export async function createLabel(name: string, color: string | null = DEFAULT_L
     toast(`✓ ${t("ラベル「")}${n}${t("」を作成")}`);
     return id;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    toast(`✗ ${errText(e, 200)}`);
     return null;
   }
 }
@@ -2030,19 +2006,32 @@ export async function renameLabel(id: number, name: string): Promise<boolean> {
     await Promise.all([refreshSidebar(), refreshList(), reloadDetail()]);
     return true;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    toast(`✗ ${errText(e, 200)}`);
     return false;
   }
 }
 
 /** 色の変更（1 件でも複数でも） */
 export async function recolorLabels(ids: number[], color: string) {
+  /** 本体の操作の結果の文（null = 成功 = 知らせない。色は見れば分かる） */
+  let msg: string | null = null;
+  let changed = 0;
   try {
-    for (const id of ids) await api.updateTag(id, null, color);
+    for (const id of ids) {
+      await api.updateTag(id, null, color);
+      changed++;
+    }
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    msg = `✗ ${errText(e, 200)}`;
   }
-  await Promise.all([refreshSidebar(), refreshList(), reloadDetail()]);
+  // 本体の失敗は読み直しの前に出す（読み直しの中の個別の知らせ = 詳細を読めず閉じた等が、後から残る）。読み直しが投げたときだけ、
+  // 本体の結果の文（成功なら変えた数）に「— ✗ 再読込に失敗」を連ねて出し直す。読み直しの失敗は呼び手へ漏らさない（漏らすとパネルが閉じない）
+  if (msg) toast(msg);
+  try {
+    await Promise.all([refreshSidebar(), refreshList(), reloadDetail()]);
+  } catch (e) {
+    toast(`${msg ?? `✓ ${tn(changed, "個のラベルの色を変更")}`} — ✗ ${t("再読込に失敗")}: ${errText(e, 200)}`);
+  }
 }
 
 /** ラベルの削除（論文は消えない・付与が外れるだけ） */
@@ -2050,7 +2039,7 @@ export async function deleteLabels(ids: number[]) {
   let fail = 0;
   const done = new Set<number>();
   for (const id of ids) await api.deleteTag(id).then(() => done.add(id), () => fail++);
-  let msg = fail ? `⚠ ${ids.length - fail} ${t("個を削除・")}${fail} ${t("個は失敗")}` : `✓ ${ids.length} ${t("個のラベルを削除（論文はそのまま）")}`;
+  let msg = fail ? `⚠ ${ids.length - fail} ${t("個を削除・")}${fail} ${t("個は失敗")}` : `✓ ${ids.length} ${t("個のラベルを削除（文献はそのまま）")}`;
   // 消えたラベルを開いていたタブは「すべて」へ。取り直したラベルの一覧で判定する（削除に失敗して残ったラベルのタブは動かさない・
   // 別の経路で先に消えていたものは移す）。取り直しに失敗したら削除できた id で判定する（deleteFolders と同じ）
   let reloaded = false;
@@ -2058,7 +2047,7 @@ export async function deleteLabels(ids: number[]) {
     await refreshSidebar();
     reloaded = true;
   } catch (e) {
-    msg += ` — ✗ ${t("ラベルの再読込に失敗")}: ${String(e).slice(0, 160)}`;
+    msg += ` — ✗ ${t("ラベルの再読込に失敗")}: ${errText(e, 160)}`;
   }
   toast(msg);
   const isGone = (id: number) => (reloaded ? !app.tags.some((t) => t.id === id) : done.has(id));
@@ -2078,14 +2067,14 @@ export async function mergeLabels(sources: number[], target: number) {
     merged = true;
     msg = `✓ ${absorbed.map((a) => `${t("「")}${a}${t("」")}`).join("")}${t("を「")}${name}${t("」に統合（")}${tn(n, "件）")}`;
   } catch (e) {
-    msg = `✗ ${String(e).slice(0, 200)}`;
+    msg = `✗ ${errText(e, 200)}`;
   }
   // 吸収されたラベルを開いていたタブは残る方のラベルへ。サイドバーを取り直してから写す（取り直しの間に、まだ出ている
   // 吸収されたラベルを開いたタブも後で移る = deleteLabels と同じ順序）。写し先は id で決まるので、取り直しに失敗しても写す
   try {
     await refreshSidebar();
   } catch (e) {
-    msg += ` — ✗ ${t("ラベルの再読込に失敗")}: ${String(e).slice(0, 160)}`;
+    msg += ` — ✗ ${t("ラベルの再読込に失敗")}: ${errText(e, 160)}`;
   }
   toast(msg);
   const patched =
@@ -2096,17 +2085,26 @@ export async function mergeLabels(sources: number[], target: number) {
 
 /** Find and replace（ラベル名の検索置換）。同名が既にあるものは飛ばす */
 export async function findReplaceLabels(find: string, replace: string) {
+  let msg: string;
   try {
     const out = await api.findReplaceTags(find, replace, false);
     const done = out.filter((o) => o.status === "renamed" && o.old !== o.new).length;
     const skipped = out.length - done;
     const renamed = new Map(out.filter((o) => o.status === "renamed").map((o) => [o.id, o.new]));
     await patchViews((v) => (v.kind === "tag" && renamed.has(v.id) ? { ...v, name: renamed.get(v.id)! } : v));
-    toast(`✓ ${done} ${t("個を改名")}${skipped ? `${t("・")}${skipped} ${t("個は対象外（同名あり等）")}` : ""}`);
+    msg = `✓ ${done} ${t("個の名前を変更")}${skipped ? `${t("・")}${skipped} ${t("個は対象外（同名あり等）")}` : ""}`;
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 200)}`);
+    msg = `✗ ${errText(e, 200)}`;
   }
-  await Promise.all([refreshSidebar(), refreshList(), reloadDetail()]);
+  // 本体の結果は読み直しの前に出す（読み直しの中の個別の知らせ = 詳細を読めず閉じた等が、後から残る）。読み直しが投げたときだけ、
+  // 本体の結果の文に「— ✗ 再読込に失敗」を連ねて出し直す（成功の件数を消さない = deleteLabels / mergeLabels と同じ文）
+  toast(msg);
+  // 読み直しの失敗は呼び手へ漏らさない（漏らすとパネルが閉じず、未捕捉の reject になる）
+  try {
+    await Promise.all([refreshSidebar(), refreshList(), reloadDetail()]);
+  } catch (e) {
+    toast(`${msg} — ✗ ${t("再読込に失敗")}: ${errText(e, 200)}`);
+  }
 }
 
 /** 行・サイドバーのラベルクリック → そのラベルのビュー（一覧の上の検索欄にチップ） */
@@ -2198,7 +2196,7 @@ export function beginRowDrag(e: PointerEvent, key: string, label: string) {
       await Promise.all([refreshSidebar(), refreshList()]); // 行のラベルバッジも更新
       await reloadDetailIfAmong(keys);
     } catch (err) {
-      toast(`✗ ${String(err).slice(0, 200)}`);
+      toast(`✗ ${errText(err, 200)}`);
     }
   });
 }
@@ -2222,7 +2220,7 @@ export function beginLabelDrag(e: PointerEvent, tagId: number, name: string) {
       await Promise.all([refreshSidebar(), refreshList()]);
       await reloadDetailIfAmong(keys);
     } catch (err) {
-      toast(`✗ ${String(err).slice(0, 200)}`);
+      toast(`✗ ${errText(err, 200)}`);
     }
   });
 }
@@ -2244,7 +2242,7 @@ export async function fetchPdfSelected() {
     toast(await api.fetchPdf(d.key));
     await Promise.all([reloadDetail(), refreshList()]);
   } catch (e) {
-    toast(`✗ ${String(e).slice(0, 300)}`);
+    toast(`✗ ${errText(e, 300)}`);
   } finally {
     busyEnd();
   }
@@ -2263,7 +2261,7 @@ export async function attachViaDialog() {
       toast(t("✓ 添付しました"));
       await Promise.all([reloadDetail(), refreshList()]);
     } catch (e) {
-      toast(`✗ ${String(e).slice(0, 300)}`);
+      toast(`✗ ${errText(e, 300)}`);
     }
   }
 }

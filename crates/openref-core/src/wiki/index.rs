@@ -10,7 +10,11 @@
 //!   `<名前>.sqlite.corrupt-<unix 秒>`（1 世代だけ）へ退避して作り直す（`with_index`。索引は再生成できるキャッシュ）。
 //!   別の接続で開き直して壊れていなければ退避しない（他のプロセスが先に作り直した索引を捨てない）。作り直しは通常の鮮度規則
 //!   （大きな走査は rebuilding の旗）で行う
-//! - `meta.root` が違えば中身を捨てる。`meta.schema` が違えば表を作り直す（版 2 = 全文検索 pages_fts を足した）
+//! - `meta.root` が違えば中身を捨てる。`meta.schema` が違えば表を作り直す（版 2 = 全文検索 pages_fts を足した・
+//!   版 3 = 除外フォルダ = 除いたフォルダの行を差分で消さず作り直す。捨てた直後に VACUUM を試みる）
+//! - 除外の規則（`scan::Rules`）は入口ごとに `Ready` で渡す（`with_index` / `Index::open` は `Ready` しか受けない = 規則を渡し忘れた
+//!   呼び手はコンパイルで落ちる）。走査は除外フォルダで引き返し、その一覧を `meta.excluded`（JSON の配列・パス順）に書く。
+//!   `refresh_paths` は除外フォルダの配下を `.` 始まりと同じく無視する
 //! - 全文検索 `pages_fts(title, body)` は FTS5 の **contentless**（`content=''`・`contentless_delete=1`）。両列とも
 //!   `model::cjk_spaced`（和文は 1 字 1 トークン・英数はそのまま）で入れ、問い合わせ側も同じ変換の phrase にする（蔵書の
 //!   items_fts / fulltext_fts と同じ方式）。本文の写しを索引に持たない（93MB の wiki で 311MB → 54MB）ので、抜粋は
@@ -18,7 +22,7 @@
 
 use super::links::{LinkKind, Resolver};
 use super::parse_md::Parsed;
-use super::scan::{self, Entry, Kind};
+use super::scan::{self, Entry, Judge, Kind, Rules};
 use super::{parse_html, parse_md};
 use crate::{CoreError, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -32,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
 /// 表の版。表の形を変えたら上げる（開いたときに作り直す）
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 /// 最終走査からこれ未満なら走査しない
 const STALE_MS: i64 = 5_000;
 /// rebuilding の旗の寿命
@@ -55,6 +59,21 @@ pub fn index_path(app_dir: &Path, root: &Path) -> PathBuf {
     let s: String = root.to_string_lossy().nfc().collect();
     app_dir.join(INDEX_DIR).join(format!("{}.sqlite", &sha256_hex(s.as_bytes())[..16]))
 }
+/// 索引を使う入口に要るもの = 索引のパス・canonical な root・除外の規則。`Ctx::ready()` が返す。`with_index` / `Index::open` は
+/// これしか受けない = 規則を渡さない入口を作れない（渡し忘れた 1 経路が除外フォルダの中身を入れ直すのを型で防ぐ）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ready {
+    pub index: PathBuf,
+    pub root: PathBuf,
+    pub rules: Rules,
+}
+
+impl Ready {
+    pub fn new(index: impl Into<PathBuf>, root: impl Into<PathBuf>, rules: Rules) -> Ready {
+        Ready { index: index.into(), root: root.into(), rules }
+    }
+}
+
 /// 本文を読めなかったページの mtime の印。走査が出す mtime（0 以上。epoch 前・取れない = 0）と重ならない値にして、
 /// 次の走査で必ず mtime が合わず再試行される
 pub const READ_ERROR_MTIME: i64 = -1;
@@ -90,6 +109,8 @@ pub struct Index {
     conn: Connection,
     path: PathBuf,
     root: PathBuf,
+    /// 除外の規則（`with_index` が呼び出しごとに入口の物に差し替える）
+    rules: Rules,
     /// 自分が立てた rebuilding の旗の開始時刻（立てていなければ None）
     flag_start: Option<i64>,
 }
@@ -234,7 +255,8 @@ pub fn is_corrupt(e: &CoreError) -> bool {
 /// プロセスに 1 つの索引で f を走らせる（索引パスか root が変われば開き直す）。
 /// 開く・f の途中で索引が壊れていると分かったら、退避して（`quarantine`）新しい索引で f を 1 回だけやり直す。
 /// 注意: f は 2 回走りうる = f の中に vault へのファイル書込などの副作用を入れるなら、やり直しで二重に効かないようにする
-pub fn with_index<T>(index_path: &Path, root: &Path, mut f: impl FnMut(&mut Index) -> Result<T>) -> Result<T> {
+pub fn with_index<T>(at: &Ready, mut f: impl FnMut(&mut Index) -> Result<T>) -> Result<T> {
+    let (index_path, root) = (at.index.as_path(), at.root.as_path());
     #[cfg(test)]
     let _held = InIndex::enter();
     let m = GLOBAL.get_or_init(|| Mutex::new(None));
@@ -249,9 +271,14 @@ pub fn with_index<T>(index_path: &Path, root: &Path, mut f: impl FnMut(&mut Inde
         let r = (|| {
             if g.as_ref().is_none_or(|ix| ix.path != index_path || ix.root != root) {
                 *g = None;
-                *g = Some(Index::open(index_path, root)?);
+                *g = Some(Index::open(at)?);
             }
-            f(g.as_mut().expect("直前に入れた"))
+            let ix = g.as_mut().expect("直前に入れた");
+            // 規則は呼び出しごとに入口の物（設定の変更がすぐ効く・開き直さない）
+            if ix.rules != at.rules {
+                ix.rules = at.rules.clone();
+            }
+            f(ix)
         })();
         match r {
             Err(e) if !retried && is_corrupt(&e) => {
@@ -317,7 +344,7 @@ fn quarantine(index_path: &Path, why: &CoreError, busy: Duration) -> Result<()> 
     Ok(())
 }
 
-/// 索引のファイル（と -wal / -shm）を消す（GUI の Settings › OpenNote › 索引を削除）。プロセスの接続がこの索引なら
+/// 索引のファイル（と -wal / -shm）を消す（GUI の「索引を作り直す」が作り直しに失敗したときのやり直し・履歴から外した root の索引）。プロセスの接続がこの索引なら
 /// 閉じてから消す（作り直し中なら終わるまで待つ）。ロックを握ったまま消すので、消す間に他のスレッドが開き直すことはない。
 /// 無いファイルは無視。他のプロセスが開いている接続は消したファイルを持ち続ける（次に開くとき作り直す）
 pub fn remove_index(index_path: &Path) -> Result<()> {
@@ -380,7 +407,8 @@ impl Index {
     /// 索引を開く（無ければ作る）。root は canonicalize 済みの vault（`wiki::check_root` の戻り値）。
     /// 表・版・root が合っていれば**読むだけ**（他のプロセスが作り直し中でもロックを取らない）。作る・捨てる必要があるときだけ
     /// `BEGIN IMMEDIATE`（busy_timeout が効く）で書く。読んでから書きに上げる deferred は同時に開くと即 BUSY になるので使わない
-    pub fn open(index_path: &Path, root: &Path) -> Result<Index> {
+    pub fn open(at: &Ready) -> Result<Index> {
+        let (index_path, root) = (at.index.as_path(), at.root.as_path());
         if let Some(d) = index_path.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -395,14 +423,17 @@ impl Index {
             Ok(())
         })?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let ix = Index { conn, path: index_path.to_path_buf(), root: root.to_path_buf(), flag_start: None };
+        let ix = Index { conn, path: index_path.to_path_buf(), root: root.to_path_buf(), rules: at.rules.clone(), flag_start: None };
         let root_s = root.to_string_lossy().to_string();
+        let mut dropped = false;
         if ix.needs_setup(&root_s)? {
             let tx = wtx(&ix.conn)?;
             // ロックを取ってから読み直す（同時に開いた他のプロセスが先に整えていれば何もしない）
             if ix.needs_setup(&root_s)? {
                 tx.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
                 if ix.meta("schema")?.as_deref() != Some(SCHEMA_VERSION) {
+                    // 前の版の表が実際にあった（新しいファイルではない）ときだけ VACUUM する
+                    dropped = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'pages'", [], |r| r.get::<_, i64>(0))? > 0;
                     tx.execute_batch(
                         "DROP TABLE IF EXISTS pages; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS pages_fts;
                          DELETE FROM meta;",
@@ -418,6 +449,12 @@ impl Index {
                 }
             }
             tx.commit()?;
+        }
+        if dropped {
+            // 前の版の索引（巨大なワークスペースで数百 MB）を縮める。他の接続が読んでいる等で失敗しても無視（次の版上げまで大きいまま = 害は容量だけ）
+            if let Err(e) = ix.conn.execute_batch("VACUUM") {
+                eprintln!("openref: OpenNote の索引の VACUUM に失敗しました（無視）: {e}");
+            }
         }
         Ok(ix)
     }
@@ -437,6 +474,15 @@ impl Index {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn rules(&self) -> &Rules {
+        &self.rules
+    }
+
+    /// 最後の走査が引き返した除外フォルダ（meta `excluded`・パス順）。走査前・読めない値は空
+    pub fn excluded(&self) -> Result<Vec<String>> {
+        Ok(self.meta("excluded")?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -487,7 +533,7 @@ impl Index {
     }
 
     fn scan_inner(&mut self, held: bool) -> Result<Fresh> {
-        let walk = scan::walk(&self.root)?;
+        let walk = scan::walk(&self.root, &self.rules)?;
         let known = self.known()?;
         let seen: HashSet<&str> = walk.entries.iter().map(|e| e.rel.as_str()).collect();
         let changed: Vec<&Entry> =
@@ -508,6 +554,7 @@ impl Index {
         set_meta(&tx, "used_find", if walk.used_find { "1" } else { "0" })?;
         set_meta(&tx, "walk_errors", &walk.errors.to_string())?;
         set_meta(&tx, "read_errors", &read_errors.to_string())?;
+        set_meta(&tx, "excluded", &serde_json::to_string(&walk.excluded).unwrap_or_else(|_| "[]".into()))?;
         tx.commit()?;
         Ok(Fresh::Ok)
     }
@@ -629,7 +676,7 @@ impl Index {
     }
 
     /// 指定のパスだけ取り込み直す（GUI のファイル監視・書込の後）。絶対パス（vault の中）か vault 相対。
-    /// 消えていれば索引から外す。`.` 始まりの区画・vault の外は無視。戻り値 = 取り込み直した / 外したパス（種別ごと = GUI が "wiki-changed" に載せる）
+    /// 消えていれば索引から外す。`.` 始まりの区画・除外フォルダの配下・vault の外は無視。戻り値 = 取り込み直した / 外したパス（種別ごと = GUI が "wiki-changed" に載せる）
     pub fn refresh_paths<P: AsRef<Path>>(&mut self, paths: &[P]) -> Result<Refreshed> {
         let known = self.known()?;
         let mut changed = Vec::new();
@@ -637,9 +684,15 @@ impl Index {
         let mut added = Vec::new();
         let mut set_changed = false;
         let mut seen = HashSet::new();
+        let rules = self.rules.clone();
+        let mut judge = Judge::new(&self.root, &rules);
         for p in paths {
             let Some(rel) = self.rel_of(p.as_ref()) else { continue };
             if scan::hidden(&rel) || !seen.insert(rel.clone()) {
+                continue;
+            }
+            // 除外フォルダの配下 = 走査に現れない物（`.` 始まりと同じく無視）
+            if judge.excluded_at(&rel, false).is_some() {
                 continue;
             }
             match scan::stat_io(&self.root.join(&rel)) {
@@ -713,6 +766,15 @@ impl Index {
     /// 戻り値 = (絞込後の総数, パス順の先頭 limit 件)。総数は count(*)・行は LIMIT で取る（全行を読んでから切らない）。
     /// 2 つは 1 つの読みトランザクション = 同じスナップショット（間に他のプロセスの走査が入っても総数と行がずれない）
     pub fn list(&self, q: &ListQuery) -> Result<(usize, Vec<PageRow>)> {
+        self.list_in(q, false).map(|(t, r, _)| (t, r))
+    }
+
+    /// list + 除外フォルダ（meta `excluded` のうち prefix に前方一致する物）を同じ読みトランザクション（同じスナップショット）で
+    pub fn list_snapshot(&self, q: &ListQuery) -> Result<(usize, Vec<PageRow>, Vec<String>)> {
+        self.list_in(q, true)
+    }
+
+    fn list_in(&self, q: &ListQuery, with_excluded: bool) -> Result<(usize, Vec<PageRow>, Vec<String>)> {
         let mut cond = String::from("1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(pre) = q.prefix.as_deref().filter(|s| !s.is_empty()) {
@@ -738,8 +800,20 @@ impl Index {
             let rows = st.query_map(rusqlite::params_from_iter(args.iter()), page_row)?.collect::<rusqlite::Result<_>>()?;
             rows
         };
+        let raw: Option<String> = if with_excluded {
+            tx.query_row("SELECT value FROM meta WHERE key = 'excluded'", [], |r| r.get(0)).optional()?
+        } else {
+            None
+        };
         tx.commit()?;
-        Ok((total as usize, rows))
+        let pre = q.prefix.as_deref().unwrap_or("");
+        let excluded = raw
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.starts_with(pre))
+            .collect();
+        Ok((total as usize, rows, excluded))
     }
 
     /// 検索: 題名の部分一致（完全一致 → 前方一致 → 全語を含む）を上に、続いて全文（FTS・bm25 順）。tags は AND の絞込。
@@ -921,6 +995,7 @@ impl Index {
             "used_find": self.meta("used_find")?.as_deref() == Some("1"),
             "walk_errors": self.meta("walk_errors")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
             "read_errors": self.meta("read_errors")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+            "excluded": self.excluded()?.len(),
         }))
     }
 }
@@ -1243,12 +1318,123 @@ mod tests {
         (Tmp(base, serial), root, ip)
     }
 
+    fn put(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn all_paths_of(at: &Ready) -> Vec<String> {
+        with_index(at, |ix| ix.all_paths()).unwrap()
+    }
+
+    /// 除外: 新しく除いたフォルダの既知のページが消える・そこを指すリンクが未解決になる・
+    /// meta.excluded・refresh_paths は除外の配下を無視する・list / refresh_paths / rebuild のどの入口でも同じ集合・
+    /// with_index は規則の変更を開き直さずに効かせる・入れ直すと戻る
+    #[test]
+    fn exclusion_is_same_on_every_entry() {
+        let (_t, root, ip) = tmp("excl");
+        put(&root, "notes/a.md", "# A\n[[deep]] [[keep]]\n");
+        put(&root, "proj/testdata/deep.md", "# deep\n");
+        put(&root, "proj/testdata/sub/x.md", "x");
+        put(&root, "proj/keep.md", "# keep\n");
+        put(&root, "app/node_modules/m/readme.md", "m");
+        let base = Ready::new(&ip, &root, Rules::default());
+        with_index(&base, |ix| ix.refresh().map(|_| ())).unwrap();
+        assert_eq!(all_paths_of(&base), ["notes/a.md", "proj/keep.md", "proj/testdata/deep.md", "proj/testdata/sub/x.md"]);
+        assert_eq!(with_index(&base, |ix| ix.excluded()).unwrap(), ["app/node_modules"]);
+        let link_of = |at: &Ready, target: &str| {
+            with_index(at, |ix| Ok(ix.links_from("notes/a.md")?.into_iter().find(|l| l.target == target).unwrap().path)).unwrap()
+        };
+        assert_eq!(link_of(&base, "deep").as_deref(), Some("proj/testdata/deep.md"));
+        // proj/testdata を除く: 同じ索引のまま規則だけ替えて走査 = 既知のページが消え・リンクは未解決・meta.excluded に載る
+        let ex = Ready::new(&ip, &root, Rules::new([], ["proj/testdata".to_string()]));
+        with_index(&ex, |ix| ix.refresh().map(|_| ())).unwrap();
+        let after = vec!["notes/a.md".to_string(), "proj/keep.md".into()];
+        assert_eq!(all_paths_of(&ex), after);
+        assert_eq!(link_of(&ex, "deep"), None, "除外フォルダの中を指していたリンクは未解決");
+        assert_eq!(link_of(&ex, "keep").as_deref(), Some("proj/keep.md"));
+        assert_eq!(with_index(&ex, |ix| ix.excluded()).unwrap(), ["app/node_modules", "proj/testdata"]);
+        let (total, rows, excl) =
+            with_index(&ex, |ix| ix.list_snapshot(&ListQuery { limit: 100, ..Default::default() })).unwrap();
+        assert_eq!((total, rows.len()), (2, 2));
+        assert_eq!(excl, ["app/node_modules", "proj/testdata"]);
+        let (_, _, excl) =
+            with_index(&ex, |ix| ix.list_snapshot(&ListQuery { prefix: Some("proj/".into()), limit: 100, ..Default::default() })).unwrap();
+        assert_eq!(excl, ["proj/testdata"], "prefix の配下だけ");
+        assert_eq!(with_index(&ex, |ix| ix.stats()).unwrap()["excluded"], 2);
+        // refresh_paths: 除外の配下は（変わっても・新しくても）無視 = 入らない。除外の外は今どおり
+        put(&root, "proj/testdata/new.md", "n");
+        put(&root, "app/node_modules/m/new.md", "n");
+        put(&root, "notes/b.md", "b");
+        let r = with_index(&ex, |ix| {
+            ix.refresh_paths(&["proj/testdata/new.md", "proj/testdata/deep.md", "app/node_modules/m/new.md", "notes/b.md"])
+        })
+        .unwrap();
+        assert_eq!(r, Refreshed { added: vec!["notes/b.md".into()], ..Default::default() });
+        let mut want = after.clone();
+        want.insert(1, "notes/b.md".into());
+        assert_eq!(all_paths_of(&ex), want);
+        // rebuild も同じ集合
+        with_index(&ex, |ix| ix.rebuild().map(|_| ())).unwrap();
+        assert_eq!(all_paths_of(&ex), want);
+        assert_eq!(with_index(&ex, |ix| ix.excluded()).unwrap(), ["app/node_modules", "proj/testdata"]);
+        // 規則を戻す（入れ直す）と次の走査で戻る
+        with_index(&base, |ix| ix.refresh().map(|_| ())).unwrap();
+        assert_eq!(
+            all_paths_of(&base),
+            ["notes/a.md", "notes/b.md", "proj/keep.md", "proj/testdata/deep.md", "proj/testdata/new.md", "proj/testdata/sub/x.md"]
+        );
+        assert_eq!(link_of(&base, "deep").as_deref(), Some("proj/testdata/deep.md"));
+        // include が既定に勝つ（node_modules を入れる）
+        let inc = Ready::new(&ip, &root, Rules::new(["app/node_modules".to_string()], []));
+        with_index(&inc, |ix| ix.refresh().map(|_| ())).unwrap();
+        assert!(all_paths_of(&inc).contains(&"app/node_modules/m/new.md".to_string()));
+        assert!(with_index(&inc, |ix| ix.excluded()).unwrap().is_empty());
+    }
+
+    /// 版上げ（schema 2 → 3）: 前の版の表を捨てて作り直し・VACUUM でファイルが縮む。新しいファイルでは VACUUM しない（表が無い）
+    #[test]
+    fn schema_bump_drops_and_vacuums() {
+        let (_t, root, ip) = tmp("vacuum");
+        let body = "x ".repeat(20_000);
+        for i in 0..200 {
+            put(&root, &format!("p{i}.md"), &format!("# p{i}\n{body}\n"));
+        }
+        let at = Ready::new(&ip, &root, Rules::default());
+        with_index(&at, |ix| {
+            ix.refresh()?;
+            ix.conn_for_test().execute("UPDATE meta SET value = '2' WHERE key = 'schema'", [])?;
+            ix.conn_for_test().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        })
+        .unwrap();
+        remove_index_conn(&ip);
+        let before = std::fs::metadata(&ip).unwrap().len();
+        let ix = Index::open(&at).unwrap();
+        assert_eq!(ix.meta("schema").unwrap().as_deref(), Some(SCHEMA_VERSION));
+        assert_eq!(ix.all_paths().unwrap().len(), 0, "前の版の行は捨てる（次の走査で作り直す）");
+        assert!(ix.meta("last_scan").unwrap().is_none());
+        drop(ix);
+        let after = std::fs::metadata(&ip).unwrap().len();
+        assert!(after * 4 < before, "VACUUM で縮む: {before} → {after}");
+    }
+
+    /// 試験用: プロセス共有の接続（GLOBAL）がこの索引なら閉じる（ファイルの大きさを測る前）
+    fn remove_index_conn(ip: &Path) {
+        let m = GLOBAL.get_or_init(|| Mutex::new(None));
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_some_and(|ix| ix.path == ip) {
+            *g = None;
+        }
+    }
+
     /// remove_index: プロセスの接続を閉じてファイル一式を消す・無いファイルは無視・次の with_index は空の索引から作り直す
     #[test]
     fn remove_index_closes_and_deletes() {
         let (_t, root, ip) = tmp("rm");
         std::fs::write(root.join("a.md"), "# A\n").unwrap();
-        let n = with_index(&ip, &root, |ix| {
+        let n = with_index(&Ready::new(&ip, &root, Rules::default()), |ix| {
             ix.refresh()?;
             Ok(ix.list(&ListQuery { limit: 10, ..Default::default() })?.0)
         })
@@ -1260,7 +1446,7 @@ mod tests {
             assert!(!PathBuf::from(format!("{}{s}", ip.display())).exists(), "{s}");
         }
         remove_index(&ip).unwrap(); // 2 回目（ファイル無し）もエラーにしない
-        let n = with_index(&ip, &root, |ix| Ok(ix.list(&ListQuery { limit: 10, ..Default::default() })?.0)).unwrap();
+        let n = with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.list(&ListQuery { limit: 10, ..Default::default() })?.0)).unwrap();
         assert_eq!(n, 0, "消した後は空の索引から");
     }
 
@@ -1275,7 +1461,7 @@ mod tests {
         assert_eq!(name.len(), 16 + ".sqlite".len(), "{name}");
         assert!(name.ends_with(".sqlite") && name[..16].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{name}");
         assert_eq!(name[..16], sha256_hex(b"/Users/u/Documents/ref")[..16]);
-        let b = index_path(app, Path::new("/Users/u/Documents/blog"));
+        let b = index_path(app, Path::new("/Users/u/Documents/site"));
         assert_ne!(a, b, "別の root は別のファイル");
         assert_ne!(a, index_path(app, Path::new("/Users/u/Documents/ref/")), "文字列が違えば別（root は canonical で来る）");
         let nfc = "/Users/u/マイドライブ/wiki";
@@ -1289,7 +1475,7 @@ mod tests {
         static LIST_SQL: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// list（A-29）: 総数 = count(*)・行 = LIMIT。全行を取ってから切る旧の形（SQL を写した参照）と、条件 × limit（0 / 1 / 全件 / 全件超 /
+    /// list: 総数 = count(*)・行 = LIMIT。全行を取ってから切る旧の形（SQL を写した参照）と、条件 × limit（0 / 1 / 全件 / 全件超 /
     /// usize::MAX）の全組合せで総数と行（順序も）が同じ・件数 = min(limit, 総数)。発行する SQL は count 1 本と LIMIT 付きの 1 本だけ
     #[test]
     fn list_counts_and_limits_in_sql() {
@@ -1306,7 +1492,7 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, body).unwrap();
         }
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         // 旧の list（全行を取ってから limit で切る）
         let old = |ix: &Index, q: &ListQuery| -> (usize, Vec<String>) {
@@ -1392,7 +1578,7 @@ mod tests {
             v
         };
         let search = |q: &str| {
-            with_index(&ip, &root, |ix| {
+            with_index(&Ready::new(&ip, &root, Rules::default()), |ix| {
                 ix.refresh()?;
                 Ok(ix.search(&SearchQuery { query: q.into(), limit: 10, ..Default::default() })?.1.len())
             })
@@ -1406,7 +1592,7 @@ mod tests {
         let first = corrupt_files();
         // 2) malformed（本体の途中を壊す = 開けるが読むと SQLITE_CORRUPT）
         remove_index_handle(&ip);
-        with_index(&ip, &root, |ix| Ok(ix.conn_for_test().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?)).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.conn_for_test().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?)).unwrap();
         remove_index_handle(&ip);
         let mut bytes = std::fs::read(&ip).unwrap();
         let len = bytes.len();
@@ -1431,7 +1617,7 @@ mod tests {
         let (_t, root, ip) = tmp("busy");
         std::fs::write(root.join("a.md"), "# A\n").unwrap();
         {
-            let mut ix = Index::open(&ip, &root).unwrap();
+            let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
             ix.refresh().unwrap();
         }
         let why = CoreError::wiki(crate::wiki::codes::FS, "test");
@@ -1476,7 +1662,7 @@ mod tests {
     #[test]
     fn drop_flag_only_removes_own_flag() {
         let (_t, root, ip) = tmp("own");
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         assert!(ix.take_flag().unwrap());
         // 他のプロセスが引き継いだ（旗の値が変わった）
         ix.conn.execute("UPDATE meta SET value = '1:5:5' WHERE key = 'rebuilding'", []).unwrap();
@@ -1500,7 +1686,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_t, root, ip) = tmp("fail");
         std::fs::write(root.join("a.md"), "x").unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
         let r = ix.rebuild();
@@ -1519,7 +1705,7 @@ mod tests {
         let (_t, root, ip) = tmp("case");
         std::fs::write(root.join("Page.md"), "x").unwrap();
         std::fs::write(root.join("other.md"), "y").unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         assert_eq!(ix.lookup_path("page.md").unwrap().as_deref(), Some("Page.md"));
         let same = std::fs::canonicalize(root.join("page.md")).unwrap();
@@ -1549,7 +1735,7 @@ mod tests {
         std::fs::write(root.join("locked/deep/y.md"), "zebrafish").unwrap();
         std::fs::write(root.join("top.md"), "[[locked/x]]").unwrap();
         std::fs::write(root.join("gone.md"), "g").unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         assert_eq!(ix.stats().unwrap()["pages"], 4);
         let count = |ix: &Index, sql: &str| ix.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
@@ -1602,7 +1788,7 @@ mod tests {
         assert_ne!(real_mtime, 0);
         std::fs::set_permissions(root.join("r.md"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let _unlock = Unlock(root.join("r.md"));
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         assert_eq!(ix.refresh().unwrap(), Fresh::Ok);
         let st = ix.stats().unwrap();
         assert_eq!(st["pages"], 3, "{st}");
@@ -1655,7 +1841,7 @@ mod tests {
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
         }
         let _unlock = Unlock(root.join("u"));
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         // 初回は新規 n 件 = 大きな走査（自分で旗を立てて外す）
         assert_eq!(ix.refresh().unwrap(), Fresh::Ok);
         assert_eq!(ix.stats().unwrap()["read_errors"], n as i64);
@@ -1744,7 +1930,7 @@ mod tests {
         w("misc/dup.md", "");
         w("page.html", "<a href=\"notes/alpha.md\">a</a><img src=\"img/pic.jpg\"><a href=\"gone.md\">g</a>");
         w("img/pic.jpg", "jpg");
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         let r0 = same_as_full(&mut ix, "初回");
         assert_eq!(link(&r0, "index.md", "alpha"), (Some("notes/alpha.md"), 0));
@@ -1817,7 +2003,7 @@ mod tests {
         };
         w("index.md", "[[gone]] [[late]]");
         w("gone.md", "");
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         // 中断を模す: gone.md の削除と late.md の追加は commit されたが解決は走らなかった
         std::fs::remove_file(root.join("gone.md")).unwrap();
@@ -1853,7 +2039,7 @@ mod tests {
         };
         w("index.md", "[[alpha]]");
         w("notes/alpha.md", "");
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         let p = w("other/alpha.md", "");
         FAIL_DELTA.with(|f| f.set(true));
@@ -1886,7 +2072,7 @@ mod tests {
         let dir = root.join("zz-delta-resolve");
         let _ = std::fs::remove_dir_all(&dir);
         let (_t, _, ip) = tmp("real-delta");
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         let r0 = same_as_full(&mut ix, "初回");
         let q = |sql: &str| -> Vec<(String, String, Option<String>)> {

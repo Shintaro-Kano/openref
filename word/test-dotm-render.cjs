@@ -2,17 +2,10 @@
 // HTML → 本文 + 書式 run の変換と、本物の citeproc（vendor/citeproc.js）+ 同梱スタイルでの render。
 // 実行: node word/test-dotm-render.cjs
 "use strict";
-const fs = require("fs");
-const path = require("path");
-const vm = require("vm");
 const assert = require("assert");
+const { loadCite } = require("./test-lib.cjs");
 
-const dir = __dirname;
-vm.runInThisContext(fs.readFileSync(path.join(dir, "vendor/citeproc.js"), "utf8"));
-vm.runInThisContext(fs.readFileSync(path.join(dir, "cite-core.js"), "utf8"));
-vm.runInThisContext(fs.readFileSync(path.join(dir, "dotm-render.js"), "utf8"));
-const EN = fs.readFileSync(path.join(dir, "vendor/locales-en-US.xml"), "utf8");
-const style = (id) => fs.readFileSync(path.join(dir, "styles", id + ".csl"), "utf8");
+const { locale: EN, style } = loadCite({ dotm: true }); // global に CSL・OpenRefCite・OpenRefDotm
 const R = OpenRefDotm;
 
 let failures = 0;
@@ -90,7 +83,7 @@ const K1 = {
 };
 const K2 = {
   type: "article-journal",
-  title: "小児の中枢神経感染症",
+  title: "小児の架空症例の画像所見",
   author: [{ family: "Corrêa", given: "José" }],
   "container-title": "日本小児放射線学会雑誌",
   issued: { "date-parts": [[2024]] },
@@ -109,7 +102,7 @@ check("render vancouver: 番号は文書順の初出順・複製 CC も 1 個ず
   assert.strictEqual(out.items, 2);
   const lines = out.bib.text.split("\n");
   assert.strictEqual(lines.length, 2);
-  assert.ok(lines[0].startsWith("1. Corrêa J. 小児の中枢神経感染症. 日本小児放射線学会雑誌. 2024;44(8):e230216"), lines[0]);
+  assert.ok(lines[0].startsWith("1. Corrêa J. 小児の架空症例の画像所見. 日本小児放射線学会雑誌. 2024;44(8):e230216"), lines[0]);
   assert.ok(lines[1].startsWith("2. Stoffel EM, Goggins M. Pancreatic cancer: changing epidemiology. Gastroenterology."), lines[1]);
   assert.strictEqual(out.bib.runs, "", "Vancouver の文献リストは書式なし");
 });

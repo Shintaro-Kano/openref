@@ -3,10 +3,10 @@
 use super::{
     files::{digest, AttachmentRoots},
     inventory,
-    plan::{self, AttachmentPlan, ExistingLibrary, ImportPlan, ItemAction},
+    plan::{AttachmentPlan, ExistingLibrary, ImportPlan, ItemAction},
     ImportInput, ImportItem,
 };
-use crate::{CoreError, Result};
+use crate::{identity, CoreError, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -85,8 +85,8 @@ pub(crate) fn describe(plan: &mut ImportPlan, library: &ExistingLibrary) {
                     csl_sha256: digest(i.csl.to_string().as_bytes()),
                     key: i.key.clone(),
                     title: crate::model::s(&i.csl, "title").unwrap_or("").into(),
-                    doi: plan::doi(&i.csl),
-                    pmid: plan::pmid(&i.csl),
+                    doi: identity::doi(&i.csl),
+                    pmid: identity::pmid(&i.csl),
                 })
                 .collect();
         }
@@ -184,7 +184,7 @@ pub fn resolve(
             ItemAction::AddMissing { item_key } if mapped && item_key == &target.key => {}
             _ => return Err(invalid()),
         }
-        if plan::conflicts(&source.csl, &target.csl) {
+        if identity::conflicts(&source.csl, &target.csl) {
             return Err(invalid());
         }
         planned.selection = Some(Selection {
@@ -269,7 +269,7 @@ pub(crate) fn recheck(
     };
     let csl: serde_json::Value = serde_json::from_str(&raw)?;
     if digest(csl.to_string().as_bytes()) != selection.csl_sha256
-        || plan::conflicts(&item.csl, &csl)
+        || identity::conflicts(&item.csl, &csl)
     {
         return Ok(blocked());
     }
@@ -279,7 +279,7 @@ pub(crate) fn recheck(
         _ => false,
     };
     // All strong identifiers must point at this target, even for a weak match.
-    let candidates = plan::identifier_candidates(conn, &item.csl, None)?;
+    let candidates = identity::identifier_candidates(conn, &item.csl, None)?;
     if !eligible
         || candidates
             .iter()

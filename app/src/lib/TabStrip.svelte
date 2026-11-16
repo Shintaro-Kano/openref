@@ -7,13 +7,14 @@
      最後の 1 枚は × を出さない（PDF / Wiki / 本棚のタブなら出す = 中身だけ閉じる）。題名は id から引く（viewTitle）。検索語・チップは題名に
      足さず tooltip に出す。PDF タブは文書のアイコン + 論文の題名（tooltip は題名の全文）。
      並べ替え = タブを掴んで左右へドラッグ（pointer イベントで自作 = onTabDown。HTML5 の D&D は Tauri の dragDropEnabled と競合する）。
-     右端 = チャットの柱（ChatDock）の開閉ボタン（⌘⌥C と同じ・チャットが出せるときだけ・応答中は点）。空きのダブルクリックはボタンの上では効かない。
+     右端 = チャットの柱（ChatDock）の開閉ボタン（⌘⌥C と同じ・応答中は点）。チャットが無効と分かっているときも出す = 吹き出しの線を破線にした絵で、
+     押すと有効にする説明（ChatConsent）を開く。状態を読めていない間は出さない。空きのダブルクリックはボタンの上では効かない。
      class は tabs- 接頭辞（tb- は viewer のツールバーが使用中） */
   import { tick } from "svelte";
   import LabelBadge from "./LabelBadge.svelte";
   import { app, activateTab, closeTab, moveTab, openTabInMode, tabView, viewTitle, type Tab, type View } from "./state.svelte";
   import { wikiTabTitle, wikiTabWorkspace } from "./wiki/wiki.svelte";
-  import { chat, chatShown, toggleDock } from "./chat/chat.svelte";
+  import { chat, chatEntryShown, chatShown, openChatEntry } from "./chat/chat.svelte";
   import { shelfTabTitle } from "./shelf/shelf.svelte";
 
   let listEl = $state<HTMLDivElement | null>(null);
@@ -333,14 +334,16 @@
     {/each}
   </div>
   <button class="tabs-new" title={t("新しいタブ（⌘T）")} aria-label={t("新しいタブ")} onclick={() => void openTabInMode()}>{t("＋")}</button>
-  {#if chatShown()}
+  {#if chatEntryShown()}
+    {@const on = chatShown()}
     <button
       class="tabs-chat"
-      class:tabs-chat-on={chat.dock.open}
-      aria-pressed={chat.dock.open}
-      title={t("チャット（⌘⌥C）")}
-      aria-label={t("チャット（⌘⌥C）")}
-      onclick={toggleDock}>
+      class:tabs-chat-on={on && chat.dock.open}
+      class:tabs-chat-off={!on}
+      aria-pressed={on && chat.dock.open}
+      title={on ? t("チャット（⌘⌥C）") : t("チャット（無効・押すと有効にする説明を開きます）")}
+      aria-label={on ? t("チャット（⌘⌥C）") : t("チャット（無効・押すと有効にする説明を開きます）")}
+      onclick={openChatEntry}>
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"
         ><path
           d="M2.5 3.6c0-.66.54-1.2 1.2-1.2h8.6c.66 0 1.2.54 1.2 1.2v6c0 .66-.54 1.2-1.2 1.2H7.2l-2.9 2.4v-2.4h-.6c-.66 0-1.2-.54-1.2-1.2z"

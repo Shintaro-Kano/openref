@@ -3,7 +3,7 @@
 //! Db を手放し、ここの関数（Db を要しない）を呼ぶ。GUI の Tauri 包みも同じ: Db のロックは `Ctx::from_db_pinned` の間だけ。
 
 use super::codes;
-use super::index::{self, default_title, sha256_hex, with_index, Fresh, Index, ListQuery, SearchQuery};
+use super::index::{self, default_title, sha256_hex, with_index, Fresh, Index, ListQuery, Ready, SearchQuery};
 use super::scan::{self, Kind};
 use super::workspaces;
 use crate::{CoreError, Db, Result};
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
 /// 無効のときのエラー文（`wiki_status` 以外の全部）
-pub const DISABLED: &str = "OpenNote は無効です（Settings › OpenNote）";
+pub const DISABLED: &str = "OpenNote は無効です（設定 › OpenNote）";
 
 /// 登録表の関数が Db から読む設定（これを読んだら Db は要らない）
 #[derive(Debug, Clone, Default)]
@@ -75,8 +75,9 @@ impl Ctx {
         }
     }
 
-    /// 使える状態なら (索引のパス, canonical な root)。索引 = `<app_dir>/wiki-index/<root の hash>.sqlite`（`index::index_path`）
-    pub fn ready(&self) -> Result<(PathBuf, PathBuf)> {
+    /// 使える状態なら索引の入口（索引のパス・canonical な root・除外の規則）。索引 = `<app_dir>/wiki-index/<root の hash>.sqlite`
+    /// （`index::index_path`）・規則 = 設定 `wiki_workspaces` のこの root の `include` / `exclude`（`workspaces::rules`）
+    pub fn ready(&self) -> Result<Ready> {
         if !self.enabled {
             return Err(CoreError::wiki(codes::UNAVAILABLE, DISABLED));
         }
@@ -85,11 +86,16 @@ impl Ctx {
             .as_deref()
             .ok_or_else(|| CoreError::wiki(codes::UNAVAILABLE, "in-memory の DB では OpenNote を使えません（索引の置き場が無い）"))?;
         let root = self.root.as_deref().ok_or_else(|| {
-            CoreError::wiki(codes::UNAVAILABLE, "ワークスペースのフォルダが未設定です（GUI の Settings › OpenNote › 有効 でフォルダを選ぶ）")
+            CoreError::wiki(codes::UNAVAILABLE, "ワークスペースのフォルダが未設定です（GUI の 設定 › OpenNote › 有効 でフォルダを選ぶ）")
         })?;
         let home = self.home.as_deref().ok_or_else(|| CoreError::wiki(codes::UNAVAILABLE, "HOME が未設定のためワークスペースのフォルダを検査できません"))?;
+        let raw = root;
         let root = super::check_root(Path::new(root), home, Some(app_dir))?;
-        Ok((index::index_path(app_dir, &root), root))
+        // 履歴の鍵は canonical（rekey 済み）。寄せる前の生の綴りの項目しか無ければそちらを読む
+        let canon_s = root.to_string_lossy();
+        let key = if self.workspaces.contains_key(canon_s.as_ref()) { canon_s.as_ref() } else { raw };
+        let rules = workspaces::rules(&self.workspaces, key);
+        Ok(Ready::new(index::index_path(app_dir, &root), root, rules))
     }
 
     /// ホストのファイルのパス p（絶対か vault 相対）がワークスペースの中の通常のファイルなら canonical なパスを返す（symlink を解いてから
@@ -98,7 +104,7 @@ impl Ctx {
     /// MCP の許可一覧で起動したセッションの import_pdf 等が使う
     pub fn host_path_in_vault(&self, p: &Path) -> Result<PathBuf> {
         use super::paths::Reject;
-        let (_, root) = self.ready()?;
+        let root = self.ready()?.root;
         // vault 相対に `..` は使わせない（wiki の他のコマンドと同じ）。残り（絶対パスの `..`・隠し区画）は canonicalize の後に実体で判定
         let opts = super::paths::Opts { allow_dir: false, judge_by_canonical: true };
         super::paths::resolve_existing(&root, p, opts).map(|(_, canon)| canon).map_err(|r| match r {
@@ -134,15 +140,15 @@ pub fn pin_arg(a: &Value) -> Result<Option<String>> {
     }
 }
 
+/// エージェント向けの手がかり（MCP / CLI の文の末尾。GUI は CoreError::without_hint で外す）
+pub const ROOT_HINT: &str = "root には wiki_status の workspaces の root をそのまま渡す";
+
 /// root が最近のワークスペースの履歴（設定 wiki_workspaces の鍵）と文字列で等しいか。無ければ code unknown_root
 pub fn known_root(m: &workspaces::Map, root: &str) -> Result<()> {
     if m.contains_key(root) {
         Ok(())
     } else {
-        Err(CoreError::wiki(
-            codes::UNKNOWN_ROOT,
-            format!("履歴に無いワークスペースです: {root}（root には wiki_status の workspaces の root をそのまま渡す）"),
-        ))
+        Err(CoreError::wiki(codes::UNKNOWN_ROOT, format!("履歴に無いワークスペースです: {root}")).hint(ROOT_HINT))
     }
 }
 
@@ -173,8 +179,8 @@ fn tag_args(a: &Value) -> Result<Vec<String>> {
 
 /// 索引を鮮度規則で更新してから f（作り直し中ならエラー）
 fn fresh<T>(ctx: &Ctx, mut f: impl FnMut(&mut Index) -> Result<T>) -> Result<T> {
-    let (ip, root) = ctx.ready()?;
-    with_index(&ip, &root, |ix| {
+    let at = ctx.ready()?;
+    with_index(&at, |ix| {
         if let Fresh::Rebuilding(p) = freshen(ctx, ix)? {
             return Err(rebuilding(p));
         }
@@ -212,7 +218,7 @@ pub fn resolve_entry(root: &Path, p: &str, allow_dir: bool) -> Result<(String, P
         Reject::Outside => bad(format!("ワークスペースの外のパスは読めません: {p}")),
         Reject::DotDot | Reject::DotStart(_) => bad(format!("パスに `..`・`.` 始まりの区画・root は使えません: {p}")),
         Reject::Missing(_) => CoreError::NotFound(format!("ワークスペースのファイル {p}")),
-        Reject::Escapes => bad(format!("ワークスペースの外を指しています（symlink）: {p}")),
+        Reject::Escapes => bad(format!("ワークスペースの外を指しています（シンボリックリンク）: {p}")),
         Reject::Root | Reject::Hidden(_) => bad(format!("このパスは読めません: {p}")),
         Reject::NotFile(_) => bad(format!("ファイルではありません: {p}")),
     })
@@ -241,7 +247,7 @@ pub fn status(ctx: &Ctx, _a: &Value) -> Result<Value> {
     // root が使えない（error の枝）・作り直し中の枝でも返す = 履歴が出口になる。current は設定 wiki_root が使えれば canonical と、
     // 使えなければ設定の生の値と比べる（symlink・末尾 `/` の綴りで履歴の current が外れない）
     let ready = ctx.ready();
-    let canon = |r: Option<&(PathBuf, PathBuf)>| r.map(|(_, r)| r.to_string_lossy().into_owned());
+    let canon = |r: Option<&Ready>| r.map(|r| r.root.to_string_lossy().into_owned());
     let current = match &ctx.pinned_from {
         None => canon(ready.as_ref().ok()).or_else(|| ctx.root.clone()),
         Some(set) => {
@@ -250,15 +256,15 @@ pub fn status(ctx: &Ctx, _a: &Value) -> Result<Value> {
         }
     };
     out["workspaces"] = workspaces_json(ctx, current.as_deref());
-    let (ip, root) = match ready {
+    let at = match ready {
         Ok(v) => v,
         Err(e) => {
             out["error"] = json!(e.to_string());
             return Ok(out);
         }
     };
-    out["root"] = json!(root.to_string_lossy());
-    out["index_path"] = json!(ip.to_string_lossy());
+    out["root"] = json!(at.root.to_string_lossy());
+    out["index_path"] = json!(at.index.to_string_lossy());
     // このプロセスで壊れた索引を退避して作り直した（索引が壊れていたので作り直しました）
     if let Some((at, moved)) = index::recovered() {
         out["recovered"] = json!({"at": at, "moved_to": moved, "message": "索引が壊れていたので作り直しました"});
@@ -270,7 +276,7 @@ pub fn status(ctx: &Ctx, _a: &Value) -> Result<Value> {
             return Ok(out);
         }
     }
-    with_index(&ip, &root, |ix| {
+    with_index(&at, |ix| {
         match freshen(ctx, ix)? {
             Fresh::Rebuilding(p) => out["rebuilding"] = json!({"percent": p}),
             Fresh::Ok => out["rebuilding"] = Value::Null,
@@ -318,11 +324,13 @@ pub fn list(ctx: &Ctx, a: &Value) -> Result<Value> {
         limit: limit as usize,
     };
     fresh(ctx, |ix| {
-        let (total, rows) = ix.list(&q)?;
+        // 除外フォルダ（索引から除いたフォルダ = いちばん上の物・prefix の配下だけ）も同じスナップショットで（木が薄い行で出す）
+        let (total, rows, excluded) = ix.list_snapshot(&q)?;
         Ok(json!({
             "total": total,
             "count": rows.len(),
             "pages": rows.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+            "excluded": excluded,
         }))
     })
 }
@@ -334,11 +342,11 @@ pub fn read(ctx: &Ctx, a: &Value) -> Result<Value> {
     if max_chars < 0 {
         return Err(bad("max_chars は 0 以上"));
     }
-    let (ip, root) = ctx.ready()?;
-    let (rel, abs) = resolve_path(&root, &path)?;
+    let at = ctx.ready()?;
+    let (rel, abs) = resolve_path(&at.root, &path)?;
     // 索引のロックの中では表記・行・リンクだけ取る（本文の read・解析・sha は外 = その間に監視・検索・バックリンクを待たせない）。
     // ファイルの書込はもとから索引のロックの外なので、ロックは行と本文の一致を守っていない（中で読んでも同じ窓がある）
-    let (rel, st, title, links) = with_index(&ip, &root, |ix| {
+    let (rel, st, title, links) = with_index(&at, |ix| {
         if let Fresh::Rebuilding(p) = freshen(ctx, ix)? {
             return Err(rebuilding(p));
         }
@@ -538,7 +546,7 @@ pub fn backlinks(ctx: &Ctx, a: &Value) -> Result<Value> {
     if path.is_some() == key.is_some() {
         return Err(bad("wiki_backlinks: path か key のどちらか 1 つを渡してください"));
     }
-    let (_, root) = ctx.ready()?;
+    let root = ctx.ready()?.root;
     // path は read と同じ解決（ワークスペースの中・`..` なし・symlink の先・実在）を通し、索引の表記に揃える。解けなければエラー
     let given = match &path {
         Some(p) => Some(resolve_path(&root, p)?),
@@ -938,8 +946,9 @@ fn read_file(abs: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(abs)
 }
 
-/// read_file と同じ（数え方も）で、先頭 max + 1 バイトまで（長さ > max = 上限を超えている）
-fn read_file_capped(abs: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+/// read_file と同じ（数え方も）で、先頭 max + 1 バイトまで（長さ > max = 上限を超えている）。
+/// 大きさを見た後に増えたファイルを丸ごと読まない（GUI の参照フォルダの html も使う）
+pub fn read_file_capped(abs: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     count_read();
     let mut out = Vec::new();
@@ -993,6 +1002,25 @@ fn link_line<'a>(text: &'a str, kind: Kind, needles: &[String]) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wiki::scan::Rules;
+
+    /// read_file_capped は上限 + 1 バイトまでしか読まない（大きさを見た後に伸びたファイルも丸ごとは読まない = 長さ > 上限で
+    /// 超えたと分かる）。上限以下ならそのまま全部・上限が u64::MAX でも桁あふれしない
+    #[test]
+    fn read_file_capped_reads_at_most_one_past_the_limit() {
+        let dir = std::env::temp_dir().join(format!("openref-capped-{}-{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.html");
+        std::fs::write(&f, b"12345").unwrap();
+        assert_eq!(read_file_capped(&f, 10).unwrap(), b"12345", "上限以下 = 全部");
+        // 大きさを見た（5 バイト）後に 100 バイトへ伸びた
+        std::fs::write(&f, vec![b'x'; 100]).unwrap();
+        assert_eq!(read_file_capped(&f, 10).unwrap().len(), 11, "上限 + 1 まで");
+        assert_eq!(read_file_capped(&f, 99).unwrap().len(), 100);
+        assert_eq!(read_file_capped(&f, 100).unwrap().len(), 100, "ちょうど = 超えていない");
+        assert_eq!(read_file_capped(&f, u64::MAX).unwrap().len(), 100);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// 偽ホームの下に vault と app_dir を作る（drop で消す）
     struct Env {
@@ -1175,7 +1203,7 @@ mod tests {
     #[test]
     fn ready_index_is_per_workspace() {
         let e = env("ready-ix");
-        let (ip, root) = e.ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
         let app = e.ctx.app_dir.clone().unwrap();
         assert_eq!(ip, index::index_path(&app, &root));
         assert_eq!(ip.parent().unwrap(), app.join(index::INDEX_DIR));
@@ -1185,10 +1213,10 @@ mod tests {
         assert!(ip.exists(), "status が索引を作った");
         assert!(!app.join(index::INDEX_FILE).exists());
         // 別の root = 別の索引
-        let other = e.base.join("home/Documents/blog");
+        let other = e.base.join("home/Documents/site");
         std::fs::create_dir_all(&other).unwrap();
         let o = Ctx { root: Some(other.to_string_lossy().into()), ..e.ctx.clone() };
-        assert_ne!(o.ready().unwrap().0, ip);
+        assert_ne!(o.ready().unwrap().index, ip);
     }
 
     /// wiki_status の workspaces: 新しい順・exists = is_dir・current = 設定 wiki_root と文字列が等しい。
@@ -1197,19 +1225,19 @@ mod tests {
     fn status_lists_workspaces() {
         let e = env("ws");
         let cur = e.root.to_string_lossy().to_string();
-        let blog = e.base.join("home/Documents/blog");
-        std::fs::create_dir_all(&blog).unwrap();
-        let blog = blog.to_string_lossy().to_string();
+        let site = e.base.join("home/Documents/site");
+        std::fs::create_dir_all(&site).unwrap();
+        let site = site.to_string_lossy().to_string();
         let gone = e.base.join("home/Documents/gone").to_string_lossy().to_string();
         let raw = json!({
-            cur.clone(): {"last_used": 200, "ref_dirs": ["/kb"]},
-            blog.clone(): {"last_used": 300},
+            cur.clone(): {"last_used": 200, "ref_dirs": ["/notes"]},
+            site.clone(): {"last_used": 300},
             gone.clone(): {"last_used": 100, "future": 1},
         })
         .to_string();
         let ctx = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
         let want = json!([
-            {"root": blog, "last_used": 300, "exists": true, "current": false},
+            {"root": site, "last_used": 300, "exists": true, "current": false},
             {"root": cur, "last_used": 200, "exists": true, "current": true},
             {"root": gone, "last_used": 100, "exists": false, "current": false},
         ]);
@@ -1265,27 +1293,27 @@ mod tests {
     fn pin_accepts_only_history_keys() {
         let e = env("pin");
         let cur = e.root.to_string_lossy().to_string();
-        let blog = e.base.join("home/Documents/blog");
-        std::fs::create_dir_all(&blog).unwrap();
-        let blog_s = blog.to_string_lossy().to_string();
-        let link = e.base.join("home/Documents/blog-link");
-        std::os::unix::fs::symlink(&blog, &link).unwrap();
-        let raw = json!({cur.clone(): {"last_used": 2}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let site = e.base.join("home/Documents/site");
+        std::fs::create_dir_all(&site).unwrap();
+        let site_s = site.to_string_lossy().to_string();
+        let link = e.base.join("home/Documents/site-link");
+        std::os::unix::fs::symlink(&site, &link).unwrap();
+        let raw = json!({cur.clone(): {"last_used": 2}, site_s.clone(): {"last_used": 1}}).to_string();
         let base = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
         assert_eq!(base.setting_root(), Some(cur.as_str()));
         let code = |r: Result<()>| match r {
-            Err(CoreError::Wiki { code, .. }) => code,
+            Err(e) => e.code().unwrap_or_else(|| panic!("{e:?}")),
             other => panic!("{other:?}"),
         };
-        for bad_root in [String::new(), " ".into(), link.to_string_lossy().to_string(), format!("{blog_s}/"), "/nope".into(), format!(" {blog_s}")] {
+        for bad_root in [String::new(), " ".into(), link.to_string_lossy().to_string(), format!("{site_s}/"), "/nope".into(), format!(" {site_s}")] {
             let mut c = base.clone();
             assert_eq!(code(c.pin(&bad_root)), codes::UNKNOWN_ROOT, "{bad_root:?}");
             assert_eq!(c.root.as_deref(), Some(cur.as_str()), "拒否したら root は変えない: {bad_root:?}");
             assert_eq!(c.pinned_from, None);
         }
         let mut c = base.clone();
-        c.pin(&blog_s).unwrap();
-        assert_eq!(c.root.as_deref(), Some(blog_s.as_str()));
+        c.pin(&site_s).unwrap();
+        assert_eq!(c.root.as_deref(), Some(site_s.as_str()));
         assert_eq!(c.setting_root(), Some(cur.as_str()), "設定の root は覚えておく");
         // 2 度目の pin（現在の root へ）でも設定の root は最初の値のまま
         c.pin(&cur).unwrap();
@@ -1296,6 +1324,9 @@ mod tests {
         assert_eq!(code(empty.pin(&cur)), codes::UNKNOWN_ROOT);
         let msg = e.ctx.clone().pin("/nope").unwrap_err().to_string();
         assert!(msg.starts_with("履歴に無いワークスペースです: /nope"), "{msg}");
+        // MCP / CLI の文は手がかりまで（前と同じ字）・GUI の文（without_hint）は手がかりを含まない
+        assert_eq!(msg, format!("履歴に無いワークスペースです: /nope（{ROOT_HINT}）"));
+        assert_eq!(e.ctx.clone().pin("/nope").unwrap_err().without_hint().to_string(), "履歴に無いワークスペースです: /nope");
     }
 
     /// 固定した root の ready() はその root の索引・status の root / index_path / 件数はその root の物・workspaces[].current は
@@ -1304,50 +1335,50 @@ mod tests {
     fn pinned_ctx_reads_that_root_and_status_current_stays() {
         let e = env("pin-ready");
         let cur = e.root.to_string_lossy().to_string();
-        let blog = e.base.join("home/Documents/blog");
-        std::fs::create_dir_all(&blog).unwrap();
-        let blog_s = blog.to_string_lossy().to_string();
-        put(&e.root, "kb.md", "# KB\n");
-        put(&blog, "post.md", "# Post\n");
-        put(&blog, "draft.md", "# Draft\n");
-        let raw = json!({cur.clone(): {"last_used": 2}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let site = e.base.join("home/Documents/site");
+        std::fs::create_dir_all(&site).unwrap();
+        let site_s = site.to_string_lossy().to_string();
+        put(&e.root, "notes.md", "# Notes\n");
+        put(&site, "post.md", "# Post\n");
+        put(&site, "draft.md", "# Draft\n");
+        let raw = json!({cur.clone(): {"last_used": 2}, site_s.clone(): {"last_used": 1}}).to_string();
         let base = Ctx { workspaces: workspaces::parse(Some(&raw)).unwrap(), ..e.ctx.clone() };
         let app = base.app_dir.clone().unwrap();
         let mut pinned = base.clone();
-        pinned.pin(&blog_s).unwrap();
-        let (ip, root) = pinned.ready().unwrap();
-        assert_eq!((ip.clone(), root.clone()), (index::index_path(&app, &blog), blog.clone()));
-        assert_ne!(ip, base.ready().unwrap().0);
+        pinned.pin(&site_s).unwrap();
+        let Ready { index: ip, root, .. } = pinned.ready().unwrap();
+        assert_eq!((ip.clone(), root.clone()), (index::index_path(&app, &site), site.clone()));
+        assert_ne!(ip, base.ready().unwrap().index);
         let st = status(&pinned, &json!({})).unwrap();
-        assert_eq!(st["root"], json!(blog_s));
+        assert_eq!(st["root"], json!(site_s));
         assert_eq!(st["index_path"], json!(ip.to_string_lossy()));
         assert_eq!(st["pages"], json!(2), "{st}");
         let cur_of = |st: &Value| -> Vec<(String, bool)> {
             st["workspaces"].as_array().unwrap().iter().map(|w| (w["root"].as_str().unwrap().to_string(), w["current"] == json!(true))).collect()
         };
-        assert_eq!(cur_of(&st), vec![(cur.clone(), true), (blog_s.clone(), false)], "current は設定 wiki_root");
+        assert_eq!(cur_of(&st), vec![(cur.clone(), true), (site_s.clone(), false)], "current は設定 wiki_root");
         let paths = |c: &Ctx| -> Vec<String> {
             list(c, &json!({})).unwrap()["pages"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap().to_string()).collect()
         };
         assert_eq!(paths(&pinned), vec!["draft.md".to_string(), "post.md".into()]);
-        assert_eq!(paths(&base), vec!["kb.md".to_string()], "固定しなければ設定の root");
+        assert_eq!(paths(&base), vec!["notes.md".to_string()], "固定しなければ設定の root");
         // 設定の root が symlink の綴り = current は canonical で照合
-        let link = e.base.join("home/Documents/kb-link");
+        let link = e.base.join("home/Documents/notes-link");
         std::os::unix::fs::symlink(&e.root, &link).unwrap();
         let mut spelled = Ctx { root: Some(link.to_string_lossy().into()), ..base.clone() };
-        spelled.pin(&blog_s).unwrap();
-        assert_eq!(cur_of(&status(&spelled, &json!({})).unwrap()), vec![(cur.clone(), true), (blog_s.clone(), false)]);
+        spelled.pin(&site_s).unwrap();
+        assert_eq!(cur_of(&status(&spelled, &json!({})).unwrap()), vec![(cur.clone(), true), (site_s.clone(), false)]);
         // 設定の root が消えた（使えない）= 生の値と比べる・固定した root は読める
         let gone = e.base.join("home/Documents/gone").to_string_lossy().to_string();
-        let raw2 = json!({gone.clone(): {"last_used": 3}, blog_s.clone(): {"last_used": 1}}).to_string();
+        let raw2 = json!({gone.clone(): {"last_used": 3}, site_s.clone(): {"last_used": 1}}).to_string();
         let mut lost = Ctx { root: Some(gone.clone()), workspaces: workspaces::parse(Some(&raw2)).unwrap(), ..base.clone() };
-        lost.pin(&blog_s).unwrap();
+        lost.pin(&site_s).unwrap();
         let st = status(&lost, &json!({})).unwrap();
         assert!(st.get("error").is_none(), "{st}");
-        assert_eq!(cur_of(&st), vec![(gone.clone(), true), (blog_s.clone(), false)]);
+        assert_eq!(cur_of(&st), vec![(gone.clone(), true), (site_s.clone(), false)]);
         // 無効 = {enabled, root} だけ（root は固定した root）
         let off = Ctx { enabled: false, ..pinned.clone() };
-        assert_eq!(status(&off, &json!({})).unwrap(), json!({"enabled": false, "root": blog_s}));
+        assert_eq!(status(&off, &json!({})).unwrap(), json!({"enabled": false, "root": site_s}));
     }
 
     /// from_db_pinned: 引数 root が無い・null = 設定の root・文字列 = pin（空も unknown_root）・他の型 = BadInput
@@ -1364,7 +1395,7 @@ mod tests {
         assert_eq!((c.root.as_deref(), c.setting_root()), (Some("/v/b"), Some("/v/a")));
         for r in ["", "/v/c", "/v/b/"] {
             match Ctx::from_db_pinned(&db, &json!({"root": r})) {
-                Err(CoreError::Wiki { code, .. }) => assert_eq!(code, codes::UNKNOWN_ROOT, "{r:?}"),
+                Err(e) => assert_eq!(e.code(), Some(codes::UNKNOWN_ROOT), "{r:?}"),
                 other => panic!("{r:?}: {other:?}"),
             }
         }
@@ -1475,8 +1506,8 @@ mod tests {
     fn freshness_and_refresh_paths() {
         let e = env("fresh");
         put(&e.root, "a.md", "[[b]]");
-        let (ip, root) = e.ctx.ready().unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         assert_eq!(ix.refresh_if_stale().unwrap(), Fresh::Ok);
         assert_eq!(ix.unresolved(10).unwrap().len(), 1);
         // 5 秒以内は走査しない → 新しいファイルは見えない。refresh_paths で取り込む
@@ -1496,18 +1527,18 @@ mod tests {
         assert_eq!(n(&ix), before);
     }
 
-    /// A-16: GUI が監視中（ctx.watched）なら入口の鮮度規則の stat 走査を省く（5 秒を過ぎても新しいファイルは見えない = 取り込むのは監視）。
+    /// GUI が監視中（ctx.watched）なら入口の鮮度規則の stat 走査を省く（5 秒を過ぎても新しいファイルは見えない = 取り込むのは監視）。
     /// 作り直しの旗があれば今どおり（他の生きたプロセスの旗 = REBUILDING）。監視なし（watched = false）なら stat 走査が再開する
     #[test]
     fn watched_skips_stale_scan_unless_flag() {
         let e = env("watched");
         put(&e.root, "a.md", "x");
-        let (ip, root) = e.ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
         let total = |ctx: &Ctx| list(ctx, &json!({})).unwrap()["total"].as_u64().unwrap();
         assert_eq!(total(&e.ctx), 1);
         let w = Ctx { watched: true, ..e.ctx.clone() };
         put(&e.root, "b.md", "[[a]]");
-        let sql = |q: String| with_index(&ip, &root, |ix| Ok(ix.conn_for_test().execute_batch(&q)?)).unwrap();
+        let sql = |q: String| with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.conn_for_test().execute_batch(&q)?)).unwrap();
         // 最終走査を古くする（5 秒の鮮度規則なら走査する状態）
         let age = || sql("UPDATE meta SET value = '0' WHERE key = 'last_scan'".into());
         age();
@@ -1516,7 +1547,7 @@ mod tests {
         assert_eq!(backlinks(&w, &json!({"path": "a.md"})).unwrap()["total"], 0);
         assert_eq!(tags(&w, &json!({})).unwrap()["total"], 0);
         assert_eq!(read(&w, &json!({"path": "a.md"})).unwrap()["content"], "x");
-        let last = || with_index(&ip, &root, |ix| ix.meta("last_scan")).unwrap();
+        let last = || with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.meta("last_scan")).unwrap();
         assert_eq!(last().as_deref(), Some("0"), "走査していない");
         // 旗（他の生きたプロセス = pid 1）があれば今どおり = 作り直し中
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -1539,7 +1570,7 @@ mod tests {
         assert_eq!(backlinks(&e.ctx, &json!({"path": "a.md"})).unwrap()["total"], 3);
     }
 
-    /// I1: backlinks の抜粋はリンクの形で当てる（needle を含むだけの行・コードブロックの中は選ばない）。md = 抽出器と同じ規則・
+    /// backlinks の抜粋はリンクの形で当てる（needle を含むだけの行・コードブロックの中は選ばない）。md = 抽出器と同じ規則・
     /// item の鍵は openref:// の key・html は属性の値。形で見つからない（frontmatter の items 等）ときは needle を含む最初の行（従来）
     #[test]
     fn backlinks_excerpt_matches_link_form() {
@@ -1568,7 +1599,7 @@ mod tests {
         assert_eq!(keys, ["excerpt", "kind", "link_kinds", "path", "title"]);
     }
 
-    /// I2: read は stat（索引の行）の後に上限を超えて増えたファイルを丸ごと読まない = 上限 + 1 バイトまで読んで、超えていれば
+    /// read は stat（索引の行）の後に上限を超えて増えたファイルを丸ごと読まない = 上限 + 1 バイトまで読んで、超えていれば
     /// stat で超えていたときと同じエラー。上限以下で増えた分は読む（従来と同じ）
     #[test]
     fn read_caps_file_grown_after_stat() {
@@ -1608,11 +1639,11 @@ mod tests {
         let total = |ctx: &Ctx| list(ctx, &json!({})).unwrap()["total"].as_u64().unwrap();
         assert_eq!(total(&e.ctx), 2);
         assert_eq!(total(&w), 2);
-        let (ip, root) = e.ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
         // プロセスの接続を外す（別の索引を開く = 握っている接続が閉じる）→ 索引にゴミを書く
         let other = e.base.join("home/other-app/wiki-index.sqlite");
         std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-        with_index(&other, &root, |_| Ok(())).unwrap();
+        with_index(&Ready::new(&other, &root, Rules::default()), |_| Ok(())).unwrap();
         for s in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{s}", ip.display()));
         }
@@ -1622,7 +1653,7 @@ mod tests {
         assert!(index::recovered().is_some());
         // 走査の後（last_scan あり）は省く
         put(&e.root, "c.md", "z");
-        with_index(&ip, &root, |ix| Ok(ix.conn_for_test().execute("UPDATE meta SET value = '0' WHERE key = 'last_scan'", [])?)).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.conn_for_test().execute("UPDATE meta SET value = '0' WHERE key = 'last_scan'", [])?)).unwrap();
         assert_eq!(total(&w), 2);
         assert_eq!(total(&e.ctx), 3);
     }
@@ -1631,8 +1662,8 @@ mod tests {
     fn foreign_rebuild_flag_and_root_change() {
         let e = env("flag");
         put(&e.root, "a.md", "x");
-        let (ip, root) = e.ctx.ready().unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         // 他の生きたプロセスの旗（pid 1 = launchd・kill(1, 0) は EPERM = 生きている）→ 待たずに作り直し中を返す
@@ -1662,7 +1693,7 @@ mod tests {
         // root が変われば捨てる
         let other = e.base.join("home/Documents/other");
         std::fs::create_dir_all(&other).unwrap();
-        let ix2 = Index::open(&ip, &std::fs::canonicalize(&other).unwrap()).unwrap();
+        let ix2 = Index::open(&Ready::new(&ip, std::fs::canonicalize(&other).unwrap(), Rules::default())).unwrap();
         assert_eq!(ix2.stats().unwrap()["pages"], 0);
         assert_eq!(ix2.meta("last_scan").unwrap(), None);
     }
@@ -1671,12 +1702,12 @@ mod tests {
     fn schema_version_change_rebuilds_tables() {
         let e = env("schema");
         put(&e.root, "a.md", "x");
-        let (ip, root) = e.ctx.ready().unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         ix.conn_for_test().execute("UPDATE meta SET value = '0' WHERE key = 'schema'", []).unwrap();
         drop(ix);
-        let ix = Index::open(&ip, &root).unwrap();
+        let ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         assert_eq!(ix.stats().unwrap()["pages"], 0, "版が違えば作り直す");
         assert_eq!(ix.meta("schema").unwrap().as_deref(), Some(index::SCHEMA_VERSION));
     }
@@ -1710,8 +1741,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let e = env("locked");
         put(&e.root, "a.md", "x");
-        let (ip, root) = e.ctx.ready().unwrap();
-        let mut ix = Index::open(&ip, &root).unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
+        let mut ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         ix.refresh().unwrap();
         std::fs::set_permissions(&e.root, std::fs::Permissions::from_mode(0o000)).unwrap();
         let r = ix.refresh();
@@ -1778,15 +1809,15 @@ mod tests {
         assert_eq!(t["total"], 4);
         assert_eq!(tags(&e.ctx, &json!({"limit": 1})).unwrap()["count"], 1);
         // 更新と削除: refresh_paths で全文検索も追随する（古い語は引けず・新しい語は引ける）
-        let (ip, root) = e.ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
         put(&e.root, "notes/gbm.md", "# GBM\n\nastrocytoma だけ\n");
         std::fs::remove_file(e.root.join("notes/misc.md")).unwrap();
-        with_index(&ip, &root, |ix| ix.refresh_paths(&["notes/gbm.md", "notes/misc.md"])).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.refresh_paths(&["notes/gbm.md", "notes/misc.md"])).unwrap();
         assert_eq!(paths(&s(json!({"query": "glioblastoma"}))), ["img/glioblastoma.png", "notes/glioma.md"]);
         assert_eq!(paths(&s(json!({"query": "astrocytoma"}))), ["notes/gbm.md"]);
         assert_eq!(paths(&s(json!({"query": "胆道"}))), ["notes/biliary.md"]);
         // 作り直しても同じ結果
-        with_index(&ip, &root, |ix| ix.rebuild()).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.rebuild()).unwrap();
         assert_eq!(paths(&s(json!({"query": "astrocytoma"}))), ["notes/gbm.md"]);
     }
 
@@ -1841,7 +1872,7 @@ mod tests {
         assert_eq!(m("**胆道**の", &["胆道"]), "\u{e000}胆道\u{e001}の", "強調の中の一致も印がずれない");
     }
 
-    /// 本文・抜粋の read は索引のロック（with_index）の外（A-13・A-14）。中では行とリンクだけ取る
+    /// 本文・抜粋の read は索引のロック（with_index）の外。中では行とリンクだけ取る
     #[test]
     fn body_reads_are_outside_index_lock() {
         let e = env("lockfree");
@@ -1915,8 +1946,8 @@ mod tests {
         put(&e.root, "ingest/.DS_Store", "x");
         put(&e.root, "ingest/.hidden/x.pdf", "%PDF");
         put(&e.root, "notes/ingest/b.md", "# not inbox");
-        let (ip, root) = e.ctx.ready().unwrap();
-        with_index(&ip, &root, |ix| ix.refresh()).unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.refresh()).unwrap();
         let r = inbox(&e.ctx, &json!({})).unwrap();
         assert_eq!(r["count"], 2, "{r}");
         assert_eq!(r["files"][0], json!({"path": "ingest/a.png", "name": "a.png", "kind": "media", "media": "image", "size": 5, "mtime": r["files"][0]["mtime"]}));
@@ -1926,9 +1957,9 @@ mod tests {
         assert_eq!(status(&e.ctx, &json!({})).unwrap()["inbox"], 2);
         // dir = chat-log（チャットの記録）は別の箱。ingest/ は数えない。それ以外の dir は拒否
         put(&e.root, "chat-log/2026-11-01 1200 x.md", "# log");
-        with_index(&ip, &root, |ix| ix.refresh()).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.refresh()).unwrap();
         put(&e.root, "chat-log/2026-11-02 0900 y.md", "# log 2");
-        with_index(&ip, &root, |ix| ix.refresh()).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.refresh()).unwrap();
         let r = inbox(&e.ctx, &json!({"dir": "chat-log", "limit": 1})).unwrap();
         assert_eq!((r["dir"].as_str(), r["total"].as_u64(), r["count"].as_u64()), (Some("chat-log/"), Some(2), Some(1)), "{r}");
         assert_eq!(r["files"][0]["path"], "chat-log/2026-11-02 0900 y.md", "新しい順・limit で古い方が落ちる");
@@ -1946,20 +1977,20 @@ mod tests {
             return;
         };
         let ctx = Ctx { enabled: true, root: Some(root), app_dir: Some(PathBuf::from(&app)), home: std::env::var_os("HOME").map(PathBuf::from), watched: false, ..Default::default() };
-        let (ip, root) = ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = ctx.ready().unwrap();
         let size = |ip: &Path| -> u64 {
             ["", "-wal", "-shm"].iter().filter_map(|s| std::fs::metadata(format!("{}{s}", ip.display())).ok()).map(|m| m.len()).sum()
         };
         index::remove_index(&ip).unwrap();
         let t = std::time::Instant::now();
-        with_index(&ip, &root, |ix| ix.refresh()).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.refresh()).unwrap();
         let first = t.elapsed();
         let t = std::time::Instant::now();
-        with_index(&ip, &root, |ix| ix.rebuild()).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| ix.rebuild()).unwrap();
         let rebuild = t.elapsed();
-        with_index(&ip, &root, |ix| Ok(ix.conn_for_test().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?)).unwrap();
+        with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.conn_for_test().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?)).unwrap();
         let main_size = std::fs::metadata(&ip).unwrap().len();
-        let fts_pages: i64 = with_index(&ip, &root, |ix| Ok(ix.conn_for_test().query_row("SELECT count(*) FROM pages", [], |r| r.get(0))?)).unwrap();
+        let fts_pages: i64 = with_index(&Ready::new(&ip, &root, Rules::default()), |ix| Ok(ix.conn_for_test().query_row("SELECT count(*) FROM pages", [], |r| r.get(0))?)).unwrap();
         eprintln!("BENCH pages={fts_pages} first_scan={first:?} rebuild={rebuild:?} index_file={}MB (with wal/shm {}MB)", main_size / 1_048_576, size(&ip) / 1_048_576);
         let qs = ["胆道", "PI-RADS", "glioblastoma", "肝細胞癌", "MRI", "拡散強調像", "meningioma", "造影 CT", "dural tail", "小児"];
         let mut all = Vec::new();
@@ -2001,7 +2032,7 @@ mod tests {
             return;
         };
         let r = (|| -> Result<String> {
-            let mut ix = Index::open(Path::new(&ip), Path::new(&root))?;
+            let mut ix = Index::open(&Ready::new(Path::new(&ip), Path::new(&root), Rules::default()))?;
             let f = if mode == "rebuild" { ix.rebuild()? } else { ix.refresh_if_stale()? };
             let pages = ix.stats()?["pages"].clone();
             Ok(format!("{f:?} pages={pages}"))
@@ -2019,7 +2050,7 @@ mod tests {
         for i in 0..3000 {
             put(&e.root, &format!("d{}/p{i}.md", i % 30), &format!("# P{i}\n[[p{}]] [[missing{i}]] #t{}\n", i + 1, i % 7));
         }
-        let (ip, root) = e.ctx.ready().unwrap();
+        let Ready { index: ip, root, .. } = e.ctx.ready().unwrap();
         let exe = std::env::current_exe().unwrap();
         let spawn = |mode: &str| {
             std::process::Command::new(&exe)
@@ -2052,7 +2083,7 @@ mod tests {
         assert!(r2.iter().all(|l| l.starts_with("RESULT ok")), "{r2:#?}");
         assert!(r2[0].contains("Ok pages=3000"), "{r2:#?}");
         eprintln!("multi_process: {r1:?} / {r2:?}");
-        let ix = Index::open(&ip, &root).unwrap();
+        let ix = Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         assert_eq!(ix.stats().unwrap()["pages"], 3000);
         assert_eq!(ix.meta("rebuilding").unwrap(), None, "旗は残らない");
     }

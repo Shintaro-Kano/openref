@@ -96,7 +96,7 @@ export interface Heading {
 
 export interface FinishResult {
   headings: Heading[];
-  /** `![[ページ]]` の置き場（MdView が readPage で 1 段だけ埋める） */
+  /** `![[ページ]]` の置き場（ShadowPage が readPage で 1 段だけ埋める） */
   pageEmbeds: { el: HTMLElement; path: string; heading: string | null }[];
 }
 
@@ -202,7 +202,7 @@ function setNav(el: Element, nav: Nav) {
   el.classList.add(`wk-l-${nav.t}`);
 }
 
-/** 書き換えた後の `<a>` から遷移先を読む（MdView / HtmlView のクリックの横取り） */
+/** 書き換えた後の `<a>` から遷移先を読む（ShadowPage のクリックの横取り） */
 export function navOf(el: Element): Nav {
   const p = el.getAttribute("data-wk-path");
   if (p) return { t: "page", path: p, heading: el.getAttribute("data-wk-heading") };
@@ -538,33 +538,4 @@ export function anchorTarget(root: ShadowRoot | DocumentFragment | Element, id: 
   const byId = "getElementById" in root ? (root as ShadowRoot).getElementById(id) : (root as Element).querySelector(`[id="${CSS.escape(id)}"]`);
   if (byId) return byId;
   return findHeading(headingsOf(Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"))), id)?.el ?? null;
-}
-
-/** md の描画で拾ったリンク（node test が core の fixture と比べる）: 出現順の (kind, target) */
-export function collectLinks(frag: DocumentFragment | Element): { kind: string; target: string }[] {
-  const out: { kind: string; target: string }[] = [];
-  const els = frag.querySelectorAll("[data-wk-href], [data-wk-src], .wk-embed, .wk-embed-link, .wk-embed-page-title, .wk-media");
-  for (const el of Array.from(els)) {
-    const wiki = el.getAttribute("data-wk-href");
-    if (el.classList.contains("wk-embed-page-title") || el.classList.contains("wk-embed-link") || el.classList.contains("wk-media") || el.classList.contains("wk-embed")) {
-      const t = el.getAttribute("data-wk-target") ?? el.getAttribute("data-wk-embed");
-      if (t) out.push({ kind: "embed", target: t });
-      continue;
-    }
-    if (wiki != null) {
-      if (wiki.startsWith("[[") && wiki.endsWith("]]")) out.push({ kind: "wiki", target: wiki.slice(2, -2) });
-      else {
-        const s = schemeOf(wiki);
-        if (wiki.startsWith("#") || !wiki.trim()) continue;
-        out.push({ kind: s === "openref" ? "openref" : s === "file" ? "file" : s ? "external" : "md", target: wiki });
-      }
-      continue;
-    }
-    const src = el.getAttribute("data-wk-src");
-    if (src != null) {
-      const s = schemeOf(src);
-      out.push({ kind: s === "file" ? "file" : s ? "external" : "md", target: src });
-    }
-  }
-  return out;
 }

@@ -2,7 +2,7 @@ mod crossref;
 mod isho;
 mod pubmed;
 
-pub use crossref::{search_bibliographic, Candidate};
+pub use crossref::{parse_candidates, search_bibliographic, Candidate};
 pub(crate) use crossref::with_crossref_gate;
 
 use crate::{CoreError, Result};
@@ -18,14 +18,14 @@ pub enum AddInput {
 pub struct Resolved {
     pub csl: Value,
     pub retracted: Option<String>,
-    /// 書誌の取得元（resolver = pubmed / doi.org / isho-ris。resolver の外で作るものは connector・capture・pdf-import 等）
+    /// 書誌の取得元（resolver = pubmed / doi.org / isho-ris。resolver の外で作るものは capture・pdf-import 等。旧版で保存した item には connector が残る）
     pub source: &'static str,
     /// 書誌は取れたが経路に欠けがあった（普段は空）。今は「DOI → PubMed の照合が失敗して doi.org で代用した」だけ
     /// = PMID・抄録・MeSH・撤回を見ていない。入口（MCP・CLI・GUI・connectd・PDF 取込）が利用者へ出す
     pub warnings: Vec<String>,
 }
 
-/// PMID / DOI / PubMed URL / doi.org URL を解釈する。
+/// PMID / DOI / PubMed URL / doi.org URL を解釈する。前置き `PMID:` / `pmid:` と `doi:`（大小を問わない）を外す。
 /// 誌面 URL の meta タグ抽出と title 検索は未対応（誠実にエラーで案内）。
 pub fn parse_input(raw: &str) -> Result<AddInput> {
     let t = raw.trim();
@@ -43,6 +43,13 @@ pub fn parse_input(raw: &str) -> Result<AddInput> {
     }
     if t.starts_with("10.") && t.contains('/') {
         return Ok(AddInput::Doi(t.to_string()));
+    }
+    // `doi:` の前置き（大小を問わない = `model::DOI_PREFIXES` と揃える）。後ろの DOI の大小は変えない（素の DOI と同じ）
+    if t.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("doi:")) {
+        let rest = t[4..].trim();
+        if rest.starts_with("10.") && rest.contains('/') {
+            return Ok(AddInput::Doi(rest.to_string()));
+        }
     }
     if t.starts_with("http://") || t.starts_with("https://") {
         let no_scheme = t.splitn(2, "://").nth(1).unwrap_or("");
@@ -126,8 +133,9 @@ fn resolve_with(net: &Sources, input: &AddInput) -> Result<Resolved> {
     }
 }
 
-/// 通信の失敗を利用者向けの短い理由にする（ureq のエラー文 = 「<what>: <URL>: status code N」「<what>: <URL>: Connection Failed: …」）
-fn short_reason(e: &CoreError) -> String {
+/// 通信の失敗を利用者向けの短い理由にする（ureq のエラー文 = 「<what>: <URL>: status code N」「<what>: <URL>: Connection Failed: …」）。
+/// connectd の `/capture/save` も Crossref 検索の失敗の理由（要確認の import_note）に使う
+pub fn short_reason(e: &CoreError) -> String {
     let CoreError::Http(m) = e else {
         return match e {
             CoreError::Json(_) | CoreError::Parse(_) => "応答を読めない".into(),
@@ -176,6 +184,14 @@ mod tests {
             parse_input("https://doi.org/10.1148/rg.230216").unwrap(),
             AddInput::Doi("10.1148/rg.230216".into())
         );
+        // `doi:` の前置き（大小・空白を問わない・後ろの DOI の大小は保つ = 素の DOI と同じ）
+        for raw in ["doi:10.1148/rg.230216", "DOI: 10.1148/rg.230216", " Doi:10.1148/rg.230216 "] {
+            assert_eq!(parse_input(raw).unwrap(), AddInput::Doi("10.1148/rg.230216".into()), "{raw:?}");
+        }
+        assert_eq!(parse_input("doi:10.1148/RG.230216").unwrap(), AddInput::Doi("10.1148/RG.230216".into()));
+        for raw in ["doi:", "doi: hello", "doi:10.1148", "doi:36804602", "ドイ:10.1/x"] {
+            assert!(parse_input(raw).is_err(), "{raw:?}");
+        }
         assert!(parse_input("hello world").is_err());
         // 誌面 URL は未対応（doi.org を含まない URL）
         assert!(parse_input("https://www.ajronline.org/doi/10.2214/AJR.24.31234").is_err());

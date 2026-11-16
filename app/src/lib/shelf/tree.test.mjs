@@ -1,6 +1,6 @@
 /* 本棚の純関数（node app/src/lib/shelf/tree.test.mjs・Node 22.18+ の type stripping）。dir・上限つきの設定を含む */
 import assert from "node:assert/strict";
-import { ASSET_MAX, breadcrumbOf, collectBooks, dirOf, filterBooks, fmtSize, hueOf, indexDirs, indexFolders, indexParents, norm, pushPos, pushRecent, rangeParts, repBooks, searchTerms, sortBooks } from "./tree.ts";
+import { ASSET_MAX, breadcrumbOf, collectBooks, dirOf, filterBooks, fmtSize, hideRootParents, hueOf, indexDirs, indexFolders, indexParents, norm, pushPos, pushRecent, rangeParts, repBooks, searchTerms, sortBooks } from "./tree.ts";
 
 const book = (id, title, folder, size = 1, mtime = 1) => ({ id, title, folder, path: `/r/${id}.pdf`, size, mtime });
 const fld = (id, path, name, books = [], children = []) => ({ id, name, path, books, children, totalBooks: books.length + children.reduce((n, c) => n + c.totalBooks, 0) });
@@ -85,5 +85,28 @@ assert.equal(fmtSize(5 << 20), "5 MB");
 assert.equal(fmtSize(100), "1 KB");
 assert.equal(hueOf("題名"), hueOf("題名"));
 assert.ok(hueOf("題名") >= 0 && hueOf("題名") < 360);
+
+// 失敗の文の root → フォルダ名（Rust の殻 shelf_gui::hide_roots と同じ表 = 2 つの綴りの行を除く）。理由の文（/ を含む物も）は欠けない。
+// 二重に畳んでも同じ字（Rust が畳んだ文を画面がもう 1 度通す）
+{
+  const cloud = "iCloud Drive / CloudStorage の最上位です。その中のフォルダを選んでください";
+  for (const [msg, root, want] of [
+    ["本棚のフォルダに /Users/me/本棚 は使えません（見つかりません）", "/Users/me/本棚", "本棚のフォルダに 本棚 は使えません（見つかりません）"],
+    ["履歴に無い本棚です: /Users/me/books/（root には shelf_status の root をそのまま渡す）", "/Users/me/books/", "履歴に無い本棚です: books（root には shelf_status の root をそのまま渡す）"],
+    ["本棚のフォルダに /Users/me/My Books 本の棚 は使えません（見つかりません）", "/Users/me/My Books 本の棚", "本棚のフォルダに My Books 本の棚 は使えません（見つかりません）"],
+    ["x /Users/me/A／B∕C y", "/Users/me/A／B∕C", "x A／B∕C y"],
+    ["/Users/me/b と /Users/me/b", "/Users/me/b", "b と b"],
+    ["本棚 b を読めません: Permission denied", "/Users/me/b", "本棚 b を読めません: Permission denied"],
+    ["本棚のフォルダに /x は使えません（見つかりません）", "", "本棚のフォルダに /x は使えません（見つかりません）"],
+    [`本棚のフォルダに / は使えません（${cloud}）`, "/", `本棚のフォルダに / は使えません（${cloud}）`],
+    [`本棚のフォルダに /Users/me/Library/CloudStorage は使えません（${cloud}）`, "/Users/me/Library/CloudStorage", `本棚のフォルダに CloudStorage は使えません（${cloud}）`],
+    ["本棚のフォルダに /Users/me/Library/CloudStorage/GoogleDrive-user@example.com/マイドライブ/本 は使えません（見つかりません）",
+      "/Users/me/Library/CloudStorage/GoogleDrive-user@example.com/マイドライブ/本", "本棚のフォルダに 本 は使えません（見つかりません）"],
+    ["/Users/me/books2/x.pdf", "/Users/me/books", "books2/x.pdf"],
+  ]) {
+    assert.equal(hideRootParents(msg, root), want, `${msg} / ${root}`);
+    assert.equal(hideRootParents(want, root), want, `二重に畳むと変わる: ${want}`);
+  }
+}
 
 console.log("shelf tree: ok");

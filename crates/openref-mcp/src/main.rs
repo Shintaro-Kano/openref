@@ -548,6 +548,7 @@ const SCHEMA_NOTES: &str = "\
 - `PRAGMA data_version` は他の接続の書込で増える（app はこれを 2 秒ごとに見て一覧を読み直す = call の書込はすぐ画面に出る）。
 - sql の PRAGMA は値なしの読み（`PRAGMA user_version` 等）と表の情報（table_info・table_xinfo・table_list・index_list・index_info・index_xinfo・foreign_key_list・integrity_check・quick_check）だけ。表の情報は `SELECT * FROM pragma_table_info('items')` の形でも読める（JOIN・WHERE に使える）。
 - OpenNote（OpenRef のページ機能・任意・既定は無効。コマンドは `wiki_*`）: ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。正はディスクのファイルで、索引 `<app_dir>/wiki-index/<hash>.sqlite`（ワークスペースごと）は再生成できるキャッシュ（sql からは見えない）。読むのは call の `wiki_status` / `wiki_list` / `wiki_read`（画像は画像そのもの・PDF は抽出テキスト）/ `wiki_backlinks` / `wiki_search`（題名 + 本文の全文検索・和文可・tag の AND 絞込）/ `wiki_tags` / `wiki_inbox`（`ingest/` に置かれた素材の一覧）、書くのは `wiki_write`（md / html）/ `wiki_move`（パスはワークスペース相対）。`wiki_write` で既存を上書きすると上書き前を `<app_dir>/wiki-history/<16 桁>/<unix 秒>.<拡張子>` に退避して応答の `backup` に返す（ファイルごとに新しい 10 世代・同じフォルダの `path.txt` が元のファイルの絶対パス）= 戻すときはその中身を `wiki_write` で書き戻す。有効化は GUI だけ（Settings › OpenNote・フォルダは左の木のワークスペース名のメニュー）。最近のワークスペースは `wiki_status` の `workspaces`（settings の `wiki_workspaces`・切替は GUI だけ）。settings の `wiki_enabled`（\"1\" = 有効）`wiki_root`（ワークスペースの絶対パス）。ページから item へのリンクは `[題名](openref://open?key=KEY)`（KEY は実在の key だけ・`wiki_backlinks` の key で逆に引ける）。
+- OpenNote の除外フォルダ: `node_modules` と、規格の署名つきの `CACHEDIR.TAG` を持つフォルダ（Rust の target/ 等のビルド生成物）は既定で索引に入らない（`wiki_list` / `wiki_search` / `wiki_backlinks` に出ない・中を指すリンクは未解決・中へは `wiki_write` / `wiki_move` できない・`wiki_read` は明示のパスなら読める）。一覧は `wiki_list` の `excluded`（ワークスペース相対）。フォルダごとに除く / 入れ直すのは GUI だけ（左の木の右クリック = settings の `wiki_workspaces` の `exclude` / `include`）。
 - OpenNote のワークスペースの固定: `wiki_*` は任意の引数 `root`（`wiki_status` の `workspaces[].root` の文字列をそのまま = 履歴にあるものだけ・他はエラー）で読み書きするワークスペースを固定できる。省略 = settings の `wiki_root` = 利用者が OpenRef の前面のタブで見ているワークスペース（タブを行き来すると変わる。OpenRef のチャットの中では省略 = チャットを始めたワークスペース = env `OPENREF_WIKI_ROOT`）= 複数のワークスペースを使うとき・書いている間に既定が変わると困るときは `root` を渡す。`wiki_status {root}` の `root`・件数は固定した root の物で、`workspaces[].current` は settings の `wiki_root`（前面）のまま。
 - OpenNote の用例（雛形。何を書くかはその場の指示で決める）: (1) ingest/ の素材を記事に = `wiki_inbox` → `wiki_read`（素材）→ 関係する論文を `list_items` で探す → `wiki_write`（記事。frontmatter の `sources` に素材のパス・`items` に key・`tags`）→ `wiki_move`（素材を ingest/ の外の置き場へ）。(2) 選んだ論文の要約ページを作る = `get_item` と `get_fulltext` で読む → `wiki_write`（`[題名](openref://open?key=KEY)` 付き）→ `wiki_backlinks {key}` で載ったかを確かめる。書誌は get_item の値だけを使う（作らない）。
 ";
@@ -646,7 +647,7 @@ mod tests {
         let r = openref_core::resolver::Resolved {
             csl: json!({
                 "type": "article-journal", "title": "MCP Seed Article on pancreatic imaging",
-                "author": [{"family": "Kano", "given": "S"}], "container-title": "Test Journal",
+                "author": [{"family": "Kato", "given": "S"}], "container-title": "Test Journal",
                 "issued": {"date-parts": [[2026]]}, "DOI": "10.9999/mcp.seed", "PMID": "88888888"
             }),
             retracted: None,

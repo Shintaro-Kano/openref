@@ -1,10 +1,10 @@
 //! Cross-export IDs are hints for review, never authority to merge or recreate.
 use super::{
     files::digest,
-    plan::{self, ItemAction},
+    plan::ItemAction,
     ImportFolder, ImportInput, ImportItem, ImportTag,
 };
-use crate::Result;
+use crate::{identity, Result};
 use rusqlite::Connection;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -26,9 +26,9 @@ fn item_tokens(item: &ImportItem) -> Vec<String> {
         format!("csl:{}", digest(bibliography.to_string().as_bytes())),
     ];
     for (kind, value) in [
-        ("doi", plan::doi(&item.csl)),
-        ("pmid", plan::pmid(&item.csl)),
-        ("description", plan::descriptive(&item.csl)),
+        ("doi", identity::doi(&item.csl)),
+        ("pmid", identity::pmid(&item.csl)),
+        ("description", identity::descriptive(&item.csl)),
     ] {
         if let Some(value) = value {
             tokens.push(format!("{kind}:{value}"));

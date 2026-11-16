@@ -7,6 +7,8 @@
    ③ bad_query: searchError = null（0 件）・他の code / 素の文は searchError に message
    ④ code の無いエラー（素の文）は従来どおり toast（文はそのまま）
    ⑤ 参照フォルダの追加 / 外す（refdirs.svelte.ts）: 呼ぶ command と引数・wk.refDirs・toast（成功 / 退避 / 取り消し / 失敗。dirs の欠けは []）
+   ⑥ 除外フォルダ: 木の読みが wiki_list の excluded を wk.excluded に（欠け = []）・
+      「索引から除く / 入れる」= wiki_exclude_set {dir, excluded}・「Finder で表示」= wiki_open_path {path, reveal: true}（args に包まない）・失敗は toast
    出力 = `wiki ipc: ok (N tests)`（N = 列 0 のブロックの数） */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -154,7 +156,15 @@ const toasts = () => S.app.toast;
   await R.addRefDir();
   assert.deepEqual(calls.map((c) => c.name), ["wiki_ref_dir_add"]);
   assert.deepEqual(W.wk.refDirs, ["/c", "/d"]);
-  assert.ok(toasts().startsWith("⚠ 参照フォルダを追加しました: /d") && toasts().includes("wiki_ref_dirs.bak"), toasts());
+  assert.equal(toasts(), "⚠ 参照フォルダを追加しました: d (元の設定は解釈できなかったので退避しました: wiki_ref_dirs.bak)");
+  // 追加: 成功 = 完了の案内はフォルダ名まで（親のパスを出さない）・一覧（wk.refDirs）はフルパスのまま
+  S.app.toast = "";
+  const ADDED = "/Users/me/Library/CloudStorage/GoogleDrive-user@example.com/マイドライブ/論文 集/";
+  handlers.wiki_ref_dir_add = () => ({ dirs: ["/c", "/d", ADDED], added: ADDED });
+  await R.addRefDir();
+  assert.deepEqual(W.wk.refDirs, ["/c", "/d", ADDED]);
+  assert.equal(toasts(), "✓ 参照フォルダを追加しました: 論文 集");
+  W.wk.refDirs = ["/c", "/d"];
   // 追加: 取り消し（dirs = null・added = null）= 何もしない
   S.app.toast = "";
   handlers.wiki_ref_dir_add = () => ({ dirs: null, added: null });
@@ -166,6 +176,40 @@ const toasts = () => S.app.toast;
   await R.addRefDir();
   assert.deepEqual(W.wk.refDirs, ["/c", "/d"]);
   assert.ok(toasts().startsWith("✗ 参照フォルダを追加できません") && toasts().includes("add failed"), toasts());
+  tests++;
+}
+
+// ---- ⑥ 除外フォルダ ----
+{
+  handlers.wiki_list = () => ({ pages: [{ path: "a.md", kind: "md", title: "a", tags: [], items: [], mtime: 0, size: 1 }], count: 1, total: 1, excluded: ["app/node_modules", "target"] });
+  await W.loadTree();
+  assert.deepEqual(W.wk.excluded, ["app/node_modules", "target"]);
+  handlers.wiki_list = () => LIST; // 古い応答（excluded の無い形）= 空
+  await W.loadTree();
+  assert.deepEqual(W.wk.excluded, []);
+  S.app.toast = "";
+  calls.length = 0;
+  handlers.wiki_exclude_set = (a) => ({ dir: a.dir, excluded: a.excluded });
+  await W.setExcluded("proj/testdata", true);
+  await W.setExcluded("target", false);
+  assert.deepEqual(
+    calls.map((c) => [c.name, c.args.dir, c.args.excluded]),
+    [["wiki_exclude_set", "proj/testdata", true], ["wiki_exclude_set", "target", false]],
+    JSON.stringify(calls)
+  );
+  assert.ok(toasts().includes("索引に入れました"), toasts());
+  S.app.toast = "";
+  handlers.wiki_exclude_set = reject("exclude failed");
+  await W.setExcluded("x", true);
+  assert.ok(toasts().startsWith("✗") && toasts().includes("exclude failed"), toasts());
+  calls.length = 0;
+  handlers.wiki_open_path = () => true;
+  await W.revealInFinder("target");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "wiki_open_path");
+  assert.equal(calls[0].args.path, "target");
+  assert.equal(calls[0].args.reveal, true, "reveal を渡さない = 開いてしまう");
+  assert.ok(!("args" in calls[0].args), "wiki_open_path は args に包まない（main.rs の引数の形）");
   tests++;
 }
 

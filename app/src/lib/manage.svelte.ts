@@ -6,6 +6,7 @@ import { SvelteMap } from "svelte/reactivity";
 import type { RenameOutcome } from "./api";
 import { toast } from "./state.svelte";
 import { t } from "./i18n.svelte";
+import { errText } from "./err";
 
 export interface Row<T> {
   item: T;
@@ -112,7 +113,7 @@ export class Manage<T extends { id: number; name: string }> {
         .catch((e) => {
           if (my !== this.fseq) return;
           this.preview = [];
-          this.previewErr = String(e).slice(0, 200);
+          this.previewErr = errText(e, 200);
           this.previewing = false;
         });
     });
@@ -243,7 +244,7 @@ export class Manage<T extends { id: number; name: string }> {
     this.armed = null;
     // 改名の確定中・押し始めてから改名を送ったなら置換しない（プレビューは改名前の一覧で取ったもの = 取り直したのを見て押し直す）
     if (this.sending.size > 0 || (from !== null && from !== this.sent)) {
-      toast(t("改名を保存したのでプレビューを取り直しました。確かめてからもう一度 Replace を押してください"));
+      toast(t("名前の変更を保存したのでプレビューを取り直しました。確かめてからもう一度「置換」を押してください"));
       return;
     }
     if (this.previewing || this.busy || !this.findText || this.willRename === 0) return;

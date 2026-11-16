@@ -1,8 +1,11 @@
 //! 設定 `wiki_workspaces` = 最近のワークスペースの純関数。書くのは GUI だけ
 //! （切替・選び直し・起動時・参照フォルダの追加 / 外す）。MCP / CLI は `Ctx::from_db` で読むだけ（`wiki_status` の `workspaces`）。
 //!
-//! 形 = JSON object `{ "<canonical な root>": { "last_used": <unix 秒>, "ref_dirs": ["<絶対パス>", …] } }`。
-//! `ref_dirs` は任意（無ければ空）・**未知の項目は保つ**（後の版が足した項目を古い版の書込で消さない）。
+//! 形 = JSON object `{ "<canonical な root>": { "last_used": <unix 秒>, "ref_dirs": ["<絶対パス>", …],
+//! "exclude": ["<vault 相対>", …], "include": ["<vault 相対>", …] } }`。
+//! `ref_dirs` / `exclude` / `include` は任意（無ければ空）・**未知の項目は保つ**（後の版が足した項目を古い版の書込で消さない）。
+//! `exclude` / `include` = 索引から除く / 既定の除外（node_modules・CACHEDIR.TAG）を越えて入れるフォルダ（`set_excluded`）。
+//! 要素は vault 相対・NFC・`/` 区切り（glob なし・完全一致）。無くなったフォルダの要素は残ってよい（掃除しない）
 //! 上限 `MAX`（超えたら `last_used` の古い順に落とす・現在の root は落とさない）。`last_used` が無い・整数でない項目は 0 として扱う
 
 use crate::{CoreError, Result};
@@ -15,6 +18,13 @@ pub const MAX: usize = 10;
 
 /// root → その root の object（`last_used` / `ref_dirs` / 未知の項目）
 pub type Map = serde_json::Map<String, Value>;
+
+/// 履歴（`wiki_workspaces` / `shelf_workspaces`）の 1 回の読み → 変更 → 書きを BEGIN IMMEDIATE で囲む（同じ DB を開いた別の接続 =
+/// 別のプロセスの書込を、読んでから書くまでの間に混ぜない。後から来た方は busy_timeout まで待ち、待ちきれなければ SQLITE_BUSY の Err）。
+/// 戻り値を commit せずに落とすと rollback
+pub fn begin_immediate(db: &crate::Db) -> crate::Result<rusqlite::Transaction<'_>> {
+    Ok(rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?)
+}
 
 /// 設定の値 → Map。未設定・空白は空。JSON の object でなければ Err（BadInput = 黙って空にしない。壊れた値の退避は GUI の仕事）。
 /// 値が object でない項目・鍵が空白の項目は捨てる
@@ -79,7 +89,7 @@ pub fn remove(m: &mut Map, root: &str) -> bool {
     m.remove(root).is_some()
 }
 
-/// この root の項目に `ref_dirs` があるか（空の配列でも true。旧キー `wiki_ref_dirs` の取り込みは無いときだけ）
+/// この root の項目に `ref_dirs` があるか（空の配列でも true = rekey が生の綴りの鍵の一覧を引き継ぐかの判定）
 pub fn has_ref_dirs(m: &Map, root: &str) -> bool {
     m.get(root).and_then(|v| v.get("ref_dirs")).is_some()
 }
@@ -154,6 +164,59 @@ pub fn rekey(m: &mut Map, from: &str, to: &str) -> bool {
     true
 }
 
+/// 文字列の配列の項目（無い・配列でない = 空。文字列でない要素は飛ばす）
+fn str_list(m: &Map, root: &str, k: &str) -> Vec<String> {
+    m.get(root)
+        .and_then(|v| v.get(k))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// この root の除外の規則（`include` / `exclude` = vault 相対のフォルダの配列）。
+/// 無い・配列でない = 既定の規則だけ。正規化（NFC・前後の `/`・不正な要素を捨てる）は `scan::Rules::new`
+pub fn rules(m: &Map, root: &str) -> super::scan::Rules {
+    super::scan::Rules::new(str_list(m, root, "include"), str_list(m, root, "exclude"))
+}
+
+/// フォルダ dir（vault 相対・NFC・`/` 区切り）を索引から除く / 入れる（GUI の木の右クリック = wiki_exclude_set）。
+/// excluded = true: `include` から外し、既定の規則に当たらなければ `exclude` に足す。
+/// excluded = false: `exclude` から外し、既定の規則に当たれば `include` に足す。default_hit = dir が既定の規則
+/// （`scan::Rules::default_excludes`）に当たるか（呼び手がファイルシステムで判定する = ここは純関数）。
+/// root の項目が無ければ作る（last_used は入れない）・他の項目は保つ。配列に重複は作らない。
+/// 外すときの比較は走査の規則と同じ正規化（`scan::norm_dir` = NFC・前後の `/`）= 手で書いた `"proj/testdata/"` や NFD の綴りも外れる
+/// （外れずに除外されたまま・画面は成功、を作らない）。正規化できない既存の要素は触らない。
+/// 戻り値 = 書いた。dir そのものが正規化できない（`""`・`"."`・`"a//b"`・`.` 始まりの区画）なら何も書かずに false
+/// （走査の規則が捨てる値を設定に入れて成功に見せない）
+pub fn set_excluded(m: &mut Map, root: &str, dir: &str, excluded: bool, default_hit: bool) -> bool {
+    let norm = super::scan::norm_dir;
+    let Some(dir) = norm(dir) else { return false };
+    let e = m.entry(root.to_string()).or_insert_with(|| Value::Object(Map::new()));
+    if !e.is_object() {
+        *e = Value::Object(Map::new());
+    }
+    let Some(o) = e.as_object_mut() else { return false };
+    let list = |o: &Map, k: &str| -> Vec<String> {
+        o.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+    };
+    let (mut inc, mut exc) = (list(o, "include"), list(o, "exclude"));
+    inc.retain(|d| norm(d).as_deref() != Some(dir.as_str()));
+    exc.retain(|d| norm(d).as_deref() != Some(dir.as_str()));
+    if excluded && !default_hit {
+        exc.push(dir.clone());
+    }
+    if !excluded && default_hit {
+        inc.push(dir.clone());
+    }
+    for (k, v) in [("include", inc), ("exclude", exc)] {
+        if v.is_empty() && !o.contains_key(k) {
+            continue;
+        }
+        o.insert(k.into(), json!(v));
+    }
+    true
+}
+
 /// Map → 設定の値（JSON の文字列）
 pub fn serialize(m: &Map) -> String {
     serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
@@ -207,9 +270,9 @@ mod tests {
     /// touch: last_used を入れる・他の項目（ref_dirs・未知の項目）は保つ・新しい root は作る
     #[test]
     fn touch_keeps_other_fields() {
-        let mut m = map(json!({"/a": {"last_used": 1, "ref_dirs": ["/kb"], "future": {"x": 1}}}));
+        let mut m = map(json!({"/a": {"last_used": 1, "ref_dirs": ["/notes"], "future": {"x": 1}}}));
         assert!(touch(&mut m, "/a", 100, MAX).is_empty());
-        assert_eq!(m["/a"], json!({"last_used": 100, "ref_dirs": ["/kb"], "future": {"x": 1}}));
+        assert_eq!(m["/a"], json!({"last_used": 100, "ref_dirs": ["/notes"], "future": {"x": 1}}));
         assert!(touch(&mut m, "/b", 200, MAX).is_empty());
         assert_eq!(m["/b"], json!({"last_used": 200}));
         // 往復しても未知の項目は残る
@@ -265,16 +328,16 @@ mod tests {
     #[test]
     fn rekey_merges_spellings() {
         let mut m = map(json!({
-            "/v/kb": {"last_used": 0, "ref_dirs": ["/ref", "/both"], "future": "raw", "only_raw": 1},
-            "/v/kb-real": {"last_used": 50, "ref_dirs": ["/both", "/c"], "future": "canon"},
+            "/v/notes": {"last_used": 0, "ref_dirs": ["/ref", "/both"], "future": "raw", "only_raw": 1},
+            "/v/notes-real": {"last_used": 50, "ref_dirs": ["/both", "/c"], "future": "canon"},
             "/v/other": {"last_used": 7},
         }));
-        assert!(rekey(&mut m, "/v/kb", "/v/kb-real"));
+        assert!(rekey(&mut m, "/v/notes", "/v/notes-real"));
         assert_eq!(
-            m["/v/kb-real"],
+            m["/v/notes-real"],
             json!({"last_used": 50, "ref_dirs": ["/both", "/c", "/ref"], "future": "canon", "only_raw": 1})
         );
-        assert!(!m.contains_key("/v/kb"));
+        assert!(!m.contains_key("/v/notes"));
         assert_eq!(m["/v/other"], json!({"last_used": 7}), "他の root は触らない");
         // to が無い = from の中身をそのまま（last_used が大きい方 = from の値）
         let mut m = map(json!({"/v/ref/": {"last_used": 9, "ref_dirs": ["/ref"]}}));
@@ -291,11 +354,88 @@ mod tests {
         assert_eq!(m, before);
     }
 
+    /// set_excluded の 4 通り（除く × 既定に当たる / 当たらない・入れる × 同）と往復・未知の項目を保つ・rules が読む
+    #[test]
+    fn set_excluded_transitions() {
+        let mut m = map(json!({"/v": {"last_used": 3, "ref_dirs": ["/notes"], "future": 1}}));
+        // 1. 普通のフォルダを除く = exclude に足す
+        set_excluded(&mut m, "/v", "proj/testdata", true, false);
+        assert_eq!(m["/v"], json!({"last_used": 3, "ref_dirs": ["/notes"], "future": 1, "exclude": ["proj/testdata"]}));
+        // 2. それを入れ直す = exclude から外す（既定に当たらない = include に足さない）
+        set_excluded(&mut m, "/v", "proj/testdata", false, false);
+        assert_eq!(m["/v"], json!({"last_used": 3, "ref_dirs": ["/notes"], "future": 1, "exclude": []}));
+        // 3. 既定で除かれるフォルダを入れる = include に足す
+        set_excluded(&mut m, "/v", "proj/target", false, true);
+        assert_eq!(m["/v"]["include"], json!(["proj/target"]));
+        assert_eq!(m["/v"]["exclude"], json!([]));
+        // 4. それを除き直す = include から外す（既定に当たる = exclude には足さない）
+        set_excluded(&mut m, "/v", "proj/target", true, true);
+        assert_eq!(m["/v"], json!({"last_used": 3, "ref_dirs": ["/notes"], "future": 1, "exclude": [], "include": []}));
+        // 重複を作らない・他のフォルダは保つ
+        set_excluded(&mut m, "/v", "a", true, false);
+        set_excluded(&mut m, "/v", "a", true, false);
+        set_excluded(&mut m, "/v", "b", true, false);
+        assert_eq!(m["/v"]["exclude"], json!(["a", "b"]));
+        // rules が読む（正規化つき）
+        let r = rules(&m, "/v");
+        assert_eq!(r.exclude(), ["a".to_string(), "b".into()]);
+        assert!(r.include().is_empty());
+        // root の項目が無ければ作る（last_used は入れない）
+        set_excluded(&mut m, "/w", "x", true, false);
+        assert_eq!(m["/w"], json!({"exclude": ["x"]}));
+        // 往復しても残る
+        assert_eq!(parse(Some(&serialize(&m))).unwrap(), m);
+        // 配列でない値は空として扱う
+        let mut odd = map(json!({"/v": {"exclude": "x", "include": 3}}));
+        set_excluded(&mut odd, "/v", "y", true, false);
+        assert_eq!(odd["/v"], json!({"exclude": ["y"], "include": []}));
+        assert!(rules(&map(json!({"/v": {"exclude": "x"}})), "/v").exclude().is_empty());
+    }
+
+    /// 正規化できない dir（空・`.`・空の区画・`.` 始まり）は何も書かず false（root の項目も作らない）・書いたら true
+    #[test]
+    fn set_excluded_refuses_unnormalizable_dir() {
+        let mut m = map(json!({"/v": {"last_used": 1, "exclude": ["a"]}}));
+        let before = m.clone();
+        for bad in ["", ".", "a//b", "/", " ", "x/../y", ".git"] {
+            for (excluded, hit) in [(true, false), (false, true), (true, true), (false, false)] {
+                assert!(!set_excluded(&mut m, "/v", bad, excluded, hit), "{bad:?}");
+                assert!(!set_excluded(&mut m, "/new", bad, excluded, hit), "{bad:?}");
+            }
+        }
+        assert_eq!(m, before, "設定を変えない");
+        assert!(set_excluded(&mut m, "/v", "b/", true, false));
+        assert_eq!(m["/v"]["exclude"], json!(["a", "b"]));
+    }
+
+    /// 手で書いた綴り（末尾 `/`・先頭 `/`・NFD）の既存の要素も、走査の規則と同じ正規化で比べて外す
+    #[test]
+    fn set_excluded_matches_normalized_spellings() {
+        use unicode_normalization::UnicodeNormalization;
+        let nfd: String = "データ/raw".nfd().collect();
+        assert_ne!(nfd, "データ/raw");
+        let mut m = map(json!({"/v": {"exclude": ["proj/testdata/", nfd.clone(), "/keep/", "../bad"], "include": [" proj/target/ "]}}));
+        // 走査はこれらを除外として読む
+        assert_eq!(rules(&m, "/v").exclude(), ["proj/testdata".to_string(), "データ/raw".into(), "keep".into()]);
+        set_excluded(&mut m, "/v", "proj/testdata", false, false);
+        set_excluded(&mut m, "/v", "データ/raw", false, false);
+        // 入れ直した 2 つは外れ（走査の規則からも消える）・他の要素（正規化できない物も）は触らない
+        assert_eq!(m["/v"]["exclude"], json!(["/keep/", "../bad"]));
+        assert_eq!(rules(&m, "/v").exclude(), ["keep".to_string()]);
+        // include 側も同じ（既定に当たるフォルダを除き直す = include から外す）
+        set_excluded(&mut m, "/v", "proj/target", true, true);
+        assert_eq!(m["/v"]["include"], json!([]));
+        // 書く側は正規化した綴り（NFD で渡されても NFC で 1 つ）
+        set_excluded(&mut m, "/v", &nfd, true, false);
+        set_excluded(&mut m, "/v", "データ/raw/", true, false);
+        assert_eq!(m["/v"]["exclude"], json!(["/keep/", "../bad", "データ/raw"]));
+    }
+
     /// remove・ref_dirs・set_ref_dirs（無い root は last_used なしで作る・他の項目は保つ）
     #[test]
     fn ref_dirs_and_remove() {
-        let mut m = map(json!({"/a": {"last_used": 1, "ref_dirs": ["/kb", "", 3, "/kb", "/x"], "k": true}}));
-        assert_eq!(ref_dirs(&m, "/a"), vec!["/kb".to_string(), "/x".into()]);
+        let mut m = map(json!({"/a": {"last_used": 1, "ref_dirs": ["/notes", "", 3, "/notes", "/x"], "k": true}}));
+        assert_eq!(ref_dirs(&m, "/a"), vec!["/notes".to_string(), "/x".into()]);
         assert!(has_ref_dirs(&m, "/a"));
         assert!(ref_dirs(&m, "/none").is_empty() && !has_ref_dirs(&m, "/none"));
         set_ref_dirs(&mut m, "/a", &["/y".to_string()]);
@@ -304,7 +444,7 @@ mod tests {
         assert_eq!(m["/b"], json!({"ref_dirs": []}));
         assert!(has_ref_dirs(&m, "/b"), "空の配列でもある");
         // ref_dirs が配列でない = 空
-        let odd = map(json!({"/a": {"ref_dirs": "/kb"}}));
+        let odd = map(json!({"/a": {"ref_dirs": "/notes"}}));
         assert!(ref_dirs(&odd, "/a").is_empty());
         assert!(remove(&mut m, "/b"));
         assert!(!remove(&mut m, "/b"));

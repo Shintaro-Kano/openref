@@ -6,6 +6,7 @@
   import { composing } from "../input";
   import type { WikiPageData } from "./types";
   import { ed, resolveConflict } from "./edit.svelte";
+  import { trapTab } from "../focusTrap";
 
   let { onReloaded }: { onReloaded?: (p: WikiPageData) => void } = $props();
   let busy = $state(false);
@@ -37,7 +38,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="overlay" role="presentation">
-  <div class="modal wide wk-conflict" role="alertdialog" aria-labelledby="wk-conflict-h">
+  <div class="modal wide wk-conflict" role="alertdialog" aria-labelledby="wk-conflict-h" use:trapTab>
     <div class="modal-head"><h3 id="wk-conflict-h">{t("このページは外部で書き換えられています")}</h3></div>
     <div class="modal-body">
       <p class="wk-cf-lead">

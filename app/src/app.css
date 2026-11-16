@@ -11,6 +11,8 @@
   --banner: #fdecea;
   /* OpenNote: md ページの見出しの色分け（h1〜h6・shadow root へ継承される。控えめ = 本文色寄りの青〜緑青〜藍） */
   --wk-h1: #1957b0; --wk-h2: #1d6390; --wk-h3: #1b6e64; --wk-h4: #4b4f9e; --wk-h5: #55687b; --wk-h6: var(--dim);
+  /* 左バーの外形の影（.sidepane） */
+  --side-shadow: 0 0.25px 0.75px rgb(0 0 0 / 0.05), 0 2px 6px rgb(0 0 0 / 0.1);
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Helvetica Neue", sans-serif;
   font-size: 13px;
   color-scheme: light dark;
@@ -26,6 +28,7 @@
     --accent-soft: #223650;
     --banner: #4a2320;
     --wk-h1: #8cc0ff; --wk-h2: #80c4e6; --wk-h3: #7fd0c0; --wk-h4: #b0b4f0; --wk-h5: #a9b6c3;
+    --side-shadow: 0 0.25px 0.75px rgb(0 0 0 / 0.2), 0 2px 6px rgb(0 0 0 / 0.4);
   }
 }
 
@@ -43,8 +46,9 @@ header {
 }
 .brand { font-weight: 700; letter-spacing: 0.5px; font-size: 15px; }
 /* 検索ボックス = チップ + 入力（sb- 接頭辞）。枠は wrap が持ち、input は素通し */
+/* 最大の幅 640（識別子の欄は「＋ 追加 ▾」の中にあり、その分を検索欄に回す。広い窓で欄が間延びしない上限は残す） */
 .sb-wrap {
-  flex: 1; max-width: 480px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  flex: 1; max-width: 640px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
   padding: 2px 4px 2px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); cursor: text;
 }
 .sb-wrap:focus-within { border-color: var(--accent); }
@@ -60,11 +64,6 @@ header {
 .sb-x:hover { color: var(--danger); background: rgba(0, 0, 0, 0.06); }
 .search {
   padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
-}
-.quickadd { flex: 1; max-width: 420px; }
-.quickadd input {
-  width: 100%; padding: 6px 10px;
-  border: 1px solid var(--accent); border-radius: 6px; background: var(--bg);
 }
 .spinner {
   width: 14px; height: 14px; border: 2px solid var(--border);
@@ -130,6 +129,8 @@ header {
 }
 .tabs-chat:hover { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); color: var(--text); }
 .tabs-chat.tabs-chat-on { background: var(--panel); color: var(--accent); }
+/* チャットが無効（OpenNote は有効）= 吹き出しの線を破線に（色は有効で閉じているときと同じ --dim = 押せる濃さのまま）。押すと有効にする説明 */
+.tabs-chat.tabs-chat-off path { stroke-dasharray: 2.2 1.6; }
 .tabs-chat-dot { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 /* タブの中身（.tabs-page）とチャットの柱（ChatDock = .cd）の横の並び。柱は常に全幅が窓の中 = 縮むのは .tabs-page
    （min-width: 0・はみ出しは .tabs-page の中で切る = 窓の最小幅 900 で柱を開いても柱が右へ押し出されない。
@@ -138,23 +139,40 @@ header {
 /* タブの中身（ヘッダー + main + PDF ビューア）。PDF タブのビューア（.viewer-overlay）はこの全面を覆う */
 .tabs-page { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: clip; display: flex; flex-direction: column; }
 
+/* 列の幅の数字は lib/sidebarw.svelte.ts の定数と対（CSS は数字のまま）: 230 = SIDEBAR_DEFAULT・180 = SIDEBAR_MIN・360 = CENTER_MIN・
+   380 = RIGHT_W・740 = CENTER_MIN + RIGHT_W。同じ数字は WikiPage の集中モード（.wk-sidebar / .wk-info の幅）と SidebarGrip の
+   --sb-col の既定にもある。変えるときは全部を一緒に（sidebarw.test の ① が照合する） */
 main { display: grid; grid-template-columns: 230px minmax(360px, 1fr) 380px; flex: 1; min-height: 0; }
 main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360px, 1fr); } /* 右ペインを隠したとき（OpenNote / 一覧） */
+/* 左の列の幅を変えられるモード（LIBRARY / NOTE = App が class sbw と --sb-w を付ける・本棚と集中モードは上の固定のまま）。
+   --sb-col = 覚えた幅（--sb-w）を窓に合わせて詰めた表示の幅（中央の最小幅 360 と右ペイン 380 を残す・下限 180 = 覚えた値は書き換えない）。
+   つまみ（SidebarGrip = .sbw-grip）も同じ --sb-col を受け継いで境界に置く（main が基準 = position: relative・100% = main の幅。
+   中の absolute の部品はどれも手前に positioned の親を持つ = 基準は変わらない・集中モードの main も relative） */
+main.sbw { position: relative; --sb-col: max(180px, min(var(--sb-w, 230px), 100% - 740px)); grid-template-columns: var(--sb-col) minmax(360px, 1fr) 380px; }
+main.sbw.wk-main-noinfo, main.sbw.lib-nodetail { --sb-col: max(180px, min(var(--sb-w, 230px), 100% - 360px)); grid-template-columns: var(--sb-col) minmax(360px, 1fr); }
 
 /* ---------- sidebar ---------- */
-.sidebar {
-  border-right: 1px solid var(--border); background: var(--panel);
-  overflow-y: auto; padding: 8px 6px; display: flex; flex-direction: column; gap: 1px;
+/* LIBRARY と本棚の左バー（Sidebar / ShelfSidebar の <nav class="ls-nav sidepane">）。以前の素の class 名 .sidebar は、pdf.js の
+   pdfjs-dist/web/pdf_viewer.css（PdfViewer が読む = 画面の全体に効く）の素の .sidebar（width 239px・min / max・position・角丸・影・枠 ほか）に
+   掴まれていた → 接頭辞つきに改めて pdf.js から切り離した。外形（角丸・枠・影・背景）は 3 つの左バーで共通の .sidepane */
+.ls-nav {
+  overflow-y: auto; padding: 8px 6px; display: flex; flex-direction: column; gap: 1px; min-width: 0;
 }
-.sidebar button {
+/* 左バーの外形（LIBRARY・本棚 = .ls-nav・NOTE = .wk-sidebar に共通）= 角丸 8px・全周 1px の枠・薄い影・面の色。OpenRef 自身の値
+   （前は pdf.js の .sidebar から漏れた形 = それに合わせた・色は OpenRef の変数）。position: relative = 影を右の一覧の上に描く
+   （無いと後ろの一覧の面が影を覆う）。左バーのつまみ（SidebarGrip）は列の端（右の枠の上）に重なる */
+.sidepane {
+  position: relative; border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--side-shadow); background: var(--panel);
+}
+.ls-nav button {
   display: flex; justify-content: space-between; align-items: center; gap: 6px;
   padding: 5px 10px; border-radius: 6px; text-align: left; width: 100%;
 }
-.sidebar button .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar button:hover { background: var(--bg); }
-.sidebar button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.sidebar .n { color: var(--dim); font-size: 11px; }
-.sidebar .sep {
+.ls-nav button .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-nav button:hover { background: var(--bg); }
+.ls-nav button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.ls-nav .n { color: var(--dim); font-size: 11px; }
+.ls-nav .sep {
   margin: 10px 10px 4px; font-size: 11px; color: var(--dim);
   border-top: 1px solid var(--border); padding-top: 8px;
 }
@@ -216,15 +234,33 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 .lb-tail { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px 10px; margin-left: auto; }
 .lb-count { color: var(--dim); white-space: nowrap; min-width: 11em; text-align: right; } /* 「· 1 選択」の幅も取っておく = 行を選んでツールバーが折り返して行がずれない */
 .lb-count b { color: var(--accent); font-weight: 600; }
-/* 右ペインの開閉（OpenNote のヘッダーの .wk-head-pane と同じ絵） */
-.lb-pane {
-  flex: none; margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 24px;
-  border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--accent);
+/* OpenNote の畳める節の見出し（左バーの Ingest / Chat log / Tags・右ペインの目次）と ▸（木のフォルダも）= 1 つの規則。
+   右ペインの目次は h3 の中に置き、左右の余白の分だけ外へ出して他の節の見出しと字の頭を揃える（WikiInfo の .wk-sec-toggle） */
+.wk-box-h {
+  display: flex; align-items: center; gap: 4px; padding: 3px 6px; border: 0; border-radius: 5px; background: transparent;
+  cursor: pointer; color: var(--dim); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; text-align: left;
 }
-.lb-pane:hover { border-color: var(--accent); }
-.lb-pane-off { color: var(--dim); }
-.lb-pane-fill { opacity: 0.35; }
-.lb-pane-off .lb-pane-fill { opacity: 0; }
+.wk-box-h:hover { background: var(--bg); }
+.wk-chev { display: inline-block; width: 10px; font-size: 9px; color: var(--dim); transition: transform 0.1s; }
+.wk-chev-open { transform: rotate(90deg); }
+/* 右ペインの開閉（▣ = PaneToggle）= 一覧・本棚・OpenNote はアプリのヘッダーの右端、本の読み手は読み手の段の右端。
+   30 × 26（PDF のビューアの .tb-pane と同じ大きさ）・開 = 右の帯を塗る・閉 = 枠だけで薄く。
+   ヘッダーでは最後（order 2 = 「＋ 追加」の order 1 の後）・「＋ 追加」が無いヘッダー（本棚）では右端へ押す（margin-left: auto）。
+   右端からの距離は 14px に揃える（ヘッダーの余白 14px・本の読み手の段は余白 10px + 4px・PDF のツールバーは 12px + 2px） */
+.pn-toggle {
+  flex: none; order: 2; margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 26px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--accent); cursor: pointer;
+}
+/* 右端へ押すのは、その段に margin-left: auto の物がほかに無いときだけ（2 つあると余りを半分ずつ取り、左の物が真ん中へ寄る =
+   OpenNote のヘッダーの [＋ 新規] が 289px 左へ動いた）。一覧のヘッダー =「＋ 追加」（.nm-wrap）・OpenNote のヘッダー =
+   [＋ 新規]（WikiHeader の .wk-head-new）が右へ押す = ▣ はその後ろに並ぶだけ */
+.nm-wrap ~ .pn-toggle, .wk-head .pn-toggle { margin-left: 0; }
+.pn-toggle:hover { border-color: var(--accent); }
+.pn-off { color: var(--dim); }
+.pn-fill { opacity: 0.35; }
+.pn-off .pn-fill { opacity: 0; }
+.sh-v-bar .pn-toggle { margin-right: 4px; }
+.v-toolbar .tb-pane { margin-right: 2px; }
 /* クラス名は lb- 接頭辞で統一（app.css は単一グローバルで素のクラス名は他の部品と衝突する。
    ラベルのピッカーの .picker を共用すると bottom: 指定が混入し、高さ 0 の透明な箱になる） */
 .lb-pop {
@@ -319,9 +355,8 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
   background: var(--banner); color: var(--danger);
   padding: 8px 10px; border-radius: 6px; font-weight: 600;
 }
-.detail .banner.trash { color: var(--text); font-weight: 400; }
+.detail .banner.trash { color: var(--text); font-weight: 400; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .detail .banner button { color: var(--accent); font-weight: 600; }
-.detail .banner.trash { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .detail .banner button.danger { color: var(--danger); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .actions button {
@@ -341,6 +376,10 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 .abstract { font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
 .kw { font-size: 12px; color: var(--dim); }
 .att { font-size: 12px; display: flex; gap: 6px; align-items: baseline; }
+/* 「この添付を読む」は 2 本目以降だけ = ボタンの無い行と高さを揃える。行の高さを明示する（normal のままだと、和文の
+   ボタンの行は和文フォントの normal = 18px・ファイル名だけの行は欧文の normal = 15px で揃わない）。ボタンも同じ行の高さで描く */
+.att { line-height: 1.5; }
+.att .link { font-size: inherit; line-height: inherit; }
 .att .mode { font-size: 10px; color: var(--dim); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 .att .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .att .warn { color: var(--danger); }
@@ -363,53 +402,89 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
     border-color: color-mix(in srgb, var(--lb-fg) 55%, var(--panel));
   }
 }
-/* 見出し（MY LIBRARY / LABELS）の右の操作（＋ / … / 🔍） */
-.sidebar .sec-head { display: flex; justify-content: space-between; align-items: center; }
-.sidebar .sec-head .head-actions { display: flex; gap: 2px; align-items: center; }
-.sidebar .sec-head .head-actions button {
+/* 見出し（LABELS）の右の操作（＋ / … / 🔍） */
+.ls-nav .sec-head { display: flex; justify-content: space-between; align-items: center; }
+.ls-nav .sec-head .head-actions { display: flex; gap: 2px; align-items: center; }
+.ls-nav .sec-head .head-actions button {
   padding: 0 5px; height: 20px; border-radius: 4px; color: var(--dim); width: auto; display: inline-flex; align-items: center;
 }
-.sidebar .sec-head .head-actions button:hover,
-.sidebar .sec-head .head-actions button.on { color: var(--text); background: var(--bg); }
-/* フォルダ行（MY LIBRARY。fd- 接頭辞）= [chevron][📁][名前][件数]・hover で件数の位置に「…」。字下げ = 段 × 16px。
+.ls-nav .sec-head .head-actions button:hover,
+.ls-nav .sec-head .head-actions button.on { color: var(--text); background: var(--bg); }
+/* 「すべて」の行（ls-all = Sidebar）= [すべて][＋][…][件数]。＋ / … は常に出す（hover で出さない）。
+   行 = 枠の div + 行を覆う透明のボタン（.ls-all-hit）+ 兄弟の ＋ / …（下の「行を覆うボタン」）= .ls-nav button の行の形（余白・角・hover・
+   active）を枠に写す。件数は右 10px = Starred・フォルダの行と揃う。
+   中のボタンは見出しの ＋ / …（.head-actions）と同じ大きさ・色（.ls-nav button の幅 100%・両端寄せを外す） */
+.ls-nav .ls-all {
+  position: relative; display: flex; align-items: center; gap: 0; padding: 5px 10px; border-radius: 6px; cursor: pointer;
+  user-select: none; -webkit-user-select: none;
+}
+.ls-nav .ls-all:hover { background: var(--bg); }
+.ls-nav .ls-all.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.ls-nav .ls-all:has(> .ls-all-hit:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ls-nav .ls-all .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-nav .ls-all .n { flex: none; margin-left: 6px; text-align: right; font-weight: normal; }
+/* 当たりは 20 × 20 以上（min-width）。左右の余白は 3px・行の gap は 0（… と件数の間は 6px = 前と同じ）（英語・180・件数 5 桁で
+   「All Papers」の余りが 1px を切った）。
+   上下の margin -2px = 行の高さは字で決める（英語の字の行 16px でも 20px のボタンで行が 26 → 30px に伸びて Starred の行とずれない。
+   日本語は字の行が 20px = 前から 30px のまま） */
+.ls-nav .ls-all .ls-all-act {
+  position: relative; flex: none; padding: 0 3px; min-width: 20px; height: 20px; margin: -2px 0; border-radius: 4px; color: var(--dim); width: auto;
+  display: inline-flex; align-items: center; justify-content: center; font-weight: normal;
+}
+.ls-nav .ls-all .ls-all-act:hover, .ls-nav .ls-all .ls-all-act.on { color: var(--text); background: var(--bg); }
+.ls-nav .ls-all.active .ls-all-act:hover, .ls-nav .ls-all.active .ls-all-act.on { background: var(--panel); }
+/* フォルダ行（LIBRARY。fd- 接頭辞）= [chevron][📁][名前][件数]・hover で件数の位置に「…」。字下げ = 段 × 16px。
    件数の右端は すべて / Starred / ラベルの行と揃える（右 10px）。
-   行は div role="button"（中のボタンに .sidebar button の幅 100% などが効かないよう個別に上書き） */
-.sidebar .fd-row {
+   行 = 枠の div + 行を覆う透明のボタン（.fd-hit）+ 兄弟の chevron / 「…」。中のボタンに .ls-nav button の幅 100% などが効かないよう個別に上書き */
+.ls-nav .fd-row {
   position: relative; display: flex; align-items: center; gap: 4px; padding: 4px 10px 4px calc(4px + var(--depth, 0) * 16px);
   border-radius: 6px; cursor: pointer; user-select: none; -webkit-user-select: none;
 }
-.sidebar .fd-row:hover { background: var(--bg); }
-.sidebar .fd-row.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.sidebar .fd-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sidebar .fd-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-nav .fd-row:hover { background: var(--bg); }
+.ls-nav .fd-row.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.ls-nav .fd-row:has(> .fd-hit:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ls-nav .fd-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 件数の欄は hover で重ねる「…」の幅だけ確保する（名前の末尾と「…」がぶつからない）。右寄せで他の行の件数と揃う */
-.sidebar .fd-row .n { flex: none; min-width: 18px; text-align: right; }
-.sidebar .fd-chev {
+.ls-nav .fd-row .n { flex: none; min-width: 18px; text-align: right; }
+.ls-nav .fd-chev {
   flex: none; width: 16px; height: 16px; padding: 0; border-radius: 4px; gap: 0;
   display: inline-flex; align-items: center; justify-content: center; color: var(--dim);
 }
-.sidebar .fd-chev svg { transition: transform 0.12s; }
-.sidebar .fd-chev.open svg { transform: rotate(90deg); }
-.sidebar button.fd-chev:hover { background: var(--border); color: var(--text); }
-.sidebar .fd-ico { flex: none; color: var(--dim); }
-.sidebar .fd-row.active .fd-ico { color: var(--accent); }
-.sidebar .fd-more {
+/* 覆いの上に重ねるのはボタンの chevron だけ（子の無いフォルダの空の span まで relative にすると、16×16 の欄が覆いの
+   上に乗ってクリック・中クリック・右クリックを吸った） */
+.ls-nav button.fd-chev { position: relative; }
+.ls-nav .fd-chev svg { transition: transform 0.12s; }
+.ls-nav .fd-chev.open svg { transform: rotate(90deg); }
+.ls-nav button.fd-chev:hover { background: var(--border); color: var(--text); }
+.ls-nav .fd-ico { flex: none; color: var(--dim); }
+.ls-nav .fd-row.active .fd-ico { color: var(--accent); }
+.ls-nav .fd-more {
   position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
   width: 20px; height: 18px; padding: 0; border-radius: 4px; gap: 0;
   justify-content: center; color: var(--dim); visibility: hidden;
 }
 /* 「…」は hover・メニュー表示中・キーボードでフォーカスした行だけ（その間は件数を隠す。マウスで押した chevron に
    残るフォーカスでは出さない） */
-.sidebar .fd-row:hover .fd-more, .sidebar .fd-row.menu-open .fd-more,
-.sidebar .fd-row:focus-visible .fd-more, .sidebar .fd-row:has(:focus-visible) .fd-more { visibility: visible; }
-.sidebar .fd-row:hover .n, .sidebar .fd-row.menu-open .n,
-.sidebar .fd-row:focus-visible .n, .sidebar .fd-row:has(:focus-visible) .n { visibility: hidden; }
-.sidebar button.fd-more:hover { background: var(--border); color: var(--text); }
-.sidebar .nolabels { color: var(--dim); padding: 2px 10px 6px; font-size: 12px; }
-.sidebar .tagrow { display: flex; padding-top: 4px; padding-bottom: 4px; }
-.sidebar .tagrow .lbadge { max-width: 170px; }
-.sidebar .tagrow.active { background: var(--accent-soft); }
-.sidebar .drophover {
+.ls-nav .fd-row:hover .fd-more, .ls-nav .fd-row.menu-open .fd-more, .ls-nav .fd-row:has(:focus-visible) .fd-more { visibility: visible; }
+.ls-nav .fd-row:hover .n, .ls-nav .fd-row.menu-open .n, .ls-nav .fd-row:has(:focus-visible) .n { visibility: hidden; }
+/* 行を覆うボタン（「すべて」の行 .ls-all-hit・フォルダの行 .fd-hit）= 枠の全体（余白を含む）を覆う透明の当たり。字は持たない
+   （名前 = aria-label「名前 件数」）。後に置く中のボタン（＋ / … / chevron = position: relative・「…」= absolute）が上に重なる。
+   hover の面・焦点の輪は枠が描く（:hover は枠に伝わる・輪は :has(> 覆い:focus-visible)）= 前の div role="button" と同じ見た目 */
+.ls-nav .ls-all-hit, .ls-nav .fd-hit {
+  position: absolute; inset: 0; width: auto; padding: 0; border-radius: inherit; background: transparent;
+}
+.ls-nav .ls-all-hit:hover, .ls-nav .fd-hit:hover { background: transparent; }
+.ls-nav .ls-all-hit:focus-visible, .ls-nav .fd-hit:focus-visible { outline: none; }
+/* 「すべて」の行は覆いの containing block として position: relative = 位置づけた要素は後から描かれる → 直下の Starred の行（static）の
+   キーボードの焦点の輪の外側の縁（上の 1px）を覆ってしまう。直下の行も relative にして、描く順を
+   前と同じ DOM の順に戻す（位置は動かない） */
+.ls-nav .ls-all + button { position: relative; }
+.ls-nav button.fd-more:hover { background: var(--border); color: var(--text); }
+.ls-nav .nolabels { color: var(--dim); padding: 2px 10px 6px; font-size: 12px; }
+.ls-nav .tagrow { display: flex; padding-top: 4px; padding-bottom: 4px; }
+.ls-nav .tagrow .lbadge { max-width: 170px; }
+.ls-nav .tagrow.active { background: var(--accent-soft); }
+.ls-nav .drophover {
   outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-soft);
 }
 .ls-search { position: relative; margin: 0 4px 4px; }
@@ -417,7 +492,7 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
   width: 100%; padding: 4px 22px 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); font-size: 12px;
 }
 .ls-search input:focus { outline: none; border-color: var(--accent); }
-.sidebar .ls-search .ls-x {
+.ls-nav .ls-search .ls-x {
   position: absolute; right: 2px; top: 50%; transform: translateY(-50%); width: auto; padding: 0 6px; color: var(--dim);
 }
 /* 「…」メニュー（fixed・Sort labels › の右に副メニュー） */
@@ -595,7 +670,7 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 .mf-newrow { display: flex; align-items: center; gap: 8px; }
 .mf-dellist { margin: 0; padding-left: 18px; max-height: 120px; overflow-y: auto; font-size: 12px; }
 .mf-dellist li { margin: 1px 0; }
-.modal.nf-modal:focus, .modal.mf-modal:focus { outline: none; }
+.modal.nf-modal:focus, .modal.mf-modal:focus, .modal.im-modal:focus { outline: none; }
 
 /* 引用スタイルの設定（StyleModal。class は sm- 接頭辞） */
 .modal.sm-modal { width: 660px; }
@@ -650,7 +725,6 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 .sm-err { color: var(--danger); overflow-wrap: anywhere; }
 .sm-dim { color: var(--dim); }
 .sm-foot-note { margin-right: auto; align-self: center; color: var(--dim); font-size: 11px; }
-.dim.small { font-size: 11px; }
 
 /* ---------- reference editor ---------- */
 .newref {
@@ -659,8 +733,10 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 }
 .newref:hover { border-color: var(--accent); color: var(--accent); }
 
-/* ---------- ＋ 新規 メニュー（nm- 接頭辞） ---------- */
-.nm-wrap { position: relative; }
+/* ---------- ＋ 追加 メニュー（nm- 接頭辞・AddMenu）= 最上段に識別子の欄・その下に PDF を取り込む… / 手動で作成… ---------- */
+/* 右端に寄せる（NOTE のヘッダーの [＋ 新規] と同じ場所 = 同じ骨格・同じ場所に揃える。検索欄は最大 640 のまま・間は空き）。
+   order: 1 = ヘッダーの最後（処理中のスピナーは検索欄の後に出る = 出ても消えてもボタンが動かない） */
+.nm-wrap { position: relative; margin-left: auto; order: 1; }
 .nm-caret { color: var(--dim); font-size: 10px; margin-left: 2px; }
 .nm-menu {
   position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 260px;
@@ -673,6 +749,14 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 }
 .nm-menu button:hover { background: var(--accent-soft); }
 .nm-menu kbd { color: var(--dim); font-family: inherit; font-size: 11px; }
+/* 登録中のスピナーは欄の右端の中に重ねる（欄は無効にしない = 貼れる・Enter は済むまで待つ） */
+.nm-menu .nm-qa-busy { position: absolute; top: 14px; right: 16px; }
+.nm-menu .nm-qa {
+  display: block; width: 340px; max-width: calc(100vw - 48px); padding: 6px 30px 6px 10px;
+  border: 1px solid var(--accent); border-radius: 6px; background: var(--bg);
+}
+.nm-menu .nm-qa:focus { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+.nm-sep { height: 1px; margin: 6px 2px; background: var(--border); }
 
 /* ---------- PDF 取込モーダル（im- 接頭辞） ---------- */
 .modal.im-modal { width: 680px; max-width: 94vw; }
@@ -750,7 +834,6 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 .pages { flex: 1; overflow: auto; overflow-anchor: none; scrollbar-gutter: stable; background: #4a4f55; padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 14px; }
 /* 前面になったときに focus する（Space / ↑↓ でスクロール）。枠は出さない */
 .pages:focus { outline: none; }
-.pages .center { color: #fff; padding: 40px; }
 .pages-overlay {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   pointer-events: none; color: #fff; padding: 40px; text-align: center;
@@ -797,8 +880,12 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
   border-radius: 6px; background: var(--bg); color: var(--text);
 }
 .tb-pagesep { color: var(--dim); }
+/* 診断の警告（テキスト層なし・途中のエラー）。枠（.tb-diagslot = 余白）の幅で 1 行に切り、全文は title。
+   枠は min-width 0 で縮む = 診断が長くてもツールバーは折れない（折れるのはボタンだけで幅が足りないとき = 前と同じ） */
+.tb-diagslot { min-width: 0; display: flex; }
+.tb-diag { color: var(--danger); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tb-spacer { flex: 1; }
-/* PDF ビューアの右バーの開閉（Toolbar・一覧の右ペインの開閉 .lb-pane と同じ絵: 開 = 右の帯を塗る・閉 = 枠だけで薄く） */
+/* PDF ビューアの右バーの開閉（Toolbar・右ペインの開閉 .pn-toggle と同じ絵: 開 = 右の帯を塗る・閉 = 枠だけで薄く） */
 .tb-pane { color: var(--accent); }
 .tb-pane-off { color: var(--dim); }
 .tb-pane-fill { opacity: 0.35; }
@@ -889,7 +976,6 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
   top: 0; cursor: text;
   -webkit-user-select: text; user-select: text;
 }
-.v-head .tl-warn { color: var(--danger); }
 .pageerr {
   background: #fdecea; color: #c0392b; border-radius: 8px; padding: 10px 14px;
   font-size: 12px; max-width: 640px;
@@ -1016,11 +1102,14 @@ main.wk-main-noinfo, main.lib-nodetail { grid-template-columns: 230px minmax(360
 body.dragging { user-select: none; -webkit-user-select: none; cursor: grabbing; }
 
 /* ---------- overlay ---------- */
+/* z-index 80 = 窓の覆い（.overlay 40）・浮きメニュー（.lmenu 50 ほか）・OpenNote の引用の窓（60）・画像の拡大表示（70）より上 = 窓の間の
+   toast（「開いている窓を閉じてから…」ほか）を覆いの下に暗く沈めない。字だけの知らせ = pointer-events: none
+   （上に重なっても下のメニュー・ボタンの押下を奪わない） */
 .toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
   background: var(--text); color: var(--bg);
   padding: 8px 16px; border-radius: 8px; max-width: 70vw;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); z-index: 20; font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); z-index: 80; pointer-events: none; font-size: 12px;
 }
 /* 新版のお知らせ（ヘッダー下の帯・ub- 接頭辞。App の {#if app.updateLatest}） */
 .ub-bar {

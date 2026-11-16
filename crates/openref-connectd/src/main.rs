@@ -211,7 +211,7 @@ fn ingest_or_stub<'a>(st: &'a St, bytes: &[u8], from: &PdfFrom) -> Result<(std::
     let src_name = format!("{}.pdf", pdfingest::safe_filename_stem(&from.title.map(pdfingest::strip_pdf_suffix).unwrap_or_default()));
     let Ok((mut db, res)) =
         pdfingest::ingest_pdf_bytes_unlocked(|| Ok::<_, std::convert::Infallible>(st.db()), bytes, &src_name, None, &opts);
-    let pdfingest::IngestReport { outcome, warnings, reason, fail, info_title, md5 } = res.map_err(|e| e.to_string())?;
+    let pdfingest::IngestReport { outcome, warnings, reason, fail, info_title, md5, text } = res.map_err(|e| e.to_string())?;
     for w in &warnings {
         eprintln!("{}: ⚠ {w}", from.log);
     }
@@ -230,7 +230,7 @@ fn ingest_or_stub<'a>(st: &'a St, bytes: &[u8], from: &PdfFrom) -> Result<(std::
             let note = stub_note(&fail, &reason);
             let origin = pdfingest::StubOrigin::Page { title: from.title, url: from.url, source: from.source };
             let mut stub_warnings = Vec::new();
-            let made = pdfingest::create_review_stub(&mut db, &origin, info_title.as_deref(), bytes, &md5, &note, &mut stub_warnings);
+            let made = pdfingest::create_review_stub(&mut db, &origin, info_title.as_deref(), bytes, &md5, &note, &mut stub_warnings, text.as_ref());
             for w in &stub_warnings {
                 eprintln!("{}: ⚠ {w}", from.source);
             }
@@ -284,6 +284,7 @@ fn summarize_item(db: &Db, key: &str, status: &str) -> Result<Value, String> {
     let Some(it) = search::get_by_key(db, key).map_err(|e| e.to_string())? else {
         return Ok(json!({ "key": key, "status": status, "trashed": true }));
     };
+    // 読めなければ応答は false のまま（保存は成功している = 撤回の印と同じ扱い）だが、黙って落とさずログに残す
     let has_pdf: i64 = db
         .conn
         .query_row(
@@ -291,7 +292,10 @@ fn summarize_item(db: &Db, key: &str, status: &str) -> Result<Value, String> {
             [it.id],
             |r| r.get(0),
         )
-        .unwrap_or(0);
+        .unwrap_or_else(|e| {
+            eprintln!("capture: {key} の添付の有無を読めず（応答は has_pdf=false）: {e}");
+            0
+        });
     // 読めなければ応答は null のまま（保存は成功している）だが、黙って落とさずログに残す
     let retraction = search::retraction_of(db, it.id).unwrap_or_else(|e| {
         eprintln!("capture: {key} の撤回の印を読めず（応答は null）: {e}");
@@ -319,9 +323,30 @@ struct SaveReq {
     title: Option<String>,
     url: Option<String>,
     collection_id: Option<i64>,
+    /// ページが自分について宣言した書誌メタ（識別子が無いときの照合の証拠だけ。保存しない）
+    evidence: pdfingest::PageEvidence,
 }
 
-/// {doi?, pmid?, url?, title?, collection_id?} → 書誌確定して登録（既存なら existing を返す）
+/// 要求の evidence（拡張 content.js の `evidence` = {title?, authors?, date?, journal?}・それぞれ {value, source}）から、
+/// 照合に使う題名・筆頭著者・年を取る（誌名は照合に使わない）。無い・形の違う値は無いものとして扱う（旧拡張は evidence を送らない）
+fn page_evidence(ev: Option<&Value>) -> pdfingest::PageEvidence {
+    let text = |k: &str| -> Option<String> {
+        let s = ev?.pointer(&format!("/{k}/value"))?.as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    let first_author = ev
+        .and_then(|v| v.pointer("/authors/value"))
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().filter_map(Value::as_str).map(str::trim).find(|s| !s.is_empty()))
+        .map(str::to_string);
+    pdfingest::PageEvidence {
+        title: text("title"),
+        first_author,
+        year: text("date").as_deref().and_then(pdfingest::PageEvidence::year_of),
+    }
+}
+
+/// {doi?, pmid?, url?, title?, collection_id?, evidence?} → 書誌確定して登録（既存なら existing を返す）
 async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoResponse {
     let p: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     let clean = |k: &str| {
@@ -337,10 +362,14 @@ async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRespon
         title: clean("title"),
         url: clean("url"),
         collection_id: p.get("collection_id").and_then(|v| v.as_i64()),
+        evidence: page_evidence(p.get("evidence")),
     };
 
     let st2 = st.clone();
-    let res = tokio::task::spawn_blocking(move || capture_save_unlocked(&st2, req, resolver::resolve)).await;
+    let res = tokio::task::spawn_blocking(move || {
+        capture_save_unlocked(&st2, req, resolver::resolve, resolver::search_bibliographic)
+    })
+    .await;
     match res {
         Ok(Ok(v)) => zjson(StatusCode::OK, v),
         Ok(Err(e)) => zjson(StatusCode::UNPROCESSABLE_ENTITY, json!({ "error": e })),
@@ -350,19 +379,31 @@ async fn capture_save(State(st): State<Arc<St>>, body: Bytes) -> impl IntoRespon
 
 /// `/capture/save` の本体（blocking）。① ロックして dedup（登録済みなら resolver を呼ばない）→ ② **ロックを離して** resolver
 /// （PubMed / doi.org・Crossref の門の列に並ぶ = 数秒〜数十秒。その間も Word・他の /capture/* を止めない）→ ③ 再ロックして登録。
-/// ① と ③ の間に同じ識別子が別経路で入っていたら、③ の add_item が Duplicate を返す → existing（新しい分岐は要らない）
+/// ① と ③ の間に同じ識別子が別経路で入っていたら、③ の add_item が Duplicate を返す → existing（新しい分岐は要らない）。
+/// 識別子が無いときは ② でページの書誌メタ（evidence）の題名で Crossref を引いて照合し（`search` = 差し替えの口・`link_by_evidence`）、
+/// 結べたら DOI を（登録済みでなければ）resolver で確定する。結べなければページの題名のみの document に「要確認」ラベルと import_note。
+/// どちらも応答に reason
 fn capture_save_unlocked(
     st: &St,
     req: SaveReq,
     resolve: impl FnOnce(&resolver::AddInput) -> openref_core::Result<resolver::Resolved>,
+    search: impl FnOnce(&str, usize) -> openref_core::Result<Vec<resolver::Candidate>>,
 ) -> Result<Value, String> {
     let mut db = st.db();
     let mut dup_retraction: Option<String> = None;
     // resolver の警告（PubMed の照合に失敗して doi.org で代用した等）。登録に使ったときだけ応答・ログへ
     let mut warnings: Vec<String> = Vec::new();
+    // 識別子の無い保存の理由（結べた照合の理由 / 結べなかった理由 = import_note）と、「要確認」ラベルを付けるか
+    let mut reason: Option<String> = None;
+    let mut review = false;
     let (key, status) = match search::find_by_ids(&db, req.pmid.as_deref(), req.doi.as_deref()) {
         Ok(Some((_id, key))) => (key, "existing"),
-        _ => {
+        // 登録済みか確かめられない（DB の異常）を「未登録」に落とさない = resolver を呼ばず 422 + error（重複登録を黙って作らない）
+        Err(e) => {
+            eprintln!("capture: 登録済みかを確かめられません: {e}");
+            return Err(format!("登録済みかを確かめられません: {e}"));
+        }
+        Ok(None) => 'fresh: {
             drop(db);
             let input = req
                 .pmid
@@ -372,18 +413,57 @@ fn capture_save_unlocked(
             let resolved = match input {
                 Some(i) => resolve(&i).map_err(|e| e.to_string())?,
                 None => {
-                    // 識別子ゼロ: 捏造せず、ページ情報だけで document を作る
-                    let t = req.title.ok_or("DOI / PMID もタイトルも見つかりません")?;
-                    resolver::Resolved {
-                        csl: json!({
-                            "type": "document",
-                            "title": t,
-                            "URL": req.url,
-                            "custom": { "source": "capture" }
-                        }),
-                        retracted: None,
-                        source: "capture",
-                        warnings: vec![],
+                    // 識別子ゼロ: ページの書誌メタで Crossref の候補と欄ごとに照合。結べたら resolver の書誌だけを保存する
+                    let ev = &req.evidence;
+                    // 結べなかったときの題名 = ページの題名（書誌メタの値は保存しない。ページの題名が無いときだけ書誌メタの題名）
+                    let t = req.title.or_else(|| ev.title.clone()).ok_or("DOI / PMID もタイトルも見つかりません")?;
+                    let linked = match link_by_evidence(ev, search) {
+                        Ok(m) => {
+                            // 結べた DOI が登録済みなら resolver を呼ばない（① と同じ。読めなければ resolver へ進み、③ の add_item が重複を止める）
+                            let found = search::find_by_ids(&st.db(), None, Some(&m.doi)).unwrap_or_else(|e| {
+                                eprintln!("capture: DOI {} が登録済みかを確かめられません（resolver へ進む）: {e}", m.doi);
+                                None
+                            });
+                            if let Some((_id, key)) = found {
+                                eprintln!("capture: 識別子なし → ページの書誌メタで DOI {} に結んだ（{}）→ 登録済み {key}", m.doi, m.reason);
+                                reason = Some(format!("ページの書誌メタで照合: {}", m.reason));
+                                db = st.db();
+                                break 'fresh (key, "existing");
+                            }
+                            match resolve(&resolver::AddInput::Doi(m.doi.clone())) {
+                                Ok(r) => Ok((r, m)),
+                                Err(e) => Err(format!(
+                                    "ページの書誌メタで DOI {} に結べましたが、書誌を確定できませんでした（{}）。DOI/PMID を入力して書誌を引き直してください",
+                                    m.doi,
+                                    resolver::short_reason(&e)
+                                )),
+                            }
+                        }
+                        Err(note) => Err(note),
+                    };
+                    match linked {
+                        Ok((r, m)) => {
+                            eprintln!("capture: 識別子なし → ページの書誌メタで DOI {} に結んだ（{}）", m.doi, m.reason);
+                            reason = Some(format!("ページの書誌メタで照合: {}", m.reason));
+                            r
+                        }
+                        Err(note) => {
+                            // 捏造せず、ページの題名だけで document を作る
+                            eprintln!("capture: 識別子なし → 題名のみ・要確認（{note}）");
+                            review = true;
+                            reason = Some(note.clone());
+                            resolver::Resolved {
+                                csl: json!({
+                                    "type": "document",
+                                    "title": t,
+                                    "URL": req.url,
+                                    "custom": { "source": "capture", "import_note": note }
+                                }),
+                                retracted: None,
+                                source: "capture",
+                                warnings: vec![],
+                            }
+                        }
                     }
                 }
             };
@@ -405,6 +485,12 @@ fn capture_save_unlocked(
             }
         }
     };
+    if review && status == "created" {
+        // 一覧から見つけられるよう「要確認」ラベル（要確認 stub と同じ物）。付けられなくても保存は成功のまま（警告で出す）
+        if let Err((what, e)) = pdfingest::attach_review_label(&db, &key) {
+            warnings.push(format!("{what} {e}"));
+        }
+    }
     if let Some(cid) = req.collection_id {
         add_to_folder(&db, &key, cid, "capture");
     }
@@ -423,8 +509,32 @@ fn capture_save_unlocked(
     }
     if let Some(o) = v.as_object_mut() {
         o.insert("warnings".into(), json!(warnings));
+        if let Some(r) = reason {
+            o.insert("reason".into(), json!(r));
+        }
     }
     Ok(v)
+}
+
+/// 識別子の無いページ: ページの書誌メタの題名（+ 筆頭著者の姓 + 年）で Crossref を引き、候補を欄ごとに照合する
+/// （`pdfingest::pick_evidence_match`）。Ok = 結べた DOI と理由・Err = 結べなかった理由（import_note と応答の reason）。
+/// 検索の失敗も Err（保存は題名のみで続ける）。題名が無ければ検索しない
+fn link_by_evidence(
+    ev: &pdfingest::PageEvidence,
+    search: impl FnOnce(&str, usize) -> openref_core::Result<Vec<resolver::Candidate>>,
+) -> Result<pdfingest::TitleMatch, String> {
+    let Some(q) = ev.query() else {
+        return Err("識別子なし・ページに書誌メタ（citation_title / dc.title / JSON-LD の題名）が無く、照合できませんでした。DOI/PMID を入力して書誌を引き直してください".into());
+    };
+    let cands = search(&q, 5).map_err(|e| {
+        format!("識別子なし・Crossref の検索に失敗しました（{}）。DOI/PMID を入力して書誌を引き直してください", resolver::short_reason(&e))
+    })?;
+    pdfingest::pick_evidence_match(&cands, ev).ok_or_else(|| {
+        format!(
+            "識別子なし・ページの書誌メタで Crossref の候補 {} 件と照合し、1 件に結べませんでした（題名の完全一致と筆頭著者の一致が要る。年だけで結ぶのは 6 語以上の題名のとき）。DOI/PMID を入力して書誌を引き直してください",
+            cands.len()
+        )
+    })
 }
 
 /// ③ の Duplicate の相手に resolver の撤回の印を書く（merge_enrichment = 題名ガード付き・権威フィールドの補完も同じ応答で）。
@@ -476,6 +586,7 @@ async fn capture_attachment(
             let Some(it) = search::get_by_key(&db, &key).map_err(|e| e.to_string())? else {
                 return Ok((StatusCode::NOT_FOUND, json!({ "error": format!("item {key} が見つかりません") })));
             };
+            // 数えられない（DB の異常）を「同一ファイルなし」に落とさない = 500 + error（拡張は「転送失敗（…）」と出す）
             let dup: i64 = db
                 .conn
                 .query_row(
@@ -483,7 +594,10 @@ async fn capture_attachment(
                     (it.id, md5.as_str()),
                     |r| r.get(0),
                 )
-                .unwrap_or(0);
+                .map_err(|e| {
+                    eprintln!("capture: {key} の添付済みファイル（md5）を照合できません: {e}");
+                    format!("添付済みのファイルを照合できません: {e}")
+                })?;
             if dup > 0 {
                 return Ok(skipped());
             }
@@ -521,22 +635,17 @@ async fn capture_attachment(
                 doi_check
             }
         };
-        // ③ 再ロックして添付。md5 の意味論は GUI 一括取込(pdfingest の ③ → attach_or_skip_with_md5)と同じ:
-        // 未添付なら添付 / 同一ファイル（md5 一致）ならスキップ / 別ファイルなら 2 本目として添付
+        // 索引用の全頁の抽出もロックの外で済ませる（③ は本文の行を書くだけ = 大きい PDF でも /capture/status・Word を止めない）
+        let text = openref_core::fulltext::extract_for_index(&body, &md5, None);
+        // ③ 再ロックして添付 + 照合印（core の `attach_verified` = サーバ側の取得と共有）。既存の添付の方針は Capture の
+        // `AddAnother` = GUI 一括取込と同じ md5 の意味論: 未添付なら添付 / 同一ファイル（md5 一致）ならスキップ / 別ファイルなら 2 本目
         let db = st2.db();
-        match pdfingest::attach_or_skip_with_md5(&db, &key, &filename, &body, &md5) {
-            Ok((outcome, attached)) => {
-                if let Some(edit::Placement::ManagedFallback { reason, .. }) = attached.as_ref().map(|a| &a.placement) {
+        match pdffetch::attach_verified(&db, &key, &filename, &body, &md5, mark, pdffetch::ExistingPdf::AddAnother, Some(&text)) {
+            Ok(pdffetch::VerifiedAttach::Attached { attached, additional }) => {
+                if let edit::Placement::ManagedFallback { reason, .. } = &attached.placement {
                     eprintln!("capture: ⚠ {reason}");
                 }
-                let status = match outcome {
-                    pdfingest::PdfIngestOutcome::DuplicateFile { .. } => return Ok(skipped()),
-                    pdfingest::PdfIngestOutcome::AttachedAdditional { .. } => "attached_additional",
-                    _ => "attached",
-                };
-                if let (Some(m), Some(a)) = (mark, &attached) {
-                    pdffetch::mark_doi_check(&db, a.id, m);
-                }
+                let status = if additional { "attached_additional" } else { "attached" };
                 eprintln!(
                     "capture: {key} に {} bytes 添付（{status}・source={source} via={via}・doi_check={}）",
                     body.len(),
@@ -547,6 +656,7 @@ async fn capture_attachment(
                     json!({ "status": status, "bytes": body.len(), "filename": filename, "doi_check": mark }),
                 ))
             }
+            Ok(pdffetch::VerifiedAttach::DuplicateFile | pdffetch::VerifiedAttach::HasPdf) => Ok(skipped()),
             Err(e) => Err(e.to_string()),
         }
     })
@@ -700,7 +810,23 @@ mod tests {
     }
 
     fn req(doi: Option<&str>, title: Option<&str>) -> SaveReq {
-        SaveReq { doi: doi.map(str::to_string), pmid: None, title: title.map(str::to_string), url: Some("https://example.org/x".into()), collection_id: None }
+        SaveReq {
+            doi: doi.map(str::to_string),
+            pmid: None,
+            title: title.map(str::to_string),
+            url: Some("https://example.org/x".into()),
+            collection_id: None,
+            evidence: Default::default(),
+        }
+    }
+
+    /// 識別子のある保存・書誌メタの無い保存（Crossref の検索を呼ばない枝）
+    fn save_ids(
+        st: &St,
+        req: SaveReq,
+        resolve: impl FnOnce(&resolver::AddInput) -> openref_core::Result<resolver::Resolved>,
+    ) -> Result<Value, String> {
+        capture_save_unlocked(st, req, resolve, |q, _| panic!("Crossref の検索を呼んだ（{q}）"))
     }
 
     fn n_items(st: &St) -> i64 {
@@ -711,7 +837,7 @@ mod tests {
     #[test]
     fn save_resolves_outside_the_lock() {
         let st = test_st();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/new"), None), |i| {
+        let v = save_ids(&st, req(Some("10.1234/new"), None), |i| {
             assert!(matches!(i, resolver::AddInput::Doi(d) if d == "10.1234/new"));
             let g = st.db.try_lock().expect("② の間に DB のロックが握られている");
             drop(g);
@@ -730,7 +856,7 @@ mod tests {
     #[test]
     fn save_reports_resolver_warnings() {
         let st = test_st();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/w"), None), |_| {
+        let v = save_ids(&st, req(Some("10.1234/w"), None), |_| {
             let mut r = resolved("10.1234/w", None);
             r.warnings.push("PubMed の照合に失敗（x）→ doi.org の書誌で代用".into());
             Ok(r)
@@ -738,7 +864,7 @@ mod tests {
         .unwrap();
         assert_eq!(v["status"], "created");
         assert_eq!(v["warnings"], json!(["PubMed の照合に失敗（x）→ doi.org の書誌で代用"]));
-        let again = capture_save_unlocked(&st, req(Some("10.1234/w"), None), |_| panic!("resolver")).unwrap();
+        let again = save_ids(&st, req(Some("10.1234/w"), None), |_| panic!("resolver")).unwrap();
         assert_eq!(again["status"], "existing");
         assert_eq!(again["warnings"], json!([]));
     }
@@ -747,8 +873,8 @@ mod tests {
     #[test]
     fn save_existing_does_not_resolve() {
         let st = test_st();
-        let first = capture_save_unlocked(&st, req(Some("10.1234/a"), None), |_| Ok(resolved("10.1234/a", None))).unwrap();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/a"), None), |_| panic!("登録済みなのに resolver を呼んだ")).unwrap();
+        let first = save_ids(&st, req(Some("10.1234/a"), None), |_| Ok(resolved("10.1234/a", None))).unwrap();
+        let v = save_ids(&st, req(Some("10.1234/a"), None), |_| panic!("登録済みなのに resolver を呼んだ")).unwrap();
         assert_eq!(v["status"], "existing");
         assert_eq!(v["key"], first["key"]);
         assert_eq!(n_items(&st), 1);
@@ -759,7 +885,7 @@ mod tests {
     fn same_doi_between_check_and_commit_is_existing() {
         let st = test_st();
         let mut other = String::new();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/race"), None), |_| {
+        let v = save_ids(&st, req(Some("10.1234/race"), None), |_| {
             let mut db = st.db();
             other = ingest::add_item(&mut db, &resolved("10.1234/race", None)).unwrap().key;
             Ok(resolved("10.1234/race", None))
@@ -774,14 +900,14 @@ mod tests {
     #[test]
     fn save_without_identifier_and_resolver_error() {
         let st = test_st();
-        let v = capture_save_unlocked(&st, req(None, Some("Page title")), |_| panic!("識別子なしで resolver")).unwrap();
+        let v = save_ids(&st, req(None, Some("Page title")), |_| panic!("識別子なしで resolver")).unwrap();
         assert_eq!(v["status"], "created");
         let it = search::get_by_key(&st.db(), v["key"].as_str().unwrap()).unwrap().unwrap();
         assert_eq!(it.csl["type"], "document");
         assert_eq!(it.csl["URL"], "https://example.org/x");
-        let e = capture_save_unlocked(&st, req(None, None), |_| panic!("resolver")).unwrap_err();
+        let e = save_ids(&st, req(None, None), |_| panic!("resolver")).unwrap_err();
         assert_eq!(e, "DOI / PMID もタイトルも見つかりません");
-        let e = capture_save_unlocked(&st, req(Some("10.1234/404"), None), |_| Err(openref_core::CoreError::Http("404".into()))).unwrap_err();
+        let e = save_ids(&st, req(Some("10.1234/404"), None), |_| Err(openref_core::CoreError::Http("404".into()))).unwrap_err();
         assert!(e.contains("404"), "{e}");
         assert_eq!(n_items(&st), 1);
     }
@@ -791,15 +917,15 @@ mod tests {
     #[test]
     fn retraction_is_reported_for_existing_items_too() {
         let st = test_st();
-        let created = capture_save_unlocked(&st, req(Some("10.1234/retracted"), None), |_| Ok(resolved("10.1234/retracted", Some("Retraction in: X 2026")))).unwrap();
+        let created = save_ids(&st, req(Some("10.1234/retracted"), None), |_| Ok(resolved("10.1234/retracted", Some("Retraction in: X 2026")))).unwrap();
         assert_eq!(created["status"], "created");
         assert_eq!(created["retraction"], "Retraction in: X 2026");
-        let existing = capture_save_unlocked(&st, req(Some("10.1234/retracted"), None), |_| panic!("resolver")).unwrap();
+        let existing = save_ids(&st, req(Some("10.1234/retracted"), None), |_| panic!("resolver")).unwrap();
         assert_eq!(existing["status"], "existing");
         assert_eq!(existing["retraction"], "Retraction in: X 2026", "既存一致でも撤回の警告");
         // ③ の Duplicate: ② の間に同じ DOI が入った（印はその item に付いている）
         let st2 = test_st();
-        let v = capture_save_unlocked(&st2, req(Some("10.1234/race-r"), None), |_| {
+        let v = save_ids(&st2, req(Some("10.1234/race-r"), None), |_| {
             let mut db = st2.db();
             ingest::add_item(&mut db, &resolved("10.1234/race-r", Some("Retracted"))).unwrap();
             Ok(resolved("10.1234/race-r", None))
@@ -807,7 +933,7 @@ mod tests {
         .unwrap();
         assert_eq!(v["status"], "existing");
         assert_eq!(v["retraction"], "Retracted", "Duplicate でも撤回の警告");
-        let plain = capture_save_unlocked(&st, req(Some("10.1234/plain"), None), |_| Ok(resolved("10.1234/plain", None))).unwrap();
+        let plain = save_ids(&st, req(Some("10.1234/plain"), None), |_| Ok(resolved("10.1234/plain", None))).unwrap();
         assert_eq!(plain["retraction"], Value::Null);
         let key = existing["key"].as_str().unwrap();
         edit::trash(&st.db(), key).unwrap();
@@ -821,7 +947,7 @@ mod tests {
     fn duplicate_keeps_retraction_from_resolver() {
         let st = test_st();
         let mut other = String::new();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/race-new"), None), |_| {
+        let v = save_ids(&st, req(Some("10.1234/race-new"), None), |_| {
             let mut db = st.db();
             other = ingest::add_item(&mut db, &resolved("10.1234/race-new", None)).unwrap().key;
             Ok(resolved("10.1234/race-new", Some("Retraction in: Y 2026")))
@@ -835,7 +961,7 @@ mod tests {
 
         // 先に入った item の題名が違う（識別子の誤り）: merge_enrichment のガードで DB には書かないが、応答には警告
         let mut odd = String::new();
-        let v = capture_save_unlocked(&st, req(Some("10.1234/race-odd"), None), |_| {
+        let v = save_ids(&st, req(Some("10.1234/race-odd"), None), |_| {
             let mut db = st.db();
             let mut csl = csl_for("10.1234/race-odd");
             csl["title"] = json!("Completely different hospital newsletter");
@@ -847,5 +973,241 @@ mod tests {
         assert_eq!(v["retraction"], "Retracted");
         let id = search::get_by_key(&st.db(), &odd).unwrap().unwrap().id;
         assert_eq!(search::retraction_of(&st.db(), id).unwrap(), None);
+    }
+
+    // ---------- 識別子の無いページ: ページの書誌メタ（evidence）で照合 ----------
+
+    const T: &str = "Imaging of Deep Endometriosis Involving Lateral Pelvic Structures";
+
+    /// 拡張（content.js）が送る形の evidence
+    fn evidence_json(title: Option<&str>, authors: &[&str], date: Option<&str>) -> Value {
+        let mut v = json!({});
+        if let Some(t) = title {
+            v["title"] = json!({ "value": t, "source": "citation_title" });
+        }
+        if !authors.is_empty() {
+            v["authors"] = json!({ "value": authors, "source": "citation_author" });
+        }
+        if let Some(d) = date {
+            v["date"] = json!({ "value": d, "source": "citation_publication_date" });
+        }
+        v["journal"] = json!({ "value": "RadioGraphics", "source": "citation_journal_title" });
+        v
+    }
+
+    fn ev_req(ev: Value) -> SaveReq {
+        SaveReq { evidence: page_evidence(Some(&ev)), ..req(None, Some("og:title of the page")) }
+    }
+
+    fn cand(doi: &str, title: &str, year: i64, family: Option<&str>, kind: &str) -> resolver::Candidate {
+        resolver::Candidate {
+            doi: doi.into(),
+            title: title.into(),
+            year: Some(year),
+            first_author_family: family.map(str::to_string),
+            kind: Some(kind.into()),
+        }
+    }
+
+    /// resolver の書誌（照合に使ったページの値とは別物 = 保存されるのはこれだけ）
+    fn resolver_csl(doi: &str) -> Value {
+        json!({ "type": "article-journal", "title": T, "DOI": doi, "container-title": "RadioGraphics",
+                "author": [{ "family": "Brandão", "given": "Alice" }], "issued": { "date-parts": [[2026, 8, 1]] },
+                "custom": { "source": "pubmed" } })
+    }
+
+    fn stored(st: &St, key: &str) -> Value {
+        search::get_by_key(&st.db(), key).unwrap().unwrap().csl
+    }
+
+    fn labeled(st: &St, key: &str) -> bool {
+        pdfingest::is_review_stub(&st.db(), key).unwrap()
+    }
+
+    #[test]
+    fn page_evidence_reads_the_extension_shape() {
+        let e = page_evidence(Some(&evidence_json(Some(" A title "), &["", "Brandão, Alice", "Pires Franco, I"], Some("2026/08/01"))));
+        assert_eq!(e.title.as_deref(), Some("A title"));
+        assert_eq!(e.first_author.as_deref(), Some("Brandão, Alice"), "空の著者は飛ばす");
+        assert_eq!(e.year, Some(2026));
+        // 無い・形の違う値は無いもの（旧拡張は evidence を送らない）
+        for bad in [json!(null), json!("x"), json!({ "title": "plain string" }), json!({ "title": { "value": 3 }, "authors": { "value": "Brandão" } })] {
+            let e = page_evidence(Some(&bad));
+            assert!(e.title.is_none() && e.first_author.is_none() && e.year.is_none(), "{bad}");
+        }
+        assert!(page_evidence(None).title.is_none());
+    }
+
+    /// 結べた: 検索はロックの外・検索語は 題名 + 姓 + 年・rows 5 → resolver の書誌**だけ**を保存（ページの題名・URL・著者の表記は入らない）・
+    /// ラベルなし・応答に reason
+    #[test]
+    fn evidence_match_saves_only_the_resolver_csl() {
+        let st = test_st();
+        let page_title = format!("{T}: A Pictorial Review From the Page");
+        let mut searched = None;
+        let v = capture_save_unlocked(
+            &st,
+            ev_req(evidence_json(Some(&page_title), &["BRANDAO, Alice C. (page spelling)"], Some("2026/08/01"))),
+            |i| {
+                assert_eq!(i, &resolver::AddInput::Doi("10.1148/rg.250127".into()));
+                Ok(resolver::Resolved { csl: resolver_csl("10.1148/rg.250127"), retracted: None, source: "pubmed", warnings: vec![] })
+            },
+            |q, rows| {
+                drop(st.db.try_lock().expect("検索の間に DB のロックが握られている"));
+                searched = Some((q.to_string(), rows));
+                Ok(vec![cand("10.1148/rg.250127.quiz", T, 2026, None, "dataset"), cand("10.1148/rg.250127", T, 2026, Some("Brandão"), "journal-article")])
+            },
+        )
+        .unwrap();
+        assert_eq!(searched, Some((format!("{page_title} BRANDAO 2026"), 5)));
+        assert_eq!(v["status"], "created");
+        assert_eq!(v["doi"], "10.1148/rg.250127");
+        // quiz（著者なし）は副題を除いた一致で年だけ = 通らない → 本体だけ
+        assert_eq!(v["reason"], "ページの書誌メタで照合: 題名一致（副題を除く）・年+筆頭著者一致");
+        let key = v["key"].as_str().unwrap();
+        assert_eq!(stored(&st, key), resolver_csl("10.1148/rg.250127"), "保存するのは resolver の書誌だけ");
+        assert!(!labeled(&st, key));
+    }
+
+    /// 結べない（候補が年も著者も合わない）・検索の失敗・結べたが resolver が失敗: ページの題名のみの document + 要確認 + import_note
+    /// （書誌メタの値 = 題名・著者・年は保存しない）
+    #[test]
+    fn evidence_without_a_match_is_a_labeled_title_only_document() {
+        let st = test_st();
+        let ev = || ev_req(evidence_json(Some(T), &["Smith, John"], Some("2019")));
+        let cases: Vec<(&str, Box<dyn FnOnce(&str, usize) -> openref_core::Result<Vec<resolver::Candidate>>>, bool, &str)> = vec![
+            ("結べない", Box::new(|_, _| Ok(vec![cand("10.1148/rg.250127", T, 2026, Some("Brandão"), "journal-article")])), false, "候補 1 件と照合し、1 件に結べませんでした"),
+            ("検索の失敗", Box::new(|_, _| Err(openref_core::CoreError::Http("crossref search: https://api.crossref.org/works?q: status code 429".into()))), false, "Crossref の検索に失敗しました（HTTP 429・再試行切れ）"),
+            ("resolver の失敗", Box::new(|_, _| Ok(vec![cand("10.1/x", T, 2019, None, "journal-article")])), true, "DOI 10.1/x に結べましたが、書誌を確定できませんでした（HTTP 404）"),
+        ];
+        for (name, search, resolves, why) in cases {
+            let v = capture_save_unlocked(
+                &st,
+                ev(),
+                |_| {
+                    assert!(resolves, "{name}: 結べないのに resolver");
+                    Err(openref_core::CoreError::Http("doi.org negotiation (10.1/x): https://doi.org/10.1/x: status code 404".into()))
+                },
+                search,
+            )
+            .unwrap();
+            assert_eq!(v["status"], "created", "{name}");
+            assert_eq!(v["doi"], Value::Null, "{name}");
+            let reason = v["reason"].as_str().unwrap();
+            assert!(reason.contains(why), "{name}: {reason}");
+            let key = v["key"].as_str().unwrap();
+            let csl = stored(&st, key);
+            assert_eq!(csl["type"], "document");
+            assert_eq!(csl["title"], "og:title of the page", "{name}: 題名はページの題名（書誌メタの題名は保存しない）");
+            assert_eq!(csl["URL"], "https://example.org/x");
+            assert_eq!(csl["custom"]["import_note"], reason, "{name}");
+            assert!(csl.get("author").is_none() && csl.get("issued").is_none(), "{name}: ページの著者・年は保存しない");
+            assert!(labeled(&st, key), "{name}: 要確認ラベル");
+        }
+    }
+
+    /// 書誌メタが無い（題名はページの題名だけ）: 検索を呼ばず（save_ids の検索は panic）、題名のみ + 要確認 + 理由
+    #[test]
+    fn no_evidence_is_labeled_without_searching() {
+        let st = test_st();
+        let v = save_ids(&st, req(None, Some("Page title")), |_| panic!("resolver")).unwrap();
+        let key = v["key"].as_str().unwrap();
+        assert!(v["reason"].as_str().unwrap().contains("書誌メタ（citation_title / dc.title / JSON-LD の題名）が無く"), "{v}");
+        assert_eq!(stored(&st, key)["custom"]["import_note"], v["reason"]);
+        assert_eq!(stored(&st, key)["title"], "Page title");
+        assert!(labeled(&st, key));
+        // 題名の無い書誌メタ（著者・年だけ）も同じ
+        let v = save_ids(&st, ev_req(evidence_json(None, &["Brandão, Alice"], Some("2026"))), |_| panic!("resolver")).unwrap();
+        assert_eq!(v["title"], "og:title of the page");
+        assert!(labeled(&st, v["key"].as_str().unwrap()));
+    }
+
+    /// 結べた DOI が登録済み → resolver を呼ばずに existing（① と同じ形 + reason）・その item にラベルを付けない
+    #[test]
+    fn evidence_match_to_an_existing_doi_is_existing() {
+        let st = test_st();
+        let first = save_ids(&st, req(Some("10.1148/rg.250127"), None), |_| {
+            Ok(resolver::Resolved { csl: resolver_csl("10.1148/rg.250127"), retracted: None, source: "pubmed", warnings: vec![] })
+        })
+        .unwrap();
+        let v = capture_save_unlocked(
+            &st,
+            ev_req(evidence_json(Some(T), &[], Some("2026"))),
+            |_| panic!("登録済みの DOI で resolver を呼んだ"),
+            |_, _| Ok(vec![cand("10.1148/rg.250127", T, 2026, Some("Brandão"), "journal-article")]),
+        )
+        .unwrap();
+        assert_eq!(v["status"], "existing");
+        assert_eq!(v["key"], first["key"]);
+        assert_eq!(v["reason"], "ページの書誌メタで照合: 題名一致・年一致");
+        assert_eq!(v["warnings"], json!([]));
+        assert!(!labeled(&st, v["key"].as_str().unwrap()));
+        assert_eq!(n_items(&st), 1);
+    }
+
+    /// 識別の物差しの connectd 側（識別子なしページの照合）: ページの書誌メタ（拡張が送る evidence の形）と Crossref の候補
+    /// （差し替え。1 件は Crossref の応答を縮めた core の fixture）を `/capture/save` の本体に通し、結べた数と要確認の数を出す。
+    /// expect = 正しい答え（None = 結んではいけない）。誤った結合（別の DOI・結んではいけない物に結ぶ）は 0 件であること。
+    /// 正しい答えがあるのに結べなかった物は「取りこぼし」として数だけ出す（要確認になる = 誤りではない）
+    #[test]
+    fn capture_evidence_baseline() {
+        let real = || {
+            let v: Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../openref-core/src/resolver/fixtures/crossref-search-rg-250127.json"
+            )))
+            .unwrap();
+            Ok(resolver::parse_candidates(&v))
+        };
+        let ja = "小児の架空症例の画像所見";
+        let abs = "Accelerated whole-brain MR fingerprinting with a deep learning reconstruction at 3T";
+        let covid = "Chest CT findings of COVID-19 pneumonia in children: a systematic review";
+        type Search = Box<dyn FnOnce(&str, usize) -> openref_core::Result<Vec<resolver::Candidate>>>;
+        let cases: Vec<(&str, Value, Search, Option<&str>)> = vec![
+            ("RadioGraphics の記事（DOI のメタなし・citation_*）・Crossref の応答の fixture",
+                evidence_json(Some(T), &["Brandão, Alice", "Pires Franco, Izabela V."], Some("2026/08/01")), Box::new(move |_, _| real()), Some("10.1148/rg.250127")),
+            ("同じ記事の別の版（年が 1 年ずれ・Given Family の表記）・Crossref の応答の fixture",
+                evidence_json(Some(T), &["Alice Brandão"], Some("2025")), Box::new(move |_, _| real()), Some("10.1148/rg.250127")),
+            // 副題付きで著者が無い = 年だけでは結ばない（取りこぼし）
+            ("1 件だけの JSON-LD（副題付き・著者なし）・Crossref の応答の fixture",
+                json!({ "title": { "value": format!("{T}: A Pictorial Review"), "source": "json-ld" }, "date": { "value": "2026-08-01", "source": "json-ld" } }),
+                Box::new(move |_, _| real()), Some("10.1148/rg.250127")),
+            ("学会抄録（citation_title だけ・Crossref に無い）", evidence_json(Some(abs), &[], None),
+                Box::new(|_, _| Ok(vec![cand("10.1002/mrm.29000", "Deep learning reconstruction for MR fingerprinting", 2022, Some("Chen"), "journal-article")])), None),
+            ("同じ題名の別論文（年も筆頭著者も違う）", evidence_json(Some(covid), &["Tanaka, Hiroshi"], Some("2023")),
+                Box::new(move |_, _| Ok(vec![cand("10.1007/s00247-020-04700-0", covid, 2020, Some("Nino"), "journal-article")])), None),
+            ("和文の短い題名（J-STAGE 型・20 字未満）", evidence_json(Some(ja), &["山田 太郎"], Some("2026")),
+                Box::new(move |_, _| Ok(vec![cand("10.20844/zzzz.42.1_5", ja, 2026, Some("山田"), "journal-article")])), None),
+            ("書誌メタなし（og:title だけ）", json!(null), Box::new(|q, _| panic!("書誌メタなしで検索（{q}）")), None),
+            ("Crossref の検索の失敗（503）", evidence_json(Some(T), &["Brandão, Alice"], Some("2026")),
+                Box::new(|_, _| Err(openref_core::CoreError::Http("crossref search: x: status code 503".into()))), None),
+        ];
+        let total = cases.len();
+        let (mut linked, mut review) = (0, 0);
+        let mut missed: Vec<&str> = Vec::new();
+        for (name, ev, search, expect) in cases {
+            let st = test_st();
+            let v = capture_save_unlocked(
+                &st,
+                ev_req(ev),
+                |i| {
+                    let resolver::AddInput::Doi(d) = i else { panic!("{name}: DOI でない") };
+                    Ok(resolver::Resolved { csl: resolver_csl(d), retracted: None, source: "pubmed", warnings: vec![] })
+                },
+                search,
+            )
+            .unwrap();
+            if v["doi"].is_null() {
+                assert!(labeled(&st, v["key"].as_str().unwrap()), "{name}: 要確認ラベル");
+                review += 1;
+                if expect.is_some() {
+                    missed.push(name);
+                }
+            } else {
+                assert_eq!(v["doi"].as_str(), expect, "{name}: 誤った結合: {v}");
+                linked += 1;
+            }
+        }
+        println!("capture evidence baseline: 結べた {linked} / {total}・要確認 {review}（うち取りこぼし {}: {}）・誤った結合 0", missed.len(), missed.join("・"));
     }
 }

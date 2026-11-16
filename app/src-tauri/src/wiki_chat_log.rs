@@ -286,7 +286,7 @@ impl ChatLog {
             return Err(format!(
                 "{}: {}",
                 dir.display(),
-                tr(self.en, "symlink には書きません", "symlinks are not written to")
+                tr(self.en, "シンボリックリンクには書きません", "symlinks are not written to")
             ));
         }
         if let Some(p) = find_existing(&dir, &self.session) {
@@ -828,10 +828,13 @@ mod tests {
         std::fs::create_dir_all(&dir2).unwrap();
         std::os::unix::fs::symlink(&outside, dir2.join(LOG_DIR)).unwrap();
         let mut lg5 = ChatLog::new(dir2.clone(), "S5".into(), false);
-        assert!(lg5
+        let e5 = lg5.user("x", None, None, None).unwrap_err();
+        assert!(e5.ends_with(": シンボリックリンクには書きません"), "{e5}");
+        // 英語の表示の字は前のまま
+        let e5en = ChatLog::new(dir2.clone(), "S5en".into(), true)
             .user("x", None, None, None)
-            .unwrap_err()
-            .contains("symlink"));
+            .unwrap_err();
+        assert!(e5en.ends_with(": symlinks are not written to"), "{e5en}");
         assert!(
             lg5.disabled && std::fs::read_dir(&outside).unwrap().count() == 0,
             "symlink の先に書いた"

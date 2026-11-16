@@ -7,6 +7,8 @@ import { invoke } from "./ipc";
 import { t } from "../i18n.svelte";
 import { toast } from "../state.svelte";
 import { shownRoot, wk } from "./wiki.svelte";
+import { errText } from "../err";
+import { hideRootParents } from "../shelf/tree";
 
 /** [追加…] = Rust のフォルダ選択ダイアログ → 検査して設定に足す（取り消しは何もしない）。
     set_aside = 設定が解釈できなかったので Rust が元の値をその鍵に退避した（toast 1 つにまとめて知らせる） */
@@ -15,13 +17,15 @@ export async function addRefDir() {
   try {
     const r = await invoke<{ dirs: string[] | null; added: string | null; set_aside?: string | null }>("wiki_ref_dir_add", { args: root ? { root } : {} });
     if (Array.isArray(r.dirs) && root === shownRoot()) wk.refDirs = r.dirs;
-    if (r.added && r.set_aside) {
-      toast(`⚠ ${t("参照フォルダを追加しました")}: ${r.added} (${t("元の設定は解釈できなかったので退避しました")}: ${r.set_aside})`, 10000);
-    } else if (r.added) {
-      toast(`✓ ${t("参照フォルダを追加しました")}: ${r.added}`);
+    // 完了の案内はフォルダ名まで（ほかの完了の案内と同じ。一覧（WikiInfo）は利用者が見分けるためにフルパスのまま）
+    const added = r.added ? hideRootParents(r.added, r.added) : null;
+    if (added && r.set_aside) {
+      toast(`⚠ ${t("参照フォルダを追加しました")}: ${added} (${t("元の設定は解釈できなかったので退避しました")}: ${r.set_aside})`, 10000);
+    } else if (added) {
+      toast(`✓ ${t("参照フォルダを追加しました")}: ${added}`);
     }
   } catch (e) {
-    toast(`✗ ${t("参照フォルダを追加できません")}: ${String(e).slice(0, 200)}`, 8000);
+    toast(`✗ ${t("参照フォルダを追加できません")}: ${errText(e, 200)}`, 8000);
   }
 }
 
@@ -33,6 +37,6 @@ export async function removeRefDir(path: string) {
     if (root === shownRoot()) wk.refDirs = r.dirs ?? [];
     toast(r.restart ? t("参照フォルダを外しました（配信を完全に止めるには OpenRef を再起動してください）") : t("参照フォルダを外しました"), 6000);
   } catch (e) {
-    toast(`✗ ${t("参照フォルダを外せません")}: ${String(e).slice(0, 200)}`, 8000);
+    toast(`✗ ${t("参照フォルダを外せません")}: ${errText(e, 200)}`, 8000);
   }
 }

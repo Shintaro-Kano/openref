@@ -46,7 +46,8 @@ const page = {
   getTextContent: async () => ({ items: [], styles: {} }),
   cleanup() {},
 };
-globalThis.__pdf = () => ({ promise: Promise.resolve({ numPages: 2, getPage: async () => page, getOutline: async () => null, destroy: async () => {} }), destroy: async () => {} });
+const pdfOpts = []; // getDocument に渡った引数（viewer/pdfdoc.ts を通る）
+globalThis.__pdf = (o) => (pdfOpts.push(o), { promise: Promise.resolve({ numPages: 2, getPage: async () => page, getOutline: async () => null, destroy: async () => {} }), destroy: async () => {} });
 
 const { mount, unmount, flushSync } = await import("svelte");
 const S = await import("../state.svelte.ts");
@@ -237,6 +238,53 @@ async function open(front = true) {
   await settle();
   assert.deepEqual([closed, !!$(".v-side .ann.editing")], [0, false], "開いている間の Esc が今どおり編集の取消にならない");
   unmount(v);
+  tests++;
+}
+
+// pdf.js の開き方 = viewer/pdfdoc.ts の openPdf を通る: この読み手の読み方（attachment_data の全量 = data）と、本棚の読み手と
+// 共通の補助データ 4 つの URL・useWorkerFetch: false・enableXfa: false・worker（無いと字や図が黙って消える）
+{
+  pdfOpts.length = 0;
+  const v = await open();
+  await waitFor(() => pdfOpts.length);
+  const PJ = await import("pdfjs-dist");
+  assert.equal(pdfOpts.length, 1, "getDocument を 1 回だけ呼ばない");
+  const { data, ...rest } = pdfOpts[0];
+  assert.ok(data instanceof Uint8Array && data.byteLength === 4, "data が attachment_data の Uint8Array でない");
+  assert.deepEqual(rest, {
+    enableXfa: false,
+    cMapUrl: "http://localhost/pdfjs/cmaps/",
+    standardFontDataUrl: "http://localhost/pdfjs/standard_fonts/",
+    wasmUrl: "http://localhost/pdfjs/wasm/",
+    iccUrl: "http://localhost/pdfjs/iccs/",
+    useWorkerFetch: false,
+  }, "文献の読み手の getDocument の引数が違う");
+  assert.equal(PJ.GlobalWorkerOptions.workerSrc, "worker.js", "worker を設定しない");
+  unmount(v);
+  tests++;
+}
+
+// getDocument を呼ぶのは viewer/pdfdoc.ts だけ・2 つの読み手は openPdf を通る（片方だけが補助データを外した getDocument を持てない）
+{
+  const { readdirSync, readFileSync, statSync } = await import("node:fs");
+  const src = new URL("../../", import.meta.url); // app/src/
+  const files = [];
+  const walk = (d) => {
+    for (const n of readdirSync(d)) {
+      const p = new URL(n, d);
+      if (statSync(p).isDirectory()) walk(new URL(n + "/", d));
+      else if (/\.(svelte|ts)$/.test(n) && !/\.test\./.test(n)) files.push(p);
+    }
+  };
+  walk(src);
+  const callers = files.filter((f) => /\bgetDocument\s*\(/.test(readFileSync(f, "utf8"))).map((f) => f.pathname.slice(src.pathname.length));
+  assert.deepEqual(callers, ["lib/viewer/pdfdoc.ts"], "pdfdoc.ts の外で getDocument を呼んでいる");
+  for (const f of ["lib/PdfViewer.svelte", "lib/shelf/ShelfViewer.svelte"]) {
+    const s = readFileSync(new URL(f, src), "utf8");
+    assert.match(s, /import \{ openPdf \} from "\.\.?\/viewer\/pdfdoc";/, `${f} が viewer/pdfdoc の openPdf を import しない`);
+    assert.match(s, /loadingTask = openPdf\(\{/, `${f} が openPdf で開かない`);
+    assert.doesNotMatch(s, /GlobalWorkerOptions\.|cMapUrl\s*:|useWorkerFetch\s*:\s*(?:true|false)\s*[,}]/, `${f} が pdf.js の設定を自分で持っている`);
+  }
   tests++;
 }
 

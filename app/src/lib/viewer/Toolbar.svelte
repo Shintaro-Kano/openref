@@ -18,6 +18,8 @@
     onGoto,
     onToggleSearch,
     onToggleSide,
+    diag = "",
+    info = "",
   }: {
     zoomPct: number;
     mode: ZoomMode;
@@ -33,6 +35,10 @@
     onGoto: (n: number) => void;
     onToggleSearch: () => void;
     onToggleSide: () => void;
+    /** 診断の警告（テキスト層なし・途中のエラー）。空なら出さない */
+    diag?: string;
+    /** 頁の欄に乗せると読む情報（頁数・テキストの件数・ビルド指紋） */
+    info?: string;
   } = $props();
 
   // ページ番号入力: 表示はカレントページに追従、編集中は上書きしない
@@ -76,7 +82,7 @@
 
   <div class="tb-sep"></div>
 
-  <div class="tb-group tb-page">
+  <div class="tb-group tb-page" title={info}>
     <input
       class="tb-pageinput"
       bind:value={buf}
@@ -99,7 +105,9 @@
     <span class="tb-pagesep">/ {pageCount}</span>
   </div>
 
-  <div class="tb-spacer"></div>
+  <!-- 診断は残りの幅を占める枠の中: 長い文は枠の幅で切れ（全文は title）、診断の有無で右のボタンの位置は変わらず、
+       診断のせいでツールバーが 2 行に折れない（枠は min-width 0 = 縮む）。枠は診断が無いときの余白（旧 tb-spacer）も兼ねる -->
+  <div class="tb-spacer tb-diagslot">{#if diag}<span class="tb-diag" title={diag}>{diag}</span>{/if}</div>
 
   <button
     class="tb-btn tb-search"
@@ -107,7 +115,7 @@
     title={t("文書内検索 (⌘F)")}
     onclick={onToggleSearch}>⌕</button
   >
-  <!-- 右バーの開閉（一覧の右ペインの開閉 .lb-pane と同じ絵・⌘⌥I） -->
+  <!-- 右バーの開閉（右ペインの開閉 .pn-toggle = PaneToggle と同じ絵・大きさ・⌘⌥I。右端の揃えは app.css） -->
   <button
     class="tb-btn tb-pane"
     class:tb-pane-off={!sideOpen}

@@ -10,12 +10,13 @@
   import { untrack } from "svelte";
   import { api, type TagRow } from "./api";
   import FindReplacePanel from "./FindReplacePanel.svelte";
-  import { composing, focusMe, onEnter } from "./input";
+  import { focusMe, onEnter } from "./input";
   import LabelBadge from "./LabelBadge.svelte";
   import LabelPalette from "./LabelPalette.svelte";
   import { DEFAULT_LABEL_COLOR, isSolid, labelVars } from "./labels";
   import { Manage, type Panel } from "./manage.svelte";
   import ManageTable from "./ManageTable.svelte";
+  import Modal from "./Modal.svelte";
   import { sameName } from "./folders";
   import { byName } from "./sort";
   import {
@@ -39,9 +40,9 @@
   // ---------- Manage labels ----------
   const m = new Manage<TagRow>({
     text: {
-      empty: () => t("ラベルはまだありません。「＋ New label」で作成できます。"),
+      empty: () => t("ラベルはまだありません。「＋ 新規ラベル」で作成できます。"),
       noMatch: (q) => `${t("「::no-label")}${q}${t("」に一致するラベルなし")}`,
-      remove: () => t("このラベルを削除（論文は消えません）"),
+      remove: () => t("このラベルを削除（文献は消えません）"),
       noFind: () => t("一致するラベルなし"),
     },
     all: () => app.tags,
@@ -156,29 +157,26 @@
     rowPal = rowPal === t.id ? null : t.id;
   }
 
-  /** Esc（App の Esc 連鎖は app.modal 中は何もしない = App.svelte。PdfViewer は capture 段で控えた coveredAtKey で見送る） */
-  function onKey(e: KeyboardEvent) {
-    if (e.key !== "Escape" || composing(e)) return;
-    if (app.modal === "newLabel") {
-      if (palOpen) palOpen = false;
-      else close();
-    } else if (app.modal === "manageLabels") {
-      if (rowPal !== null) rowPal = null;
-      else if (m.renaming !== null) m.renaming = null;
-      else if (m.confirmRow !== null) m.confirmRow = null;
-      else if (newPal) newPal = false;
-      else if (m.panel) m.panel = null;
-      else close();
-    }
+  /** Esc は内側から順に（App の Esc 連鎖は app.modal 中は何もしない = App.svelte。PdfViewer は capture 段で控えた coveredAtKey で見送る）。
+      IME の変換中の Esc は骨格（Modal）が見送る */
+  function escNew() {
+    if (palOpen) palOpen = false;
+    else close();
+  }
+  function escManage() {
+    if (rowPal !== null) rowPal = null;
+    else if (m.renaming !== null) m.renaming = null;
+    else if (m.confirmRow !== null) m.confirmRow = null;
+    else if (newPal) newPal = false;
+    else if (m.panel) m.panel = null;
+    else close();
   }
 
   const why = $derived({
-    conflict: t("同名のラベルがあるため変えません（まとめるなら Merge）"),
+    conflict: t("同名のラベルがあるため変えません（1 つにするなら「統合」）"),
     empty: t("空の名前になるため変えません"),
   });
 </script>
-
-<svelte:window onkeydown={onKey} />
 
 {#snippet tagIcon()}
   <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"
@@ -211,162 +209,156 @@
   </span>
 {/snippet}
 
-{#if app.modal === "newLabel"}
-  <div class="overlay" onclick={(e) => e.target === e.currentTarget && close()} role="presentation">
-    <div class="modal nl-modal" onclick={() => (palOpen = false)} role="dialog" aria-modal="true" aria-label="New label">
-      <div class="modal-head">
-        <h3>New label</h3>
-        <button class="x" onclick={close}>×</button>
-      </div>
-      <div class="modal-body nl-body">
-        <div class="nl-row">
-          {@render colorPicker(color, palOpen, () => (palOpen = !palOpen), (c) => {
-            color = c;
-            palOpen = false;
-            nameEl?.focus();
-          })}
-          <input
-            bind:this={nameEl}
-            class="nl-name"
-            placeholder="Label name"
-            bind:value={name}
-            onkeydown={(e) => onEnter(e, create)} />
-        </div>
-        <div class="nl-hint">
-          {#if taken}
-            <span class="nl-err">{t("同名のラベル「")}{name.trim()}{t("」が既にあります")}</span>
-          {:else if name.trim()}
-            <span class="dim">{t("表示:")}</span>
-            <LabelBadge name={name.trim()} {color} />
-          {/if}
-        </div>
-      </div>
-      <div class="modal-foot">
-        <button onclick={close}>Cancel</button>
-        <button class="primary" disabled={!name.trim() || taken} onclick={create}>Create label</button>
-      </div>
+<Modal open={app.modal === "newLabel"} cls="nl-modal" label={t("新規ラベル")} ariaModal onbackdrop={close} onescape={escNew} onframeclick={() => (palOpen = false)}>
+  <div class="modal-head">
+    <h3>{t("新規ラベル")}</h3>
+    <button class="x" onclick={close}>×</button>
+  </div>
+  <div class="modal-body nl-body">
+    <div class="nl-row">
+      {@render colorPicker(color, palOpen, () => (palOpen = !palOpen), (c) => {
+        color = c;
+        palOpen = false;
+        nameEl?.focus();
+      })}
+      <input
+        bind:this={nameEl}
+        class="nl-name"
+        placeholder={t("ラベルの名前")}
+        bind:value={name}
+        onkeydown={(e) => onEnter(e, create)} />
+    </div>
+    <div class="nl-hint">
+      {#if taken}
+        <span class="nl-err">{t("同名のラベル「")}{name.trim()}{t("」が既にあります")}</span>
+      {:else if name.trim()}
+        <span class="dim">{t("表示:")}</span>
+        <LabelBadge name={name.trim()} {color} />
+      {/if}
     </div>
   </div>
-{/if}
+  <div class="modal-foot">
+    <button onclick={close}>{t("キャンセル")}</button>
+    <button class="primary" disabled={!name.trim() || taken} onclick={create}>{t("ラベルを作成")}</button>
+  </div>
+</Modal>
 
-{#if app.modal === "manageLabels"}
-  <div class="overlay" onclick={(e) => e.target === e.currentTarget && closeManage()} role="presentation">
-    <div
-      class="modal ml-modal"
-      onclick={() => {
-        rowPal = null;
-        newPal = false;
-      }}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Manage labels">
-      <div class="modal-head">
-        <h3>Manage labels</h3>
-        <button class="x" onclick={closeManage}>×</button>
-      </div>
-      <div class="ml-top">
-        <input class="ml-q" placeholder="Type to search" bind:this={qEl} bind:value={m.q} />
-        <span class="ml-total">{app.tags.length} label{app.tags.length === 1 ? "" : "s"} total{#if m.sel.size}<b> · {m.sel.size} {t("選択")}</b>{/if}</span>
-      </div>
-      <div class="ml-tools">
-        <button class="ml-btn primary" onclick={() => openPanel("new")}>{t("＋ New label")}</button>
-        <button class="ml-btn" class:on={m.panel === "color"} disabled={m.sel.size === 0} onclick={() => openPanel("color")}>
-          Color <span class="caret">▾</span>
-        </button>
-        <button class="ml-btn" class:on={m.panel === "merge"} disabled={m.sel.size < 2} title={t("選択した 2 個以上を 1 つにまとめる")} onclick={() => openPanel("merge")}>Merge</button>
-        <button class="ml-btn" class:on={m.panel === "find"} title={t("ラベル名の検索置換")} onclick={() => openPanel("find")}>Find and replace</button>
-        <button class="ml-btn danger" class:on={m.panel === "delete"} disabled={m.sel.size === 0} onclick={() => openPanel("delete")}>Delete</button>
-      </div>
+<Modal
+  open={app.modal === "manageLabels"}
+  cls="ml-modal"
+  label={t("ラベルを管理")}
+  ariaModal
+  onbackdrop={closeManage}
+  onescape={escManage}
+  onframeclick={() => {
+    rowPal = null;
+    newPal = false;
+  }}>
+  <div class="modal-head">
+    <h3>{t("ラベルを管理")}</h3>
+    <button class="x" onclick={closeManage}>×</button>
+  </div>
+  <div class="ml-top">
+    <input class="ml-q" placeholder={t("入力して検索")} bind:this={qEl} bind:value={m.q} />
+    <span class="ml-total">{tn(app.tags.length, "個のラベル")}{#if m.sel.size}<b>{" · "}{m.sel.size} {t("選択")}</b>{/if}</span>
+  </div>
+  <div class="ml-tools">
+    <button class="ml-btn primary" onclick={() => openPanel("new")}>{t("＋ 新規ラベル")}</button>
+    <button class="ml-btn" class:on={m.panel === "color"} disabled={m.sel.size === 0} onclick={() => openPanel("color")}>
+      {t("色")} <span class="caret">▾</span>
+    </button>
+    <button class="ml-btn" class:on={m.panel === "merge"} disabled={m.sel.size < 2} title={t("選択した 2 個以上を統合する")} onclick={() => openPanel("merge")}>{t("統合")}</button>
+    <button class="ml-btn" class:on={m.panel === "find"} title={t("ラベル名の検索置換")} onclick={() => openPanel("find")}>{t("検索と置換")}</button>
+    <button class="ml-btn danger" class:on={m.panel === "delete"} disabled={m.sel.size === 0} onclick={() => openPanel("delete")}>{t("削除")}</button>
+  </div>
 
-      {#if m.panel}
-        <div class="ml-panel">
-          {#if m.panel === "new"}
-            <div class="nl-row">
-              {@render colorPicker(newColor, newPal, () => (newPal = !newPal), (c) => { newColor = c; newPal = false; })}
-              <input
-                class="nl-name"
-                placeholder="Label name"
-                use:focusMe
-                bind:value={m.newName}
-                onkeydown={(e) => onEnter(e, createInline)} />
-              <button class="ml-btn primary" disabled={!m.newName.trim() || inlineTaken} onclick={createInline}>Create label</button>
-            </div>
-            {#if inlineTaken}<div class="nl-err">{t("同名のラベルが既にあります")}</div>{/if}
-          {:else if m.panel === "color"}
-            <div class="ml-ptitle">{t("選択した")} {tn(m.sel.size, "個の色を変える")}</div>
-            <LabelPalette
-              onpick={async (c) => {
-                m.flushRename();
-                await recolorLabels([...m.sel], c);
-                m.panel = null;
-              }} />
-          {:else if m.panel === "merge"}
-            <div class="ml-ptitle">
-              {#if m.selected.length < 2}
-                {t("まとめるラベルを 2 個以上チェックしてください")}
-              {:else}
-                {t("選択した")} {tn(m.selected.length, "個を 1 つにまとめます（付いていた論文はすべて残すラベルへ）")}
-              {/if}
-            </div>
-            <div class="ml-merge">
-              <span class="dim">{t("残すラベル")}</span>
-              {#each m.selected as t (t.id)}
-                <label class="ml-radio">
-                  <input type="radio" name="ml-merge" checked={mergeTo === t.id} onchange={() => (mergeTarget = t.id)} />
-                  <LabelBadge name={t.name} color={t.color} /><span class="dim">{t.nItems}</span>
-                </label>
-              {/each}
-            </div>
-            <div class="ml-pfoot">
-              <button class="ml-btn" onclick={() => (m.panel = null)}>Cancel</button>
-              <button class="ml-btn primary" disabled={m.busy || !mergeOk} onclick={doMerge}>Merge</button>
-            </div>
-          {:else if m.panel === "find"}
-            <FindReplacePanel {m} {why} />
-          {:else if m.panel === "delete"}
-            <div class="ml-ptitle">
-              {t("選択した")} {tn(m.sel.size, "個のラベルを削除します。")}<b>{t("論文は消えません")}</b>{t("（ラベルが外れるだけ）。")}
-            </div>
-            {#if m.hiddenSel}
-              <div class="nl-err">{t("検索で隠れている選択")} {tn(m.hiddenSel, "個を含みます")}</div>
-            {/if}
-            <div class="ml-pfoot">
-              <button class="ml-btn" onclick={() => (m.panel = null)}>Cancel</button>
-              <button class="ml-btn danger-solid" disabled={m.busy} onclick={() => m.doDelete([...m.sel])}>Delete</button>
-            </div>
+  {#if m.panel}
+    <div class="ml-panel">
+      {#if m.panel === "new"}
+        <div class="nl-row">
+          {@render colorPicker(newColor, newPal, () => (newPal = !newPal), (c) => { newColor = c; newPal = false; })}
+          <input
+            class="nl-name"
+            placeholder={t("ラベルの名前")}
+            use:focusMe
+            bind:value={m.newName}
+            onkeydown={(e) => onEnter(e, createInline)} />
+          <button class="ml-btn primary" disabled={!m.newName.trim() || inlineTaken} onclick={createInline}>{t("ラベルを作成")}</button>
+        </div>
+        {#if inlineTaken}<div class="nl-err">{t("同名のラベルが既にあります")}</div>{/if}
+      {:else if m.panel === "color"}
+        <div class="ml-ptitle">{t("選択した")} {tn(m.sel.size, "個の色を変える")}</div>
+        <LabelPalette
+          onpick={async (c) => {
+            m.flushRename();
+            await recolorLabels([...m.sel], c);
+            m.panel = null;
+          }} />
+      {:else if m.panel === "merge"}
+        <div class="ml-ptitle">
+          {#if m.selected.length < 2}
+            {t("統合するラベルを 2 個以上チェックしてください")}
+          {:else}
+            {t("選択した")} {tn(m.selected.length, "個を統合します（付いていた文献はすべて残すラベルへ）")}
           {/if}
+        </div>
+        <div class="ml-merge">
+          <span class="dim">{t("残すラベル")}</span>
+          {#each m.selected as t (t.id)}
+            <label class="ml-radio">
+              <input type="radio" name="ml-merge" checked={mergeTo === t.id} onchange={() => (mergeTarget = t.id)} />
+              <LabelBadge name={t.name} color={t.color} /><span class="dim">{t.nItems}</span>
+            </label>
+          {/each}
+        </div>
+        <div class="ml-pfoot">
+          <button class="ml-btn" onclick={() => (m.panel = null)}>{t("キャンセル")}</button>
+          <button class="ml-btn primary" disabled={m.busy || !mergeOk} onclick={doMerge}>{t("統合")}</button>
+        </div>
+      {:else if m.panel === "find"}
+        <FindReplacePanel {m} {why} />
+      {:else if m.panel === "delete"}
+        <div class="ml-ptitle">
+          {t("選択した")} {tn(m.sel.size, "個のラベルを削除します。")}<b>{t("文献は消えません")}</b>{t("（ラベルが外れるだけ）。")}
+        </div>
+        {#if m.hiddenSel}
+          <div class="nl-err">{t("検索で隠れている選択")} {tn(m.hiddenSel, "個を含みます")}</div>
+        {/if}
+        <div class="ml-pfoot">
+          <button class="ml-btn" onclick={() => (m.panel = null)}>{t("キャンセル")}</button>
+          <button class="ml-btn danger-solid" disabled={m.busy} onclick={() => m.doDelete([...m.sel])}>{t("削除")}</button>
         </div>
       {/if}
-
-      <ManageTable {m}>
-        {#snippet colorCell(tag)}
-          <button
-            class="nl-color lbadge small"
-            class:solid={isSolid(tag.color)}
-            style={labelVars(tag.color)}
-            title={t("色を変える")}
-            aria-label={t("色を変える")}
-            onclick={(e) => {
-              e.stopPropagation();
-              toggleRowPal(tag);
-            }}>{@render tagIcon()}</button>
-          {#if rowPal === tag.id}
-            <div class="nl-pal ml-rowpal">
-              <LabelPalette
-                value={tag.color}
-                onpick={async (c) => {
-                  rowPal = null;
-                  await recolorLabels([tag.id], c);
-                }} />
-            </div>
-          {/if}
-        {/snippet}
-        {#snippet nameCell(tag)}
-          <button class="ml-namebtn" title={t("クリックで名前を変更")} onclick={() => startRename(tag)}>
-            <LabelBadge name={m.sending.get(tag.id) ?? tag.name} color={tag.color} />
-          </button>
-        {/snippet}
-      </ManageTable>
     </div>
-  </div>
-{/if}
+  {/if}
+
+  <ManageTable {m}>
+    {#snippet colorCell(tag)}
+      <button
+        class="nl-color lbadge small"
+        class:solid={isSolid(tag.color)}
+        style={labelVars(tag.color)}
+        title={t("色を変える")}
+        aria-label={t("色を変える")}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleRowPal(tag);
+        }}>{@render tagIcon()}</button>
+      {#if rowPal === tag.id}
+        <div class="nl-pal ml-rowpal">
+          <LabelPalette
+            value={tag.color}
+            onpick={async (c) => {
+              rowPal = null;
+              await recolorLabels([tag.id], c);
+            }} />
+        </div>
+      {/if}
+    {/snippet}
+    {#snippet nameCell(tag)}
+      <button class="ml-namebtn" title={t("クリックで名前を変更")} onclick={() => startRename(tag)}>
+        <LabelBadge name={m.sending.get(tag.id) ?? tag.name} color={tag.color} />
+      </button>
+    {/snippet}
+  </ManageTable>
+</Modal>

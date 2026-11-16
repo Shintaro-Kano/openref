@@ -29,11 +29,11 @@
      ※ readTextContent ラッパーと manualTextLayer は温存（WKWebView/JSC 対応の要）。 */
   import { tick, untrack } from "svelte";
   import * as pdfjs from "pdfjs-dist";
-  import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
   import noteIconUrl from "pdfjs-dist/web/images/annotation-note.svg?url";
   import "pdfjs-dist/web/pdf_viewer.css"; // v6: textLayer は公式 CSS + --total-scale-factor が前提
   import { api, type AnnotationRow, type AnnotationPatch } from "./api";
-  import { app, showViewerSide, toast, toggleViewerSide, type TabViewer } from "./state.svelte";
+  import { app, covered, toast, type TabViewer } from "./state.svelte";
+  import { showViewerSide, toggleViewerSide } from "./prefs.svelte";
   import { composing } from "./input";
   import Toolbar from "./viewer/Toolbar.svelte";
   import SearchPanel from "./viewer/SearchPanel.svelte";
@@ -41,6 +41,7 @@
   import SelectionPopover from "./viewer/SelectionPopover.svelte";
   import OutlineTab from "./viewer/OutlineTab.svelte";
   import ThumbnailsTab from "./viewer/ThumbnailsTab.svelte";
+  import { openPdf } from "./viewer/pdfdoc";
   import AnnotationCard from "./viewer/AnnotationCard.svelte";
   import { followItemSelection } from "./viewing.svelte";
   import { embeddedComments, inertMarkup, type EmbeddedComment } from "./viewer/embedded";
@@ -78,11 +79,6 @@
     type Rect,
     type SearchHit,
   } from "./viewer/util";
-
-  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
-  // pdf.js の補助データ（scripts/copy-pdf-assets.mjs が public/pdfjs/ へ写す）。無いと JBIG2 / CCITT の画像・埋め込みなしの CID フォントの字が黙って消える。
-  // getDocument の useWorkerFetch: false = 本番の既定（tauri:// は pdf.js が worker から読めない URL と見なす）を dev の http:// でも同じにする。false の間 ICC の色は使わない（iccUrl は読まれない）
-  const pdfAsset = (dir: string) => new URL(`/pdfjs/${dir}/`, location.href).href;
 
   /** PDF タブ: viewer = このタブの PDF・front = 前面のタブ（隠れている間はキーを取らず、描画もしない。
       名前は描画帯の Set `active` と分ける）・onClose = タブを閉じる（× / Esc。最後の 1 枚ならビューアだけ閉じる） */
@@ -156,11 +152,28 @@
   // テキスト層診断（選択不可トラブルの可視化・維持）
   let tlItems = $state(0);
   let tlFallbackPages = $state(0);
-  /** テキスト層の診断（ヘッダに出す）。表示のたびに組む関数（日本語の文を含むので言語の切替で描き直る） */
+  /** テキスト層の診断（ツールバーに出す）。表示のたびに組む関数（日本語の文を含むので言語の切替で描き直る） */
   let tlErr = $state<(() => string) | null>(null);
 
   const zoomPct = $derived(Math.round(scale * 100));
-  const buildId = __BUILD_ID__; // vite define（git short sha·HHmm）。表示中のビルドの版を切り分けるためヘッダへ表示
+  const buildId = __BUILD_ID__; // vite define（git short sha·HHmm）。表示中のビルドの版を切り分ける（ツールバーの頁の欄の title）
+  /* ツールバーの診断: 見せるのは警告だけ = 読込の途中のエラー（頁数を読めた後に落ちた = 前は画面のどこにも出なかった）・
+     テキスト層なし・テキスト層の途中のエラー。どれも「⚠」で始める（狭くて切れても印は残る・全文は title）。
+     頁数・テキストの件数・ビルド指紋は頁の欄の title（乗せると読める） */
+  const diag = $derived.by(() => {
+    const out: string[] = [];
+    if (error && pageCount > 0) out.push("⚠ " + error);
+    if (!loading && tlItems === 0) out.push(t("⚠ テキスト層なし") + (tlErr ? ": " + tlErr() : ""));
+    else if (tlErr) out.push("⚠ " + tlErr());
+    return out.join(" · ");
+  });
+  // ツールバー = 読めた後（途中で落ちた = 頁数はある・読込は終わった を含む）。段はその逆（読込中・頁数を読めない失敗）
+  const toolbarShown = $derived(!loading && pageCount > 0);
+  const info = $derived(
+    [pageCount + t(" ページ"), tlItems > 0 ? `text ${tlItems}${tlFallbackPages > 0 ? `${t("（fallback")} ${tlFallbackPages}${t("p）")}` : ""}` : "", "b " + buildId]
+      .filter(Boolean)
+      .join(" · ")
+  );
 
   // ---- 非反応の内部状態（DOM/描画管理） ----
   let doc: any = null;
@@ -219,7 +232,9 @@
       anns = a;
       const buf = await api.attachmentData(attachmentId); // ArrayBuffer（base64 / atob を経由しない）
       if (disposed) return; // 読込中にタブを閉じた（unmount 済み）
-      loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf), enableXfa:false, cMapUrl: pdfAsset("cmaps"), standardFontDataUrl: pdfAsset("standard_fonts"), wasmUrl: pdfAsset("wasm"), iccUrl: pdfAsset("iccs"), useWorkerFetch: false }); // pdf.js は data を worker へ transfer する（この後は使わない）
+      // worker・補助データ（cmaps / standard_fonts / wasm / iccs）・useWorkerFetch: false は viewer/pdfdoc.ts（本棚の読み手と共通）。
+      // pdf.js は data を worker へ transfer する（この後は使わない）
+      loadingTask = openPdf({ data: new Uint8Array(buf) });
       const d = await loadingTask.promise;
       if (disposed) return; // 開く間に閉じた（unmount の後始末が loadingTask を destroy 済み）
       doc = d;
@@ -235,6 +250,10 @@
       );
       if (disposed) return; // 寸法を読む間に閉じた（doc は unmount の後始末が destroy 済み）
       loading = false;
+      // 読めた = ヘッダーの段が DOM から外れる。外れて .pages が 1 段ぶん高くなってから最初の合わせ（recomputeFit）をする
+      // = 低い高さで合わせて、すぐ ResizeObserver が合わせ直す二度手間をしない
+      await tick();
+      if (disposed) return;
       sideDoc = doc; // 目次/ページタブへ橋渡し（baseSizes/pageRotates 確定後）
       setupObservers();
       buildPlaceholders();
@@ -1587,12 +1606,13 @@
         前面のビューアが Esc でタブを閉じて隣の PDF タブが前面になった後に、その隣のビューアの onKey が同じ Esc を受ける
         （onKey の時点の front を見ると 1 回の Esc で 2 枚閉じる）
       - coveredAtKey = ビューアの上にエディタ / モーダル / 取込があったか。App と各モーダルの window keydown は onKey より先に走って
-        Esc でそれらを閉じるので、onKey の時点の状態を見ると同じ Esc でタブまで閉じてしまう */
+        Esc でそれらを閉じるので、onKey の時点の状態を見ると同じ Esc でタブまで閉じてしまう。判定は state の covered()（モーダル =
+        本体の app.modal と OpenNote / チャットの窓・参照エディタ・取込。本棚の読み手 ShelfViewer と同じ判定） */
   let frontAtKey = false;
   let coveredAtKey = false;
   function onKeyCapture() {
     frontAtKey = front;
-    coveredAtKey = !!(app.editorOpen || app.modal || app.importJob);
+    coveredAtKey = covered();
   }
 
   function onKey(e: KeyboardEvent) {
@@ -1776,22 +1796,18 @@
 
 <div class="viewer-overlay" class:v-hidden={!front} bind:this={rootEl}>
   <div class="viewer">
-    <header class="v-head">
-      <b>{viewer?.title ?? ""}</b>
-      <span class="dim">
-        {pageCount ? pageCount + t(" ページ") : ""}
-        {#if tlItems > 0}
-          · text {tlItems}{tlFallbackPages > 0 ? `${t("（fallback")} ${tlFallbackPages}${t("p）")}` : ""}{#if tlErr}
-            <span class="tl-warn">⚠ {tlErr()}</span>{/if}
-        {:else if !loading}
-          · <span class="tl-warn">{t("⚠ テキスト層なし")}{tlErr ? ": " + tlErr() : ""}</span>
-        {/if}
-      </span>
-      <span class="build-id" title="build fingerprint">b {buildId}</span>
-      <button class="x" title={t("タブを閉じる（⌘W）")} onclick={() => onClose()}>×</button>
-    </header>
+    <!-- ヘッダーの段（題名・ビルド指紋・×）は読込中と失敗のときだけ、ツールバーは読めた後だけ = 同時には出さない（
+         大きい PDF で頁数を読めてから寸法を読み終えるまで両方が出ていると、読み終えた瞬間にツールバーが 1 段ぶん跳ねる）。
+         読めた後はタブの題名・タブの ×・⌘W・Esc に任せ、本文を 1 段広く -->
+    {#if !toolbarShown}
+      <header class="v-head">
+        <b>{viewer?.title ?? ""}</b>
+        <span class="build-id" title="build fingerprint">b {buildId}</span>
+        <button class="x" title={t("タブを閉じる（⌘W）")} onclick={() => onClose()}>×</button>
+      </header>
+    {/if}
 
-    {#if pageCount > 0}
+    {#if toolbarShown}
       <Toolbar
         {zoomPct}
         mode={zoomMode}
@@ -1806,6 +1822,8 @@
         onGoto={gotoPage}
         onToggleSearch={toggleSearch}
         onToggleSide={toggleViewerSide}
+        {diag}
+        {info}
       />
     {/if}
 

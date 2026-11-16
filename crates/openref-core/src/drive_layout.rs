@@ -1,6 +1,6 @@
 //! Drive 互換レイアウトへの PDF 書込。
 //! `All Papers/<頭文字>/<著者部> <年> - <題名>.pdf` — Paperpile が書いていた実レイアウトを
-//! 蔵書の実測から導出した規約で踏襲する（下流の知識ベースの `--sync-scan` が前提とするレイアウトの維持）:
+//! 実際のファイル名から導出した規約で踏襲する（下流のツールが Drive の配置を読む前提を保つ）:
 //! - 著者部: 単著 = `家名` / 二著者 = `A and B` / 3 名以上 = `A et al.`
 //! - 題名の `: ` は ` - ` に置換（例: "Meningioma: Molecular…" → "Meningioma - Molecular…"）
 //! - ファイル名は 150 字上限・超過分は中間を ` ... ` で省略
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn place_bytes_concurrent_same_name_never_clobbers() {
         let mount = std::env::temp_dir().join(format!("openref-place-{}-{}", std::process::id(), crate::keys::new_key()));
-        let csl = json!({"title": "Race", "author": [{"family": "Kano"}], "issued": {"date-parts": [[2026]]}});
+        let csl = json!({"title": "Race", "author": [{"family": "Kato"}], "issued": {"date-parts": [[2026]]}});
         for _round in 0..5 {
             std::fs::remove_dir_all(&mount).ok();
             let bar = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -258,7 +258,7 @@ mod tests {
             }
             let dir = mount.join("All Papers/K");
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 8, "一時ファイルが残っていない");
-            assert!(dir.join("Kano 2026 - Race.pdf").exists() && dir.join("Kano 2026 - Race (8).pdf").exists());
+            assert!(dir.join("Kato 2026 - Race.pdf").exists() && dir.join("Kato 2026 - Race (8).pdf").exists());
         }
         std::fs::remove_dir_all(&mount).ok();
     }
@@ -323,9 +323,9 @@ mod tests {
     fn sanitize_slashes_and_quotes() {
         let (_, f) = relative_target(&json!({
             "title": "PI-RADS/LI-RADS \"v2\" <update>?",
-            "author": [{"family":"Kano"}],
+            "author": [{"family":"Kato"}],
             "issued": {"date-parts": [[2024]]}
         }));
-        assert_eq!(f, "Kano 2024 - PI-RADS-LI-RADS v2 update.pdf");
+        assert_eq!(f, "Kato 2024 - PI-RADS-LI-RADS v2 update.pdf");
     }
 }

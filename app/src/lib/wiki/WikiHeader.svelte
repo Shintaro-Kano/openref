@@ -1,10 +1,12 @@
 <script lang="ts">
   /* OpenNote のヘッダー（App の <header> の中・アプリ名「OpenNote」と spinner の間）: 作り直しの進捗・
-     戻る / 進む（このタブの中の履歴 = ⌘[ / ⌘]）・検索欄（WikiSearch）・監視の失敗・[＋ 新規 ▾]（メニュー = 新規ページ… / 新規フォルダ… を今のフォルダに）・[再索引]・右ペインの開閉（⌘⌥I と同じ）。
+     戻る / 進む（このタブの中の履歴 = ⌘[ / ⌘]）・検索欄（WikiSearch）・監視の失敗・[＋ 新規 ▾]（メニュー = 新規ページ… / 新規フォルダ… を今のフォルダに）・右ペインの開閉（⌘⌥I と同じ）。
+     索引を作り直すのはワークスペース名のメニュー。作り直しの進捗と失敗の印はここに残す。
      */
   import { t } from "../i18n.svelte";
   import WikiSearch from "./WikiSearch.svelte";
-  import { canGo, goHistory, reindex, toggleInfo, wk } from "./wiki.svelte";
+  import PaneToggle from "../PaneToggle.svelte";
+  import { canGo, goHistory, toggleInfo, wk } from "./wiki.svelte";
   import { openNewMenu } from "./files.svelte";
 
   /** [＋ 新規] の下にメニューを出す（開いていれば閉じる。外側の mousedown / Esc で閉じるのは WikiDialogs） */
@@ -44,23 +46,8 @@
     onclick={openNew}>
     {t("＋ 新規")}<span class="wk-head-caret" aria-hidden="true">▾</span>
   </button>
-  <button class="wk-head-btn wk-head-re" title={t("ワークスペースを全部読み直して索引を作り直す（監視も張り直す）")} onclick={() => void reindex()}>
-    {t("再索引")}
-  </button>
-  <button
-    class="wk-head-pane"
-    class:wk-head-pane-off={!wk.infoOpen}
-    title={wk.infoOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-    aria-label={wk.infoOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-    aria-pressed={wk.infoOpen}
-    onclick={toggleInfo}
-  >
-    <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
-      <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
-      <rect class="wk-head-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
-      <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
-    </svg>
-  </button>
+  <!-- 右ペインの開閉（▣ = 一覧・本棚と同じ部品・同じ場所 = アプリのヘッダーの右端） -->
+  <PaneToggle open={wk.infoOpen} ontoggle={toggleInfo} />
 </div>
 
 <style>
@@ -79,14 +66,5 @@
     color: var(--text); font-size: 12.5px;
   }
   .wk-head-btn:hover { border-color: var(--accent); }
-  .wk-head-re { margin-left: 0; }
   .wk-head-caret { margin-left: 5px; font-size: 10px; color: var(--dim); }
-  .wk-head-pane {
-    display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 26px; border: 1px solid var(--border);
-    border-radius: 6px; background: var(--bg); color: var(--accent); cursor: pointer;
-  }
-  .wk-head-pane:hover { border-color: var(--accent); }
-  .wk-head-pane-off { color: var(--dim); }
-  .wk-head-pane-fill { opacity: 0.35; }
-  .wk-head-pane-off .wk-head-pane-fill { opacity: 0; }
 </style>

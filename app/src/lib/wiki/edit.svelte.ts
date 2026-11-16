@@ -15,6 +15,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n.svelte";
 import type { WikiImportResult, WikiPageData, WikiSaveBlobResult, WikiWriteResult } from "./types";
 import { eolOf, withEol } from "./editor/eol";
+import { errText } from "../err";
 
 /** エディタ（cm.ts の EditorHandle のうちセッションが使う分） */
 export interface EditHandle {
@@ -22,6 +23,12 @@ export interface EditHandle {
   setText(s: string): void;
   insert(s: string): void;
   focus(): void;
+  /** 主の選択（無ければ caret）を文献リンクに（md のエディタだけ = cm.ts の insertCite）。置けない場所なら入れずに理由 */
+  cite?(key: string): string | null;
+  /** 今の選択に文献リンクを置けるか（置けなければ理由） */
+  citeCheck?(): string | null;
+  /** 主の選択の文字（文献の引用の窓の案内） */
+  selection?(): string;
 }
 
 export type SaveState = "clean" | "dirty" | "saving" | "saved" | "error" | "conflict";
@@ -203,7 +210,7 @@ export async function flush(): Promise<boolean> {
   return ok;
 }
 
-/** 離れる前（タブの切替・閉じる・別のページへ・表示へ戻す・MY LIBRARY へ）。保存の要らないときは同期で true
+/** 離れる前（タブの切替・閉じる・別のページへ・表示へ戻す・LIBRARY へ）。保存の要らないときは同期で true
     （Wiki を使っていない間の切替に await を足さない）。保存できなければ false = 離れない（conflict ならダイアログ） */
 export function leave(): true | Promise<boolean> {
   if (!ed.path || (!saving && ed.state !== "conflict" && current() === saved)) return true;
@@ -253,7 +260,7 @@ export async function resolveConflict(choice: "reload" | "overwrite" | "cancel")
     if (more) timer = setTimeout(() => void flush(), cfg.delay);
     return null;
   } catch (e) {
-    notice(`✗ ${String(e).slice(0, 200)}`);
+    notice(`✗ ${errText(e, 200)}`);
     return null;
   }
 }
@@ -261,7 +268,7 @@ export async function resolveConflict(choice: "reload" | "overwrite" | "cancel")
 /** 書けたが索引の更新に失敗した（core の任意の欄 index_error）= 知らせる（保存は成功） */
 function warnIndex(r: unknown) {
   const e = (r as { index_error?: unknown }).index_error;
-  if (e) notice(`⚠ ${t("保存しましたが、索引を更新できませんでした")}: ${String(e).slice(0, 160)}`);
+  if (e) notice(`⚠ ${t("保存しましたが、索引を更新できませんでした")}: ${errText(e, 160)}`);
 }
 
 function settle(s: SaveState) {
@@ -339,7 +346,7 @@ export function stopEdit() {
       if (r.ok) wrote(path, content, r);
       else strand(path, content, t("外部で書き換えられています"));
     })
-    .catch((e) => strand(path, content, String(e).slice(0, 200)));
+    .catch((e) => strand(path, content, errText(e, 200)));
 }
 
 /** 書かずに編集を終える（Wiki を無効にした・vault のフォルダが変わった = 今の root へは書かない）。未保存は ed.stranded へ */
@@ -372,6 +379,71 @@ export function resumeAutosave() {
 /** 改名に追随（wiki_rename の後）。root = 改名したワークスペース（別の root の同じ相対パスの編集は追わない） */
 export function renamed(from: string, to: string, root: string | null = null) {
   if (ed.path === from && (!root || !ed.root || ed.root === root)) ed.path = to;
+}
+
+// ---- 文献の引用（窓 = cite.svelte・貼り付けのメニュー = editor/cite.ts）----
+
+/** 知らせる（貼り付けのメニューの撤回の印・失敗） */
+export function editNotice(msg: string) {
+  notice(msg);
+}
+
+/** 今のエディタへ focus を戻す（文献の引用の窓を閉じた） */
+export function focusEditor() {
+  handle?.focus();
+}
+
+/** 今のエディタの選択の文字（無ければ空） */
+export function editSelection(): string {
+  return handle?.selection?.() ?? "";
+}
+
+/** 今の選択に文献リンクを置けるか（エディタが無い・md でなければ理由）。置ければ null */
+export function citeCheck(): string | null {
+  if (!handle?.cite) return t("編集中の md のページがありません");
+  return handle.citeCheck?.() ?? null;
+}
+
+/** 文献の引用の窓が選んだ item を今のエディタに入れる。path / root = 窓を開いたときの編集（離れていれば入れない）。
+    エディタを作り直していても（⌘E の往復）、今のエディタに入れる。入れられなければ理由を知らせて false */
+export function citeInsert(key: string, retracted: boolean, path: string | null, root: string | null): boolean {
+  if (!path || !same(path, root) || !handle?.cite) {
+    notice(`✗ ${t("編集中のページを離れたので、文献リンクを入れませんでした")}`);
+    return false;
+  }
+  const why = handle.cite(key);
+  handle.focus();
+  if (why) {
+    notice(`✗ ${why}`);
+    return false;
+  }
+  if (retracted) notice(`⚠ ${t("撤回の印がある文献です")}`);
+  return true;
+}
+
+/** = main.rs の CiteAdded（一覧の行 + created + 警告） */
+interface CiteAdded {
+  key: string;
+  title: string;
+  retracted: boolean;
+  created: boolean;
+  warnings?: string[];
+}
+
+/** 貼った DOI / PubMed の URL を登録して key を返す（wiki_cite_register = resolver。重複は既存の key）。
+    待つ間に編集を離れた（別のページ・別のワークスペース）= 本文に入れず、登録したことを知らせる（null） */
+export async function citeRegister(url: string): Promise<{ key: string; retracted: boolean } | null> {
+  const path = ed.path;
+  const root = ed.root;
+  const r = await invoke<CiteAdded>("wiki_cite_register", { input: url });
+  for (const w of r.warnings ?? []) notice(`⚠ ${w}`);
+  const title = r.title.slice(0, 80);
+  if (!path || !same(path, root)) {
+    notice(`✗ ${t("文献を登録しましたが、編集中のページを離れたので本文に入れませんでした")}: ${title}`);
+    return null;
+  }
+  if (r.created) notice(`✓ ${t("LIBRARY に登録しました")}: ${title}`);
+  return { key: r.key, retracted: r.retracted };
 }
 
 /** ArrayBuffer → base64（大きな画像でも String.fromCharCode の引数の上限を越えないよう区切る） */
@@ -410,7 +482,7 @@ export async function pasteImages(files: File[]) {
       embeds.push(r.embed);
       done.push(r.path || blobName(f));
     } catch (e) {
-      notice(`✗ ${t("画像を保存できません")}: ${String(e).slice(0, 200)}`);
+      notice(`✗ ${t("画像を保存できません")}: ${errText(e, 200)}`);
     }
   }
   if (!embeds.length) return;
@@ -439,7 +511,7 @@ export async function dropPaths(paths: string[]): Promise<boolean> {
       embeds.push(r.embed);
       done.push(r.path || base(abs));
     } catch (e) {
-      notice(`✗ ${t("取り込めません")}: ${base(abs)} · ${String(e).slice(0, 160)}`);
+      notice(`✗ ${t("取り込めません")}: ${base(abs)} · ${errText(e, 160)}`);
     }
   }
   if (!embeds.length) return true;
@@ -471,7 +543,7 @@ export async function pickFiles(): Promise<boolean> {
   try {
     p = await openDialog({ multiple: true, filters: [{ name: t("画像・PDF・動画・音声"), extensions: PICK_EXT }] });
   } catch (e) {
-    notice(`✗ ${t("ファイルを選べません")}: ${String(e).slice(0, 160)}`);
+    notice(`✗ ${t("ファイルを選べません")}: ${errText(e, 160)}`);
     return false;
   }
   const paths = Array.isArray(p) ? (p as string[]) : typeof p === "string" ? [p] : [];

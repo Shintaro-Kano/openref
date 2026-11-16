@@ -87,7 +87,8 @@ pub fn index_attachment_opts(
 
 /// 添付直後の索引（全添付経路の統一入口 = `edit` の添付関数が呼ぶ）: 今書いたバイト列から本文を抽出する =
 /// 書いたファイルを読み直さず、md5 も取り直さない（`md5` は添付行に入れた値。そのまま fulltext.md5 に入れる）。
-/// `path` は pdftotext fallback に渡す実体（= 書込先）
+/// `path` は pdftotext fallback に渡す実体（= 書込先）。抽出と書込を続けて行う = DB を Mutex で共有する呼び手は
+/// 抽出をロックの外の [`extract_for_index`] で済ませ、ロックの中では [`store_extracted`] だけにする
 pub fn index_bytes(
     conn: &rusqlite::Connection,
     attachment_id: i64,
@@ -95,7 +96,40 @@ pub fn index_bytes(
     path: &Path,
     md5: &str,
 ) -> Result<IndexOutcome> {
-    match crate::pdftools::extract_all_bytes(bytes, Some(path)) {
+    store_extracted(conn, attachment_id, &extract_for_index(bytes, md5, Some(path)), md5)
+}
+
+/// 本文の全頁抽出の結果（**DB に触らずに作る** = ロックの外で作り、添付の行を入れるのと同じロックの中で
+/// [`store_extracted`] が書く。2026-11-14）。抽出元のバイト列の md5 を持つ = 別のバイト列の添付には書かない
+#[derive(Debug)]
+pub struct ExtractedText {
+    md5: String,
+    result: std::result::Result<crate::pdftools::Extracted, String>,
+}
+
+impl ExtractedText {
+    /// 抽出元のバイト列の 16 進 md5
+    pub fn md5(&self) -> &str {
+        &self.md5
+    }
+}
+
+/// 全頁を抽出する（DB に触らない）。`md5` = `bytes` の 16 進 md5（呼び手が取った値）。`file` = 同じ内容のファイル
+/// （pdftotext fallback 用。None なら必要なときだけ一時ファイルに落とす = 中身は同じなので結果も同じ）
+pub fn extract_for_index(bytes: &[u8], md5: &str, file: Option<&Path>) -> ExtractedText {
+    ExtractedText { md5: md5.to_string(), result: crate::pdftools::extract_all_bytes(bytes, file).map_err(|e| e.to_string()) }
+}
+
+/// [`extract_for_index`] の結果を添付行に書く（`page_count` の UPDATE と fulltext 行の貼り替え）。`md5` = 添付行の md5。
+/// 抽出元と md5 が違えば書かずに Err（古い / 別のバイト列の本文で上書きしない）
+pub fn store_extracted(conn: &rusqlite::Connection, attachment_id: i64, extracted: &ExtractedText, md5: &str) -> Result<IndexOutcome> {
+    if extracted.md5 != md5 {
+        return Err(CoreError::BadInput(format!(
+            "添付 {attachment_id} の本文: 抽出元（md5 {}）と添付（md5 {md5}）が違うので書かない",
+            extracted.md5
+        )));
+    }
+    match &extracted.result {
         Ok(ex) => {
             let pages = ex.pages.len();
             conn.execute(
@@ -121,17 +155,25 @@ pub fn index_bytes(
                 Ok(IndexOutcome::Empty { pages })
             }
         }
-        Err(e) => {
-            let reason = e.to_string();
-            store_text(conn, attachment_id, "", Some(md5), "error", Some(&reason))?;
-            Ok(IndexOutcome::Failed(reason))
+        Err(reason) => {
+            store_text(conn, attachment_id, "", Some(md5), "error", Some(reason))?;
+            Ok(IndexOutcome::Failed(reason.clone()))
         }
     }
 }
 
 /// 添付経路用: 索引できなくても添付自体は失敗させない（理由は stderr = connectd ログ / GUI ログへ）
 pub fn index_bytes_quietly(conn: &rusqlite::Connection, attachment_id: i64, bytes: &[u8], path: &Path, md5: &str) {
-    match index_bytes(conn, attachment_id, bytes, path, md5) {
+    log_index(attachment_id, index_bytes(conn, attachment_id, bytes, path, md5));
+}
+
+/// [`store_extracted`] の添付経路用（`index_bytes_quietly` と同じく失敗はログへ・添付は成立させる）
+pub fn store_extracted_quietly(conn: &rusqlite::Connection, attachment_id: i64, extracted: &ExtractedText, md5: &str) {
+    log_index(attachment_id, store_extracted(conn, attachment_id, extracted, md5));
+}
+
+fn log_index(attachment_id: i64, res: Result<IndexOutcome>) {
+    match res {
         Ok(IndexOutcome::Indexed { .. }) | Ok(IndexOutcome::Empty { .. }) => {}
         Ok(IndexOutcome::Failed(r)) | Ok(IndexOutcome::Skipped(r)) => {
             eprintln!("fulltext: 添付 {attachment_id} の本文索引を見送り: {r}")

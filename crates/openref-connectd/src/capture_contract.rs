@@ -1,6 +1,6 @@
 //! `/capture/*` の応答契約（Capture 拡張 = extension/popup.js が読む形）を cargo test で固定する。
 //! main と同じ `connector_router` を一時ディレクトリの DB で 127.0.0.1 の空きポートに立て、素の HTTP/1.1 で叩く。
-//! ネット不要の枝だけ（resolver を呼ぶ枝は `capture_save_unlocked` の resolve 引数で差し替える）。
+//! ネット不要の枝だけ（resolver・Crossref の検索を呼ぶ枝は `capture_save_unlocked` の resolve / search 引数で差し替える）。
 //! 固定するもの = 各枝の HTTP status code・応答 JSON のキー集合・区分値（status / created / existing 等）。値の全一致は見ない。
 //! - 拡張が読むキー（popup.js の grep）: status・key・doi・has_pdf・retraction・trashed・reason・doi_check・bytes・error・
 //!   source（fetch-oa の成功 = ネットが要るので対象外）・title・first_author・year・journal・items・collections[].id / path / n_items
@@ -191,12 +191,25 @@ async fn capture_save_contract() {
     assert_eq!(r.1["status"], "existing");
     assert_eq!(r.1["key"], k_pmid.as_str());
 
-    // 識別子なし・題名あり: document を作る（resolver を呼ばない）
+    // 識別子なし・題名あり・書誌メタなし: 題名のみの document + 「要確認」+ reason（resolver も Crossref の検索も呼ばない）
+    let save_reason = with(&save, &["reason"]);
     let r = post_json(port, "/capture/save", json!({ "title": "Page title", "url": "https://example.org/p" })).await;
-    shape("save created(題名のみ)", &r, 200, &save);
+    shape("save created(題名のみ)", &r, 200, &save_reason);
     assert_eq!(r.1["status"], "created");
     assert_eq!(r.1["doi"], Value::Null);
     assert_eq!(r.1["warnings"], json!([]));
+    assert!(r.1["reason"].as_str().unwrap().contains("書誌メタ"), "{}", r.1);
+    assert!(pdfingest::is_review_stub(&lib.st.db(), r.1["key"].as_str().unwrap()).unwrap());
+    // 書誌メタに題名が無い（著者・年だけ）: 検索しない = 同じ枝（ネットに出ない）
+    let ev = json!({ "authors": { "value": ["Brandão, Alice"], "source": "citation_author" }, "date": { "value": "2026", "source": "citation_date" } });
+    let r = post_json(port, "/capture/save", json!({ "title": "Page title 2", "evidence": ev })).await;
+    shape("save created(題名のみ・題名のない書誌メタ)", &r, 200, &save_reason);
+    assert_eq!(r.1["title"], "Page title 2");
+    // 識別子があれば書誌メタは見ない（reason は付かない）
+    let ev = json!({ "title": { "value": "Another title of a long enough length", "source": "citation_title" } });
+    let r = post_json(port, "/capture/save", json!({ "doi": "10.1234/abc", "evidence": ev })).await;
+    shape("save existing(doi・書誌メタ付き)", &r, 200, &save);
+    assert_eq!(r.1["key"], k_doi.as_str());
 
     // 識別子も題名も無い・JSON でない本文 = 422 {error}
     shape("save 識別子なし", &post_json(port, "/capture/save", json!({ "url": "https://example.org/q" })).await, 422, &["error"]);
@@ -206,7 +219,7 @@ async fn capture_save_contract() {
     // resolver を通る新規（継ぎ目で差し替え）: 同じキー集合 + warnings に resolver の警告
     let v = capture_save_unlocked(
         &lib.st,
-        SaveReq { doi: Some("10.1234/new".into()), pmid: None, title: None, url: None, collection_id: None },
+        SaveReq { doi: Some("10.1234/new".into()), pmid: None, title: None, url: None, collection_id: None, evidence: Default::default() },
         |_| {
             Ok(resolver::Resolved {
                 csl: json!({ "type": "article-journal", "title": "New", "DOI": "10.1234/new" }),
@@ -215,12 +228,57 @@ async fn capture_save_contract() {
                 warnings: vec!["PubMed の照合に失敗".into()],
             })
         },
+        |_, _| panic!("識別子のある保存で Crossref の検索"),
     )
     .unwrap();
     shape("save created(resolver)", &(200, v.clone()), 200, &save);
     assert_eq!(v["status"], "created");
     assert_eq!(v["retraction"], "Retraction in: X");
     assert_eq!(v["warnings"], json!(["PubMed の照合に失敗"]));
+
+    // 識別子なし・書誌メタあり（Crossref の検索と resolver を継ぎ目で差し替え）: 結べた新規・結べた既存・結べない・検索の失敗。
+    // どれも save + reason のキー集合
+    let t = "Imaging of Deep Endometriosis Involving Lateral Pelvic Structures";
+    let ev_req = |tag: &str| SaveReq {
+        doi: None,
+        pmid: None,
+        title: Some(format!("og {tag}")),
+        url: Some("https://example.org/e".into()),
+        collection_id: None,
+        evidence: pdfingest::PageEvidence { title: Some(t.into()), first_author: Some("Brandão, Alice".into()), year: Some(2026) },
+    };
+    let cand = |doi: &str| resolver::Candidate {
+        doi: doi.into(),
+        title: t.into(),
+        year: Some(2026),
+        first_author_family: Some("Brandão".into()),
+        kind: Some("journal-article".into()),
+    };
+    let found = |doi: &'static str| {
+        move |_: &resolver::AddInput| {
+            Ok(resolver::Resolved {
+                csl: json!({ "type": "article-journal", "title": t, "DOI": doi }),
+                retracted: None,
+                source: "stub",
+                warnings: vec![],
+            })
+        }
+    };
+    let v = capture_save_unlocked(&lib.st, ev_req("a"), found("10.1148/rg.250127"), |_, _| Ok(vec![cand("10.1148/rg.250127")])).unwrap();
+    shape("save created(書誌メタで結べた)", &(200, v.clone()), 200, &save_reason);
+    assert_eq!((v["status"].as_str(), v["doi"].as_str()), (Some("created"), Some("10.1148/rg.250127")));
+    // 結べた DOI が登録済み → resolver を呼ばずに existing
+    let v = capture_save_unlocked(&lib.st, ev_req("b"), |_| panic!("登録済みの DOI で resolver"), |_, _| Ok(vec![cand("10.1234/abc")])).unwrap();
+    shape("save existing(書誌メタで結べた・登録済み)", &(200, v.clone()), 200, &save_reason);
+    assert_eq!((v["status"].as_str(), v["key"].as_str()), (Some("existing"), Some(k_doi.as_str())));
+    let v = capture_save_unlocked(&lib.st, ev_req("d"), |_| panic!("結べないのに resolver"), |_, _| Ok(vec![])).unwrap();
+    shape("save created(書誌メタで結べない)", &(200, v.clone()), 200, &save_reason);
+    // 題名はページの題名（書誌メタの題名は保存しない）
+    assert_eq!((v["status"].as_str(), v["doi"].as_str(), v["title"].as_str()), (Some("created"), None, Some("og d")));
+    let v = capture_save_unlocked(&lib.st, ev_req("e"), |_| panic!("検索の失敗で resolver"), |_, _| Err(openref_core::CoreError::Http("crossref search: https://api.crossref.org/works?x: status code 503".into())))
+        .unwrap();
+    shape("save created(検索の失敗)", &(200, v.clone()), 200, &save_reason);
+    assert!(v["reason"].as_str().unwrap().contains("HTTP 503"), "{v}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -275,6 +333,30 @@ async fn capture_attachment_contract() {
     let r = post_json(port, "/capture/save", json!({ "doi": "10.1234/att" })).await;
     shape("save has_pdf", &r, 200, &with(&ITEM, &["warnings"]));
     assert_eq!(r.1["has_pdf"], true);
+}
+
+/// DB の異常を黙って「未登録」「同一ファイルなし」に落とさない。正常時の応答の形は上の契約のまま。
+/// 異常は表を改名して起こす（items = 登録済みの照合が失敗・attachments = 添付の照合が失敗）
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_db_errors_are_not_silent() {
+    // 添付の照合（md5）が失敗 → 500 + error（② の照合・③ の添付へ進まない）。has_pdf の読みの失敗は保存の応答を壊さない
+    let lib = temp_lib("dberr-att");
+    let key = add(&lib.st, Some("10.1234/dberr"), None, "DB error paper");
+    lib.st.db().conn.execute_batch("ALTER TABLE attachments RENAME TO attachments_gone").unwrap();
+    let port = serve(lib.st.clone()).await;
+    let r = post_pdf(port, &format!("/capture/attachment?key={key}&source=meta&via=page"), &pdf("DB error paper doi:10.1234/dberr")).await;
+    shape("attachment md5 照合の失敗", &r, 500, &["error"]);
+    assert!(r.1["error"].as_str().unwrap().contains("添付済みのファイルを照合できません"), "{}", r.1);
+    let r = post_json(port, "/capture/save", json!({ "doi": "10.1234/dberr" })).await;
+    shape("save existing（has_pdf を読めない）", &r, 200, &with(&ITEM, &["warnings"]));
+    assert_eq!(r.1["has_pdf"], false);
+
+    // 登録済みかの照合が失敗 → resolver を呼ばず Err（HTTP では 422 + error）
+    let lib = temp_lib("dberr-save");
+    lib.st.db().conn.execute_batch("ALTER TABLE items RENAME TO items_gone").unwrap();
+    let req = SaveReq { doi: Some("10.1234/dberr".into()), pmid: None, title: None, url: None, collection_id: None, evidence: Default::default() };
+    let e = capture_save_unlocked(&lib.st, req, |_| panic!("照合に失敗したのに resolver"), |_, _| panic!("識別子のある保存で検索")).unwrap_err();
+    assert!(e.contains("登録済みかを確かめられません"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

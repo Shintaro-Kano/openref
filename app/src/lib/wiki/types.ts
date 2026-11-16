@@ -1,4 +1,4 @@
-// OpenNote の画面側の共有型。骨組み（wiki.svelte.ts）と描画部品（MdView / HtmlView / MediaView）の受け渡しの契約。
+// OpenNote の画面側の共有型。骨組み（wiki.svelte.ts）と描画部品（render/ShadowPage = md / html・MediaView）の受け渡しの契約。
 // GUI の wiki_read_gui（core の read）/ wiki_list / wiki_backlinks / wiki_status / wiki_search / wiki_tags / wiki_inbox の戻り値（crates/openref-core/src/wiki/commands.rs）と同じ形。
 
 export type WikiKind = "md" | "html" | "media" | "other";
@@ -41,6 +41,14 @@ export interface WikiPageData {
   external?: string;
 }
 
+/** wiki_list の戻り値（excluded = 索引から除いたフォルダ = vault 相対・いちばん上の物・prefix の配下だけ） */
+export interface WikiListResult {
+  total: number;
+  count: number;
+  pages: WikiListEntry[];
+  excluded: string[];
+}
+
 export interface WikiListEntry {
   path: string;
   kind: WikiKind;
@@ -80,6 +88,8 @@ export interface WikiStatus {
   rebuilding?: { percent: number } | null;
   pages?: number;
   inbox?: number;
+  /** 索引から除いたフォルダの数（node_modules・CACHEDIR.TAG のフォルダと、木の右クリックで除いたもの） */
+  excluded?: number;
   last_scan?: number | null;
   /** このプロセスで壊れた索引を退避して作り直した（core の wiki_status） */
   recovered?: { at: number; moved_to: string } | null;
@@ -128,7 +138,7 @@ export interface WikiInboxFile {
 
 /** Tauri event "wiki-changed"（wiki_gui.rs の WikiChanged）の payload = 索引を更新したパス（vault 相対）を種別ごとに。
     種別は core の取り込み結果から（added = 索引に無かった / removed = 消えたので外した / modified = あった = 読み直した）。
-    all = 全走査の後（[再索引]・起動時・監視がフォルダの増減で全走査に切り替えた）= 何が増減したか分からない = 全部が変わったものとして扱う（配列は空）。
+    all = 全走査の後（索引を作り直す・起動時・監視がフォルダの増減で全走査に切り替えた）= 何が増減したか分からない = 全部が変わったものとして扱う（配列は空）。
     注意: core が同期で索引に入れた書込（GUI の保存・チャット / MCP の wiki_write・取込）は、監視が拾う時点で索引にある = 新しいページでも modified で届く。
     画面は「知らない（木に無い）modified」を増として扱う（reloadPlan の known）。
     画面: 木（wiki_list）は all / added / removed / 知らない modified のときだけ・Tags 箱は毎回（ログの `#tag` も索引に入る）・Ingest / Chat log 箱はそのフォルダに変更があるときだけ */
@@ -156,7 +166,7 @@ export type WikiNav =
   | { kind: "open"; abs: string }                        // ホストの open に渡すファイル（vault 外の file:// を含む・安全の判定は wiki_open_path）
   | { kind: "ref"; abs: string };                        // 参照フォルダの中の pdf / html / 画像 / 動画 / 音声 = 内蔵の表示で開く（wiki_read_ref）
 
-/** MdView / HtmlView / MediaView の共通 props */
+/** 描画部品（ShadowPage・MediaView）の共通 props */
 export interface WikiViewProps {
   page: WikiPageData;
   /** vault の root（絶対パス）。asset URL の組立てに使う。参照フォルダのページでは、そのフォルダ（path はその相対） */
@@ -231,7 +241,7 @@ export interface WikiImportResult { path: string; embed: string; copied: boolean
 
 /** wiki_chat_status {force?} → 使えるか。enabled = 設定 wiki_chat_enabled(Wiki が有効なときだけ true になりうる)。
  *  **無効なら何も調べずに返す**(claude の検出・`claude auth status` を起動しない)。cli / version / logged_in / mcp は null。
- *  `claude auth status` は 30 秒覚える(右ペインの mount・exit ごとに起こさない)。force: true(画面の [再確認])・login / logout・有効 / 無効の切替で捨てる */
+ *  `claude auth status` は 30 秒覚える(右ペインの mount・exit ごとに起こさない)。force: true(画面の [再確認])・login・有効 / 無効の切替で捨てる */
 export interface WikiChatStatus {
   enabled: boolean;
   /** 見つかった claude の実行ファイル(無ければ null) */
@@ -261,12 +271,12 @@ export type WikiChatState = "off" | "starting" | "idle" | "busy" | "stopping";
 export interface WikiChatAuth { logged_in: boolean; method: string | null; email: string | null; subscription: string | null }
 
 /** wiki_chat_set_model {model}(空 = 既定)→ WikiChatStatus。設定を書き、子プロセスを止める(次の送信で --resume + 新しい --model) */
-/** wiki_chat_auth {action: "login" | "logout"} → WikiChatStatus。logout = 子を止めて `claude auth logout`・login = Terminal.app に `claude auth login` を開く
- *  (対話 = ブラウザ + ターミナル。終わったら画面の [再確認]) */
+/** wiki_chat_auth {action: "login"} → WikiChatStatus。Terminal.app に `claude auth login` を開く
+ *  (対話 = ブラウザ + ターミナル。終わったら画面の [再確認])。action は "login" だけ(ログアウトは画面から呼ばない = ターミナルの `claude auth logout` を案内) */
 
 /** wiki_chat_set_enabled {enabled} → WikiChatStatus(OFF にすると子プロセスを止める) */
 /** Settings › OpenNote の [チャット](ネイティブのメニュー = Rust): ON を選ぶと Rust は設定を変えずに Tauri event "wiki-chat-consent"(payload なし)を出し、
- *  画面の確認ダイアログ(WikiChatConsent の説明)が [有効にする] で wiki_chat_set_enabled {enabled: true} を呼ぶ。OFF は Rust がそのまま無効にする。
+ *  画面の確認ダイアログ(ChatConsent の説明)が [有効にする] で wiki_chat_set_enabled {enabled: true} を呼ぶ。OFF は Rust がそのまま無効にする。
  *  有効 / 無効が変わったら(メニュー・command・Wiki の ON/OFF・vault の切替のどれでも・子の有無によらず)Rust は wiki-chat {type: "enabled"} を出す
  *  (画面は wiki_chat_status を読み直す)。{type: "state"} はターンの busy / idle 等の子の状態だけ(画面は status を読み直さない = claude --version 等を毎ターン起こさない) */
 
@@ -305,4 +315,4 @@ export type WikiChatEvent =
   | { type: "state"; state: WikiChatState; session_id: string | null }
   | { type: "enabled"; enabled: boolean }                                 // 有効 / 無効の変化(画面は wiki_chat_status を読み直す)
   | { type: "changes"; session_id: string; turn: number; changes: WikiChatChange[] } // ターン中に増えるたびに全体を送り直す
-  | { type: "exit"; code: number | null; signal: string | null }; // signal = "SIGTERM" 等の名前
+  | { type: "exit"; code: number | null; signal: string | null }; // signal = "SIGTERM" 等の名前・表に名前の無い物は番号だけ（"30"）

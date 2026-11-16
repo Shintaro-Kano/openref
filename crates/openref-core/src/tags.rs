@@ -113,12 +113,15 @@ pub fn create_tag(db: &Db, name: &str, color: Option<&str>) -> Result<i64> {
     Ok(id)
 }
 
-/// 改名だけ（検査は update_tag と同じ）
-pub fn rename_tag(db: &Db, id: i64, new_name: &str) -> Result<()> {
+/// 改名だけ（検査は update_tag と同じ）。試験だけが呼ぶ（2026-11-14 に `#[cfg(test)]` に）
+#[cfg(test)]
+fn rename_tag(db: &Db, id: i64, new_name: &str) -> Result<()> {
     update_tag(db, id, Some(new_name), None)
 }
 
-pub fn set_tag_color(db: &Db, id: i64, color: Option<&str>) -> Result<()> {
+/// 色の変更（None = 色を消す）。試験だけが呼ぶ（2026-11-14 に `#[cfg(test)]` に。画面・MCP は `update_tag`）
+#[cfg(test)]
+fn set_tag_color(db: &Db, id: i64, color: Option<&str>) -> Result<()> {
     check_color(color)?;
     let n = db
         .conn
@@ -130,7 +133,7 @@ pub fn set_tag_color(db: &Db, id: i64, color: Option<&str>) -> Result<()> {
 }
 
 /// ラベルの改名と色の変更を 1 トランザクションで行う（`None` = 変えない）。検証（存在・名前・色）をすべて済ませてから書くので、
-/// 色が不正なら改名も残らない。両方 `None` は存在確認だけ。色を消す（NULL に戻す）操作は無い（`set_tag_color` を使う）
+/// 色が不正なら改名も残らない。両方 `None` は存在確認だけ。色を消す（NULL に戻す）操作は無い（試験用の `set_tag_color` だけ）
 pub fn update_tag(db: &Db, id: i64, new_name: Option<&str>, color: Option<&str>) -> Result<()> {
     let exists: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)", [id], |r| r.get(0))?;
     if !exists {

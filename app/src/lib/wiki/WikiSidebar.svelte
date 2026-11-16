@@ -2,13 +2,17 @@
   /* OpenNote の左ペイン = セグメント + vault の木（wiki_list の全件から組む）。
      フォルダは閉じた状態から（開いた物だけ行を作る = 7,000 ページでも行は少ない）。前面のページの祖先は自動で開く。
      クリック = 前面の Wiki タブで開く・⌘クリック / 中クリック = 新しいタブ。木の読み直しは wiki.svelte.ts（wiki-changed）。
+     索引から除いたフォルダ（wk.excluded = wiki_list の excluded）は薄い行で出す: 中身は持たない・クリックでは開かない・右クリックで
+     「索引に入れる」「Finder で表示」。
      検索欄はヘッダー（WikiSearch）→ 中央に結果一覧（WikiResults）。
      木の下に Ingest 箱（ingest/ の未処理の素材。OpenRef は処理しない = 開く・改名・ゴミ箱だけ）と Chat log 箱（chat-log/ = チャットの記録）と Tags 箱（件数の多い順・クリックで AND の絞込） */
   import { t } from "../i18n.svelte";
-  import { frontWiki } from "../state.svelte";
+  import { covered, frontWiki } from "../state.svelte";
+  import { composing } from "../input";
   import type { WikiListEntry } from "./types";
   import { baseName } from "./render/asset";
-  import WikiSegment from "./WikiSegment.svelte";
+  import { fmtSize } from "./size";
+  import ModeSegment from "../ModeSegment.svelte";
   import { openWikiPage, vaultName, wk, workspaceList } from "./wiki.svelte";
   import { toggleTag } from "./search.svelte";
 
@@ -22,18 +26,13 @@
   const shownTags = $derived(tagsAll ? wk.tags : wk.tags.slice(0, TAGS_FOLDED));
   const picked = (tag: string) => wk.qTags.some((x) => x.toLowerCase() === tag.toLowerCase());
 
-  function fmtSize(n: number): string {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
-  }
-
   interface Dir {
     name: string;
     path: string;
     dirs: Map<string, Dir>;
     files: WikiListEntry[];
+    /** 索引から除いたフォルダ（中身は持たない・開けない） */
+    excluded?: boolean;
   }
   type Row = { dir: Dir; depth: number } | { file: WikiListEntry; depth: number };
 
@@ -57,6 +56,8 @@
     }
     // この起動で作った空のフォルダ（wiki_list には出ない）
     for (const d of wk.newDirs) if (d) dirAt(d.split("/"));
+    // 索引から除いたフォルダ（走査はその中へ降りない = 中のページは来ない）
+    for (const d of wk.excluded) if (d) dirAt(d.split("/")).excluded = true;
     return root;
   });
 
@@ -67,7 +68,7 @@
     const walk = (d: Dir, depth: number) => {
       for (const sub of [...d.dirs.values()].sort((a, b) => byName(a.name, b.name))) {
         out.push({ dir: sub, depth });
-        if (wk.open.has(sub.path)) walk(sub, depth + 1);
+        if (!sub.excluded && wk.open.has(sub.path)) walk(sub, depth + 1);
       }
       for (const f of [...d.files].sort((a, b) => byName(baseName(a.path), baseName(b.path)))) out.push({ file: f, depth });
     };
@@ -95,21 +96,31 @@
     return f.kind === "md" ? b.replace(/\.md$/i, "") : b;
   }
 
-  /** ワークスペース名の行のクリック / 右クリック: ホーム / 最近のワークスペース / 別のフォルダを選ぶ… / 参照フォルダ（読み取り専用）を追加…
-      （WikiDialogs が出す）。位置はボタンの直下。y の上限 = メニューの高さの見積もり（パス + 3 項目 + 見出し + 区切り = 約 165px・履歴 1 行 = 約 28px） */
-  function vaultMenu(e: MouseEvent) {
+  /** ワークスペース名の行のクリック / 右クリック / キー: ホーム / 最近のワークスペース（× = 外す）/ 別のフォルダを選ぶ… / フォルダの設定… /
+      索引を作り直す（WikiDialogs が出す）。位置はボタンの直下。y の上限 = メニューの高さの見積もり（パス + 4 項目 + 見出し + 区切り =
+      約 197px・履歴 1 行 = 約 28px）。
+      キーで開いた（Enter / Space / ↓・キーの click = detail 0）ときは最初の項目へ焦点を移し、Esc / 実行の後に名前のボタンへ戻す
+      （ページの [⋯] と同じ = keyboard と opener）。覆いの間は開かない（[⋯] と同じ門） */
+  function vaultMenu(e: MouseEvent | KeyboardEvent, keyboard = e instanceof MouseEvent && e.type === "click" && e.detail === 0) {
     e.preventDefault();
     e.stopPropagation();
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const h = 165 + 28 * Math.max(1, workspaceList().length);
-    wk.menu = { kind: "vault", path: wk.status?.root ?? "", x: Math.min(r.left, window.innerWidth - 280), y: Math.max(4, Math.min(r.bottom + 2, window.innerHeight - h)) };
+    if (covered()) return;
+    const opener = e.currentTarget as HTMLElement;
+    const r = opener.getBoundingClientRect();
+    const h = 197 + 28 * Math.max(1, workspaceList().length);
+    wk.menu = { kind: "vault", path: wk.status?.root ?? "", x: Math.min(r.left, window.innerWidth - 280), y: Math.max(4, Math.min(r.bottom + 2, window.innerHeight - h)), keyboard, opener };
+  }
+  /** 名前のボタンのキー: Enter / Space / ↓ = 開いて最初の項目へ（覆いの間は素通し = 奪わない） */
+  function vaultKey(e: KeyboardEvent) {
+    if (composing(e) || e.metaKey || e.ctrlKey || e.altKey || covered()) return;
+    if (e.key === "Enter" || e.key === " " || e.key === "ArrowDown") vaultMenu(e, true);
   }
 
   /** 右クリック: ページ = 名前の変更・複製・ゴミ箱 / フォルダ = その中に新規ページ・新規フォルダ・フォルダをゴミ箱（WikiDialogs が出す）。
       y の上限 = メニューの高さの見積もり（フォルダは見出し + 3 項目） */
-  function menu(e: MouseEvent, kind: "file" | "dir", path: string) {
+  function menu(e: MouseEvent, kind: "file" | "dir" | "excluded", path: string) {
     e.preventDefault();
-    const h = kind === "dir" ? 150 : 110;
+    const h = kind === "dir" ? 180 : 110;
     wk.menu = { kind, path, x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - h) };
   }
 
@@ -121,10 +132,10 @@
   }
 </script>
 
-<nav class="wk-sidebar">
-  <WikiSegment />
+<nav class="wk-sidebar sidepane">
+  <ModeSegment />
   <!-- ワークスペース名 = メニュー（ホーム / 最近のワークスペース / 別のフォルダを選ぶ… / 参照フォルダ（読み取り専用）を追加…）。Settings のメニュー項目「フォルダを選ぶ…」をここへ移した -->
-  <button class="wk-vault" class:wk-cur={current === null} title={wk.status?.root ?? ""} aria-haspopup="menu" aria-expanded={wk.menu?.kind === "vault"} onclick={vaultMenu} oncontextmenu={vaultMenu}>
+  <button class="wk-vault" class:wk-cur={current === null} title={wk.status?.root ?? ""} aria-haspopup="menu" aria-expanded={wk.menu?.kind === "vault"} onclick={(e) => vaultMenu(e)} oncontextmenu={(e) => vaultMenu(e, false)} onkeydown={vaultKey}>
     {vaultName() || "OpenNote"}
     {#if wk.pages.length}<span class="wk-n">{wk.pages.length}</span>{/if}
   </button>
@@ -141,12 +152,26 @@
   {/if}
   <div class="wk-tree" role="tree" aria-label={t("ページの一覧")}>
     {#each rows as r ("dir" in r ? "d:" + r.dir.path : "f:" + r.file.path)}
-      {#if "dir" in r}
+      {#if "dir" in r && r.dir.excluded}
+        <!-- 索引から除いたフォルダ = 薄い行。クリックでは開かない（中身は索引に無い）・右クリックで「索引に入れる」「Finder で表示」 -->
+        <button
+          class="wk-row wk-dir wk-excl"
+          role="treeitem"
+          aria-selected="false"
+          aria-disabled="true"
+          title={`${r.dir.path}\n${t("索引から除いています（右クリックで索引に入れられます）")}`}
+          style:padding-left="{6 + r.depth * 12}px"
+          oncontextmenu={(e) => menu(e, "excluded", r.dir.path)}>
+          <span class="wk-chev wk-excl-mark" aria-hidden="true">–</span>
+          <span class="wk-name">{r.dir.name}</span>
+        </button>
+      {:else if "dir" in r}
         <button
           class="wk-row wk-dir"
           role="treeitem"
           aria-selected="false"
           aria-expanded={wk.open.has(r.dir.path)}
+          title={r.dir.path}
           style:padding-left="{6 + r.depth * 12}px"
           onclick={() => toggle(r.dir.path)}
           oncontextmenu={(e) => menu(e, "dir", r.dir.path)}>
@@ -233,7 +258,7 @@
       </button>
       {#if tagsOpen}
         {#if !wk.tags.length}
-          <p class="wk-msg">{t("tag はありません")}</p>
+          <p class="wk-msg">{t("タグはありません")}</p>
         {:else}
           <div class="wk-tags">
             {#each shownTags as tg (tg.tag)}
@@ -257,9 +282,9 @@
 </nav>
 
 <style>
+  /* 外形（角丸・枠・影・面の色）は LIBRARY / 本棚と共通の .sidepane（app.css） */
   .wk-sidebar {
-    border-right: 1px solid var(--border); background: var(--panel); overflow-y: auto; padding: 8px 6px;
-    display: flex; flex-direction: column; gap: 1px; min-width: 0;
+    overflow-y: auto; padding: 8px 6px; display: flex; flex-direction: column; gap: 1px; min-width: 0;
   }
   .wk-vault {
     display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 5px 8px; margin-bottom: 4px;
@@ -278,16 +303,14 @@
   .wk-row:hover { background: var(--bg); }
   .wk-row.wk-cur { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
   .wk-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wk-chev { display: inline-block; width: 10px; font-size: 9px; color: var(--dim); transition: transform 0.1s; }
-  .wk-chev-open { transform: rotate(90deg); }
+  /* .wk-chev・.wk-box-h（畳める節の見出し）は app.css（右ペインの目次と共用） */
   .wk-dir { font-weight: 500; }
+  /* 索引から除いたフォルダ = 薄い行（押しても開かない = 手の形にしない） */
+  .wk-row.wk-excl { color: var(--dim); opacity: 0.55; font-weight: 400; cursor: default; }
+  .wk-row.wk-excl:hover { background: transparent; opacity: 0.8; }
+  .wk-excl-mark { text-align: center; }
   .wk-k-media, .wk-k-other { color: var(--dim); }
   .wk-box { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 6px; display: flex; flex-direction: column; gap: 1px; }
-  .wk-box-h {
-    display: flex; align-items: center; gap: 4px; padding: 3px 6px; border: 0; border-radius: 5px; background: transparent;
-    cursor: pointer; color: var(--dim); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; text-align: left;
-  }
-  .wk-box-h:hover { background: var(--bg); }
   .wk-box-t { flex: 1; }
   .wk-size { margin-left: auto; flex-shrink: 0; padding-left: 6px; }
   .wk-tags { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 6px; }

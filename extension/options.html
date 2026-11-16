@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>OpenRef Capture の設定</title>
+  <style>
+    :root {
+      --bg: #f6f7f8; --panel: #fff; --border: #dfe3e6; --text: #1c2733;
+      --dim: #6b7a89; --accent: #1a73e8; --danger: #c0392b; --ok: #1e8e3e;
+      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; font-size: 13px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 14px; background: var(--bg); color: var(--text); min-width: 480px; }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+    .card + .card { margin-top: 10px; }
+    /* 全サイト許可のスイッチ。中身は checkbox = 状態は実際の権限から読む（options.js） */
+    .switch { display: flex; align-items: center; gap: 8px; font-weight: 600; margin: 0; cursor: pointer; }
+    .switch input { appearance: none; -webkit-appearance: none; flex: none; width: 34px; height: 20px; padding: 0; margin: 0; border: 0; border-radius: 10px; background: #c4ccd4; position: relative; cursor: pointer; transition: background .15s; }
+    .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s; }
+    .switch input:checked { background: var(--accent); }
+    .switch input:checked::after { left: 16px; }
+    .switch input:disabled { opacity: .5; cursor: default; }
+    .switch input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #allsites-status { margin-top: 8px; min-height: 18px; white-space: pre-wrap; color: var(--dim); }
+    #allsites-status.ok { color: var(--ok); }
+    #allsites-status.err { color: var(--danger); }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    .exp { display: inline-block; border: 1px solid var(--danger); color: var(--danger); border-radius: 4px; font-size: 10px; padding: 0 4px; margin-left: 4px; font-weight: normal; }
+    .row { display: flex; gap: 6px; }
+    input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+    #status { margin-top: 8px; min-height: 18px; white-space: pre-wrap; word-break: break-all; color: var(--dim); }
+    #status.ok { color: var(--ok); }
+    #status.err { color: var(--danger); }
+    ul { margin: 10px 0 0; padding-left: 18px; color: var(--dim); line-height: 1.6; }
+    code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text); word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>OpenRef Capture の設定</h1>
+  <form class="card" id="form">
+    <label for="proxy">大学プロキシの前置き<span class="exp">実験的</span></label>
+    <div class="row">
+      <input id="proxy" type="text" spellcheck="false" autocomplete="off" placeholder="https://login.ezproxy.example.ac.jp/login?url=" />
+      <button type="submit" id="save">保存</button>
+    </div>
+    <div id="status"></div>
+    <ul>
+      <li>学外から購読誌の PDF を取るときに使います。空にして保存すると使いません（今までどおり）。</li>
+      <li>EZproxy の例: <code>https://login.ezproxy.example.ac.jp/login?url=</code>（末尾に URL をそのまま付けます）</li>
+      <li>OpenAthens の例: <code>https://go.openathens.net/redirector/example.ac.jp?url={url}</code>（<code>{url}</code> の所に URL を符号化して入れます）</li>
+      <li>受け付けるのは <code>https://</code> で始まる URL だけです。所属機関の図書館の案内にある前置きを入れてください。</li>
+      <li>使う所: ①PDF が取れないとき DOI ページを背景タブで開く経路（全サイト許可が要る）を、この前置き経由で開きます。
+        ②保存の結果が「ログインが要る」「止まった」のとき、ポップアップに「プロキシ経由で開く」を出します（自動では開き直しません）。</li>
+      <li>前置きは OpenRef（この Mac のアプリ）には送りません。OpenRef 側の取得はプロキシを使いません。</li>
+    </ul>
+  </form>
+  <div class="card" id="allsites-card">
+    <label class="switch" for="allsites"><input id="allsites" type="checkbox" role="switch" disabled />PDF が取れないとき、背景タブで探す（全サイトへのアクセス）</label>
+    <div id="allsites-status"></div>
+    <ul>
+      <li>オンにすると、Chrome が全サイトへのアクセスの許可を求めます。許可すると、ページから PDF が取れないとき、PDF・PMC 本文・DOI ページを背景タブで開いて探します。保存の結果が「ログインが要る」などのとき、ポップアップに「窓で開いて確認・ログインする」を出します。</li>
+      <li>オフにすると許可を外します。次の保存から背景タブを使わず（結果の詳細は「未試行」）、保存のときにも許可を聞きません。走っている保存は、始めたときの許可のまま進みます。</li>
+      <li>書誌の保存と、ページ内・拡張からの PDF の取得は、オフでも今までどおりです。</li>
+    </ul>
+  </div>
+  <script src="pdfbytes.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

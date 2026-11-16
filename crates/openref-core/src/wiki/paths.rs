@@ -101,8 +101,69 @@ pub fn resolve_existing(root: &Path, given: &Path, opts: Opts) -> Result<(String
     Ok((rel, canon))
 }
 
+/// `exclude_dir` が断る理由（文言は呼び手 = GUI の木の右クリックの「索引から除く / 入れる」）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcludeReject {
+    /// ワークスペースの root そのもの（空・`/` だけを含む）
+    Root,
+    /// `.` 始まりの区画・空の区画（`..` を解いた後に root の外 / root そのものになるものを含む）
+    BadSegment,
+    /// フォルダでない（ファイル・symlink）
+    NotDir,
+    /// 無い
+    NotFound,
+    /// 途中に symlink がある（canonical の vault 相対が字面と違う）
+    ViaSymlink,
+}
+
+/// 索引から除く / 入れるフォルダ（GUI が渡す vault 相対の dir）の検査 → (vault 相対（NFC）, 絶対パス)。この順に見る: 前後の空白と `/` を
+/// 落として vault 相対に（strip_root = NFC）→ 空 = root → `.` 始まり / 空の区画 → lstat でフォルダか（symlink は不可）→ canonicalize した
+/// vault 相対が字面と同じ（途中に symlink が無い）。scan の除外の規則とは別（ここは利用者が選んだフォルダの形の検査）
+pub fn exclude_dir(root: &Path, dir: &str) -> Result<(String, PathBuf), ExcludeReject> {
+    let raw = dir.trim().trim_matches('/');
+    let rel = if raw.is_empty() { String::new() } else { strip_root(root, &root.join(raw)).unwrap_or_default() };
+    if rel.is_empty() {
+        return Err(ExcludeReject::Root);
+    }
+    if rel.split('/').any(|s| s.is_empty() || s.starts_with('.')) {
+        return Err(ExcludeReject::BadSegment);
+    }
+    let abs = root.join(&rel);
+    match std::fs::symlink_metadata(&abs) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Err(ExcludeReject::NotDir),
+        Err(_) => return Err(ExcludeReject::NotFound),
+    }
+    let back = std::fs::canonicalize(&abs).ok().and_then(|c| strip_root(root, &c));
+    if back.as_deref() != Some(rel.as_str()) {
+        return Err(ExcludeReject::ViaSymlink);
+    }
+    Ok((rel, abs))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::index::Ready;
+
+    /// exclude_dir の理由（GUI の文は app が付ける）: root / `.` 始まり / `..` / 無い / ファイル / symlink / 途中の symlink・
+    /// 前後の `/` と空白は落とす
+    #[test]
+    fn exclude_dir_reasons() {
+        use super::{exclude_dir, ExcludeReject as R};
+        let base = std::env::temp_dir().join(format!("openref-paths-excl-{}-{}", std::process::id(), fastrand::u64(..)));
+        let root = base.join("vault");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("a/f.md"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("link")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(exclude_dir(&root, " /a/b/ "), Ok(("a/b".to_string(), root.join("a/b"))));
+        for (d, want) in [("", R::Root), ("/", R::Root), (".git", R::BadSegment), ("a/../a", R::BadSegment), ("nope", R::NotFound), ("a/f.md", R::NotDir), ("link", R::NotDir), ("link/b", R::ViaSymlink)] {
+            assert_eq!(exclude_dir(&root, d), Err(want), "{d}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    use super::super::scan::Rules;
     use super::super::{commands, edit, index, Ctx};
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -191,8 +252,8 @@ mod tests {
     fn core_table() -> String {
         let f = fix("table");
         let _serial = index::test_serial();
-        let (ip, root) = f.ctx.ready().unwrap();
-        let ix = index::Index::open(&ip, &root).unwrap();
+        let Ready { index: ip, root, .. } = f.ctx.ready().unwrap();
+        let ix = index::Index::open(&Ready::new(&ip, &root, Rules::default())).unwrap();
         let mut out = String::new();
         for (label, s) in inputs(&f) {
             let rows: Vec<(&str, String)> = vec![
@@ -333,25 +394,25 @@ target_path | 隠しsymlinkで中(絶対) | Err("入力を解釈できません:
 reject_symlink | 隠しsymlinkで中(絶対) | Ok(())
 import_file | 隠しsymlinkで中(絶対) | Ok("{\"copied\":false,\"embed\":\"[[sub/b.md]]\",\"path\":\"sub/b.md\"}")
 Index::rel_of | 隠しsymlinkで中(絶対) | Some(".alias/b.md")
-resolve_entry | symlinkで外 | Err("入力を解釈できません: ワークスペースの外を指しています（symlink）: <B>/home/Documents/vault/out-link.md")
-resolve_entry(dir) | symlinkで外 | Err("入力を解釈できません: ワークスペースの外を指しています（symlink）: <B>/home/Documents/vault/out-link.md")
+resolve_entry | symlinkで外 | Err("入力を解釈できません: ワークスペースの外を指しています（シンボリックリンク）: <B>/home/Documents/vault/out-link.md")
+resolve_entry(dir) | symlinkで外 | Err("入力を解釈できません: ワークスペースの外を指しています（シンボリックリンク）: <B>/home/Documents/vault/out-link.md")
 host_path_in_vault | symlinkで外 | Err("入力を解釈できません: ワークスペース（<B>/home/Documents/vault）の外です: <B>/home/Documents/vault/out-link.md")
-target_path | symlinkで外 | Err("入力を解釈できません: symlink には書けません: <B>/home/Documents/vault/out-link.md")
-reject_symlink | symlinkで外 | Err("入力を解釈できません: symlink は扱えません: <B>/home/Documents/vault/out-link.md")
+target_path | symlinkで外 | Err("入力を解釈できません: シンボリックリンクには書けません: <B>/home/Documents/vault/out-link.md")
+reject_symlink | symlinkで外 | Err("入力を解釈できません: シンボリックリンクは扱えません: <B>/home/Documents/vault/out-link.md")
 import_file | symlinkで外 | Err("入力を解釈できません: ワークスペースの外から取り込めるのは画像・PDF・動画・音声だけです: outside.md")
 Index::rel_of | symlinkで外 | Some("out-link.md")
 resolve_entry | symlinkで中 | Ok(("a.pdf", "<B>/home/Documents/vault/a.pdf"))
 resolve_entry(dir) | symlinkで中 | Ok(("a.pdf", "<B>/home/Documents/vault/a.pdf"))
 host_path_in_vault | symlinkで中 | Ok("<B>/home/Documents/vault/a.pdf")
-target_path | symlinkで中 | Err("入力を解釈できません: symlink には書けません: <B>/home/Documents/vault/in-link.pdf")
-reject_symlink | symlinkで中 | Err("入力を解釈できません: symlink は扱えません: <B>/home/Documents/vault/in-link.pdf")
+target_path | symlinkで中 | Err("入力を解釈できません: シンボリックリンクには書けません: <B>/home/Documents/vault/in-link.pdf")
+reject_symlink | symlinkで中 | Err("入力を解釈できません: シンボリックリンクは扱えません: <B>/home/Documents/vault/in-link.pdf")
 import_file | symlinkで中 | Ok("{\"copied\":false,\"embed\":\"![[a.pdf]]\",\"path\":\"a.pdf\"}")
 Index::rel_of | symlinkで中 | Some("in-link.pdf")
 resolve_entry | symlinkで隠し | Err("入力を解釈できません: このパスは読めません: <B>/home/Documents/vault/vis-link.md")
 resolve_entry(dir) | symlinkで隠し | Err("入力を解釈できません: このパスは読めません: <B>/home/Documents/vault/vis-link.md")
 host_path_in_vault | symlinkで隠し | Err("入力を解釈できません: `.` で始まるフォルダ・ファイルの中は使えません: .obsidian/x.md")
-target_path | symlinkで隠し | Err("入力を解釈できません: symlink には書けません: <B>/home/Documents/vault/vis-link.md")
-reject_symlink | symlinkで隠し | Err("入力を解釈できません: symlink は扱えません: <B>/home/Documents/vault/vis-link.md")
+target_path | symlinkで隠し | Err("入力を解釈できません: シンボリックリンクには書けません: <B>/home/Documents/vault/vis-link.md")
+reject_symlink | symlinkで隠し | Err("入力を解釈できません: シンボリックリンクは扱えません: <B>/home/Documents/vault/vis-link.md")
 import_file | symlinkで隠し | Err("入力を解釈できません: ワークスペースの外から取り込めるのは画像・PDF・動画・音声だけです: x.md")
 Index::rel_of | symlinkで隠し | Some("vis-link.md")
 resolve_entry | 外のsymlinkで中 | Err("入力を解釈できません: ワークスペースの外のパスは読めません: <B>/to-in.pdf")

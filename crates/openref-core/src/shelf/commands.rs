@@ -132,7 +132,7 @@ fn apply_opts(o: &mut serde_json::Map<String, Value>, a: &Value) -> Result<()> {
 pub fn set_opts(db: &Db, a: &Value) -> Result<Value> {
     let root = root_arg(a)?;
     let o: Opts = with_workspaces(db, |m| {
-        let e = m.get_mut(&root).and_then(Value::as_object_mut).ok_or_else(|| bad(format!("履歴に無い本棚です: {root}（root には shelf_status の root をそのまま渡す）")))?;
+        let e = m.get_mut(&root).and_then(Value::as_object_mut).ok_or_else(|| super::unknown(&root))?;
         apply_opts(e, a)?;
         Ok(Opts::of(m.get(&root)))
     })?;
@@ -201,7 +201,10 @@ mod tests {
             assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains("本棚に無いフォルダ"), "{d}: {e}");
         }
         let e = list(&f.ctx, &json!({"root": f.base.to_string_lossy()})).unwrap_err();
-        assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains("履歴に無い本棚"), "{e}");
+        // MCP / CLI の文は手がかりまで（前と同じ字）・GUI の文（without_hint）は BadInput の手がかりの無い文
+        assert_eq!(e.to_string(), format!("入力を解釈できません: 履歴に無い本棚です: {}（{}）", f.base.to_string_lossy(), super::super::ROOT_HINT));
+        let e = e.without_hint();
+        assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains("履歴に無い本棚") && !e.to_string().contains("shelf_status"), "{e}");
         assert!(list(&f.ctx, &json!({})).unwrap_err().to_string().contains("root は必須"));
         assert!(list(&f.ctx, &json!({"root": 1})).unwrap_err().to_string().contains("root は文字列"));
         assert!(list(&f.ctx, &json!({"root": f.root, "dir": 1})).unwrap_err().to_string().contains("dir は文字列"));
@@ -254,7 +257,8 @@ mod tests {
             (json!({"collapse_single": true}), "root は必須"),
         ] {
             let e = set_opts(&db, &a).unwrap_err();
-            assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains(want), "{a}: {e}");
+            assert!(e.to_string().contains(want), "{a}: {e}");
+            assert!(matches!(e.without_hint(), CoreError::BadInput(_)), "{a}");
         }
         assert_eq!(db.setting(KEY).unwrap(), before, "拒否は何も書かない");
     }

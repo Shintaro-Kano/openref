@@ -95,7 +95,8 @@ impl Db {
         Ok(())
     }
 
-    /// settings の行を消す（無ければ何もしない）。GUI が旧キー（`wiki_ref_dirs` は `wiki_workspaces` へ移した）を消すのに使う
+    /// settings の行を消す（無ければ何もしない）。呼び手は GUI の本棚（shelf_gui.rs の `shelf_heal`）だけ = 解釈できない
+    /// `shelf_workspaces` を別の鍵へ退避した後に元の鍵を消す
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
@@ -147,7 +148,7 @@ impl Db {
                     backfill_fulltext_fts_v7(&tx)?;
                 }
                 if v == 10 {
-                    crate::import::plan::create_identity_indexes(&tx)?;
+                    crate::identity::create_identity_indexes(&tx)?;
                 }
                 tx.pragma_update(None, "user_version", v)?;
                 tx.commit()?;

@@ -53,6 +53,8 @@ pub struct Downloaded {
     pub bytes: Vec<u8>,
     pub source: String,
     pub doi_check: Option<&'static str>,
+    /// 索引用の全頁の抽出（`fetch_pdf_download` がロックの外で済ませる。None なら ③ の中で抽出する）
+    pub text: Option<crate::fulltext::ExtractedText>,
 }
 
 /// ① item を読み、既に PDF 添付があれば拒否する（DB 読取のみ・短い）
@@ -78,7 +80,14 @@ fn has_pdf(db: &Db, item_id: i64) -> Result<bool> {
 
 /// ② 連鎖を回す（DB に触らない）: PMC → Unpaywall → Crossref link[] → doi.org 着地ページ。
 /// 取れた PDF は `check_pdf_identity` で目的の論文か照合し、採否は所在の種類ごとに `verdict` が決める（`judge` 経由）。
+/// 採った PDF の索引用の全頁抽出もここ（ロックの外）で済ませる（③ は本文の行を書くだけ）
 pub fn fetch_pdf_download(plan: &FetchPlan) -> Result<Downloaded> {
+    let mut dl = download_chain(plan)?;
+    dl.text = Some(crate::fulltext::extract_for_index(&dl.bytes, &md5_hex(&dl.bytes), None));
+    Ok(dl)
+}
+
+fn download_chain(plan: &FetchPlan) -> Result<Downloaded> {
     let csl = &plan.csl;
     let mut tried: Vec<String> = Vec::new();
 
@@ -140,30 +149,81 @@ pub fn fetch_pdf_download(plan: &FetchPlan) -> Result<Downloaded> {
     }
 
     Err(CoreError::NotFound(format!(
-        "PDF を自動取得できませんでした — {}。paywall 論文はサーバ側からは取得できません（設計どおり）。ブラウザで PDF を開いた状態で取り込んでください",
+        "PDF を自動取得できませんでした — {}。paywall の文献はサーバ側からは取得できません（設計どおり）。ブラウザで PDF を開いた状態で取り込んでください",
         tried.join(" / ")
     )))
 }
 
 /// ③ 添付して照合結果（`doi_check` = 'match' / 'unknown' / None = 印なし）を添付行に記録する。
-/// ② の間にロックを離しているので、別経路で添付済みになっていたら拒否する
+/// ② の間にロックを離しているので、別経路で添付済みになっていたら拒否する（`ExistingPdf::Reject`）
 pub fn fetch_pdf_attach(db: &Db, plan: &FetchPlan, dl: Downloaded) -> Result<Fetched> {
-    let item = search::get_by_key(db, &plan.key)?
-        .ok_or_else(|| CoreError::NotFound(format!("item {}", plan.key)))?;
-    if has_pdf(db, item.id)? {
-        return Err(CoreError::Conflict(format!(
+    let filename = suggest_filename(&plan.csl);
+    let md5 = md5_hex(&dl.bytes);
+    match attach_verified(db, &plan.key, &filename, &dl.bytes, &md5, dl.doi_check, ExistingPdf::Reject, dl.text.as_ref())? {
+        VerifiedAttach::Attached { .. } => Ok(Fetched { source: dl.source, filename, bytes_len: dl.bytes.len() }),
+        VerifiedAttach::HasPdf | VerifiedAttach::DuplicateFile => Err(CoreError::Conflict(format!(
             "item {} には取得中に別経路で PDF が添付されました（{}・{} bytes は破棄）",
             plan.key,
             dl.source,
             dl.bytes.len()
-        )));
+        ))),
     }
-    let filename = suggest_filename(&plan.csl);
-    let attached = edit::attach_auto_bytes(db, &plan.key, &filename, &dl.bytes)?;
-    if let Some(mark) = dl.doi_check {
+}
+
+/// 既に添付があるときの方針。**経路ごとに違い、揃えていない**（2026-11-14 に引数に明示した）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingPdf {
+    /// サーバ側の取得（`fetch_pdf_attach` = Tauri の Fetch PDF・connectd の fetch-oa・CLI / MCP）: kind='pdf' の添付が
+    /// 1 本でもあれば添付しない（`HasPdf`）。item がゴミ箱・無い = NotFound
+    Reject,
+    /// Capture の `/capture/attachment`: 添付（種類を問わない）が無ければ添付・同じ md5 があればスキップ（`DuplicateFile`）・
+    /// 別ファイルなら 2 本目として添付（GUI の一括取込と同じ `pdfingest::attach_or_skip_with_md5`）
+    AddAnother,
+}
+
+/// `attach_verified` の結果
+#[derive(Debug)]
+pub enum VerifiedAttach {
+    /// 添付した。`additional` = 既存の添付と別ファイルの 2 本目（`AddAnother` だけ）
+    Attached { attached: edit::Attached, additional: bool },
+    /// 同じ md5 のファイルが添付済み（`AddAnother` だけ）= 何もしていない
+    DuplicateFile,
+    /// PDF が添付済み（`Reject` だけ）= 何もしていない
+    HasPdf,
+}
+
+/// 「照合済み（`verdict` が Attach）の PDF → 既存の添付の方針 → 添付 → 照合印」の ③（ロックの中）。サーバ側の取得と
+/// Capture の `/capture/attachment` が共有する。照合（`check_pdf_identity`）と採否（`verdict`）は呼び手がロックの外で済ませる。
+/// `md5` = `bytes` の 16 進 md5・`doi_check` = 添付行に書く印（None = 印なし）・`text` = ロックの外で済ませた本文の抽出
+/// （`fulltext::extract_for_index`。None ならこの中で抽出する）
+#[allow(clippy::too_many_arguments)]
+pub fn attach_verified(
+    db: &Db,
+    key: &str,
+    filename: &str,
+    bytes: &[u8],
+    md5: &str,
+    doi_check: Option<&'static str>,
+    existing: ExistingPdf,
+    text: Option<&crate::fulltext::ExtractedText>,
+) -> Result<VerifiedAttach> {
+    let (attached, additional) = match existing {
+        ExistingPdf::Reject => {
+            let item = search::get_by_key(db, key)?.ok_or_else(|| CoreError::NotFound(format!("item {key}")))?;
+            if has_pdf(db, item.id)? {
+                return Ok(VerifiedAttach::HasPdf);
+            }
+            (edit::attach_auto_extracted(db, key, filename, bytes, md5, text)?, false)
+        }
+        ExistingPdf::AddAnother => match crate::pdfingest::attach_or_skip_with_md5(db, key, filename, bytes, md5, text)? {
+            (crate::pdfingest::PdfIngestOutcome::DuplicateFile { .. }, _) | (_, None) => return Ok(VerifiedAttach::DuplicateFile),
+            (outcome, Some(a)) => (a, matches!(outcome, crate::pdfingest::PdfIngestOutcome::AttachedAdditional { .. })),
+        },
+    };
+    if let Some(mark) = doi_check {
         mark_doi_check(db, attached.id, mark);
     }
-    Ok(Fetched { source: dl.source, filename, bytes_len: dl.bytes.len() })
+    Ok(VerifiedAttach::Attached { attached, additional })
 }
 
 /// 便宜関数: ①②③を続けて行う（CLI / MCP など Mutex を持たない呼び手向け）
@@ -467,10 +527,10 @@ fn judge(
     match verdict(kind, &check_pdf_identity(&bytes, csl)) {
         Verdict::Attach { doi_check } => {
             let source = if doi_check == Some("unknown") { format!("{source}・DOI 未確認") } else { source };
-            Ok(Downloaded { bytes, source, doi_check })
+            Ok(Downloaded { bytes, source, doi_check, text: None })
         }
         Verdict::Mismatch { found_doi } => {
-            Err(format!("{stage}: 別論文（DOI {found_doi}）の PDF でした（{} bytes・添付せず）", bytes.len()))
+            Err(format!("{stage}: 別の文献（DOI {found_doi}）の PDF でした（{} bytes・添付せず）", bytes.len()))
         }
         Verdict::Unverified { why } => Err(format!(
             "{stage}: {source} の .pdf リンク（ヒューリスティック所在）は{why}（{} bytes・添付せず）",
@@ -848,7 +908,7 @@ fn http_get(
 
 /// 外部 URL から PDF をダウンロードして `%PDF` を検証する（`http_get` = 手動リダイレクト・各ホップに SSRF ガード `url_allowed`・
 /// 本文 200 MB 上限）。`referer` は着地ページ（出版社ホストが要求することがある）。`allow_http` は Unpaywall（文書化 API が返す URL）だけ true。
-pub fn download_pdf(url: &str, referer: Option<&str>, allow_http: bool) -> std::result::Result<Vec<u8>, String> {
+fn download_pdf(url: &str, referer: Option<&str>, allow_http: bool) -> std::result::Result<Vec<u8>, String> {
     pdf_body(http_get(url, referer, "application/pdf,*/*;q=0.8", PDF_CAP, allow_http)?)
 }
 
@@ -1310,17 +1370,8 @@ pub fn suggest_filename(csl: &Value) -> String {
     let title = model::s(csl, "title").unwrap_or("untitled");
     let head = if multi { format!("{fam} et al.") } else { fam };
     let name = format!("{head} {year} - {title}");
-    let name: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
-            c => c,
-        })
-        .collect();
-    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-    let name = model::truncate_chars(&name, 140);
-    // タイトル末尾のピリオド（PubMed 由来）で "..pdf" にならないようにする
-    format!("{}.pdf", name.trim_end_matches('.'))
+    // 無害化は safe_filename_stem と共通（末尾のピリオド = PubMed 由来の題名で "..pdf" にならないよう落とすのも共通部）
+    format!("{}.pdf", crate::pdfingest::sanitize_filename_chars(&name))
 }
 
 #[cfg(test)]
@@ -1732,7 +1783,7 @@ mod doi_tests {
         // 前方一致は Match にしない（mu-430 ≠ mu-4308）→ p.1 の別 DOI で Mismatch
         assert_eq!(identity_from_pages(&combined, "10.11152/mu-430"), IdentityCheck::Mismatch { found_doi: "10.11152/mu-4292".into() });
         assert_eq!(identity_from_pages(&combined, "10.11152/mu-429"), IdentityCheck::Mismatch { found_doi: "10.11152/mu-4292".into() });
-        // 表記ゆれ（実物 iranjradiol の p.1 印字 `doi.org/10.5812/ijradiol-138586.`）→ Unknown
+        // 表記ゆれ（iranjradiol の p.1 の印字の型 `doi.org/10.5812/ijradiol-138586.`）→ Unknown
         let pages = pg(&["Iran J Radiol. 2024\nhttps://doi.org/10.5812/ijradiol-138586.\nAbstract"]);
         assert_eq!(identity_from_pages(&pages, "10.5812/iranjradiol-138586"), IdentityCheck::Unknown);
         // 一致: そのまま / 大文字 / doi.org URL 形 + 文末ピリオド / 改行で割れている / 2 頁目（1 頁目に別 DOI なし）
@@ -1823,7 +1874,7 @@ mod doi_tests {
         let bytes = pdf("Med Ultrason DOI: 10.11152/mu-4292, Corresponding");
         let n = bytes.len();
         let note = judge(LocationKind::Declared, &csl, bytes, "crossref", "crossref-link".into()).unwrap_err();
-        assert_eq!(note, format!("crossref: 別論文（DOI 10.11152/mu-4292）の PDF でした（{n} bytes・添付せず）"));
+        assert_eq!(note, format!("crossref: 別の文献（DOI 10.11152/mu-4292）の PDF でした（{n} bytes・添付せず）"));
         // Heuristic × Unknown → 添付しない
         let bytes = pdf("Instructions for authors");
         let n = bytes.len();
@@ -1891,57 +1942,6 @@ mod doi_tests {
         }
         assert!(crossref_pdf_links("10.62713/aic.4729").unwrap().is_empty());
         assert!(crossref_pdf_links("10.1016/j.radcr.2026.08.005").unwrap().is_empty());
-    }
-
-    /// 実弾（既存 DB の読み取りのみ）: 保存済み本文（fulltext・冒頭 2 頁）に同一性照合を再適用し、Match 率と Mismatch 0 を確認する。
-    /// `OPENREF_PROD_DB=<path> cargo test -p openref-core --lib -- --ignored identity_prod_recheck --nocapture`
-    /// （未設定なら ~/Library/Application Support/OpenRef/openref.sqlite を read-only で開く）
-    #[test]
-    #[ignore]
-    fn identity_prod_recheck() {
-        let path = crate::env_os("PROD_DB").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/OpenRef/openref.sqlite")
-        });
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .expect("read-only open");
-        let mut stmt = conn
-            .prepare(
-                "SELECT i.key, json_extract(i.csl,'$.DOI'), f.text FROM items i
-                 JOIN attachments a ON a.item_id = i.id JOIN fulltext f ON f.attachment_id = a.id
-                 WHERE i.deleted_at IS NULL AND a.kind = 'pdf'",
-            )
-            .unwrap();
-        let rows: Vec<(String, Option<String>, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        let (mut m, mut u, mut mm, mut nodoi) = (0, 0, 0, 0);
-        for (key, doi, text) in &rows {
-            let Some(doi) = doi else { nodoi += 1; continue };
-            let pages: Vec<String> = text.split('\u{c}').take(2).map(str::to_string).collect();
-            match identity_from_pages(&pages, doi) {
-                IdentityCheck::Match => m += 1,
-                IdentityCheck::Unknown => {
-                    u += 1;
-                    eprintln!("Unknown  {key} {doi}");
-                }
-                IdentityCheck::Mismatch { found_doi } => {
-                    mm += 1;
-                    eprintln!("MISMATCH {key} {doi} found={found_doi}");
-                }
-                IdentityCheck::Unchecked { reason } => {
-                    u += 1;
-                    eprintln!("Unchecked {key} {doi} ({reason})");
-                }
-            }
-        }
-        eprintln!("prod recheck: total {} (DOI なし {nodoi}) Match {m} Unknown/Unchecked {u} Mismatch {mm}", rows.len());
-        assert_eq!(mm, 0, "本番蔵書で誤拒否があってはならない");
-        assert!(m > 0);
     }
 
     /// 実弾（手元の実 PDF）: `OPENREF_QA_PDF_DIR=<dir> cargo test -p openref-core --lib -- --ignored identity_qa_pdfs --nocapture`

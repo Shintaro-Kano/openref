@@ -221,7 +221,10 @@ fn malformed_graph_external_entities_and_collection_cycles_are_rejected() {
 #[test]
 #[ignore = "explicit path to the public official Zotero test artifact; no production DB"]
 fn official_zotero_rdf_artifact() {
-    let p = std::env::var_os("OPENREF_TEST_ZOTERO_RDF").expect("set official zotero_rdf.xml path");
+    let Some(p) = openref_core::env_os("TEST_ZOTERO_RDF") else {
+        eprintln!("OPENREF_TEST_ZOTERO_RDF 未設定のためスキップ");
+        return;
+    };
     let input = import::zotero_rdf::read_input(Path::new(&p), source()).unwrap();
     assert_eq!(input.items.len(), 2);
     let book = input

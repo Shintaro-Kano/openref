@@ -1,5 +1,5 @@
 // OpenNote の画面側の状態と動詞。骨組み = モード・タブ・木・ページの遷移・右ペインの読込。
-// 描画は MdView / HtmlView / MediaView。Tauri command は main.rs の wiki_*（読みは登録表と同じ形 = invoke(name, { args })）。
+// 描画は render/ShadowPage（md / html）と MediaView。Tauri command は main.rs の wiki_*（読みは登録表と同じ形 = invoke(name, { args })）。
 // Wiki が無効（app.wikiOn = false）の間は何も描かず、既存の挙動を変えない
 // 検索の動詞 = search.svelte.ts・ファイル操作（新規 / 改名 / ゴミ箱）= files.svelte.ts・参照フォルダの追加 / 外す = refdirs.svelte.ts（どれもここを読む一方向）
 
@@ -8,7 +8,7 @@ import { listen } from "@tauri-apps/api/event";
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import { t } from "../i18n.svelte";
 import { api } from "../api";
-import { activateTab, app, frontViewer, frontWiki, modalOpen, openTab, reveal, setLeaveGuard, setModalGuard, setRootGuard, setView, tabOpsAllowed, toast, toggleDetail, toggleViewerSide, type TabWiki } from "../state.svelte";
+import { activateTab, app, covered, frontViewer, frontWiki, openTab, reveal, setLeaveGuard, setModalGuard, setRootGuard, toast, toggleDetail, toggleViewerSide, type TabWiki } from "../state.svelte";
 import { viewKindOf } from "./render/asset.ts";
 import { findHeading } from "./render/sanitize.ts";
 import type {
@@ -17,6 +17,7 @@ import type {
   WikiHeading,
   WikiInboxFile,
   WikiListEntry,
+  WikiListResult,
   WikiNav,
   WikiPageData,
   WikiRenamePreview,
@@ -27,6 +28,8 @@ import type {
   WikiWorkspace,
 } from "./types";
 import { dirty, discardEdit, dropPaths, ed, flush, leave, setNotice, setOnSaved, stopEdit, strandEdit } from "./edit.svelte";
+import { errText } from "../err";
+import { cite } from "./cite.svelte"; // 文献の引用の窓（WikiCite）= モーダル
 import { chat } from "../chat/chat.svelte"; // chat.svelte も wk を読む（循環）= guard の中でだけ読む（module の評価では触らない）
 
 // 読み取り専用の大きな配列（木の 1 万件・検索の結果・箱・tag）は $state.raw = 丸ごと置き換えるだけ（push / splice しない = grep で確認）。
@@ -41,7 +44,7 @@ let chatLogRaw = $state.raw<WikiInboxFile[]>([]);
 /** 変更なし（起動時・OFF の間）= 全走査と同じ「全部」の意味にはしない（all = false・配列は空 = 何も touched でない） */
 const NO_CHANGE: WikiChanged = { all: false, added: [], removed: [], modified: [] };
 
-// タブごとのワークスペース: wk の中身は「前面の OpenNote タブの root」（前面が MY LIBRARY / PDF なら最後に前面だった OpenNote タブの root）
+// タブごとのワークスペース: wk の中身は「前面の OpenNote タブの root」（前面が LIBRARY / PDF なら最後に前面だった OpenNote タブの root）
 // の物。その root = wk.status.root（shownRoot）。root に縛られる部分（木・箱・展開・題名の覚え・空のフォルダ・検索・エラー・参照フォルダ・status）は
 // タブの行き来で root ごとの写し（shelves）へ退避 / 復元する（enterRoot）= 部品は wk.* を読むだけ・変えない。表示の好み（infoOpen・headColors・split）と
 // 前面のページ（page / headings / scrollTo）は共通（ページは前面のタブの切替で読み直る）
@@ -55,8 +58,13 @@ export const wk = $state({
   set pages(v: WikiListEntry[]) {
     pagesRaw = v;
   },
+  /** 索引から除いたフォルダ（wiki_list の excluded = vault 相対・いちばん上の物）。木が薄い行で出す（中身は持たない・開けない） */
+  excluded: [] as string[],
   treeLoading: false,
   treeError: null as string | null,
+  /** wk.pages を読めたワークスペース（wiki_list が通ったときの画面の root）。null = まだ読めていない（起動直後・切替の直後・OFF）。
+      ホームが「最近開いたページは 0 件」と言ってよいかを見る（読む前の空の木で 0 件と言わない） */
+  treeRoot: null as string | null,
   /** 開いたフォルダ（vault 相対・永続しない） */
   open: new SvelteSet<string>(),
   /** 前面の Wiki タブで表示中のページ（WikiPage が読み、WikiInfo が使う） */
@@ -77,15 +85,20 @@ export const wk = $state({
   /** 読んだページの題名（path → title。wiki_read_gui の結果）。木（wiki_list）は modified（題名だけの変更）では読み直さないので、
       タブの題名は 開いた / 読み直した / 保存した ページはこちら → 無ければ木の索引（titleIndex）。木を読んだら捨てる（索引が新しい） */
   titleOverrides: new SvelteMap<string, string>(),
-  /** 監視・走査の失敗（"wiki-error"）。[再索引] で消す */
+  /** 監視・走査の失敗（"wiki-error"）。名前のメニューの「索引を作り直す」で消す */
   error: null as string | null,
   /** 右ペイン（WikiInfo）を出す（ui_wiki_info = "0" で隠す）。隠すと中央が右端まで広がる */
   infoOpen: true,
   /** md ページの見出しを h1〜h6 で色分けする（ui_wiki_heading_colors = "0" で切る） */
   headColors: true,
-  /** 表示設定（infoOpen / headColors）を読み終えた（読むまで右ペインを描かない = 一瞬出て消える・押下が上書きされるのを防ぐ） */
+  /** 「索引を作り直す」の command（wiki_reindex）を待っている間（名前のメニューの項目を押せない = 二度押しで 2 回呼ばない）。
+      作り直しの本体は背景 = その間は wk.status.rebuilding（ヘッダーの「索引を作成中… N%」）で押せない */
+  reindexing: false,
+  /** 右ペインの目次の行を出す（ui_wiki_toc = "0" で畳む = 見出しの行と件数だけ）。全ページ共通の 1 つ */
+  tocOpen: true,
+  /** 表示設定（infoOpen / headColors / tocOpen）を読み終えた（読むまで右ペインを描かない = 一瞬出て消える・押下が上書きされるのを防ぐ） */
   prefsReady: false,
-  // ---- 検索（ヘッダーの検索欄 → 中央の結果一覧。MY LIBRARY の検索とは独立） ----
+  // ---- 検索（ヘッダーの検索欄 → 中央の結果一覧。LIBRARY の検索とは独立） ----
   /** 検索欄の文字列 */
   q: "",
   /** Tags 箱で選んだ tag（AND） */
@@ -137,10 +150,23 @@ export const wk = $state({
     | { kind: "newdir"; dir: string }
     | { kind: "rename"; path: string; preview: WikiRenamePreview | null; to: string }
     | { kind: "trash"; path: string; dir: boolean }
-    | { kind: "discard"; path: string; error: string },
-  /** 木の右クリック / ツールバーの「…」/ ヘッダーの [＋ 新規] のメニュー（fixed で出す位置）。
-      file = ページ（改名・ゴミ箱）・dir = フォルダ・new = ヘッダー（dir / new の path = 作る場所のフォルダ） */
-  menu: null as null | { kind: "file" | "dir" | "new" | "vault"; path: string; x: number; y: number },
+    | { kind: "discard"; path: string; error: string }
+    | { kind: "folders" },
+  /** 浮きメニュー（WikiDialogs・fixed で出す位置 x / y）。種類: page = ページのツールバーの [⋯]（分割・見出しの色・外部で開く + file の 3 項目。
+      abs = 外部で開く先・canEdit = 分割を出す・md = 見出しの色を出す）・file = 木のファイルの右クリック（名前の変更・複製・ゴミ箱）・
+      dir = 木のフォルダ・excluded = 索引から除いたフォルダ・new = ヘッダーの [＋ 新規]（dir / new の path = 作る場所のフォルダ）・vault = 名前のメニュー。
+      keyboard = キーで開いた（最初の項目へ焦点を移す・実行 / Esc の後に opener へ焦点を戻す）・opener = 開いたボタン */
+  menu: null as null | {
+    kind: "file" | "page" | "dir" | "excluded" | "new" | "vault";
+    path: string;
+    x: number;
+    y: number;
+    abs?: string;
+    canEdit?: boolean;
+    md?: boolean;
+    keyboard?: boolean;
+    opener?: HTMLElement;
+  },
   /** この起動で作った空のフォルダ（wiki_list はページしか返さない = 木に出すために覚える・永続しない） */
   newDirs: new SvelteSet<string>(),
   /** 参照フォルダ（設定 wiki_workspaces[現在の root].ref_dirs・絶対パス・Rust が読む）。その下の pdf / html / 画像 / 動画 / 音声への file:// は内蔵の表示で開く */
@@ -167,9 +193,9 @@ setLeaveGuard(() => {
   return r.then((ok) => ok || afterFail());
 });
 // Wiki のモーダルが開いている間はタブの操作（⌘1〜9・⌘⇧]・⌘T・⌘W・クリック）と ⌘⌥I を受け付けない（state の tabOpsAllowed / modalOpen）。
-// WikiDialogs は WikiPage の中に居る = タブを外れると消え、戻ると古いダイアログが出る。conflict（WikiConflict）・チャットの説明（WikiChatConsent）・
-// 救出（WikiRescue）も同じ扱い。メニュー（wk.menu）はモーダルではない（外側の押下で閉じる）
-setModalGuard(() => !!wk.dialog || ed.dialog || chat.consent || ed.stranded.length > 0);
+// WikiDialogs は WikiPage の中に居る = タブを外れると消え、戻ると古いダイアログが出る。conflict（WikiConflict）・チャットの説明（ChatConsent）・
+// 救出（WikiRescue）・文献の引用の窓（WikiCite）も同じ扱い。メニュー（wk.menu）はモーダルではない（外側の押下で閉じる）
+setModalGuard(() => !!wk.dialog || ed.dialog || chat.consent || ed.stranded.length > 0 || cite.open);
 // OpenNote のタブを前面にした = そのタブの root の写しへ。root の分からないタブ（状態が届く前に開いた）は画面の root を採る
 setRootGuard((w) => {
   const shown = shownRoot();
@@ -272,7 +298,7 @@ export async function loadRefDirs() {
     wk.refDirs = r.dirs ?? [];
   } catch (e) {
     if (seq !== refSeq) return;
-    toast(`✗ ${t("参照フォルダを読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("参照フォルダを読めません")}: ${errText(e, 160)}`);
   }
 }
 
@@ -354,7 +380,7 @@ function scheduleFrontRetry() {
   }, wikiCfg.frontRetry);
 }
 
-/** 左の木のワークスペース名のメニュー・右ペインのホームの「別のフォルダを選ぶ…」= Rust のダイアログ（検査・保存・履歴・適用・toast は Rust）。
+/** 左の木のワークスペース名のメニューの「別のフォルダを選ぶ…」= Rust のダイアログ（検査・保存・履歴・適用・toast は Rust）。
     前面のタブだけを選んだ root へ（戻り値の root・取り消しは null = 何もしない）。前面の編集の未保存は先に保存する（保存できなければ選ばない） */
 export async function pickRoot() {
   const tabId = app.tab;
@@ -408,18 +434,26 @@ function switched(tabId: number, root: string) {
   else if (front.root) void frontRoot(front.root);
 }
 
-/** ワークスペースを履歴から外す（どのタブも使っていない root だけ = 使っていれば [外す] を出さない・その索引も Rust が消す）。
-    toast と wiki-state（一覧の読み直し）は Rust */
+/** ワークスペースを履歴から外す（名前のメニューの × = 確認なし・前の右ペインの [外す] と同じ）。
+    どのタブ・チャットも使っていない root だけ（使っていれば × を出さない = rootInUse）。
+    Rust（wiki_forget_root）はその root の項目ごと消す = 参照フォルダ・除外フォルダの設定（ref_dirs・exclude / include）・索引のファイル・
+    最近開いたページのその root の分（次に書くときに捨てる）= 選び直しても戻らない。フォルダの中のファイルは触らない。toast と wiki-state は Rust */
 export async function forgetWorkspace(root: string) {
-  if (rootInUse(root)) return;
+  if (rootInUse(root) || forgetting.has(root)) return; // 実行中の 2 回目（ダブルクリック・Enter の連打）は弾く
+  forgetting.add(root);
   try {
     await invoke("wiki_forget_root", { args: { root } });
   } catch (e) {
     console.warn("wiki_forget_root:", e);
     return;
+  } finally {
+    forgetting.delete(root);
   }
   shelves.delete(root);
 }
+/** 外している最中の root（forgetWorkspace の 2 回目を弾く） */
+const forgetting = new Set<string>();
+
 
 /** どれかのタブ（か画面・チャットの子）が使っている root（[外す] を出さない。子の root を外すと子の wiki_* が unknown_root になる） */
 export function rootInUse(root: string): boolean {
@@ -491,7 +525,7 @@ export function wikiTabWorkspace(w: TabWiki): string {
 }
 
 /** 起動時: 有効 / 無効だけを設定から読む（wiki_settings = 索引に触らない）。restoreTabs が Wiki タブを戻すかに使う。
-    状態と木（索引の走査を待ちうる）は後で loadWikiStatus が読む = 起動の MY LIBRARY を Wiki の走査で待たせない。
+    状態と木（索引の走査を待ちうる）は後で loadWikiStatus が読む = 起動の LIBRARY を Wiki の走査で待たせない。
     読めなければ無効として扱い、知らせる */
 export async function loadWikiEnabled() {
   try {
@@ -510,25 +544,26 @@ export async function loadWikiEnabled() {
     if (s.enabled) void loadRefDirs();
   } catch (e) {
     app.wikiOn = false;
-    toast(`✗ ${t("OpenNote の状態を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("OpenNote の状態を読めません")}: ${errText(e, 160)}`);
   }
 }
 
 let prefsLoaded = false;
 /** 読込中に押された表示設定（読み終えた値で押下を上書きしない） */
 const prefsTouched = new Set<string>();
-/** 表示設定（右ペインの開閉・見出しの色分け）を読む。Wiki が有効になったときに 1 回だけ（無効の間は読まない）。
+/** 表示設定（右ペインの開閉・見出しの色分け・目次の開閉）を読む。Wiki が有効になったときに 1 回だけ（無効の間は読まない）。
     読み終えるまで右ペインを描かない（wk.prefsReady）。失敗しても既定の値で描く（次に有効になったとき読み直す） */
 async function loadWikiPrefs() {
   if (prefsLoaded) return;
   prefsLoaded = true;
   try {
-    const [info, hc] = await Promise.all([api.getUiPref("ui_wiki_info"), api.getUiPref("ui_wiki_heading_colors")]);
+    const [info, hc, toc] = await Promise.all([api.getUiPref("ui_wiki_info"), api.getUiPref("ui_wiki_heading_colors"), api.getUiPref("ui_wiki_toc")]);
     if (!prefsTouched.has("ui_wiki_info")) wk.infoOpen = info !== "0";
     if (!prefsTouched.has("ui_wiki_heading_colors")) wk.headColors = hc !== "0";
+    if (!prefsTouched.has("ui_wiki_toc")) wk.tocOpen = toc !== "0"; // 鍵が無い（前の版が書いた設定）= 開いている
   } catch (e) {
     prefsLoaded = false;
-    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("表示設定を読めません")}: ${errText(e, 160)}`);
   } finally {
     wk.prefsReady = true;
   }
@@ -536,7 +571,7 @@ async function loadWikiPrefs() {
 
 function savePref(key: string, on: boolean) {
   prefsTouched.add(key);
-  api.setUiPref(key, on ? "1" : "0").catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
+  api.setUiPref(key, on ? "1" : "0").catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${errText(e, 160)}`));
 }
 
 /** 右ペインの開閉（WikiHeader のボタン・⌘⌥I） */
@@ -545,11 +580,10 @@ export function toggleInfo() {
   savePref("ui_wiki_info", wk.infoOpen);
 }
 
-/** ⌘⌥I（右ペインの開閉）を受け付けるか（App の keydown が見る）= モーダル（本体・Wiki のダイアログ）が開いていない。
-    前面が OpenNote なら常に・それ以外（一覧 / PDF のタブ = 右バー / 本棚 / 本）はエディタ・取込の下では受け付けない */
+/** ⌘⌥I（右ペインの開閉）を受け付けるか（App の keydown が見る）= 覆いが無い（covered() = モーダル（本体・Wiki / チャットの窓）・参照エディタ・取込）。
+    前面の種類に依らない（前は OpenNote が前面なら参照エディタ・取込の下でも裏の右ペインを開閉していた） */
 export function infoKeyAllowed(): boolean {
-  if (modalOpen()) return false;
-  return !!frontWiki() || (!app.editorOpen && !app.importJob);
+  return !covered();
 }
 
 /** ⌘⌥I = 前面のモードの右ペインを開閉する（OpenNote = ui_wiki_info・PDF のタブ = 右バーの ui_viewer_side・一覧 / 本棚 / 本 = ui_detail） */
@@ -557,6 +591,14 @@ export function togglePane() {
   if (frontWiki()) toggleInfo();
   else if (frontViewer()) toggleViewerSide();
   else toggleDetail();
+}
+
+/** 右ペインの目次の開閉（目次の節の見出し）。鍵は ui_wiki_info と同じ "1" / "0" の形で別の鍵 = 前の版は知らない鍵を読まない（今ある鍵の値は変えない）。
+    覆いの下では何もしない（ホームの行・新規ページと同じ） */
+export function toggleToc() {
+  if (covered()) return;
+  wk.tocOpen = !wk.tocOpen;
+  savePref("ui_wiki_toc", wk.tocOpen);
 }
 
 /** md ページの見出しの色分けの切替（WikiPage のツールバー） */
@@ -709,118 +751,85 @@ function settleTabs(st: WikiStatus, asked: string | null) {
 
 // ---------- ワークスペースの写し ----------
 
-/** wk のうち root に縛られる部分。Svelte の Set / Map と raw の配列は object ごと預ける（複製しない = 行き来が軽い） */
-interface Shelf {
-  status: WikiStatus | null;
-  pages: WikiListEntry[];
-  treeError: string | null;
-  tags: WikiTagCount[];
-  tagsTotal: number;
-  inbox: WikiInboxFile[];
-  inboxTotal: number;
-  chatLog: WikiInboxFile[];
-  chatLogTotal: number;
-  open: SvelteSet<string>;
-  titleOverrides: SvelteMap<string, string>;
-  newDirs: SvelteSet<string>;
-  q: string;
-  qTags: string[];
-  showResults: boolean;
-  results: WikiSearchHit[];
-  resultsTotal: number;
-  sel: number;
-  searchError: string | null;
-  error: string | null;
-  refDirs: string[];
-}
+/** wk のうち root に縛られる部分の表（1 つ）。並びが退避 / 復元の順。項目ごとに:
+    copy = 写し方（same = そのまま預ける = Svelte の Set / Map・raw の配列（置き換えるだけで中を変えない）・数・文字 /
+    array = 配列を複製する / snapshot = $state.snapshot（null はそのまま））・blank = 初めての root と OFF の空の値（root = 移る先）・
+    put = 戻すときの手当て（無ければそのまま）・off: "keep" = OFF にしても戻さない。
+    takeShelf / blankShelf / putShelf と OFF の初期化（setWikiOn）はこの表から回す = 項目を足すのは 1 か所（試験 workspaces.test ④ ⑲） */
+type ShelfCopy = "same" | "array" | "snapshot";
+type ShelfSpec = { copy: ShelfCopy; blank: (root: string) => unknown; put?: (v: never) => unknown; off?: "keep" };
+export const SHELF = {
+  // 初めての root の status は仮（履歴は今の物を引き継ぐ。読み直しで本物に）・戻すときも履歴（workspaces）は今の物（写しの中の履歴は古い）。
+  // OFF では戻さない（OFF の status = その直前に読んだ状態）
+  status: {
+    copy: "snapshot",
+    blank: (root: string): WikiStatus | null => {
+      const ws = wk.status?.workspaces;
+      return { enabled: true, root, ...(ws ? { workspaces: $state.snapshot(ws) as WikiWorkspace[] } : {}) };
+    },
+    put: (v: WikiStatus | null): WikiStatus | null => {
+      const ws = wk.status?.workspaces;
+      return v && ws ? { ...v, workspaces: $state.snapshot(ws) as WikiWorkspace[] } : v;
+    },
+    off: "keep",
+  },
+  pages: { copy: "same", blank: (): WikiListEntry[] => [] },
+  excluded: { copy: "array", blank: (): string[] => [] },
+  treeError: { copy: "same", blank: (): string | null => null },
+  treeRoot: { copy: "same", blank: (): string | null => null },
+  tags: { copy: "same", blank: (): WikiTagCount[] => [] },
+  tagsTotal: { copy: "same", blank: () => 0 },
+  inbox: { copy: "same", blank: (): WikiInboxFile[] => [] },
+  inboxTotal: { copy: "same", blank: () => 0 },
+  chatLog: { copy: "same", blank: (): WikiInboxFile[] => [] },
+  chatLogTotal: { copy: "same", blank: () => 0 },
+  open: { copy: "same", blank: () => new SvelteSet<string>() },
+  titleOverrides: { copy: "same", blank: () => new SvelteMap<string, string>() },
+  newDirs: { copy: "same", blank: () => new SvelteSet<string>() },
+  q: { copy: "same", blank: () => "" },
+  qTags: { copy: "array", blank: (): string[] => [] },
+  showResults: { copy: "same", blank: () => false },
+  results: { copy: "same", blank: (): WikiSearchHit[] => [] },
+  resultsTotal: { copy: "same", blank: () => 0 },
+  sel: { copy: "same", blank: () => 0 },
+  searchError: { copy: "same", blank: (): string | null => null },
+  error: { copy: "same", blank: (): string | null => null },
+  refDirs: { copy: "array", blank: (): string[] => [] },
+} satisfies Record<string, ShelfSpec>;
+type ShelfKey = keyof typeof SHELF;
+type Shelf = { [K in ShelfKey]: ReturnType<(typeof SHELF)[K]["blank"]> };
+
+/** 写しの項目一覧（表の並び） */
+export const SHELF_KEYS = Object.keys(SHELF) as ShelfKey[];
+
+/** wk の写しの項目（表の鍵で読み書きする口） */
+const wkShelf = wk as unknown as Record<ShelfKey, unknown>;
 
 /** root ごとの写し（画面の root の物は wk に居る = ここには無い）。タブの題名（wikiTabTitle）が読むので reactive */
 const shelves = new SvelteMap<string, Shelf>();
 
-/** 写しの項目一覧（試験 workspaces.test ④ が以前の leaveRoot が捨てていた項目と突き合わせる） */
-export const SHELF_KEYS = [
-  "status", "pages", "treeError", "tags", "tagsTotal", "inbox", "inboxTotal", "chatLog", "chatLogTotal",
-  "open", "titleOverrides", "newDirs", "q", "qTags", "showResults", "results", "resultsTotal", "sel", "searchError", "error", "refDirs",
-] as const;
-
 function takeShelf(): Shelf {
-  return {
-    status: wk.status ? ($state.snapshot(wk.status) as WikiStatus) : null,
-    pages: wk.pages,
-    treeError: wk.treeError,
-    tags: wk.tags,
-    tagsTotal: wk.tagsTotal,
-    inbox: wk.inbox,
-    inboxTotal: wk.inboxTotal,
-    chatLog: wk.chatLog,
-    chatLogTotal: wk.chatLogTotal,
-    open: wk.open,
-    titleOverrides: wk.titleOverrides,
-    newDirs: wk.newDirs,
-    q: wk.q,
-    qTags: [...wk.qTags],
-    showResults: wk.showResults,
-    results: wk.results,
-    resultsTotal: wk.resultsTotal,
-    sel: wk.sel,
-    searchError: wk.searchError,
-    error: wk.error,
-    refDirs: [...wk.refDirs],
-  };
+  const s = {} as Record<ShelfKey, unknown>;
+  for (const k of SHELF_KEYS) {
+    const v = wkShelf[k];
+    const how: ShelfCopy = SHELF[k].copy;
+    s[k] = how === "array" ? [...(v as unknown[])] : how === "snapshot" && v != null ? $state.snapshot(v) : v;
+  }
+  return s as Shelf;
 }
 
-/** 初めて移る root の写し = 空（status は仮 = 履歴は今の物を引き継ぐ。読み直しで本物に） */
+/** 初めて移る root の写し = 表の空の値 */
 function blankShelf(root: string): Shelf {
-  const ws = wk.status?.workspaces;
-  return {
-    status: { enabled: true, root, ...(ws ? { workspaces: $state.snapshot(ws) as WikiWorkspace[] } : {}) },
-    pages: [],
-    treeError: null,
-    tags: [],
-    tagsTotal: 0,
-    inbox: [],
-    inboxTotal: 0,
-    chatLog: [],
-    chatLogTotal: 0,
-    open: new SvelteSet(),
-    titleOverrides: new SvelteMap(),
-    newDirs: new SvelteSet(),
-    q: "",
-    qTags: [],
-    showResults: false,
-    results: [],
-    resultsTotal: 0,
-    sel: 0,
-    searchError: null,
-    error: null,
-    refDirs: [],
-  };
+  const s = {} as Record<ShelfKey, unknown>;
+  for (const k of SHELF_KEYS) s[k] = SHELF[k].blank(root);
+  return s as Shelf;
 }
 
 function putShelf(s: Shelf) {
-  // 履歴（workspaces）はワークスペースによらない = 今の物を残す（写しの中の履歴は古い）
-  const ws = wk.status?.workspaces;
-  wk.status = s.status && ws ? { ...s.status, workspaces: $state.snapshot(ws) as WikiWorkspace[] } : s.status;
-  wk.pages = s.pages;
-  wk.treeError = s.treeError;
-  wk.tags = s.tags;
-  wk.tagsTotal = s.tagsTotal;
-  wk.inbox = s.inbox;
-  wk.inboxTotal = s.inboxTotal;
-  wk.chatLog = s.chatLog;
-  wk.chatLogTotal = s.chatLogTotal;
-  wk.open = s.open;
-  wk.titleOverrides = s.titleOverrides;
-  wk.newDirs = s.newDirs;
-  wk.q = s.q;
-  wk.qTags = s.qTags;
-  wk.showResults = s.showResults;
-  wk.results = s.results;
-  wk.resultsTotal = s.resultsTotal;
-  wk.sel = s.sel;
-  wk.searchError = s.searchError;
-  wk.error = s.error;
-  wk.refDirs = s.refDirs;
+  for (const k of SHELF_KEYS) {
+    const spec: ShelfSpec = SHELF[k];
+    wkShelf[k] = spec.put ? spec.put(s[k] as never) : s[k];
+  }
 }
 
 /** 前面のページと、前の root を指すもの（メニュー・ダイアログ・待っている読み）を捨てる（写しには入れない = 前面のタブの切替で読み直る）。
@@ -886,21 +895,15 @@ function setWikiOn(on: boolean) {
   answerDiscard(false);
   wk.dialog = null;
   wk.menu = null;
-  chat.consent = false; // WikiChatConsent は OFF で描かれなくなる = 見えないモーダルがタブ操作を止め続けないように
-  wk.pages = [];
+  chat.consent = false; // ChatConsent は OFF で描かれなくなる = 見えないモーダルがタブ操作を止め続けないように
   wk.page = null;
   wk.headings = [];
-  wk.error = null;
-  wk.q = "";
-  wk.qTags = [];
-  wk.showResults = false;
-  wk.results = [];
-  wk.tags = [];
-  wk.inbox = [];
-  wk.chatLog = [];
-  wk.newDirs.clear();
-  wk.open.clear();
-  wk.titleOverrides.clear();
+  // 写しの表の項目は全部空に（status だけは今読んだ OFF の状態のまま = off: "keep"）。木・箱・検索・件数・エラー・参照フォルダ・展開・題名の覚え
+  const root = wk.status?.root ?? "";
+  for (const k of SHELF_KEYS) {
+    const spec: ShelfSpec = SHELF[k];
+    if (spec.off !== "keep") wkShelf[k] = spec.blank(root);
+  }
   // ワークスペースの写しも捨てる（痕跡を残さない）。次に ON にしたら root 無しで読んで設定の root を採る（仮の状態に戻す）
   shelves.clear();
   provisional = true;
@@ -926,11 +929,14 @@ let treeSeq = 0;
 export async function loadTree() {
   if (!app.wikiOn) return;
   const seq = ++treeSeq;
+  const root = wk.status?.root ?? null; // この読みの root（読む間に切り替わったら seq が捨てる）
   wk.treeLoading = true;
   try {
-    const r = await wikiArgs("wiki_list", { limit: 1_000_000 });
+    const r: Partial<WikiListResult> = await wikiArgs("wiki_list", { limit: 1_000_000 });
     if (seq !== treeSeq) return;
     wk.pages = r.pages ?? [];
+    wk.treeRoot = root;
+    wk.excluded = r.excluded ?? [];
     wk.titleOverrides.clear(); // 索引の題名が新しい
     wk.treeError = null;
   } catch (e) {
@@ -955,7 +961,7 @@ async function loadTags() {
     wk.tags = r.tags ?? [];
     wk.tagsTotal = r.total ?? wk.tags.length;
   } catch (e) {
-    if (seq === tagsSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("tag を読めません")}: ${String(e).slice(0, 160)}`);
+    if (seq === tagsSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("タグを読めません")}: ${errText(e, 160)}`);
   }
 }
 
@@ -970,7 +976,7 @@ async function loadIngest() {
     wk.inbox = r.files ?? [];
     wk.inboxTotal = r.total ?? wk.inbox.length;
   } catch (e) {
-    if (seq === inboxSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("ingest/ を読めません")}: ${String(e).slice(0, 160)}`);
+    if (seq === inboxSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("ingest/ を読めません")}: ${errText(e, 160)}`);
   }
 }
 
@@ -985,7 +991,7 @@ async function loadChatLog() {
     wk.chatLog = c.files ?? [];
     wk.chatLogTotal = c.total ?? wk.chatLog.length;
   } catch (e) {
-    if (seq === chatLogSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("chat-log/ を読めません")}: ${String(e).slice(0, 160)}`);
+    if (seq === chatLogSeq && errorCode(e) !== WIKI_CODES.rebuilding) toast(`✗ ${t("chat-log/ を読めません")}: ${errText(e, 160)}`);
   }
 }
 
@@ -1172,13 +1178,20 @@ export async function exitRequest() {
   }
 }
 
-/** [再索引] = 監視を張り直して全走査（背景。進捗は wiki_status） */
+/** 名前のメニューの「索引を作り直す」= 監視を張り直して全走査（背景。進捗は
+    wiki_status = ヘッダーの「索引を作成中… N%」）。command を待つ間と作り直しの間は 2 回目を呼ばない。覆いの下では何もしない。
+    ワークスペースを揃えられない間（status.frontError）は呼ばない（command は設定の root = 前のワークスペースを作り直す）。
+    作り直しが失敗したら Rust が索引のファイルを消して 1 回だけやり直す（wiki_rebuild_steps = 前の Settings › 索引を削除 の手） */
 export async function reindex() {
+  if (wk.reindexing || wk.status?.rebuilding || wk.status?.frontError || covered()) return;
+  wk.reindexing = true;
   wk.error = null;
   try {
     await invoke("wiki_reindex");
   } catch (e) {
-    toast(`✗ ${t("OpenNote の索引を作り直せません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("OpenNote の索引を作り直せません")}: ${errText(e, 200)}`);
+  } finally {
+    wk.reindexing = false;
   }
 }
 
@@ -1211,28 +1224,6 @@ export function onShown(w: TabWiki | null | undefined): w is TabWiki {
   if (!w) return false;
   const shown = shownRoot();
   return !w.root || !shown || w.root === shown;
-}
-
-/** セグメント [MY LIBRARY | OPENNOTE] の押下。一覧タブ ⇄ Wiki ホームはそのタブを変える・PDF / 読み手のタブからは新しいタブ。
-    本棚のタブから MY NOTE = 本棚を外して Wiki に（中身は常に 1 つ）。本棚は MY LIBRARY 側の中身 = MY LIBRARY を押しても変わらない */
-export async function switchMode(to: "library" | "wiki") {
-  const tab = app.tabs.find((x) => x.id === app.tab);
-  if (!tab || !tabOpsAllowed()) return; // 処理中・モーダル・エディタ・取込中はタブの切替と同じく受け付けない
-  if (tab.wiki && to === "library" && !(await canLeave())) return; // 編集中の未保存を保存してから
-  if (tab.viewer || tab.shelfBook) {
-    await openTab({ kind: "all" }, to === "wiki" ? home(rootForNew()) : null);
-    return;
-  }
-  if (to === "wiki") {
-    if (!tab.wiki) {
-      tab.shelf = null;
-      tab.wiki = home(rootForNew()); // 前面は OpenNote でない = 最後の OpenNote の root（画面の root）= 写しはそのまま
-    }
-    return;
-  }
-  if (!tab.wiki) return;
-  tab.wiki = null;
-  await setView({ kind: "all" });
 }
 
 /** ページを開く。newTab = 新しい Wiki タブ（⌘クリック・ItemDetail の Wiki 節）・それ以外は前面の Wiki タブの中で遷移 */
@@ -1378,7 +1369,7 @@ export async function navigate(nav: WikiNav, newTab = false) {
         else await openWikiPage(nav.path, newTab, nav.heading);
         return;
       case "item":
-        // 頁の指定（page / att）は未対応。ここでは MY LIBRARY に出すだけ
+        // 頁の指定（page / att）は未対応。ここでは LIBRARY に出すだけ
         await reveal(nav.key);
         return;
       case "external":
@@ -1402,7 +1393,37 @@ export async function navigate(nav: WikiNav, newTab = false) {
         return;
     }
   } catch (e) {
-    toast(`✗ ${t("開けません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("開けません")}: ${errText(e, 200)}`);
+  }
+}
+
+/** 名前のメニューの「フォルダの設定…」= 参照フォルダと除外フォルダの窓（WikiFolders）。覆いの下では開かない */
+export function openFolderSettings() {
+  wk.menu = null;
+  if (covered()) return;
+  wk.dialog = { kind: "folders" };
+}
+
+/** 木の右クリック: フォルダを索引から除く（excluded = true）/ 索引に入れる（false）= wiki_exclude_set {dir, excluded, root}。
+    Rust が設定を書いて背景で走査し、wiki-changed（全部）で木が読み直る */
+export async function setExcluded(dir: string, excluded: boolean): Promise<boolean> {
+  try {
+    await wikiArgs("wiki_exclude_set", { dir, excluded });
+    toast(excluded ? t("索引から除きました（木に薄い行で残ります）") : t("索引に入れました（読み込み中…）"));
+    return true;
+  } catch (e) {
+    toast(`✗ ${errText(e, 240)}`, 8000);
+    return false;
+  }
+}
+
+/** ワークスペースの中のファイル・フォルダを Finder で表示する（開かない = wiki_open_path {path, reveal: true, root}） */
+export async function revealInFinder(path: string) {
+  const root = shownRoot();
+  try {
+    await invoke<boolean>("wiki_open_path", root ? { path, root, reveal: true } : { path, reveal: true });
+  } catch (e) {
+    toast(`✗ ${errText(e, 240)}`, 8000);
   }
 }
 
@@ -1413,7 +1434,7 @@ export async function openPath(path: string) {
     // 文書の拡張子以外・実行ビット付き・「このアプリで開く」の指定付きは Rust が open せず Finder で場所を表示する（true）
     if (await invoke<boolean>("wiki_open_path", root ? { path, root } : { path })) toast(t("安全のため、開かずに Finder で表示しました"));
   } catch (e) {
-    toast(`✗ ${t("外部で開けません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("外部で開けません")}: ${errText(e, 200)}`);
   }
 }
 

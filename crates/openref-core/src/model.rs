@@ -16,7 +16,7 @@ pub fn s<'a>(csl: &'a Value, key: &str) -> Option<&'a str> {
     csl.get(key).and_then(|v| v.as_str())
 }
 
-/// DOI の前に付きうる接頭辞（URL 形と `doi:`）。照合用の SQL 索引（`import::plan::identifier_sql`）も
+/// DOI の前に付きうる接頭辞（URL 形と `doi:`）。照合用の SQL 索引（`identity::identifier_sql`）も
 /// この表から式を作る = 足すと既存 DB の索引の式とずれる（索引が使われなくなる）。
 pub const DOI_PREFIXES: [&str; 5] = [
     "https://doi.org/",
@@ -27,7 +27,7 @@ pub const DOI_PREFIXES: [&str; 5] = [
 ];
 
 /// DOI の表記を揃える（保存・照合の共通形）: 前後の空白を除いて小文字にし、`DOI_PREFIXES` を 1 つだけ剥がし、
-/// もう一度空白を除く。妥当性は見ない（`10.` で始まるか等は `import::plan::doi`）。`%` の URL エンコードは
+/// もう一度空白を除く。妥当性は見ない（`10.` で始まるか等は `identity::doi`）。`%` の URL エンコードは
 /// 復号しない（SQL 側の索引の式と同じ結果にするため）。
 pub fn normalize_doi(s: &str) -> String {
     let raw = s.trim().to_lowercase();

@@ -6,7 +6,7 @@
    ③ Wiki の検索欄（WikiSearch）: 取消 Esc で検索を消さない・確定 Enter で結果を開かない・素の Esc は消す・変換中の input で検索しない
    ④ 結果一覧の Esc（WikiPage の window）: 入力欄から上がってきた取消 Esc で検索ごと消さない・素の Esc は消す
    ④' ⌘E（WikiPage の window）: IME の ⌘E で表示 ⇄ 編集を切り替えない・素の ⌘E は切り替える
-   ⑤ window の Esc で閉じるモーダル（WikiConflict・WikiDialogs・WikiChatConsent）: 取消 Esc で閉じない・素の Esc は閉じる
+   ⑤ window の Esc で閉じるモーダル（WikiConflict・WikiDialogs・ChatConsent）: 取消 Esc で閉じない・素の Esc は閉じる
    ⑥ 結果一覧の hover（WikiResults・IME ではないが同じ検索欄の ↑↓ の部品なのでここ）: hover の選択ではリストをスクロールしない・↑↓ ではする
    出力 = `wiki ime: ok (N tests)`（N = 列 0 のブロックの数） */
 import assert from "node:assert/strict";
@@ -44,11 +44,12 @@ const mkTarget = () => {
   tests++;
 }
 
-// ---- ② ページ内検索の欄（ShadowPage = MdView の中身）----
+// ---- ② ページ内検索の欄（ShadowPage）----
 {
-  const { default: MdView } = await import("./MdView.svelte");
+  const { default: ShadowPage } = await import("./render/ShadowPage.svelte");
   const target = mkTarget();
   const props = proxy({
+    mode: "md",
     page: { path: "f.md", abs_path: "/v/f.md", kind: "md", title: "f", size: 0, mtime: 0, content: "alpha 1\n\nalpha 2\n\nalpha 3\n", sha256: "F0", truncated: false, links: [] },
     root: "/v",
     refs: [],
@@ -58,7 +59,7 @@ const mkTarget = () => {
       throw new Error("no");
     },
   });
-  const cmp = mount(MdView, { target, props });
+  const cmp = mount(ShadowPage, { target, props });
   flushSync();
   assert.ok(await waitFor(() => (target.querySelector(".wk-md")?.shadowRoot?.textContent ?? "").includes("alpha 3")), "描かない");
   props.findRequest = 1; // ⌘F
@@ -194,7 +195,7 @@ handlers.wiki_search = () => ({ hits: [], total: 0 });
   handlers.wiki_backlinks = () => ({ total: 0, pages: [] });
   tab.wiki = { path: "e.md", scrollTop: 0, editing: false };
   flushSync();
-  assert.ok(await waitFor(() => W.wk.page?.path === "e.md" && !!target.querySelector(".wk-seg"), 2000), "編集できるページを描かない（⌘E を確かめられない）");
+  assert.ok(await waitFor(() => W.wk.page?.path === "e.md" && !!target.querySelector(".wk-edit-btn"), 2000), "編集できるページを描かない（⌘E を確かめられない）");
   const cmdE = (init = {}) => window.dispatchEvent(key("e", { metaKey: true, ...init }));
   for (const [name, init] of IME) {
     cmdE(init);
@@ -218,14 +219,14 @@ handlers.wiki_search = () => ({ hits: [], total: 0 });
   const C = await import("../chat/chat.svelte.ts");
   const { default: WikiConflict } = await import("./WikiConflict.svelte");
   const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
-  const { default: WikiChatConsent } = await import("../chat/ChatConsent.svelte");
+  const { default: ChatConsent } = await import("../chat/ChatConsent.svelte");
   handlers.wiki_chat_set_enabled = () => null;
   const cases = [
     // [名前, 部品, 開く, 開いているか]
     // conflict のダイアログ（キャンセル = ダイアログだけ閉じる。ed は編集の状態機械を通さず直に置く = Esc の配線だけを見る）
     ["WikiConflict", WikiConflict, () => Object.assign(E.ed, { path: "c.md", state: "conflict", dialog: true }), () => E.ed.dialog],
     ["WikiDialogs（ダイアログ）", WikiDialogs, () => (W.wk.dialog = { kind: "new", dir: "" }), () => !!W.wk.dialog],
-    ["WikiChatConsent", WikiChatConsent, () => (C.chat.consent = true), () => !!C.chat.consent],
+    ["ChatConsent", ChatConsent, () => (C.chat.consent = true), () => !!C.chat.consent],
   ];
   for (const [name, Cmp, open, isOpen] of cases) {
     const target = mkTarget();

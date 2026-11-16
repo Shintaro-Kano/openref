@@ -1,20 +1,26 @@
 <script lang="ts">
-  /* OpenNote: md / html ページを shadow DOM に描く共通の部品（MdView / HtmlView の中身）。
+  /* OpenNote: md / html ページを shadow DOM に描く共通の部品（WikiPage・分割のプレビュー・ChatMd・浮き窓のプレビューが mode = md / html で使う）。
      閉じ込めは 2 重: 外箱 .wk-md-box（contain: layout paint）+ host（.wk-md・同じ contain）。体裁は adoptedStyleSheets。
      描画 = md: markdown-it / html: prepareHtml → purify（DOMPurify・inert な文書）→ finish（URL の書換え・リンクの分類）→ shadow へ。
      リンクのクリックは shadow root で横取りして onNavigate に（WebView には遷移させない・⌘クリック / 中クリック = 新しいタブ）。
      リンクの右クリックは WebView の既定のメニュー（押しても何も起きない）の代わりに OpenNote のメニュー（linkmenu.svelte.ts）。`![[ページ]]` は readPage で 1 段だけ埋める
      （読んだページは世代 wk.embedGen（索引の変更と GUI の保存の成功で進む）の間だけ覚える = 分割のプレビューが入力の一時停止ごとに描き直しても IPC は世代に 1 回）。
      描画の時間の計測（performance.measure "wk-render <path>"・初回の描画（次のフレーム）まで = "wk-paint <path>"）は旗 `window.__wkMeasure = true`
-     のときだけ残す（既定は切る = User Timing の項目が描画のたびに溜まり続けない。計測は Inspector で旗を立ててから） */
+     のときだけ残す（既定は切る = User Timing の項目が描画のたびに溜まり続けない。計測は Inspector で旗を立ててから）。
+     ページへのリンクにしばらく乗せるとプレビュー（preview.svelte.ts・浮き窓は App の WikiPreview）= ワークスペースのページ（root が画面の root）の
+     md へのリンクとまだ無いページだけ（md 以外は自分のタブで開く物・参照フォルダのページは readPage が別のフォルダを読むので出さない）。
+     浮き窓の中の描画（inPreview）は次のプレビューを出さない。
+     画像（リンクで包んでいない物）を押すと全画面の覆いで大きく見る（lightbox.svelte.ts・覆いは App の WikiLightbox）・⌘ / 中クリック = その画像を新しいタブ */
   import { onDestroy, untrack } from "svelte";
   import type { WikiPageData, WikiViewProps } from "../types";
   import { t } from "../../i18n.svelte";
   import { composing } from "../../input";
-  import { wk } from "../wiki.svelte";
+  import { opensInNewTab, wk } from "../wiki.svelte";
   import { renderMarkdown } from "./md";
   import { anchorTarget, finish, keepSection, navOf, purify, type FinishResult, type Labels } from "./sanitize";
   import { linkItems, openLinkMenu, toWikiNav, withSelection } from "../linkmenu.svelte";
+  import { closePreview, hoverEnd, hoverStart, type PreviewReq } from "../preview.svelte";
+  import { imageNav, openLightbox, pageImages } from "../lightbox.svelte";
   import { prepareHtml } from "./html";
   import { sheets } from "./styles";
   import { Finder } from "./find";
@@ -30,7 +36,8 @@
     findRequest = 0,
     headingColors = false,
     mode,
-  }: WikiViewProps & { mode: "md" | "html" } = $props();
+    inPreview = false,
+  }: WikiViewProps & { mode: "md" | "html"; inPreview?: boolean } = $props();
 
   let host: HTMLDivElement | undefined = $state();
   let shadow: ShadowRoot | null = null;
@@ -62,18 +69,45 @@
     el?.scrollIntoView({ block: "start" });
   }
 
+  /** 画像を押した（リンクで包んだ画像は onClick のリンクが先に取る）: 左 = 覆いで大きく見る（ページの中の画像の並びごと）・
+      ⌘ / Ctrl / 中ボタン = その画像のファイルを新しいタブ（MediaView）。root の外の画像（data: 等）は覆いだけ */
+  function onImage(me: MouseEvent, img: HTMLImageElement) {
+    const middle = me.type === "auxclick";
+    if (middle && me.button !== 1) return;
+    me.preventDefault();
+    // props（root・onNavigate）と並びは閉じる前に読む（浮き窓の中の描画の props は浮き窓の要求から来る）
+    const r = root;
+    const go = onNavigate;
+    const src = img.getAttribute("src") ?? "";
+    const list = shadow ? pageImages(shadow) : [img];
+    const images = list.map((i) => ({ src: i.getAttribute("src") ?? "", alt: i.getAttribute("alt") ?? "", nav: imageNav(i.getAttribute("src") ?? "", r) }));
+    closePreview();
+    if (middle || me.metaKey || me.ctrlKey) {
+      const nav = imageNav(src, r);
+      if (nav) go(nav, true);
+      return;
+    }
+    openLightbox({ images, index: Math.max(0, list.indexOf(img)), onNavigate: go });
+  }
+
   function onClick(e: Event) {
     const me = e as MouseEvent;
     const el = (me.target as Element | null)?.closest?.("a, button[data-wk-open]");
-    if (!el) return;
+    if (!el) {
+      const img = (me.target as Element | null)?.closest?.("img");
+      if (img instanceof HTMLImageElement && img.getAttribute("src")) onImage(me, img);
+      return;
+    }
     me.preventDefault();
     // auxclick = 左以外のボタン。中ボタン = 新しいタブ（一覧・サイドバーと同じ）・右ボタンは contextmenu が扱う
     const middle = me.type === "auxclick";
     if (middle && me.button !== 1) return;
+    const go = onNavigate; // 閉じる前に読む（onImage と同じ）
+    closePreview();
     const n = navOf(el);
     if (n.t === "anchor") return scrollToAnchor(n.id);
     const w = toWikiNav(n);
-    if (w) onNavigate(w, middle || me.metaKey || me.ctrlKey);
+    if (w) go(w, middle || me.metaKey || me.ctrlKey);
   }
 
   /** リンクの右クリック = OpenNote のメニュー（リンクの外 = WebView の既定のメニュー = 選択のコピー・調べる 等のまま）。
@@ -87,9 +121,36 @@
     const items = linkItems(n, written, { go: onNavigate, anchor: scrollToAnchor, root });
     if (!items.length) return;
     me.preventDefault();
+    closePreview();
     const head = n.t === "unresolved" ? `${t("未解決のリンク")}: ${written}` : written;
     const selected = window.getSelection()?.toString() ?? "";
     openLinkMenu({ x: me.clientX, y: me.clientY, head, items: withSelection(items, selected), origin: host });
+  }
+
+  /** プレビューを出すリンクか（出すなら要求）。ワークスペースのページの md へのリンク・まだ無いページ（`[[名前]]` 等）だけ */
+  function previewReq(a: Element): PreviewReq | null {
+    if (root !== (wk.status?.root ?? null)) return null;
+    const n = navOf(a);
+    if (n.t === "page" && !opensInNewTab(n.path)) return { path: n.path, heading: n.heading, root, refs, onNavigate, readPage };
+    if (n.t === "unresolved") return { path: null, heading: null, missing: a.getAttribute("data-wk-href") ?? "", root, onNavigate, readPage };
+    return null;
+  }
+
+  function onOver(e: Event) {
+    const me = e as MouseEvent;
+    if (me.buttons) return; // 文字を選んでいる最中（押したまま動かす）には出さない
+    const a = (me.target as Element | null)?.closest?.("a");
+    const req = a && previewReq(a);
+    if (a && req) hoverStart(a, req, me.clientX);
+  }
+
+  function onOut(e: Event) {
+    const me = e as MouseEvent;
+    const a = (me.target as Element | null)?.closest?.("a");
+    if (!a) return;
+    const to = me.relatedTarget as Node | null;
+    if (to && a.contains(to)) return; // リンクの中の子へ移っただけ
+    hoverEnd(a);
   }
 
   function ensureShadow(): ShadowRoot {
@@ -99,6 +160,10 @@
     shadow.addEventListener("click", onClick);
     shadow.addEventListener("auxclick", onClick);
     shadow.addEventListener("contextmenu", onContext);
+    if (!inPreview) {
+      shadow.addEventListener("mouseover", onOver);
+      shadow.addEventListener("mouseout", onOut);
+    }
     finder = new Finder(shadow);
     return shadow;
   }

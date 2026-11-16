@@ -8,6 +8,7 @@ import { baseName, dirOf } from "./render/asset.ts";
 import type { WikiCreateResult, WikiDuplicateResult, WikiMkdirResult, WikiRenamePreview, WikiRenameResult, WikiTrashResult } from "./types";
 import { dirty, discardEdit, ed, holdAutosave, renamed, resumeAutosave } from "./edit.svelte";
 import { canLeave, isRefPath, loadAll, onShown, openWikiPage, rewriteHistory, shownRoot, wikiArgs, wk } from "./wiki.svelte";
+import { errText } from "../err";
 
 /** 今のフォルダ（前面のページのフォルダ・ホームなら vault の直下 = ""・参照フォルダのページを見ているときも vault の直下） */
 export function currentDir(): string {
@@ -56,7 +57,7 @@ export async function createFolder(dir: string, name: string): Promise<boolean> 
     for (let i = 1; i <= parts.length; i++) wk.open.add(parts.slice(0, i).join("/"));
     return true;
   } catch (e) {
-    toast(`✗ ${t("フォルダを作れません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("フォルダを作れません")}: ${errText(e, 200)}`);
     return false;
   }
 }
@@ -102,7 +103,7 @@ export async function createPage(dir: string, name: string, ext: PageExt = "md")
         try {
           path = ((await wikiArgs("wiki_rename", { from: path, to, rewrite: false })) as WikiRenameResult).path;
         } catch (e) {
-          toast(`✗ ${t("名前を変えられません")}: ${String(e).slice(0, 200)}`);
+          toast(`✗ ${t("名前を変えられません")}: ${errText(e, 200)}`);
         }
       }
     }
@@ -111,7 +112,7 @@ export async function createPage(dir: string, name: string, ext: PageExt = "md")
     await openWikiPage(path, false, undefined, true);
     return true;
   } catch (e) {
-    toast(`✗ ${t("ページを作れません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("ページを作れません")}: ${errText(e, 200)}`);
     return false;
   }
 }
@@ -149,7 +150,7 @@ export async function previewRename(from: string, input: string) {
     }
     if (wk.dialog?.kind === "rename" && wk.dialog.path === from) wk.dialog = { kind: "rename", path: from, preview: pv, to };
   } catch (e) {
-    toast(`✗ ${t("名前を変えられません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("名前を変えられません")}: ${errText(e, 200)}`);
   }
 }
 
@@ -171,7 +172,7 @@ export async function doRename(from: string, to: string, rewrite: boolean) {
     else toast(t("名前を変えました"));
     void loadAll();
   } catch (e) {
-    toast(`✗ ${t("名前を変えられません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("名前を変えられません")}: ${errText(e, 200)}`);
   }
 }
 
@@ -191,7 +192,7 @@ export async function duplicateFile(path: string) {
     void loadAll();
     if (app.tab === tabId && shownRoot() === root && frontWiki()?.path === page) await openWikiPage(r.path);
   } catch (e) {
-    toast(`✗ ${t("複製できません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("複製できません")}: ${errText(e, 200)}`);
   }
 }
 
@@ -227,7 +228,7 @@ export async function doTrash(path: string, dir = false) {
     if (editing && underPath(ed.path, path, dir)) discardEdit(); // 移せてから編集を捨てる（失敗したらエディタも状態も元のまま）
   } catch (e) {
     if (underPath(ed.path, path, dir)) resumeAutosave();
-    toast(`✗ ${t("ゴミ箱に移せません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("ゴミ箱に移せません")}: ${errText(e, 200)}`);
     return;
   }
   // ここから下はもう移した後 = 失敗しても「移せません」とは言わない（タブは次の読み直しで消えたページとして扱われる）
@@ -254,7 +255,7 @@ export async function doTrash(path: string, dir = false) {
       }
     }
   } catch (e) {
-    toast(`✗ ${t("タブを閉じられません")}: ${String(e).slice(0, 200)}`);
+    toast(`✗ ${t("タブを閉じられません")}: ${errText(e, 200)}`);
   }
   void loadAll();
 }

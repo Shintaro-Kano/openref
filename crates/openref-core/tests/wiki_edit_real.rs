@@ -31,7 +31,7 @@ fn ctx() -> Ctx {
 }
 
 fn root(c: &Ctx) -> PathBuf {
-    c.ready().unwrap().1
+    c.ready().unwrap().root
 }
 
 /// 外部（別プロセス）の書換えと競合

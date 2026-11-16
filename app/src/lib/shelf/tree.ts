@@ -1,6 +1,15 @@
 // 本棚の純関数と型（Svelte 非依存・副作用なし）。
 // 木の形は core の shelf::scan（camelCase）= shelf_tree の tree。ここは「意味」だけ（検索の正規化・並び・パンくず・id と dir の索引）
 
+/** 本棚の読めない理由の文から root の親のパスを外す（root → フォルダ名）= Drive のパスはアカウント名を含む（「Finder で表示」の失敗の文と同じ考え =
+    名前までで親を出さない）。Rust の文（check_root_as の「本棚のフォルダに <root> は使えません（理由）」）は渡した root をそのまま含む。
+    Rust の drop_dir_part（最初と最後の / の間を落とす）は写さない: 理由の文に「iCloud Drive / CloudStorage」の / がある = 理由が欠ける */
+export function hideRootParents(msg: string, root: string): string {
+  if (!root || !msg.includes(root)) return msg;
+  const name = root.replace(/\/+$/, "").slice(root.replace(/\/+$/, "").lastIndexOf("/") + 1) || root;
+  return msg.split(root).join(name);
+}
+
 export type ShelfSortKey = "title" | "mtime" | "size";
 
 export interface ShelfBook {

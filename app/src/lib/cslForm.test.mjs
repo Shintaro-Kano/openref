@@ -21,7 +21,7 @@ const roundtrip = (csl, to = csl.type) => {
 
 // 1. 配列でない names・崩れた要素でも例外を出さない（onMount が止まって空の画面で開き、保存で書誌が消える経路を断つ）
 assert.equal(namesToText("Smith J"), "Smith J");
-assert.equal(namesToText({ family: "Kano", given: "S" }), "Kano, S");
+assert.equal(namesToText({ family: "Kato", given: "S" }), "Kato, S");
 assert.equal(namesToText([null, 3, { family: "A" }, { literal: "日本医学放射線学会" }]), "3\nA\n日本医学放射線学会");
 assert.equal(namesToText(undefined), "");
 {
@@ -53,10 +53,10 @@ assert.equal(dateToText({}), "");
   const csl = { type: "article-journal", title: "T", author, issued: { "date-parts": [[2020, 5]] } };
   assert.deepEqual(roundtrip(csl), csl);
   const { values, orig } = cslToForm(csl, types);
-  values.author = "Kano, S\n山田太郎";
+  values.author = "Kato, S\n山田太郎";
   values.issued = "2021-02-03";
   const out = formToCsl("article-journal", "review", values, orig, types);
-  assert.deepEqual(out.author, [{ family: "Kano", given: "S" }, { literal: "山田太郎" }]);
+  assert.deepEqual(out.author, [{ family: "Kato", given: "S" }, { literal: "山田太郎" }]);
   assert.deepEqual(out.issued, { "date-parts": [[2021, 2, 3]] });
   assert.deepEqual(out.custom, { subtype: "review" });
   values.issued = "  ";

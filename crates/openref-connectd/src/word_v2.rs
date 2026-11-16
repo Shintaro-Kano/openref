@@ -1414,7 +1414,7 @@ mod tests {
     fn k2() -> Value {
         json!({
             "type": "article-journal",
-            "title": "小児の中枢神経感染症",
+            "title": "小児の架空症例の画像所見",
             "author": [{"family": "Corrêa", "given": "José"}],
             "container-title": "日本小児放射線学会雑誌",
             "issued": {"date-parts": [[2024]]},
@@ -1432,7 +1432,7 @@ mod tests {
             "tab\there\nnewline\r\nCRLF",
             "back\\slash \\u0041 literal %u0041 %% 100%",
             "tilde ~user/x~ and ¥ ‾",
-            "Corrêa José 小児の中枢神経感染症",
+            "Corrêa José 小児の架空症例の画像所見",
             "emoji \u{1F600} and NBSP\u{a0}",
             "ctrl \u{1}\u{1f}\u{7f} end",
             "\\\\\\t%t%n",
@@ -1656,7 +1656,7 @@ mod tests {
         let items = payload_items(&serde_json::from_str(&p).unwrap()).unwrap();
         assert_eq!(items.len(), 2);
         assert!(items[0].1.get("abstract").is_none(), "abstract は除く");
-        assert_eq!(items[1].1["title"], "小児の中枢神経感染症");
+        assert_eq!(items[1].1["title"], "小児の架空症例の画像所見");
         assert_eq!(get("refract-style"), "radiology", "同じ名前は最初のもの");
         assert_eq!(get("refract-doi-always"), "true");
         assert_eq!(get("refract-font-name"), "游明朝");
@@ -1767,7 +1767,7 @@ mod tests {
         assert_eq!(r.cites, vec![("(1)".into(), "".into()), ("(1,2)".into(), "".into()), ("(1)".into(), "".into())]);
         assert_eq!(r.items, 2);
         let bib: Vec<&str> = r.bib.0.split('\n').collect();
-        assert!(bib[0].starts_with("1. Corrêa J. 小児の中枢神経感染症. 日本小児放射線学会雑誌. 2024;44(8):e230216"), "{}", bib[0]);
+        assert!(bib[0].starts_with("1. Corrêa J. 小児の架空症例の画像所見. 日本小児放射線学会雑誌. 2024;44(8):e230216"), "{}", bib[0]);
         assert!(bib[1].starts_with("2. Stoffel EM, Goggins M. Fresh title. Gastroenterology."), "{}", bib[1]);
         eprintln!("render_vancouver_through_jsc: 準備 {} ms + 整形 {} ms（計 {ms} ms）", r.load_ms, r.render_ms);
         // AMA = 上付き + 斜体の誌名（run は UTF-16 単位）

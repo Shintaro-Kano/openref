@@ -6,7 +6,7 @@ use super::{
     plan::{self, AttachmentPlan, ImportPlan, ItemAction},
     AttachmentMode, ImportInput, ImportItem,
 };
-use crate::{CoreError, Db, Result};
+use crate::{identity, CoreError, Db, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -349,7 +349,7 @@ fn remember(
 /// caller holds IMMEDIATE. The transaction never reads attachment file bytes.
 fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Result<ItemAction> {
     let mapped = object(conn, input, "item", scope(input, item.stable_id), &item.id)?.map(|v| v.0);
-    let mut candidates = plan::identifier_candidates(conn, &item.csl, mapped.as_deref())?;
+    let mut candidates = identity::identifier_candidates(conn, &item.csl, mapped.as_deref())?;
     if input.adopt_legacy_paperpile_ids && input.source.format == "paperpile" {
         if let Some(id) = item
             .csl
@@ -387,7 +387,7 @@ fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Resu
         });
     }
     if let Some((key, csl, deleted)) = candidates.first() {
-        return Ok(if *deleted || plan::conflicts(&item.csl, csl) {
+        return Ok(if *deleted || identity::conflicts(&item.csl, csl) {
             ItemAction::Blocked {
                 candidates: vec![key.clone()],
                 reason: "書込直前に識別子の矛盾またはゴミ箱の文献を検出しました".into(),
@@ -398,7 +398,7 @@ fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Resu
             }
         });
     }
-    if let Some(description) = plan::descriptive(&item.csl) {
+    if let Some(description) = identity::descriptive(&item.csl) {
         let mut stmt=conn.prepare_cached("SELECT i.key,i.csl FROM import_match_keys m JOIN items i ON i.id=m.item_id WHERE m.valid=1 AND m.fingerprint=?1 UNION ALL SELECT i.key,i.csl FROM import_match_keys m INDEXED BY idx_import_match_pending CROSS JOIN items i ON i.id=m.item_id WHERE m.valid=0 AND i.year=?2")?;
         let mut weak = Vec::new();
         for row in stmt.query_map(
@@ -409,7 +409,7 @@ fn match_item(conn: &Connection, input: &ImportInput, item: &ImportItem) -> Resu
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )? {
             let (key, csl) = row?;
-            if plan::descriptive(&serde_json::from_str(&csl)?) == Some(description.clone()) {
+            if identity::descriptive(&serde_json::from_str(&csl)?) == Some(description.clone()) {
                 weak.push(key);
             }
         }
@@ -1494,7 +1494,7 @@ pub fn execute(
                     }
                 }
                 if planned.register_new && matches!(action, ItemAction::Review { .. })
-                    && plan::identifier_candidates(&tx, &item.csl, None)?.is_empty()
+                    && identity::identifier_candidates(&tx, &item.csl, None)?.is_empty()
                     && prior.action(item, |key| Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE key=?1 AND deleted_at IS NULL)", [key], |r| r.get(0))?))?.is_none()
                 {
                     action = ItemAction::New;

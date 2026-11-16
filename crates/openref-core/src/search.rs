@@ -684,7 +684,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.conn
             .execute_batch(
-                "INSERT INTO items (key, csl) VALUES ('ITEM0001', '{\"title\":\"T\",\"type\":\"article-journal\",\"author\":[{\"family\":\"Kano\",\"given\":\"S\"}],\"container-title\":\"Radiology\",\"issued\":{\"date-parts\":[[2026]]}}')",
+                "INSERT INTO items (key, csl) VALUES ('ITEM0001', '{\"title\":\"T\",\"type\":\"article-journal\",\"author\":[{\"family\":\"Kato\",\"given\":\"S\"}],\"container-title\":\"Radiology\",\"issued\":{\"date-parts\":[[2026]]}}')",
             )
             .unwrap();
         crate::edit::add_tag(&db, "ITEM0001", "liver").unwrap();
@@ -696,7 +696,7 @@ mod tests {
             keys,
             ["container", "dateAdded", "firstAuthor", "firstAuthorGiven", "fulltextSnippet", "hasNote", "hasPdf", "key", "retracted", "starred", "tags", "title", "year"]
         );
-        assert_eq!((v["firstAuthor"].as_str(), v["firstAuthorGiven"].as_str(), v["year"].as_i64()), (Some("Kano"), Some("S"), Some(2026)));
+        assert_eq!((v["firstAuthor"].as_str(), v["firstAuthorGiven"].as_str(), v["year"].as_i64()), (Some("Kato"), Some("S"), Some(2026)));
         assert_eq!((v["container"].as_str(), v["hasNote"].as_bool(), v["hasPdf"].as_bool()), (Some("Radiology"), Some(true), Some(false)));
         assert_eq!(v["tags"][0]["name"], "liver");
         assert!(v["tags"][0]["id"].is_i64());

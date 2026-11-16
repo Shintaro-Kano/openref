@@ -265,7 +265,7 @@ async function open(page, opts) {
 }
 
 // ---------- 共通の小道具 ----------
-const ITEM_A = { key: "A2020", title: "Alpha <b>study</b>", first_author: "Kano", journal: "Radiology", year: 2020 };
+const ITEM_A = { key: "A2020", title: "Alpha <b>study</b>", first_author: "Kato", journal: "Radiology", year: 2020 };
 const ITEM_B = { key: "B2021", title: "Beta trial", first_author: "Sato", journal: "Neuroradiology", year: 2021 };
 const searchRoute = (items) => ["/api/search?q=", () => resp(200, { items })];
 
@@ -350,19 +350,19 @@ async function check(name, fn) {
 
   await check("cite: 検索 → Enter でチップ → 空欄 Enter で {type:insert,keys}", async () => {
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [searchRoute([ITEM_A, ITEM_B])] });
-    typeQ(env, " kano ");
+    typeQ(env, " kato ");
     assert.strictEqual(env.timers.some((t) => t.ms === 250), true, "250ms のデバウンス");
     assert.strictEqual(env.calls.length, 0);
     env.fire(250);
     await tick();
-    assert.strictEqual(env.calls[0].url, "/api/search?q=kano", "trim して encode");
+    assert.strictEqual(env.calls[0].url, "/api/search?q=kato", "trim して encode");
     assert.strictEqual(rows(env).length, 2);
     assert.ok(rows(env)[0].classList.contains("rd-hi"), "先頭が強調行");
     assert.ok(rows(env)[0].innerHTML.includes("Alpha &lt;b&gt;study&lt;/b&gt;"), "タイトルは escape");
-    assert.ok(rows(env)[0].innerHTML.includes("Kano · Radiology · 2020"));
+    assert.ok(rows(env)[0].innerHTML.includes("Kato · Radiology · 2020"));
     const e1 = env.key(env.els["rd-q"], { key: "Enter" });
     assert.ok(e1.defaultPrevented);
-    assert.deepStrictEqual(chipLabels(env), ["Kano 2020"]);
+    assert.deepStrictEqual(chipLabels(env), ["Kato 2020"]);
     assert.strictEqual(env.els["rd-q"].value, "", "追加したら入力を空に");
     assert.strictEqual(env.els["rd-ok"].disabled, false);
     assert.strictEqual(env.sent.length, 0, "Enter で追加しただけでは送らない");
@@ -397,7 +397,7 @@ async function check(name, fn) {
     env.fire(250);
     await tick();
     env.key(env.els["rd-q"], { key: "Enter" }); // 先頭 A を追加
-    assert.deepStrictEqual(chipLabels(env), ["Sato 2021", "Kano 2020"]);
+    assert.deepStrictEqual(chipLabels(env), ["Sato 2021", "Kato 2020"]);
     env.key(env.els["rd-q"], { key: "Enter", ctrlKey: true });
     assert.deepStrictEqual(env.sent, [{ type: "insert", keys: ["B2021", "A2020"] }]);
   });
@@ -425,7 +425,7 @@ async function check(name, fn) {
     assert.strictEqual(env.sent.length, 0);
     // 変換が終われば Enter は効く
     env.key(env.els["rd-q"], { key: "Enter" });
-    assert.deepStrictEqual(chipLabels(env), ["Initial", "Kano 2020"], "変換が終われば Enter で追加される");
+    assert.deepStrictEqual(chipLabels(env), ["Initial", "Kato 2020"], "変換が終われば Enter で追加される");
     // document 側（検索欄以外）の Esc も composing は無視
     const ev = env.key(env.els["rd-ok"], { key: "Escape", isComposing: true });
     assert.ok(!ev.defaultPrevented);
@@ -434,12 +434,12 @@ async function check(name, fn) {
 
   await check("cite: pendingEnter — 検索待ち(デバウンス中)の Enter は結果が来たら先頭を追加", async () => {
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [searchRoute([ITEM_A, ITEM_B])] });
-    typeQ(env, "kano");
+    typeQ(env, "kato");
     env.key(env.els["rd-q"], { key: "Enter" });
     assert.strictEqual(chips(env).length, 0, "まだ結果が無い");
     env.fire(250);
     await tick();
-    assert.deepStrictEqual(chipLabels(env), ["Kano 2020"]);
+    assert.deepStrictEqual(chipLabels(env), ["Kato 2020"]);
     assert.strictEqual(env.els["rd-q"].value, "");
     assert.strictEqual(env.sent.length, 0);
   });
@@ -447,7 +447,7 @@ async function check(name, fn) {
   await check("cite: pendingEnter — 通信中の Enter も待つ・入力が変わったら取り消す", async () => {
     const d1 = deferred();
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [["/api/search?q=", () => d1.promise]] });
-    typeQ(env, "kano");
+    typeQ(env, "kato");
     env.fire(250); // 通信開始（status = loading）
     env.key(env.els["rd-q"], { key: "Enter" });
     assert.strictEqual(chips(env).length, 0);
@@ -458,7 +458,7 @@ async function check(name, fn) {
     const env2 = await open("cite", { d: { mode: "add", items: [] }, routes: [searchRoute([ITEM_A])] });
     typeQ(env2, "kan");
     env2.key(env2.els["rd-q"], { key: "Enter" });
-    typeQ(env2, "kano");
+    typeQ(env2, "kato");
     env2.fire(250);
     await tick();
     assert.strictEqual(chips(env2).length, 0, "Enter 後に入力を変えたら自動追加しない");
@@ -488,7 +488,7 @@ async function check(name, fn) {
 
   await check("cite: 検索が HTTP 500 → 「検索できません: HTTP 500」を赤字で出し、Enter は何もしない", async () => {
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [["/api/search?q=", () => resp(500, {})]] });
-    typeQ(env, "kano");
+    typeQ(env, "kato");
     env.key(env.els["rd-q"], { key: "Enter" }); // pendingEnter
     env.fire(250);
     await tick();
@@ -935,7 +935,7 @@ async function check(name, fn) {
   await check("cite: 入力を空にすると走行中の検索の結果は捨てる（S.seq++）", async () => {
     const d1 = deferred();
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [["/api/search?q=", () => d1.promise]] });
-    typeQ(env, "kano");
+    typeQ(env, "kato");
     env.fire(250);
     typeQ(env, "");
     d1.resolve({ ok: true, status: 200, json: () => Promise.resolve({ items: [ITEM_A] }) });
@@ -947,12 +947,12 @@ async function check(name, fn) {
   await check("cite: 追加済みの文献は Enter で二重に入らない(add の重複ガード)", async () => {
     const env = await open("cite", { d: { mode: "add", items: [] }, routes: [searchRoute([ITEM_A])] });
     for (let i = 0; i < 2; i++) {
-      typeQ(env, "kano");
+      typeQ(env, "kato");
       env.fire(250);
       await tick();
       env.key(env.els["rd-q"], { key: "Enter" });
     }
-    assert.deepStrictEqual(chipLabels(env), ["Kano 2020"]);
+    assert.deepStrictEqual(chipLabels(env), ["Kato 2020"]);
   });
 
   await check("cite: 行の title / meta の escape(& < > \")・年なしの label・著者なしは ?", async () => {

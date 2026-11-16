@@ -1,0 +1,7 @@
+{"status": "ok", "message-type": "work-list", "message": {"items": [
+  {"DOI": "10.1148/rg.250127.quiz", "title": ["Imaging of Deep Endometriosis Involving Lateral Pelvic Structures"], "issued": {"date-parts": [[2026, 7, 23]]}, "container-title": ["RadioGraphics"], "type": "dataset"},
+  {"DOI": "10.1148/rg.250127.q1", "title": ["Imaging of Deep Endometriosis Involving Lateral Pelvic Structures"], "issued": {"date-parts": [[2026, 7, 23]]}, "container-title": ["RadioGraphics"], "type": "dataset"},
+  {"DOI": "10.1148/rg.250127.q2", "title": ["Imaging of Deep Endometriosis Involving Lateral Pelvic Structures"], "issued": {"date-parts": [[2026, 7, 23]]}, "container-title": ["RadioGraphics"], "type": "dataset"},
+  {"DOI": "10.1148/rg.250127", "title": ["Imaging of Deep Endometriosis Involving Lateral Pelvic                     Structures"], "author": [{"given": "Alice", "family": "Brandão", "sequence": "first"}, {"given": "Izabela V.", "family": "Pires Franco", "sequence": "additional"}], "issued": {"date-parts": [[2026, 8, 1]]}, "container-title": ["RadioGraphics"], "type": "journal-article"},
+  {"DOI": "10.1007/978-3-031-82750-1_11", "title": ["Lateral Deep Pelvic Endometriosis. Over Parietal Fascia: Nervous Locations"], "author": [{"given": "Luciana P.", "family": "Chamié", "sequence": "first"}, {"given": "Alice", "family": "Brandão", "sequence": "additional"}], "issued": {"date-parts": [[2025]]}, "container-title": ["Imaging of Endometriosis: A Comparative Guide of US, MRI and Surgery"], "type": "book-chapter"}
+]}}

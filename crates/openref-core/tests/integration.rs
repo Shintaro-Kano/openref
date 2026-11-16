@@ -7,7 +7,7 @@ fn fake_resolved() -> Resolved {
             "type": "article-journal",
             "title": "Pancreatic cancer imaging: a test review",
             "author": [
-                {"family": "Kano", "given": "S"},
+                {"family": "Kato", "given": "S"},
                 {"family": "Yamada", "given": "T"}
             ],
             "container-title": "Test Journal of Radiology",
@@ -37,7 +37,7 @@ fn add_search_dedup_roundtrip() {
     assert_eq!(hits[0].key, added.key);
 
     // FTS: 著者名で hit
-    let hits = search::search(&db, "kano", 10).unwrap();
+    let hits = search::search(&db, "kato", 10).unwrap();
     assert_eq!(hits.len(), 1);
 
     // 生成列（year / doi / pmid）が効いている
@@ -47,15 +47,15 @@ fn add_search_dedup_roundtrip() {
     // 著者チップ / 誌名チップ（list_items の author_family + author_initial / journal）
     use openref_core::search::{list_items, ListFilter};
     let n = |f: ListFilter| list_items(&db, &f).unwrap().len();
-    assert_eq!(n(ListFilter { author_family: Some("kano".into()), ..Default::default() }), 1, "姓は大小無視");
-    assert_eq!(n(ListFilter { author_family: Some("Kano".into()), author_initial: Some("S".into()), ..Default::default() }), 1);
-    assert_eq!(n(ListFilter { author_family: Some("Kano".into()), author_initial: Some("T".into()), ..Default::default() }), 0, "頭文字違いは別人");
+    assert_eq!(n(ListFilter { author_family: Some("kato".into()), ..Default::default() }), 1, "姓は大小無視");
+    assert_eq!(n(ListFilter { author_family: Some("Kato".into()), author_initial: Some("S".into()), ..Default::default() }), 1);
+    assert_eq!(n(ListFilter { author_family: Some("Kato".into()), author_initial: Some("T".into()), ..Default::default() }), 0, "頭文字違いは別人");
     assert_eq!(n(ListFilter { author_family: Some("Yamada".into()), ..Default::default() }), 1, "第 2 著者でも hit（Paperpile と同じ）");
     assert_eq!(n(ListFilter { author_family: Some("Suzuki".into()), ..Default::default() }), 0);
     assert_eq!(n(ListFilter { journal: Some("test journal of radiology".into()), ..Default::default() }), 1);
     assert_eq!(n(ListFilter { journal: Some("Radiology".into()), ..Default::default() }), 0, "誌名は完全一致");
     assert_eq!(
-        n(ListFilter { search: Some("pancreatic".into()), author_family: Some("Kano".into()), journal: Some("Test Journal of Radiology".into()), ..Default::default() }),
+        n(ListFilter { search: Some("pancreatic".into()), author_family: Some("Kato".into()), journal: Some("Test Journal of Radiology".into()), ..Default::default() }),
         1,
         "FTS + チップの AND"
     );
@@ -221,10 +221,10 @@ fn drive_mode_attach_writes_compat_layout() {
     assert_eq!(attached.md5, openref_core::pdffetch::md5_hex(b"%PDF-1.4 fake"), "添付関数は実体の md5 を返す");
     let placement = attached.placement;
 
-    // 二著者規約 = "Kano and Yamada"・`: ` → ` - `・頭文字 K フォルダ
+    // 二著者規約 = "Kato and Yamada"・`: ` → ` - `・頭文字 K フォルダ
     let expected = mount
         .join("All Papers/K")
-        .join("Kano and Yamada 2026 - Pancreatic cancer imaging - a test review.pdf");
+        .join("Kato and Yamada 2026 - Pancreatic cancer imaging - a test review.pdf");
     match &placement {
         edit::Placement::Drive(p) => assert_eq!(p, &expected),
         other => panic!("Drive 配置になっていない: {other:?}"),
@@ -613,10 +613,11 @@ fn refresh_writes_retraction_flag() {
     let k2 = ingest::add_item(&mut db, &other).unwrap();
     let mut wrong = fake_resolved();
     wrong.retracted = Some("PubMed PublicationType: Retracted Publication".into());
-    assert!(matches!(
-        ingest::merge_enrichment(&mut db, k2.id, &wrong),
-        Err(CoreError::BadInput(_))
-    ));
+    match ingest::merge_enrichment(&mut db, k2.id, &wrong) {
+        // 利用者に出る文（CLI の refresh・connectd のログ）は今の経路に合わせる = 外した Zotero Connector の名を出さない
+        Err(CoreError::BadInput(m)) => assert!(m.contains("識別子（DOI/PMID）が別の論文を指している") && !m.contains("connector"), "{m}"),
+        other => panic!("BadInput のはず: {other:?}"),
+    }
     assert!(search::retraction_of(&db, k2.id).unwrap().is_none());
 }
 
@@ -691,7 +692,7 @@ fn membership_counts_for_bulk_toolbar() {
     assert_eq!(r1.tags[1].color.as_deref(), Some("forest"));
     let r2 = rows.iter().find(|r| r.item.key == k2).unwrap();
     assert_eq!(r2.tags.len(), 1);
-    tags::rename_tag(&db, tid, "renamed").unwrap();
+    tags::update_tag(&db, tid, Some("renamed"), None).unwrap();
     assert_eq!(search::list_items(&db, &search::ListFilter { tag_id: Some(tid), ..Default::default() }).unwrap().len(), 2);
     assert_eq!(search::list_items(&db, &search::ListFilter { tag_id: Some(zeta), ..Default::default() }).unwrap().len(), 1);
     // 名前（大小無視）→ id → 絞り込み（MCP / CLI の経路）。綴り違いは None = 呼び出し側でエラーにできる
@@ -900,7 +901,7 @@ fn fulltext_search_hits_pdf_body() {
     assert_eq!(list_items(&db, &ListFilter { search: Some("pancreatic".into()), metadata_only: true, ..Default::default() }).unwrap().len(), 1);
     // チップ・ビューとは AND のまま
     assert_eq!(list_items(&db, &ListFilter { search: Some("zebrafish".into()), starred_only: true, ..Default::default() }).unwrap().len(), 0);
-    assert_eq!(list_items(&db, &ListFilter { search: Some("zebrafish".into()), author_family: Some("Kano".into()), ..Default::default() }).unwrap().len(), 1);
+    assert_eq!(list_items(&db, &ListFilter { search: Some("zebrafish".into()), author_family: Some("Kato".into()), ..Default::default() }).unwrap().len(), 1);
     // ゴミ箱の item の本文は通常ビューに出ない
     edit::trash(&db, &b.key).unwrap();
     assert_eq!(q("zebrafish").len(), 0);
@@ -1012,141 +1013,6 @@ fn fulltext_search_hits_pdf_body() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// 実弾（手元の全 PDF・読み取りのみ）:
-/// `OPENREF_TEST_DB=/path/scratch.sqlite cargo test -p openref-core --test integration -- --ignored title_guard_survey --nocapture`
-/// 題名ガード（`pdfingest::title_in_text`）の誤拒否率と「先頭 DOI = item の DOI」の一致率を蔵書全体で測る
-/// （本文 DOI 経路の取り違え対策の副作用を実データで見るため。assert は無く数値を出すだけ = 回帰防止は
-/// pdfingest の unit `first_candidate_guard` が担う。母集団の題名は Paperpile 由来なので「別論文を登録する」
-/// 退行はここでは検出できない）
-#[test]
-#[ignore]
-fn title_guard_survey() {
-    use openref_core::pdfingest::{find_dois_in_text, guard_first_candidate, lenient_reason, normalize, title_in_text, Guard};
-    use openref_core::{model, pdftools};
-    let Some(p) = openref_core::env_os("TEST_DB") else {
-        eprintln!("OPENREF_TEST_DB 未設定のためスキップ");
-        return;
-    };
-    let db = Db::open(std::path::Path::new(&p)).unwrap();
-    let rows: Vec<(String, String, String)> = {
-        let mut stmt = db
-            .conn
-            .prepare("SELECT i.key, i.csl, a.path FROM attachments a JOIN items i ON i.id = a.item_id WHERE i.deleted_at IS NULL AND a.kind = 'pdf' ORDER BY i.id")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
-    };
-    let (mut n, mut missing, mut err, mut no_doi_item, mut no_doi_text, mut first_ok, mut first_ng, mut guard_ok, mut guard_ng, mut lenient_n) =
-        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-    for (key, csl, path) in rows {
-        let csl: serde_json::Value = serde_json::from_str(&csl).unwrap();
-        let title = model::s(&csl, "title").unwrap_or("").to_string();
-        let item_doi = model::s(&csl, "DOI").map(|d| d.to_lowercase());
-        let pth = std::path::Path::new(&path);
-        if !pth.exists() {
-            missing += 1;
-            continue;
-        }
-        n += 1;
-        let ex = match pdftools::extract_pages(pth, 1, 2) {
-            Ok(e) => e,
-            Err(e) => {
-                err += 1;
-                eprintln!("ERR  {key} {e}");
-                continue;
-            }
-        };
-        let text = ex.pages.join("\n");
-        // 本番と同じ判定経路（lenient 規則・ガード）を通す = lenient 規則を変えるときはこれで測る
-        let lenient = lenient_reason(&ex.pages, &text).is_some();
-        if lenient {
-            lenient_n += 1;
-        }
-        let full = normalize(&text);
-        let guard = guard_first_candidate(&title, &text, lenient) != Guard::Reject;
-        if guard {
-            guard_ok += 1;
-        } else {
-            guard_ng += 1;
-        }
-        // 変種の計測: 冒頭 3000 字 / 6000 字に絞った場合（実測: 3000 字では Springer 系で誤拒否が出る）
-        let pos = full.find(&normalize(&title)).map(|i| i as i64).unwrap_or(-1);
-        let head3: String = full.chars().take(3000).collect();
-        let whole = title_in_text(&title, &head3);
-        let head6: String = full.chars().take(6000).collect();
-        let g6 = title_in_text(&title, &head6);
-        let dois = find_dois_in_text(&text);
-        let first = dois.first().map(|d| d.to_lowercase());
-        let doi_note = match (&item_doi, &first) {
-            (None, _) => {
-                no_doi_item += 1;
-                "item に DOI なし".to_string()
-            }
-            (Some(_), None) => {
-                no_doi_text += 1;
-                "本文に DOI なし".to_string()
-            }
-            (Some(a), Some(b)) if a == b => {
-                first_ok += 1;
-                "先頭 DOI 一致".to_string()
-            }
-            (Some(a), Some(b)) => {
-                first_ng += 1;
-                format!("先頭 DOI 不一致 item={a} text={b} 候補={dois:?}")
-            }
-        };
-        if !guard || doi_note.starts_with("先頭 DOI 不一致") {
-            eprintln!(
-                "{} {key} guard(全文)={guard} head3000={whole} head6000={g6} pos={pos} len={} lenient={lenient} backend={} | {doi_note} | {}",
-                if guard { "DOI " } else { "NG  " },
-                full.chars().count(),
-                ex.backend,
-                title.chars().take(90).collect::<String>()
-            );
-            if !guard {
-                eprintln!("      head: {}", full.chars().take(400).collect::<String>());
-            }
-        }
-    }
-    eprintln!(
-        "=== PDF {n}（欠損 {missing}・抽出エラー {err}）: 題名ガード 通過 {guard_ok} / 不通過 {guard_ng}（lenient {lenient_n}）| 先頭 DOI 一致 {first_ok} / 不一致 {first_ng} / 本文に DOI なし {no_doi_text} / item に DOI なし {no_doi_item}"
-    );
-}
-
-/// 実弾（手元 PDF の抽出統計）: `OPENREF_TEST_PDFS=a.pdf:b.pdf cargo test -p openref-core --test integration -- --ignored text_stats_live --nocapture`
-/// 冒頭 2 頁の文字数・空白率・CJK 数・ラテン文字数・文字化け率・lenient 判定を出す（題名ガードの lenient 規則の根拠づけ用）
-#[test]
-#[ignore]
-fn text_stats_live() {
-    use openref_core::{model, pdftools};
-    let Some(list) = openref_core::env_os("TEST_PDFS") else {
-        eprintln!("OPENREF_TEST_PDFS 未設定のためスキップ");
-        return;
-    };
-    for p in list.to_string_lossy().split(':').filter(|s| !s.is_empty()) {
-        let ex = match pdftools::extract_pages(std::path::Path::new(p), 1, 2) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("{p}: ERR {e}");
-                continue;
-            }
-        };
-        let text = ex.pages.join("\n");
-        let total = text.chars().count();
-        let ws = text.chars().filter(|c| c.is_whitespace()).count();
-        let cjk = text.chars().filter(|c| model::is_cjk(*c)).count();
-        let latin = text.chars().filter(|c| c.is_alphabetic() && !model::is_cjk(*c)).count();
-        eprintln!(
-            "{}: backend={} chars={total} ws={ws} ({:.0}%) cjk={cjk} latin={latin} garbled={:.3} cjk_heavy={} | head: {:?}",
-            std::path::Path::new(p).file_name().unwrap().to_string_lossy(),
-            ex.backend,
-            100.0 * ws as f64 / total.max(1) as f64,
-            pdftools::garbled_ratio(&ex.pages),
-            openref_core::pdfingest::is_cjk_heavy(&text),
-            text.chars().filter(|c| !c.is_whitespace()).take(120).collect::<String>()
-        );
-    }
-}
-
 /// 3 段 API と doi_check の印: 取得中に別経路で添付されたら attach は拒否する / 印は直前に添付した行にだけ・上書きしない
 #[test]
 fn fetch_pdf_three_phase_and_doi_check_mark() {
@@ -1165,7 +1031,7 @@ fn fetch_pdf_three_phase_and_doi_check_mark() {
     // ② の間（ロック外）に別経路で添付された → ③ は拒否し、取得物は捨てる
     let other = b"%PDF-1.4 other";
     let other_id = edit::attach_auto_bytes(&db, &added.key, "other.pdf", other).unwrap().id;
-    let dl = pdffetch::Downloaded { bytes: b"%PDF-1.4 fetched".to_vec(), source: "test".into(), doi_check: Some("match") };
+    let dl = pdffetch::Downloaded { bytes: b"%PDF-1.4 fetched".to_vec(), source: "test".into(), doi_check: Some("match"), text: None };
     let err = pdffetch::fetch_pdf_attach(&db, &plan, dl).unwrap_err();
     assert!(matches!(err, CoreError::Conflict(_)), "{err}");
     assert!(err.to_string().contains("別経路"), "{err}");
@@ -1203,7 +1069,7 @@ fn fetch_pdf_three_phase_and_doi_check_mark() {
     let f = pdffetch::fetch_pdf_attach(
         &db,
         &plan2,
-        pdffetch::Downloaded { bytes: b"%PDF-1.4 two".to_vec(), source: "publisher-page (x)".into(), doi_check: Some("match") },
+        pdffetch::Downloaded { bytes: b"%PDF-1.4 two".to_vec(), source: "publisher-page (x)".into(), doi_check: Some("match"), text: None },
     )
     .unwrap();
     assert_eq!(f.bytes_len, 12);
@@ -1228,11 +1094,143 @@ fn fetch_pdf_three_phase_and_doi_check_mark() {
     pdffetch::fetch_pdf_attach(
         &db,
         &plan3,
-        pdffetch::Downloaded { bytes: b"%PDF-1.4 three".to_vec(), source: "pmc-aws (CC BY)".into(), doi_check: None },
+        pdffetch::Downloaded { bytes: b"%PDF-1.4 three".to_vec(), source: "pmc-aws (CC BY)".into(), doi_check: None, text: None },
     )
     .unwrap();
     let d3 = search::item_detail(&db, &added3.key).unwrap().unwrap();
     assert_eq!(d3.attachments[0].doi_check, None, "PMC の Unknown は印なし");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// 本文の抽出をロックの外へ: `extract_for_index`（DB なし）→ `attach_auto_extracted`（添付の行と本文の行を同じロックで）。
+/// ① ロックの中で抽出した結果と同じ行（text・cjk・md5・status・detail・page_count）になり、FTS で引ける・後から取り直しても同じ
+/// ② 抽出元のバイト列が違う（取り違え）なら渡された本文を書かず、添付のバイト列から抽出し直す・`store_extracted` は書かずに Err
+/// ③ 抽出の後・添付の前に item が消えた → 添付は Err・添付の行も本文の行も残らない
+/// ④ `attach_auto_unlocked`（Tauri の attach_pdf 用の Mutex 版）も同じ行を作る
+#[test]
+fn extraction_outside_the_lock_keeps_fulltext_consistent() {
+    use openref_core::{edit, fulltext, pdffetch, pdftools};
+    let tmp = std::env::temp_dir().join(format!("openref-k11-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut db = Db::open(&tmp.join("t.sqlite")).unwrap();
+    let item = |db: &mut Db, n: &str| {
+        let mut r = fake_resolved();
+        r.csl["DOI"] = json!(format!("10.9999/openref.k11.{n}"));
+        r.csl["PMID"] = json!(format!("8888888{}", n.len()));
+        r.csl["title"] = json!(format!("K11 item {n}"));
+        ingest::add_item(db, &r).unwrap().key
+    };
+    type Row = (String, String, Option<String>, String, Option<String>, Option<i64>);
+    let row = |db: &Db, att: i64| -> Row {
+        db.conn
+            .query_row(
+                "SELECT f.text, f.cjk, f.md5, f.status, f.detail, a.page_count FROM fulltext f JOIN attachments a ON a.id = f.attachment_id WHERE a.id = ?1",
+                [att],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap()
+    };
+    let bytes = pdftools::minimal_pdf("Hepatic zebracorn lesion outside the lock", None);
+    let md5 = pdffetch::md5_hex(&bytes);
+
+    // ① 同値: ロックの中で抽出（今までの経路）とロックの外で抽出
+    let (k1, k2) = (item(&mut db, "a"), item(&mut db, "bb"));
+    let inside = edit::attach_auto_with_md5(&db, &k1, "a.pdf", &bytes, &md5).unwrap().id;
+    let text = fulltext::extract_for_index(&bytes, &md5, None);
+    let outside = edit::attach_auto_extracted(&db, &k2, "b.pdf", &bytes, &md5, Some(&text)).unwrap().id;
+    let want = row(&db, inside);
+    assert_eq!(want.3, "ok", "{want:?}");
+    assert!(want.0.contains("zebracorn"));
+    assert_eq!(want.5, Some(1));
+    assert_eq!(row(&db, outside), want);
+    let hits: i64 = db.conn.query_row("SELECT COUNT(*) FROM fulltext_fts WHERE fulltext_fts MATCH 'zebracorn'", [], |r| r.get(0)).unwrap();
+    assert_eq!(hits, 2, "FTS の索引は両方に入る");
+    // 同じ添付にもう一度抽出が走っても（後からの取り直し）行は同じ
+    fulltext::index_attachment(&db.conn, outside).unwrap();
+    assert_eq!(row(&db, outside), want);
+
+    // ② 取り違え: 別のバイト列の抽出を渡しても、その本文は書かない（添付のバイト列から抽出し直す）
+    let other = pdftools::minimal_pdf("Completely different quokka text", None);
+    let stale = fulltext::extract_for_index(&other, &pdffetch::md5_hex(&other), None);
+    let k3 = item(&mut db, "ccc");
+    let b3 = pdftools::minimal_pdf("Third zebracorn paper with enough body text", None);
+    let a3 = edit::attach_auto_extracted(&db, &k3, "c.pdf", &b3, &pdffetch::md5_hex(&b3), Some(&stale)).unwrap().id;
+    let r3 = row(&db, a3);
+    assert!(r3.0.contains("Third zebracorn") && !r3.0.contains("quokka"), "{r3:?}");
+    let e = fulltext::store_extracted(&db.conn, a3, &stale, &pdffetch::md5_hex(&b3)).unwrap_err();
+    assert!(matches!(e, CoreError::BadInput(_)), "{e}");
+    assert_eq!(row(&db, a3), r3, "md5 の違う抽出で上書きしない");
+
+    // ③ 抽出の後・添付の前に item が消えた
+    let k4 = item(&mut db, "dddd");
+    let b4 = pdftools::minimal_pdf("Vanishing item text", None);
+    let t4 = fulltext::extract_for_index(&b4, &pdffetch::md5_hex(&b4), None);
+    db.conn.execute("DELETE FROM items WHERE key = ?1", [&k4]).unwrap();
+    let count = |db: &Db, sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let (atts, fts) = (count(&db, "SELECT COUNT(*) FROM attachments"), count(&db, "SELECT COUNT(*) FROM fulltext"));
+    assert!(edit::attach_auto_extracted(&db, &k4, "d.pdf", &b4, &pdffetch::md5_hex(&b4), Some(&t4)).is_err());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM attachments"), atts);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM fulltext"), fts);
+
+    // ④ Mutex 版: 同じ行・無いファイルは内側の Err
+    let k5 = item(&mut db, "eeeee");
+    let f5 = tmp.join("e.pdf");
+    std::fs::write(&f5, &bytes).unwrap();
+    let m = std::sync::Mutex::new(db);
+    let a5 = edit::attach_auto_unlocked(|| m.lock(), &k5, &f5).unwrap().unwrap().id;
+    let db = m.into_inner().unwrap();
+    assert_eq!(row(&db, a5), want);
+    let m = std::sync::Mutex::new(db);
+    assert!(matches!(edit::attach_auto_unlocked(|| m.lock(), &k5, &tmp.join("none.pdf")).unwrap(), Err(CoreError::NotFound(_))));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// ③ の共通関数 `attach_verified`: 既存の添付の方針は経路ごとに違う（揃えていない）ことを引数ごとに固定する。
+/// Reject = サーバ側の取得（PDF が 1 本でもあれば HasPdf）・AddAnother = Capture（同じ md5 はスキップ・別ファイルは 2 本目）。
+/// どちらも添付したときだけ照合印を書く
+#[test]
+fn attach_verified_existing_pdf_policies() {
+    use openref_core::pdffetch::{self, ExistingPdf, VerifiedAttach};
+    let tmp = std::env::temp_dir().join(format!("openref-attach-verified-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut db = Db::open(&tmp.join("t.sqlite")).unwrap();
+    let key = ingest::add_item(&mut db, &fake_resolved()).unwrap().key;
+    let count = |db: &Db| -> i64 { db.conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap() };
+    let marks = |db: &Db| -> Vec<Option<String>> {
+        let mut st = db.conn.prepare("SELECT doi_check FROM attachments ORDER BY id").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let go = |db: &Db, bytes: &[u8], mark, policy| {
+        pdffetch::attach_verified(db, &key, "f.pdf", bytes, &pdffetch::md5_hex(bytes), mark, policy, None).unwrap()
+    };
+    let (a, b) = (b"%PDF-1.4 first".as_slice(), b"%PDF-1.4 second".as_slice());
+
+    // 未添付: どちらの方針でも添付（2 本目ではない）+ 印
+    assert!(matches!(go(&db, a, Some("match"), ExistingPdf::Reject), VerifiedAttach::Attached { additional: false, .. }));
+    assert_eq!(marks(&db), vec![Some("match".into())]);
+    // Reject: 同じファイルでも別ファイルでも HasPdf・行も印も増えない
+    assert!(matches!(go(&db, a, Some("match"), ExistingPdf::Reject), VerifiedAttach::HasPdf));
+    assert!(matches!(go(&db, b, Some("unknown"), ExistingPdf::Reject), VerifiedAttach::HasPdf));
+    assert_eq!(count(&db), 1);
+    // AddAnother: 同じ md5 はスキップ・別ファイルは 2 本目 + 印
+    assert!(matches!(go(&db, a, Some("unknown"), ExistingPdf::AddAnother), VerifiedAttach::DuplicateFile));
+    assert_eq!(count(&db), 1);
+    assert!(matches!(go(&db, b, Some("unknown"), ExistingPdf::AddAnother), VerifiedAttach::Attached { additional: true, .. }));
+    assert_eq!(marks(&db), vec![Some("match".into()), Some("unknown".into())]);
+
+    // 未添付の item に AddAnother → 1 本目（additional = false）・印 None は NULL のまま
+    let mut r2 = fake_resolved();
+    r2.csl["DOI"] = json!("10.9999/openref.test.av2");
+    r2.csl["PMID"] = json!("99999990");
+    r2.csl["title"] = json!("Attach verified second item");
+    let key2 = ingest::add_item(&mut db, &r2).unwrap().key;
+    let c = b"%PDF-1.4 third".as_slice();
+    let got = pdffetch::attach_verified(&db, &key2, "f.pdf", c, &pdffetch::md5_hex(c), None, ExistingPdf::AddAnother, None).unwrap();
+    assert!(matches!(got, VerifiedAttach::Attached { additional: false, .. }));
+    assert_eq!(marks(&db).last().cloned(), Some(None));
+    // Reject は無い key を NotFound
+    let e = pdffetch::attach_verified(&db, "NOSUCHKEY", "f.pdf", c, &pdffetch::md5_hex(c), None, ExistingPdf::Reject, None).unwrap_err();
+    assert!(matches!(e, CoreError::NotFound(_)), "{e}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

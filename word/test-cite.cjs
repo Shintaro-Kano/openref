@@ -1,14 +1,9 @@
-// cite-core の node 実弾テスト: 4 スタイル × クラスタ整形 × bibliography
+// cite-core の node 実弾テスト: 4 スタイル × クラスタ整形 × bibliography・DOI / URL を常に含める・論文以外の 8 型の文献リスト（旧 test-types.cjs）
 // 実行: node word/test-cite.cjs
-const fs = require("fs");
-const path = require("path");
-const vm = require("vm");
 const assert = require("assert");
+const { loadCite } = require("./test-lib.cjs");
 
-const dir = __dirname;
-vm.runInThisContext(fs.readFileSync(path.join(dir, "vendor/citeproc.js"), "utf8"));
-vm.runInThisContext(fs.readFileSync(path.join(dir, "cite-core.js"), "utf8"));
-const locale = fs.readFileSync(path.join(dir, "vendor/locales-en-US.xml"), "utf8");
+const { locale, style } = loadCite(); // global に CSL・OpenRefCite
 
 const items = {
   K1: {
@@ -34,7 +29,7 @@ const items = {
 
 let failures = 0;
 for (const styleId of ["vancouver", "american-medical-association", "radiology", "american-journal-of-roentgenology"]) {
-  const styleXml = fs.readFileSync(path.join(dir, "styles", styleId + ".csl"), "utf8");
+  const styleXml = style(styleId);
   try {
     const core = new OpenRefCite.CiteCore(CSL, styleXml, locale);
     core.setItems(items);
@@ -55,12 +50,12 @@ for (const styleId of ["vancouver", "american-medical-association", "radiology",
 // ---- 「DOI / URL を常に含める」（withIdentifiers）: 同梱 4 スタイル ----
 // D1 = DOI + doi.org の URL（典型）/ D2 = DOI なし・J-STAGE の URL だけ（和文誌の型）/ D3 = 識別子なし
 const DOI = "10.1053/j.gastro.2023.02.012";
-const JSTAGE = "https://www.jstage.jst.go.jp/article/jspr/42/1/42_5/_pdf/-char/ja";
+const JSTAGE = "https://www.jstage.jst.go.jp/article/zzzz/42/1/42_5/_pdf/-char/ja";
 const idItems = {
   D1: { ...items.K1, URL: "http://dx.doi.org/" + DOI },
   D2: {
     type: "article-journal",
-    title: "小児の中枢神経感染症",
+    title: "小児の架空症例の画像所見",
     author: [{ family: "山田", given: "太郎" }],
     "container-title": "日本小児放射線学会雑誌",
     issued: { "date-parts": [[2026]] },
@@ -91,7 +86,7 @@ const DOI_CASES = [
   ["american-journal-of-roentgenology", "DOI: " + DOI, true],
 ];
 for (const [styleId, wantD1, wantD2] of DOI_CASES) {
-  const styleXml = fs.readFileSync(path.join(dir, "styles", styleId + ".csl"), "utf8");
+  const styleXml = style(styleId);
   try {
     const core = new OpenRefCite.CiteCore(CSL, styleXml, locale);
     core.setItems(idItems);
@@ -126,7 +121,7 @@ for (const [styleId, doi, wantTail] of [
   ["american-journal-of-roentgenology", SICI, "DOI: " + SICI], // DOI: 形は符号化しない（HTML では &#60; に）
 ]) {
   try {
-    const styleXml = fs.readFileSync(path.join(dir, "styles", styleId + ".csl"), "utf8");
+    const styleXml = style(styleId);
     const core = new OpenRefCite.CiteCore(CSL, styleXml, locale);
     core.setItems({ D1: { ...items.K1, DOI: doi } });
     core.register(["D1"]);
@@ -160,5 +155,36 @@ for (const [xml, want] of [
   }
 }
 
-console.log(failures ? `\n${failures} style(s) FAILED` : "\nALL STYLES PASS");
-process.exit(failures ? 1 : 0);
+// 型ごとの文献リスト（Vancouver）: 論文以外の 8 型が空でない 1 件の文献になる（和文の著者・団体名の literal を含む）
+let typeFailures = 0;
+{
+  const styleXml = style("vancouver");
+  const cases = {
+    book: { type: "book", title: "画像診断コンパクトナビ", author: [{ literal: "山田太郎" }], publisher: "医学書院", "publisher-place": "東京", issued: { "date-parts": [[2025]] }, edition: "3", ISBN: "978-4-260" },
+    chapter: { type: "chapter", title: "膵腫瘍の画像診断", "container-title": "腹部画像診断学", author: [{ family: "Tanaka", given: "H" }], editor: [{ family: "Sato", given: "K" }], publisher: "South", issued: { "date-parts": [[2024]] }, page: "120-145" },
+    webpage: { type: "webpage", title: "PI-RADS v2.1", "container-title": "ACR", URL: "https://acr.org/pirads", issued: { "date-parts": [[2019]] }, accessed: { "date-parts": [[2026, 7, 25]] } },
+    report: { type: "report", title: "Imaging Guidelines 2026", author: [{ literal: "日本医学放射線学会" }], publisher: "JRS", issued: { "date-parts": [[2026]] }, number: "GL-3", genre: "Guideline" },
+    thesis: { type: "thesis", title: "Deep learning for CT", author: [{ family: "Example", given: "A" }], publisher: "Example University", issued: { "date-parts": [[2020]] }, genre: "PhD thesis" },
+    "paper-conference": { type: "paper-conference", title: "AI in radiology", "container-title": "RSNA Proceedings", "event-title": "RSNA 2026", "event-place": "Chicago", author: [{ family: "Smith", given: "J" }], issued: { "date-parts": [[2026]] } },
+    "article-newspaper": { type: "article-newspaper", title: "新しい画像診断技術", "container-title": "日本経済新聞", issued: { "date-parts": [[2026, 3, 1]] }, section: "科学" },
+    document: { type: "document", title: "院内マニュアル", publisher: "○○病院", issued: { "date-parts": [[2026]] }, genre: "内部資料" },
+  };
+  for (const [name, csl] of Object.entries(cases)) {
+    try {
+      const core = new OpenRefCite.CiteCore(CSL, styleXml, locale);
+      core.setItems({ K: csl });
+      core.register(["K"]);
+      const bib = core.bibliographyHtml().replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+      if (!bib || bib.length < 10) throw new Error("空の出力");
+      console.log(`OK   ${name.padEnd(18)} ${bib.slice(0, 88)}`);
+    } catch (e) {
+      typeFailures++;
+      console.log(`FAIL ${name}: ${e.message}`);
+    }
+  }
+}
+
+// 最後の行: スタイルの検査（上の 4 節）と型（この節）の失敗を分けて言う
+const failed = [failures && `${failures} style(s)`, typeFailures && `${typeFailures} 型`].filter(Boolean).join("・");
+console.log(failed ? `\n${failed} FAILED` : "\nALL STYLES PASS・全 8 型 OK");
+process.exit(failed ? 1 : 0);

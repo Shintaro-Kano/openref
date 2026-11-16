@@ -87,7 +87,7 @@ fn real_vault() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", ip.display()));
     }
-    let mut ix = Index::open(&ip, &vault).unwrap();
+    let mut ix = Index::open(&openref_core::wiki::index::Ready::new(&ip, &vault, Default::default())).unwrap();
     let t = std::time::Instant::now();
     ix.refresh().unwrap();
     let first = t.elapsed();

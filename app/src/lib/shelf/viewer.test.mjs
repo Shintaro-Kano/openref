@@ -73,7 +73,8 @@ const page = (n) => {
   return pages.get(n);
 };
 let destroyed = 0;
-globalThis.__pdf = () => ({
+const pdfOpts = []; // getDocument に渡った引数（viewer/pdfdoc.ts を通る）
+globalThis.__pdf = (o) => (pdfOpts.push(o), {
   promise: Promise.resolve({
     numPages: 20,
     getPage: async (n) => {
@@ -86,7 +87,7 @@ globalThis.__pdf = () => ({
   },
 });
 
-const { mount, unmount } = await import("svelte");
+const { mount, unmount, flushSync } = await import("svelte");
 const { app } = await import("../state.svelte.ts");
 const { default: ShelfViewer } = await import("./ShelfViewer.svelte");
 app.detailOpen = false;
@@ -119,6 +120,26 @@ function trackCanvas() {
   return { made, stop: () => (document.createElement = real) };
 }
 let tests = 0;
+
+// 右ペインの開閉（▣）= 読み手の段（最初の段）の右端・一覧 / OpenNote / 本棚と同じ部品（PaneToggle）
+{
+  const v = await open();
+  const bar = document.querySelector(".sh-v-bar");
+  assert.ok(bar?.lastElementChild?.classList.contains("pn-toggle"), "読み手の段の右端に ▣ が無い");
+  const pressed = bar.lastElementChild.getAttribute("aria-pressed");
+  assert.equal(bar.lastElementChild.title, pressed === "true" ? "右のペインを隠す（⌘⌥I）" : "右のペインを表示（⌘⌥I）", "▣ の title と aria-pressed が合わない");
+  // 押された側 = app.detailOpen（open を反転させない）・切り替えると追う
+  const ST = await import("../state.svelte.ts");
+  assert.equal(pressed, String(ST.app.detailOpen), "読み手の ▣ の押された側が右ペインの開閉と合わない");
+  ST.app.detailOpen = !ST.app.detailOpen;
+  flushSync();
+  assert.equal(bar.lastElementChild.getAttribute("aria-pressed"), String(ST.app.detailOpen), "右ペインの開閉を変えても読み手の ▣ が追わない");
+  ST.app.detailOpen = !ST.app.detailOpen;
+  flushSync();
+  assert.equal(document.querySelectorAll(".lb-pane").length, 0, "前の ▣（.lb-pane）が残った");
+  unmount(v);
+  tests++;
+}
 
 // 描いて枠に入る → 帯を出ると bitmap を返して page.cleanup
 {
@@ -509,6 +530,68 @@ let tests = 0;
   assert.equal(closed, 1, "モーダルの無い Esc で閉じない");
   window.removeEventListener("keydown", modalEsc);
   unmount(v);
+  tests++;
+}
+
+// pdf.js の開き方 = viewer/pdfdoc.ts の openPdf を通る: この読み手の読み方（range・分割の大きさ・自動取得なし・stream なし）と、
+// PdfViewer と共通の補助データ 4 つの URL（cmaps / standard_fonts / wasm / iccs）・useWorkerFetch: false・enableXfa: false・worker。
+// 補助データが無いと、埋め込みなしの CID フォントの字や JBIG2 等の画像が例外なしで黙って消える
+{
+  pdfOpts.length = 0;
+  const v = await open();
+  const PJ = await import("pdfjs-dist");
+  const { CHUNK } = await import("./rangeTransport.ts");
+  assert.equal(pdfOpts.length, 1, "getDocument を 1 回だけ呼ばない");
+  const { range, ...rest } = pdfOpts[0];
+  assert.ok(range instanceof PJ.PDFDataRangeTransport, "range が PDFDataRangeTransport でない");
+  assert.deepEqual(rest, { rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true, ...{
+    enableXfa: false,
+    cMapUrl: "http://localhost/pdfjs/cmaps/",
+    standardFontDataUrl: "http://localhost/pdfjs/standard_fonts/",
+    wasmUrl: "http://localhost/pdfjs/wasm/",
+    iccUrl: "http://localhost/pdfjs/iccs/",
+    useWorkerFetch: false,
+  } }, "本棚の読み手の getDocument の引数が違う");
+  assert.equal(PJ.GlobalWorkerOptions.workerSrc, "worker.js", "worker を設定しない");
+  unmount(v);
+  tests++;
+}
+
+// 日本語の表示の読み手（段・ページ番号・倍率・右ペイン・読み込みの失敗）に、許した名前の外の英単語が出ない（app.test の同じ検査と同じ形。
+// App の中の読み手は偽物なので、ここで実部品を見る）。許す = 固有の名前 Finder / PDF・容量の単位。データの値そのもの（本のパス・更新日時 =
+// toLocaleString は OS のロケールの書式で、試験の環境では「AM」が出る）は字の全体が一致する物だけ外す
+{
+  const ALLOW = new Set(["Finder", "PDF", "KB", "MB", "GB"]);
+  const DATA_VALUES = new Set([book.path, new Date(book.mtime * 1000).toLocaleString()]);
+  const words = () => {
+    const out = [];
+    const w = document.createTreeWalker(document.body, 4);
+    for (let n; (n = w.nextNode()); ) if (n.data.trim() && !DATA_VALUES.has(n.data.trim())) out.push(n.data.trim());
+    for (const el of document.querySelectorAll("[placeholder],[title],[aria-label]"))
+      for (const a of ["placeholder", "title", "aria-label"]) if (el.getAttribute(a) && !DATA_VALUES.has(el.getAttribute(a))) out.push(el.getAttribute(a));
+    return out.join("\n");
+  };
+  const extra = () => [...new Set(words().match(/[A-Za-z][A-Za-z-]+/g) ?? [])].filter((x) => !ALLOW.has(x));
+  const ST = await import("../state.svelte.ts");
+  const keepDetail = ST.app.detailOpen;
+  ST.app.detailOpen = true; // 右ペイン（本の情報）も出す
+  const v = await open();
+  await tickle();
+  flushSync();
+  assert.ok(document.querySelector(".sh-v-pager input") && document.querySelector(".sh-right"), "前提: ページ番号と右ペインが出ていない");
+  assert.deepEqual(extra(), [], "日本語の表示の読み手に許した名前の外の英単語");
+  unmount(v);
+  // 読み込みの失敗の画面（見出し・外部で開く）。詳細は例外の文そのまま = ここでは日本語の架空の文
+  const real = globalThis.__pdf;
+  globalThis.__pdf = () => ({ promise: Promise.reject(new Error("架空の失敗")), destroy: async () => {} });
+  document.body.replaceChildren();
+  const v2 = mount(ShelfViewer, { target: document.body, props: { book, onClose() {}, front: true } });
+  await waitFor(() => document.querySelector(".sh-v-err"));
+  assert.ok(document.querySelector(".sh-v-err"), "前提: 失敗の画面が出ない");
+  assert.deepEqual(extra(), [], "日本語の表示の読み手（失敗）に許した名前の外の英単語");
+  unmount(v2);
+  globalThis.__pdf = real;
+  ST.app.detailOpen = keepDetail;
   tests++;
 }
 

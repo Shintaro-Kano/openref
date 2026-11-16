@@ -1,6 +1,9 @@
 //! コマンド登録表 — エージェント（MCP の `call`）が GUI と同じ動詞で読み書きするための一覧。
-//! 各エントリは既存の core 関数を呼ぶだけ（Tauri command と同じ関数を指す = GUI parity は構造で担保。
-//! `app/src-tauri` の parity test が「Tauri command ⊆ 登録表 ∪ GUI 専用 allowlist」を固定する）。
+//! 各エントリは既存の core 関数を呼ぶ（多くは同名の Tauri command と同じ core 関数）。ただし引数の形と戻り値はエージェント向けで、
+//! 同名の Tauri command とは別（例: `attach_tag` は Tauri が tag_id を取り・ここはラベル名を取る。`attach_pdf` は Tauri が何も返さず・
+//! ここは置き場所と本文索引の結果を返す）。`app/src-tauri` の parity test が機械で固定するのは 2 つ: 「Tauri command の名前 ⊆
+//! 登録表 ∪ GUI 専用 allowlist」（全 command = 同じ動詞が呼べること）と、同名の `wiki_*` / `shelf_*` は登録表と同じ core 関数を
+//! 呼ぶこと。それ以外の同名の command の引数・処理の同一性は試験していない。
 //! 引数はエージェント向けの形: item は `key`（8 桁）・フォルダは key かパス（'親/子'・大小無視）・ラベルは名前。
 //! **数値 id は受けない**（collections.id / tags.id は削除後に再利用される = 握った id が別のものを指しうる）。
 //! 旧 MCP の 15 tool の名前は、同じ動詞なら別名（引数は上位互換）、形が違うものは別エントリで残す。
@@ -1086,10 +1089,10 @@ fn build() -> Vec<Command> {
           schema(&[("lang", "string", "例 en-US / ja-JP")], &["lang"]), cite_locale_xml),
         // ---- 読み: OpenNote（コマンドは wiki_*。ワークスペース = user が選んだ 1 フォルダの md / html / 画像等。有効化とフォルダの指定は GUI だけ） ----
         c("wiki_status", false, &[],
-          "OpenNote（コマンドは wiki_*）の状態: 有効か・ワークスペースの root・件数（ページ・種類別・リンク・未解決・同名で曖昧・ingest/ の件数・frontmatter）・最終走査（unix 秒）・`workspaces`（最近のワークスペース = root・last_used・exists・current・新しい順）。無効でもエラーにしない（root が履歴に無ければエラー・他の wiki_* は無効ならエラー）",
+          "OpenNote（コマンドは wiki_*）の状態: 有効か・ワークスペースの root・件数（ページ・種類別・リンク・未解決・同名で曖昧・ingest/ の件数・frontmatter・excluded = 索引から除いたフォルダの数）・最終走査（unix 秒）・`workspaces`（最近のワークスペース = root・last_used・exists・current・新しい順）。無効でもエラーにしない（root が履歴に無ければエラー・他の wiki_* は無効ならエラー）",
           schema(&[WIKI_ROOT], &[]), wiki_status),
         c("wiki_list", false, &[],
-          "ワークスペースのページの一覧（パス順）: path（ワークスペース相対）・title・kind（md / html / media = 画像・動画・音声・pdf / other）・tags・items（参照している item の key）・mtime（unix 秒）・size。total が count より大きければ limit で切れている",
+          "ワークスペースのページの一覧（パス順）: path（ワークスペース相対）・title・kind（md / html / media = 画像・動画・音声・pdf / other）・tags・items（参照している item の key）・mtime（unix 秒）・size。total が count より大きければ limit で切れている。`excluded` = 索引から除いたフォルダ（ワークスペース相対・いちばん上の物・prefix の配下だけ。中のファイルは pages に出ない）",
           schema(&[
               ("prefix", "string", "ワークスペース相対のパスの前方一致（例 'notes/'）"),
               ("kind", "string", "md / html / media / other"),
@@ -1366,7 +1369,8 @@ mod tests {
         let tmp = std::env::temp_dir().to_string_lossy().into_owned();
         for (name, args) in [("shelf_list", json!({"root": tmp})), ("shelf_set_opts", json!({"root": tmp, "collapse_single": true}))] {
             let e = call(&mut db, name, &args).unwrap_err();
-            assert!(matches!(e, CoreError::BadInput(_)) && e.to_string().contains("履歴に無い本棚"), "{name}: {e}");
+            assert!(e.to_string().contains("履歴に無い本棚") && e.to_string().contains(shelf::ROOT_HINT), "{name}: {e}");
+            assert!(matches!(e.without_hint(), CoreError::BadInput(_)), "{name}");
         }
         assert!(db.setting(shelf::KEY).unwrap().is_none(), "拒否は設定を作らない");
         assert!(call_err(&mut db, "shelf_list", json!({})).contains("引数 root は必須"));
@@ -1408,7 +1412,7 @@ mod tests {
             csl: json!({
                 "type": "article-journal",
                 "title": "MCP Seed Article on pancreatic imaging",
-                "author": [{"family": "Kano", "given": "S"}],
+                "author": [{"family": "Kato", "given": "S"}],
                 "container-title": "Test Journal",
                 "issued": {"date-parts": [[2026]]},
                 "DOI": "10.9999/mcp.seed", "PMID": "88888888",
@@ -1527,10 +1531,7 @@ mod tests {
             a["root"] = json!(r);
             a
         };
-        let code = |r: Result<Value>| match r {
-            Err(CoreError::Wiki { code, .. }) => Some(code),
-            _ => None,
-        };
+        let code = |r: Result<Value>| r.err().and_then(|e| e.code());
         let mut db = Db::open_in_memory().unwrap();
         for (name, args) in &nine {
             let c = find(name).unwrap();
@@ -1578,8 +1579,8 @@ mod tests {
             assert_eq!(count(&mut db, args.clone()), all, "{args}");
         }
         // 頭文字だけが空白 = 姓だけで絞る
-        let by_family = count(&mut db, json!({"author": "Kano"}));
-        assert_eq!(count(&mut db, json!({"author": "Kano", "author_initial": " "})), by_family);
+        let by_family = count(&mut db, json!({"author": "Kato"}));
+        assert_eq!(count(&mut db, json!({"author": "Kato", "author_initial": " "})), by_family);
     }
 
     /// sort / desc: GUI と同じ core の並び。desc の省略 = GUI のメニューで別の項目へ移ったときと同じ向き。効かない引数・不明な値は黙って捨てない

@@ -6,11 +6,12 @@ mod unix {
     use std::{path::PathBuf, process::Command};
     #[test]
     fn snapshot_child_connection() {
-        let Some(path) = std::env::var_os("OPENREF_SNAPSHOT_CHILD_DB") else {
+        let Some(path) = openref_core::env_os("SNAPSHOT_CHILD_DB") else {
             return;
         };
         let db = Db::open(&PathBuf::from(path)).unwrap();
-        if let Ok(expected) = std::env::var("OPENREF_SNAPSHOT_EXPECT_GUI") {
+        if let Some(expected) = openref_core::env_os("SNAPSHOT_EXPECT_GUI") {
+            let expected = expected.into_string().expect("OPENREF_SNAPSHOT_EXPECT_GUI is UTF-8");
             assert_eq!(db.setting("snapshot_gui").unwrap(), Some(expected));
         }
         db.set_setting("snapshot_cli", "external commit").unwrap();

@@ -11,6 +11,8 @@
      同じく vault の中だけ（<style>・style 属性・link の stylesheet）・link の stylesheet が読めないと console.warn に残して描画は続ける
    ⑩ 見出しの照合が 1 つの規則（headingKey）: `[[p#見出し]]` の着地（findHeading）・`![[p#見出し]]` の節（keepSection）・同じページの `#…`
      （anchorTarget）が同じ組で一致し、目次のクリックと `[[p#見出し]]` の着地が同じ id
+   ⑫ ファイルの大きさの表示（size.ts = 木の箱と右ペインが同じ桁）
+   ⑪ 編集中の目次（outline.ts の sourceHeadings = エディタの原文から）の level / 文字 / id が表示の描画（finish の見出し）と同じ・行がその見出しの行
    出力 = `ok: wiki render (N tests)`（N = 列 0 のブロックの数） */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -22,6 +24,8 @@ import { prepareHtml } from "./render/html.ts";
 import { cleanStyleSheet, cleanStyleAttr, decodeCss, MAX_CSS_DEPTH } from "./render/css.ts";
 import { assetUrl, absOf, resolveRelative, filePath, relInRoot, viewKindOf, normalizeRel, assetPath, normalizeAbs, assetInRoot, dirOf, baseName } from "./render/asset.ts";
 import { Finder } from "./render/find.ts";
+import { sourceHeadings } from "./render/outline.ts";
+import { fmtSize } from "./size.ts";
 
 const win = new JSDOM("").window;
 const labels = { openExternal: "open", playFailed: "fail", moreRows: (n) => `more ${n}`, externalImage: "img:", unresolved: "unres", pdf: "pdf" };
@@ -767,6 +771,86 @@ function shadowRender(md) {
     keepSection(frag, want);
     const kept = Array.from(frag.children).map((k) => k.textContent);
     assert.deepEqual(kept, land == null ? heads.flatMap((h, i) => [h, `body${i}`]) : [land, `body${heads.indexOf(land)}`], `keepSection: ${tag}`);
+  }
+  tests++;
+}
+
+// ---- ⑪ 編集中の目次 = 表示の描画と同じ見出しの一覧（同名の連番・記号・和文・インラインの記法）・行は原文の見出しの行 ----
+{
+  const strip = (hs) => hs.map(({ level, text, id }) => ({ level, text, id }));
+  const md = [
+    "---", "title: x", "---", // frontmatter の分だけ行がずれる
+    "# 表題",
+    "",
+    "## 所見: CT", "## 所見: CT", "## 所見: CT", // 同名 = -1 / -2
+    "### `code` と **強調** &amp; &copy; \\* [[p|別名]] [[q#節]] ![[n.md]] ![[x.png|300]] [リンク](u) ![alt](i.png) <b>B</b> 脚注[^1]",
+    "#   空白   多い   #",
+    "## \\[[逃がした]] の後",
+    "## [外 \\[[中]]](u)",
+    "setext の", "2 行目", "---",
+    "",
+    "> ## 引用の中",
+    "",
+    "- ## リストの中",
+    "",
+    "```", "# コードの中は見出しでない", "```",
+    "",
+    "<h2 id=\"own\">生の &amp; <i>HTML</i></h2>",
+    "<!-- <h3>コメントの中</h3> -->",
+    "",
+    "    # 字下げのコード",
+    "",
+    "## 末尾 a  ",
+    "## [[a.md]] ＃全角 ・ 記号!?",
+    "[toc]",
+    "",
+    "[^1]: 注",
+  ].join("\n");
+  const view = render(md).res.headings;
+  const src = sourceHeadings(md, "md", win.document);
+  assert.deepEqual(strip(src), view, "編集中の目次の見出しが表示の描画とずれる");
+  assert.deepEqual(src.map((h) => h.line), [4, 6, 7, 8, 9, 10, 11, 12, 13, 17, 19, 25, 30, 31], "見出しの行（コード・コメント・字下げの中は数えない）");
+  const rows = md.split("\n");
+  for (const h of src) {
+    const row = rows[h.line - 1] ?? "";
+    const html = row.startsWith("<h");
+    const setext = h.text.startsWith("setext");
+    assert.ok(html ? row.includes(h.text.split(" ")[0]) : setext ? row === "setext の" : /^(> |- )?#{1,6} /.test(row), `行がずれる: ${h.line} ${JSON.stringify(row)} ← ${h.text}`);
+  }
+  // CRLF の原文（エディタは書き出しの改行で返す）でも行は同じ
+  assert.deepEqual(sourceHeadings(md.replaceAll("\n", "\r\n"), "md", win.document).map((h) => h.line), src.map((h) => h.line), "CRLF で行がずれる");
+  // html のページ: 描画（prepareHtml → purify → finish）と同じ・コメント / script / style の中は数えない
+  const html = [
+    "<!doctype html><html><head><style>h1{}</style><title>t</title></head><body>",
+    "<h1 class=\"x\">表 &amp; 題</h1>",
+    "<!-- <h2>コメント</h2> -->",
+    "<script>document.write('<h2>script</h2>')</script>",
+    "<section><H2>同じ</H2><p>a</p><h2>同じ</h2></section>",
+    "<h3",
+    "  id=\"y\">改行した<br>タグ <code>c</code></h3>",
+    "<h4>  前後の空白  <b> </b></h4>",
+    "</body></html>",
+  ].join("\n");
+  const prepared = await prepareHtml(win, html, { root: "/r", path: "p.html", links: [] }, async () => "");
+  const viewH = renderHtml(prepared).res.headings;
+  const srcH = sourceHeadings(html, "html", win.document);
+  assert.deepEqual(strip(srcH), viewH, "html のページの目次が描画とずれる");
+  assert.deepEqual(srcH.map((h) => h.line), [2, 5, 5, 6, 8], "html の見出しの行");
+  assert.equal(srcH.at(-1).text, "前後の空白", "見出しの字の前後の空白を除かない（描画は trim する）");
+  tests++;
+}
+
+// ---- ⑫ ファイルの大きさの表示 = 木の箱と右ペインで同じ 1 つの関数（B / KB 小数 0 桁 / MB・GB 小数 1 桁） ----
+{
+  const K = 1024;
+  assert.deepEqual(
+    [0, 1023, K, 1536, 10 * K + 300, K * K - 1, K * K, 1.25 * K * K, K * K * K, 2.5 * K * K * K].map(fmtSize),
+    ["0 B", "1023 B", "1 KB", "2 KB", "10 KB", "1024 KB", "1.0 MB", "1.3 MB", "1.0 GB", "2.5 GB"]
+  );
+  for (const f of ["WikiSidebar.svelte", "WikiInfo.svelte"]) {
+    const src = readFileSync(new URL(f, import.meta.url), "utf8");
+    assert.ok(/import \{ fmtSize \} from "\.\/size"/.test(src), `${f} が size.ts の fmtSize を使わない`);
+    assert.ok(!/toFixed\(/.test(src), `${f} に大きさの表示の写しが残る`);
   }
   tests++;
 }

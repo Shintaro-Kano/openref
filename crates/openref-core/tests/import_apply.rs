@@ -1148,10 +1148,14 @@ fn fulltext_pending_agrees_across_execute_index_and_history_for_deleted_attachme
 #[test]
 #[ignore = "requires explicitly provided real Paperpile JSON/PDF sample; scratch DB only"]
 fn real_paperpile_copy_roundtrip_in_scratch_database() {
-    let json =
-        PathBuf::from(std::env::var_os("OPENREF_TEST_PAPERPILE_JSON").expect("set JSON path"));
-    let files =
-        PathBuf::from(std::env::var_os("OPENREF_TEST_PAPERPILE_FILES").expect("set files root"));
+    let (Some(json), Some(files)) = (
+        openref_core::env_os("TEST_PAPERPILE_JSON"),
+        openref_core::env_os("TEST_PAPERPILE_FILES"),
+    ) else {
+        eprintln!("OPENREF_TEST_PAPERPILE_JSON / OPENREF_TEST_PAPERPILE_FILES 未設定のためスキップ");
+        return;
+    };
+    let (json, files) = (PathBuf::from(json), PathBuf::from(files));
     let f = Fixture::new(json!([]));
     let input = import::paperpile::read_input(
         &json,

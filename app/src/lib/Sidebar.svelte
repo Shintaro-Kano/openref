@@ -9,16 +9,12 @@
     flatFolders,
     openFolderModal,
     openTab,
-    setFolderSort,
-    setTagSort,
     setView,
-    toggleFolderCollapsed,
     type View,
   } from "./state.svelte";
+  import { setFolderSort, setTagSort, toggleFolderCollapsed } from "./prefs.svelte";
   import { composing } from "./input";
-  import WikiSegment from "./wiki/WikiSegment.svelte";
-  import ShelfHead from "./shelf/ShelfHead.svelte";
-  import ShelfMenu from "./shelf/ShelfMenu.svelte";
+  import ModeSegment from "./ModeSegment.svelte";
 
   function isActive(kind: string, id?: number): boolean {
     const v = app.view as any;
@@ -40,19 +36,29 @@
     void openTab(v);
   }
 
-  // ---- MY LIBRARY のフォルダ（Paperpile: 折畳 chevron + 📁 + 名前 + 件数 + hover の「…」/ 右クリックでメニュー）。
-  // 行は <button> にしない（中に chevron と「…」のボタンを置くため。<button> の入れ子は Svelte 5 でコンパイルエラー）
+  // ---- LIBRARY のフォルダ（Paperpile: 折畳 chevron + 📁 + 名前 + 件数 + hover の「…」/ 右クリックでメニュー）。
+  // 行 = 枠の div（role なし・ドロップの data-drop・右クリック・中クリック・選ばれた / hover / 焦点の輪の見た目）+ 行全体を覆う
+  // 透明の <button>（名前 + 件数 = Enter / Space・クリック）+ 兄弟の <button>（chevron・「…」= 覆いの上に重ねる）。
+  // div role="button" の中にボタンを入れる作りは、ARIA の button が子を飾り扱いにする = 読み上げで中のボタンに届かない恐れがあった
   const folderRows = $derived(flatFolders({ respectCollapse: true }));
   const hasKids = $derived(new Set(app.collections.map((c) => c.parentId)));
 
   const folderView = (c: CollectionRow): View => ({ kind: "collection", id: c.id, name: c.name });
-  function onFolderKey(e: KeyboardEvent, c: CollectionRow) {
-    if (e.target !== e.currentTarget) return; // 中の chevron / 「…」での Enter はそのボタンが受ける
+  /** 行を覆うボタンの Enter / Space = 前面のタブのビュー / ⌘ つき = 新しいタブ。素のボタンの押下（Enter の keypress・Space の keyup の
+      click）は既定を止めて出さない（⌘ をそのまま渡す・二重に動かさない）。中の ＋ / … / chevron は兄弟 = この keydown は来ない */
+  function onRowKey(e: KeyboardEvent, v: View) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      go(e, folderView(c));
+      go(e, v);
     }
   }
+  /** フォルダの行の中クリック（新しいタブ）と右クリック（メニュー）。行の中の 3 つのボタン（覆い・chevron・「…」）に付ける =
+      行のどこで押しても効く（前の div role="button" の行と同じ。枠の div は全面を覆いと中のボタンが占める = 枠に付けると
+      role の無い要素に操作を付けることになる） */
+  const folderMouse = (c: CollectionRow) => ({
+    onauxclick: (e: MouseEvent) => goAux(e, folderView(c)),
+    oncontextmenu: (e: MouseEvent) => openFolderMenu(e, c.id),
+  });
   /** フォルダの「…」メニューの「新しいタブで開く」 */
   function openFolderInTab(id: number) {
     app.folderMenu = null;
@@ -99,7 +105,7 @@
     else labelQ = "";
   }
 
-  /** 見出しの「…」メニュー（MY LIBRARY / LABELS 共用）は fixed で「…」ボタンの直下に出す
+  /** 「…」メニュー（「すべて」の行の … = フォルダ / LABELS の見出しの … = ラベル の共用）は fixed で「…」ボタンの直下に出す
       （サイドバーは overflow 指定があり absolute だと切れる・ずれる） */
   let menuPos = $state({ top: 0, left: 0 });
   let subOpen = $state(false);
@@ -140,44 +146,52 @@
   }}
   oncontextmenu={() => (app.folderMenu = null)} />
 
-<nav class="sidebar">
-  <WikiSegment />
-  <div class="sep sec-head">
-    <ShelfHead />
-    <span class="head-actions">
-      <button title={t("新規フォルダ")} aria-label={t("新規フォルダ")} onclick={() => openFolderModal("newFolder")}>{t("＋")}</button>
-      <button title={t("フォルダメニュー")} aria-label={t("フォルダメニュー")} onclick={(e) => openMenu(e, "folders")}>…</button>
-    </span>
+<nav class="ls-nav sidepane">
+  <ModeSegment />
+  <!-- フォルダ節の見出しは置かない（最上段で LIBRARY が選ばれている直下に同じ字の見出しが並ぶ）。
+       その見出しにあった ＋（新規フォルダ）と …（フォルダメニュー = 並び順・フォルダを管理）は「すべて」の行の右（件数の左）に常に出す
+       （hover で出す形にしない = 隠れる操作を作らない）。行の作り = フォルダの行 fd-row と同じ（枠の div + 行を覆うボタン ls-all-hit +
+       兄弟の ＋ / …）。各行: クリック・Enter / Space = 前面のタブのビュー / ⌘クリック・中クリック = 新しいタブで開く。
+       覆いのボタンの名前 =「すべて 8」（見えている名前と件数は aria-hidden = 二重に読ませない）。覆いのボタン（ここ・フォルダの行の
+       .fd-hit）は tabindex="0" を明示する = macOS の WebKit（WKWebView）は「フルキーボードアクセス」が切（既定）だと素の <button> に
+       Tab が止まらず、押しても焦点を取らない（div tabindex="0" の行は届く）。Chrome の Tab の順は変わらない -->
+  <div class="ls-all" class:active={isActive("all")}>
+    <button
+      class="ls-all-hit"
+      tabindex="0"
+      aria-label="{t('すべて')} {app.counts.all}"
+      onclick={(e) => go(e, { kind: "all" })}
+      onauxclick={(e) => goAux(e, { kind: "all" })}
+      onkeydown={(e) => onRowKey(e, { kind: "all" })}></button>
+    <span class="name" aria-hidden="true">{t("すべて")}</span>
+    <button class="ls-all-act" title={t("新規フォルダ")} aria-label={t("新規フォルダ")} onclick={(e) => { e.stopPropagation(); openFolderModal("newFolder"); }}>{t("＋")}</button>
+    <button class="ls-all-act" class:on={app.labelMenu === "folders"} title={t("フォルダメニュー")} aria-label={t("フォルダメニュー")} onclick={(e) => openMenu(e, "folders")}>…</button>
+    <span class="n" aria-hidden="true">{app.counts.all}</span>
   </div>
-  <!-- 各行: クリック = 前面のタブのビュー / ⌘クリック・中クリック = 新しいタブで開く -->
-  <button
-    class:active={isActive("all")}
-    onclick={(e) => go(e, { kind: "all" })}
-    onauxclick={(e) => goAux(e, { kind: "all" })}>
-    <span>{t("すべて")}</span><span class="n">{app.counts.all}</span>
-  </button>
   <button
     class:active={isActive("starred")}
     onclick={(e) => go(e, { kind: "starred" })}
     onauxclick={(e) => goAux(e, { kind: "starred" })}>
-    <span>★ Starred</span><span class="n">{app.counts.starred}</span>
+    <span>{t("★ スター付き")}</span><span class="n">{app.counts.starred}</span>
   </button>
 
   {#each folderRows as { c, depth } (c.id)}
-    <!-- クリック = そのフォルダの一覧 / 行をここへドラッグ = 追加 / 「…」・右クリック = メニュー -->
+    <!-- クリック = そのフォルダの一覧 / 行をここへドラッグ = 追加 / 「…」・右クリック = メニュー。
+         中クリック・右クリックは行の中のボタンの全部が受ける（前と同じく chevron / 「…」の上でも効く）。覆いのボタンの名前 =「<フォルダ名> 2」 -->
     <div
       class="fd-row"
-      role="button"
-      tabindex="0"
       style="--depth:{depth}"
       data-drop="col:{c.id}"
       class:active={isActive("collection", c.id)}
       class:drophover={app.drag?.over === `col:${c.id}`}
-      class:menu-open={app.folderMenu?.id === c.id}
-      onclick={(e) => go(e, folderView(c))}
-      onauxclick={(e) => goAux(e, folderView(c))}
-      onkeydown={(e) => onFolderKey(e, c)}
-      oncontextmenu={(e) => openFolderMenu(e, c.id)}>
+      class:menu-open={app.folderMenu?.id === c.id}>
+      <button
+        class="fd-hit"
+        tabindex="0"
+        aria-label="{c.name} {c.nItems}"
+        {...folderMouse(c)}
+        onclick={(e) => go(e, folderView(c))}
+        onkeydown={(e) => onRowKey(e, folderView(c))}></button>
       {#if hasKids.has(c.id)}
         {@const open = !app.foldersCollapsed.has(c.key)}
         <button
@@ -186,6 +200,7 @@
           title={open ? t("折り畳む") : t("展開する")}
           aria-label={open ? t("折り畳む") : t("展開する")}
           aria-expanded={open}
+          {...folderMouse(c)}
           onclick={(e) => {
             e.stopPropagation();
             toggleFolderCollapsed(c.key);
@@ -203,9 +218,9 @@
           stroke="currentColor"
           stroke-width="1.3"
           stroke-linejoin="round" /></svg>
-      <span class="name">{c.name}</span>
-      <span class="n">{c.nItems}</span>
-      <button class="fd-more" title={t("フォルダメニュー")} aria-label={t("フォルダメニュー")} onclick={(e) => openFolderMenu(e, c.id)}>…</button>
+      <span class="name" aria-hidden="true">{c.name}</span>
+      <span class="n" aria-hidden="true">{c.nItems}</span>
+      <button class="fd-more" title={t("フォルダメニュー")} aria-label={t("フォルダメニュー")} {...folderMouse(c)} onclick={(e) => openFolderMenu(e, c.id)}>…</button>
     </div>
   {/each}
 
@@ -230,7 +245,7 @@
       <input
         bind:this={searchEl}
         bind:value={labelQ}
-        placeholder="Search labels"
+        placeholder={t("ラベルを検索")}
         onkeydown={(e) => {
           if (e.key === "Escape" && !composing(e)) {
             e.stopPropagation();
@@ -253,7 +268,7 @@
       data-drop="tag:{tag.id}"
       class:active={isActive("tag", tag.id)}
       class:drophover={app.drag?.kind === "rows" && app.drag?.over === `tag:${tag.id}`}
-      title={t("クリックで絞り込み・論文へドラッグで付与")}
+      title={t("クリックで絞り込み・文献へドラッグで付与")}
       onpointerdown={(e) => beginLabelDrag(e, tag.id, tag.name)}
       onclick={(e) => {
         if (consumeDragClick()) return;
@@ -273,7 +288,6 @@
     <span>{t("ゴミ箱")}</span><span class="n">{app.counts.trash}</span>
   </button>
 </nav>
-<ShelfMenu />
 
 {#if app.labelMenu}
   <div class="lmenu" style="top:{menuPos.top}px;left:{menuPos.left}px" role="menu" onclick={(e) => e.stopPropagation()}>
@@ -285,16 +299,16 @@
       onmouseenter={() => (subOpen = true)}
       onclick={() => (subOpen = !subOpen)}
       onkeydown={() => {}}>
-      <span><span class="lmenu-ico">⇅</span>{forFolders ? "Sort folders" : "Sort labels"}</span><span class="lmenu-caret">›</span>
+      <span><span class="lmenu-ico">⇅</span>{forFolders ? t("フォルダの並び") : t("ラベルの並び")}</span><span class="lmenu-caret">›</span>
       {#if subOpen}
         <div class="lmenu-sub" role="menu">
-          <button onclick={() => sortBy("alpha")}><span class="lmenu-check">{curSort === "alpha" ? "✓" : ""}</span>Alphabetically</button>
-          <button onclick={() => sortBy("count")}><span class="lmenu-check">{curSort === "count" ? "✓" : ""}</span>Number of references</button>
+          <button onclick={() => sortBy("alpha")}><span class="lmenu-check">{curSort === "alpha" ? "✓" : ""}</span>{t("名前順")}</button>
+          <button onclick={() => sortBy("count")}><span class="lmenu-check">{curSort === "count" ? "✓" : ""}</span>{t("件数順")}</button>
         </div>
       {/if}
     </div>
     <button class="lmenu-item" onmouseenter={() => (subOpen = false)} onclick={manage}>
-      <span><span class="lmenu-ico">⚙</span>{forFolders ? "Manage folders…" : "Manage labels…"}</span>
+      <span><span class="lmenu-ico">⚙</span>{forFolders ? t("フォルダを管理…") : t("ラベルを管理…")}</span>
     </button>
   </div>
 {/if}
@@ -307,14 +321,14 @@
       <span><span class="lmenu-ico">⧉</span>{t("新しいタブで開く")}</span>
     </button>
     <button class="lmenu-item" onclick={() => openFolderModal("renameFolder", { id: fm.id })}>
-      <span><span class="lmenu-ico">✎</span>Rename…</span>
+      <span><span class="lmenu-ico">✎</span>{t("名前を変更…")}</span>
     </button>
     <button class="lmenu-item" onclick={() => openFolderModal("newFolder", { parentId: fm.id })}>
-      <span><span class="lmenu-ico">{t("＋")}</span>Create subfolder…</span>
+      <span><span class="lmenu-ico">{t("＋")}</span>{t("サブフォルダを作成…")}</span>
     </button>
     <div class="lmenu-sep"></div>
     <button class="lmenu-item lmenu-danger" onclick={() => openFolderModal("deleteFolder", { id: fm.id })}>
-      <span><span class="lmenu-ico">🗑</span>Delete…</span>
+      <span><span class="lmenu-ico">🗑</span>{t("削除…")}</span>
     </button>
   </div>
 {/if}

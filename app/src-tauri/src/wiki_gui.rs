@@ -4,7 +4,8 @@
 //! Tauri command の包みと generate_handler!・setup は main.rs（parity test が main.rs だけを走査する）。ここは包みが呼ぶ本体
 
 use crate::wiki_asset::{wiki_has_dot_segment, wiki_not_regular_file};
-use crate::{blocking, err, lock, save_setting, wiki_chat, AppState, SettingsItems};
+use crate::wiki_chat_gui::*;
+use crate::{blocking, err, hide_paths, lock, save_setting, wiki_chat, AppState, SettingsItems};
 use openref_core::wiki::workspaces;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -34,13 +35,67 @@ pub(crate) async fn wiki_call(
 /// wiki_run の Err: `CoreError::Wiki` は `{"code", "message"}` の JSON 文字列（画面は code で分岐し文言を照合しない =
 /// app/src/lib/wiki/ipc.ts が解く）。他は err と同じ素の文。root を受ける GUI 専用の command（参照フォルダ・外部で開く等）の
 /// pin の失敗（unknown_root）もこれで返す
+/// エージェント向けの手がかり（「root には wiki_status の workspaces の root をそのまま渡す」等）は外す（CoreError::without_hint）
 pub(crate) fn wiki_err(e: openref_core::CoreError) -> String {
-    match &e {
+    wiki_err_in(e, &[])
+}
+
+/// wiki_err + 文に出るパス（それぞれの綴りと canonical）をフォルダ名に畳む（crate::hide_paths）。JSON にする前に畳む
+/// （JSON の中ではパスの字がエスケープで変わりうる）
+pub(crate) fn wiki_err_in(e: openref_core::CoreError, paths: &[&Path]) -> String {
+    match e.without_hint() {
         openref_core::CoreError::Wiki { code, msg } => {
-            serde_json::json!({"code": code, "message": msg}).to_string()
+            serde_json::json!({"code": code, "message": hide_paths(msg, paths)}).to_string()
         }
-        _ => err(e),
+        e => hide_paths(err(e), paths),
     }
+}
+
+/// wiki_run の失敗の文で畳むパス: その呼び出しの root（固定した物か設定の物）・引数の root・引数の abs（ワークスペースの外から取り込む
+/// ファイル = wiki_import_file）・アプリの置き場 app_dir（索引 wiki-index・退避 wiki-history = 開けない索引の文に出る = 利用者名を含む）
+pub(crate) fn wiki_run_paths(root: Option<&str>, app_dir: Option<&Path>, args: &serde_json::Value) -> Vec<PathBuf> {
+    let arg = |k: &str| args.get(k).and_then(|v| v.as_str()).filter(|s| s.starts_with('/'));
+    let mut v: Vec<PathBuf> = [root, arg("root"), arg("abs")].into_iter().flatten().map(PathBuf::from).collect();
+    v.extend(app_dir.map(Path::to_path_buf));
+    v
+}
+
+/// Ok の応答の中で失敗の文を入れる欄（core の wiki_* の契約 = MCP / CLI はフルパスのまま）。位置を名指す = 最上位の error
+/// （wiki_status）・index_error（書いた後に索引へ取り込めなかった = with_index_error）と、改名の skipped[] の各要素の reason だけ
+/// （利用者のデータ = frontmatter・本文・検索の抜粋・題の木には降りない = 同じ名前の鍵が frontmatter にあっても書き換えて見せない）
+const WIKI_FAIL_TOP: [&str; 2] = ["error", "index_error"];
+
+/// Ok の応答の中の失敗の文の欄（WIKI_FAIL_TOP と skipped[].reason）のパスを名前に畳む（wiki_status の error はサイドバーに
+/// ずっと出る）。データの欄（root・path・abs_path 等 = 画面が照合に使う）には触らない
+pub(crate) fn wiki_hide_fields(mut v: serde_json::Value, paths: &[&Path]) -> serde_json::Value {
+    let fold = |x: Option<&mut serde_json::Value>| {
+        if let Some(serde_json::Value::String(s)) = x {
+            *s = hide_paths(std::mem::take(s), paths);
+        }
+    };
+    if paths.is_empty() {
+        return v;
+    }
+    if let Some(m) = v.as_object_mut() {
+        for k in WIKI_FAIL_TOP {
+            fold(m.get_mut(k));
+        }
+        if let Some(serde_json::Value::Array(a)) = m.get_mut("skipped") {
+            a.iter_mut().for_each(|x| fold(x.get_mut("reason")));
+        }
+    }
+    v
+}
+
+/// Ctx::ready の失敗 → 画面の文（root はフォルダ名まで・手がかりは外す）
+pub(crate) fn wiki_ready_err(ctx: &openref_core::wiki::Ctx, e: openref_core::CoreError) -> String {
+    let roots: Vec<&Path> = ctx.root.iter().map(Path::new).chain(ctx.app_dir.as_deref()).collect();
+    hide_paths(err(e.without_hint()), &roots)
+}
+
+/// Ctx::ready（失敗の文は wiki_ready_err）
+pub(crate) fn wiki_ready(ctx: &openref_core::wiki::Ctx) -> Result<openref_core::wiki::index::Ready, String> {
+    ctx.ready().map_err(|e| wiki_ready_err(ctx, e))
 }
 
 /// validate = 登録表の名前（引数をその schema で検査する）。GUI 専用（登録表に無い）は None = 引数の検査は core の関数が行う。
@@ -53,22 +108,34 @@ pub(crate) async fn wiki_run(
 ) -> Result<serde_json::Value, String> {
     let db = state.db.clone();
     let live = state.wiki_live.clone();
-    blocking(move || {
-        let args = args
-            .filter(|a| !a.is_null())
-            .unwrap_or_else(|| serde_json::json!({}));
-        if let Some(name) = validate {
-            openref_core::commands::validate(name, &args).map_err(err)?;
-        }
-        let mut ctx = {
-            let db = lock(&db)?;
-            openref_core::wiki::Ctx::from_db_pinned(&db, &args).map_err(wiki_err)?
-        }; // ここでロックを外す
-        // 固定した root が監視中の root と違えば省かない（WikiLive::plan が root を比べる）
-        ctx.watched = wiki_watched(&live, &ctx);
-        f(&ctx, &args).map_err(wiki_err)
-    })
-    .await
+    blocking(move || wiki_run_now(&db, &live, validate, args, f)).await
+}
+
+/// wiki_run の本体（AppHandle 無し = 試験はこれで通す）。失敗の文と Ok の応答の失敗の欄はパスを名前まで・手がかりは外す
+pub(crate) fn wiki_run_now(
+    db: &Mutex<openref_core::Db>,
+    live: &WikiLive,
+    validate: Option<&'static str>,
+    args: Option<serde_json::Value>,
+    f: WikiFn,
+) -> Result<serde_json::Value, String> {
+    let args = args
+        .filter(|a| !a.is_null())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(name) = validate {
+        openref_core::commands::validate(name, &args).map_err(err)?;
+    }
+    let mut ctx = {
+        let db = lock(db)?;
+        openref_core::wiki::Ctx::from_db_pinned(&db, &args)
+            .map_err(|e| wiki_err_in(e, &wiki_run_paths(None, db.app_dir().as_deref(), &args).iter().map(PathBuf::as_path).collect::<Vec<_>>()))?
+    }; // ここでロックを外す
+    // 固定した root が監視中の root と違えば省かない（WikiLive::plan が root を比べる）
+    ctx.watched = wiki_watched(live, &ctx);
+    let paths = wiki_run_paths(ctx.root.as_deref(), ctx.app_dir.as_deref(), &args);
+    let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    // Ok の応答の中の失敗の文（wiki_status の error・書いた後の index_error・改名の skipped[].reason）も畳む
+    f(&ctx, &args).map(|v| wiki_hide_fields(v, &paths)).map_err(|e| wiki_err_in(e, &paths))
 }
 
 /// 監視が生きていれば鮮度規則の stat 走査を省く（Ctx::watched）。監視を張った後の最初の 1 回は stat 走査をしてから（wiki_prime）。
@@ -87,10 +154,10 @@ fn wiki_watched(live: &WikiLive, ctx: &openref_core::wiki::Ctx) -> bool {
 /// 監視を張った後の最初の stat 走査（今すぐ・5 秒の鮮度規則に依らない = 張る前の変更を取り込む）。true = 済んだ（以後は監視に任せてよい）。
 /// 索引に作り直しの旗があれば走査しない（false = 今どおり鮮度規則が旗を判定する）。失敗も false（呼び手の鮮度規則が同じエラーを出す）
 fn wiki_prime(ctx: &openref_core::wiki::Ctx) -> bool {
-    let Ok((ip, root)) = ctx.ready() else {
+    let Ok(at) = ctx.ready() else {
         return false;
     };
-    openref_core::wiki::with_index(&ip, &root, |ix| {
+    openref_core::wiki::with_index(&at, |ix| {
         if ix.meta("rebuilding")?.is_some() {
             return Ok(false);
         }
@@ -272,32 +339,6 @@ pub(crate) fn wiki_exit_finish(app: &tauri::AppHandle, seq: Option<u64>, proceed
 
 /// Settings › OpenNote の項目 id
 pub(crate) const WIKI_ENABLED_ID: &str = "wiki_enabled";
-pub(crate) const WIKI_REINDEX_ID: &str = "wiki_reindex";
-pub(crate) const WIKI_DROP_INDEX_ID: &str = "wiki_drop_index";
-
-pub(crate) fn wiki_enabled_text(en: bool) -> &'static str {
-    if en {
-        "Enabled"
-    } else {
-        "有効"
-    }
-}
-
-pub(crate) fn wiki_reindex_text(en: bool) -> &'static str {
-    if en {
-        "Rebuild index"
-    } else {
-        "索引を作り直す"
-    }
-}
-
-pub(crate) fn wiki_drop_index_text(en: bool) -> &'static str {
-    if en {
-        "Delete index"
-    } else {
-        "索引を削除"
-    }
-}
 
 /// 今の表示言語（Settings › Language のチェック = DB の ui_lang と同じ。メニューが無ければ日本語）
 pub(crate) fn ui_en(app: &tauri::AppHandle) -> bool {
@@ -333,12 +374,12 @@ impl WikiRuntime {
 }
 
 /// root を変える段の鍵（WikiRuntime::lock_roots）を握る。握る所 = wiki_startup・wiki_enable_with・wiki_choose_root・wiki_front_workspace・
-/// wiki_reindex_now・Settings › 索引を削除（どれも main thread の外）。握ったまま他の握る所を呼ばない（std の Mutex = 入れ子で止まる）
+/// wiki_reindex_now（どれも main thread の外）。握ったまま他の握る所を呼ばない（std の Mutex = 入れ子で止まる）
 fn wiki_root_lock(app: &tauri::AppHandle) -> std::sync::MutexGuard<'_, ()> {
     app.state::<WikiRuntime>().inner().lock_roots()
 }
 
-/// 監視が生きているかの印（A-16）。生きていて、張った後の stat 走査も済んでいる（primed）間は wiki_* の入口の鮮度規則
+/// 監視が生きているかの印。生きていて、張った後の stat 走査も済んでいる（primed）間は wiki_* の入口の鮮度規則
 /// （5 秒ごとの stat 走査）を省く（Ctx::watched）。張り直し・止めた・監視の失敗・取り込みの失敗で外れ、外れている間は今どおり
 #[derive(Default)]
 pub(crate) struct WikiLive(Mutex<WikiLiveState>);
@@ -490,7 +531,7 @@ pub(crate) fn wiki_pin(
     root: Option<&str>,
 ) -> Result<openref_core::wiki::Ctx, String> {
     if let Some(r) = root {
-        ctx.pin(r).map_err(wiki_err)?;
+        ctx.pin(r).map_err(|e| wiki_err_in(e, &[Path::new(r)]))?;
     }
     Ok(ctx)
 }
@@ -506,9 +547,11 @@ pub(crate) fn wiki_emit<S: serde::Serialize + Clone>(app: &tauri::AppHandle, ev:
     }
 }
 
-fn wiki_error(app: &tauri::AppHandle, msg: String) {
+/// 失敗を画面へ（"wiki-error"）。stderr はフルパスのまま・画面の文のワークスペースの root（綴りと canonical）はフォルダ名まで・
+/// 索引のファイル（<app_dir>/wiki-index/…sqlite = 利用者名を含む）はファイル名まで（監視（notify）・索引の失敗の文はパスを含みうる）
+fn wiki_error(app: &tauri::AppHandle, msg: String, root: &Path, index: &Path) {
     eprintln!("openref-app: OpenNote: {msg}");
-    wiki_emit(app, "wiki-error", msg);
+    wiki_emit(app, "wiki-error", hide_paths(msg, &[root, index]));
 }
 
 /// "wiki-changed" の payload の変わったパス（画面の types.ts の WikiChanged の鍵。root は WikiChangedEvent が足す）。パスは vault 相対・
@@ -608,9 +651,17 @@ fn wiki_apply_refs(
 /// 無効なら監視を止める。有効で root が検査を通れば scope に足して監視を（張り直し）、scan に応じて背景で走査する。
 /// 走査の前後に "wiki-state" / "wiki-changed" を出す
 pub(crate) fn wiki_apply(app: &tauri::AppHandle, scan: WikiScan) -> Result<(), String> {
+    wiki_apply_with(app, scan, false)
+}
+
+/// wiki_apply の本体。recover = 利用者が押した「索引を作り直す」（wiki_reindex_now だけ）= 作り直しが失敗したら索引のファイルを消して
+/// 1 回だけやり直す（wiki_rebuild_steps）。起動・切替・有効化・監視の走査は false（自動では索引を消さない）
+fn wiki_apply_with(app: &tauri::AppHandle, scan: WikiScan, recover: bool) -> Result<(), String> {
     let ctx = wiki_ctx(app)?;
     let rt = app.state::<WikiRuntime>();
-    let plan = wiki_apply_plan(ctx.enabled, ctx.ready().map_err(|e| e.to_string()));
+    let ready = wiki_ready(&ctx);
+    let rules = ready.as_ref().map(|r| r.rules.clone()).unwrap_or_default();
+    let plan = wiki_apply_plan(ctx.enabled, ready.map(|r| (r.index, r.root)));
     let (ip, root) = match plan {
         WikiApplyPlan::Off => {
             wiki_watch_stop(&rt);
@@ -640,7 +691,7 @@ pub(crate) fn wiki_apply(app: &tauri::AppHandle, scan: WikiScan) -> Result<(), S
         }
     }
     let en = ui_en(app);
-    // 監視の失敗は知らせるが、有効化そのものは止めない（[再索引] で張り直せる）
+    // 監視の失敗は知らせるが、有効化そのものは止めない（ワークスペース名のメニューの「索引を作り直す」で張り直せる）
     let gen = wiki_watch_start(app, &rt, ip.clone(), root.clone(), ctx.root.clone());
     if let Err(e) = &gen {
         wiki_error(
@@ -649,54 +700,181 @@ pub(crate) fn wiki_apply(app: &tauri::AppHandle, scan: WikiScan) -> Result<(), S
                 "{}: {e}",
                 tr(
                     en,
-                    "ファイルの監視を始められません（変更はヘッダーの [再索引] で取り込めます）",
-                    "Could not start watching files (use Reindex in the header to pick up changes)"
+                    "ファイルの監視を始められません（変更はワークスペース名のメニューの「索引を作り直す」で取り込めます）",
+                    "Could not start watching files (use \"Rebuild index\" in the workspace name menu to pick up changes)"
                 )
             ),
+            &root,
+            &ip,
         );
     }
     wiki_emit(app, "wiki-state", ());
     if scan != WikiScan::None {
-        let app = app.clone();
         let live = rt.live.clone();
-        std::thread::spawn(move || {
-            let res = openref_core::wiki::with_index(&ip, &root, |ix| {
-                // 索引を握ってから知らせる = この間の wiki_status は待たずに進捗を返す（index::busy）
-                wiki_emit(&app, "wiki-state", ());
-                if scan == WikiScan::Rebuild {
-                    ix.rebuild()
-                } else {
-                    ix.refresh()
-                }
-            });
-            match res {
-                // 監視を張った後の走査が済んだ = 入口の stat 走査を省いてよい
-                Ok(openref_core::wiki::Fresh::Ok) => {
-                    if let Ok(g) = gen {
-                        live.prime(g);
-                    }
-                }
-                Ok(openref_core::wiki::Fresh::Rebuilding(p)) => wiki_error(
-                    &app,
-                    if en {
-                        format!("Another process is rebuilding the index ({p}%). It will be readable when done")
-                    } else {
-                        format!("他のプロセスが索引を作り直し中です（{p}%）。終わると読めます")
-                    },
-                ),
-                Err(e) => wiki_error(
-                    &app,
-                    format!(
-                        "{}: {e}",
-                        tr(en, "索引を作れません", "Could not build the index")
-                    ),
-                ),
+        let at = openref_core::wiki::index::Ready::new(ip, root, rules);
+        // 監視を張った後の走査が済んだ = 入口の stat 走査を省いてよい
+        let on_ok = move || {
+            if let Ok(g) = gen {
+                live.prime(g);
             }
-            wiki_emit(&app, "wiki-changed", WikiChangedEvent::new(&root, WikiChanged::everything()));
-            wiki_emit(&app, "wiki-state", ());
-        });
+        };
+        wiki_scan_bg(app.clone(), at, scan, Some(en), WIKI_SCAN_FAIL_BUILD, on_ok, recover && scan == WikiScan::Rebuild);
     }
     Ok(())
+}
+
+/// 走査の失敗の文の前置き（ja, en）: 有効化・切替の走査（wiki_apply）/ 除外を変えた後の走査（wiki_exclude_set）
+const WIKI_SCAN_FAIL_BUILD: (&str, &str) = ("索引を作れません", "Could not build the index");
+const WIKI_SCAN_FAIL_UPDATE: (&str, &str) = ("索引を更新できません", "Could not update the index");
+
+/// 索引を握って走査する（Rebuild = 中身を捨てて全走査・それ以外 = stat 走査）。on_hold = 索引を握った直後（"wiki-state" を出す =
+/// この間の wiki_status は待たずに進捗を返す = index::busy）
+pub(crate) fn wiki_scan(
+    at: &openref_core::wiki::index::Ready,
+    scan: WikiScan,
+    on_hold: impl Fn(),
+) -> openref_core::Result<openref_core::wiki::Fresh> {
+    openref_core::wiki::with_index(at, |ix| {
+        on_hold();
+        if scan == WikiScan::Rebuild {
+            ix.rebuild()
+        } else {
+            ix.refresh()
+        }
+    })
+}
+
+/// 走査の結果の知らせ（純関数）: Ok = 無し・他のプロセスが作り直し中 = その文（進み具合つき）・Err = fail の前置き + 理由
+pub(crate) fn wiki_scan_message(
+    en: bool,
+    res: &openref_core::Result<openref_core::wiki::Fresh>,
+    fail: (&str, &str),
+) -> Option<String> {
+    match res {
+        Ok(openref_core::wiki::Fresh::Ok) => None,
+        Ok(openref_core::wiki::Fresh::Rebuilding(p)) => Some(if en {
+            format!("Another process is rebuilding the index ({p}%). It will be readable when done")
+        } else {
+            format!("他のプロセスが索引を作り直し中です（{p}%）。終わると読めます")
+        }),
+        Err(e) => Some(format!("{}: {e}", tr(en, fail.0, fail.1))),
+    }
+}
+
+/// 背景の走査（GUI の 2 か所 = 有効化・切替の wiki_apply と、除外を変えた後の wiki_exclude_set）: 索引を握ったら "wiki-state" →
+/// 走査（wiki_scan）→ Ok なら on_ok → 知らせ（wiki_scan_message → "wiki-error"）→ "wiki-changed"（全部）→ "wiki-state"。
+/// en = 知らせる言語（None = 走査の後に読む）
+fn wiki_scan_bg(
+    app: tauri::AppHandle,
+    at: openref_core::wiki::index::Ready,
+    scan: WikiScan,
+    en: Option<bool>,
+    fail: (&'static str, &'static str),
+    on_ok: impl FnOnce() + Send + 'static,
+    recover: bool,
+) {
+    std::thread::spawn(move || {
+        let (res, retried) = if recover {
+            let rebuild = || wiki_scan(&at, WikiScan::Rebuild, || wiki_emit(&app, "wiki-state", ()));
+            wiki_rebuild_steps(&at.index, rebuild, openref_core::wiki::index::remove_index)
+        } else {
+            (wiki_scan(&at, scan, || wiki_emit(&app, "wiki-state", ())), None)
+        };
+        let en = en.unwrap_or_else(|| ui_en(&app));
+        if matches!(res, Ok(openref_core::wiki::Fresh::Ok)) {
+            on_ok();
+        }
+        if let Some(why) = &retried {
+            eprintln!("openref-app: wiki: 索引を作り直せなかったので索引のファイルを消してやり直しました（最初の失敗: {why}）");
+        }
+        // 消してやり直して直った = 画面にも知らせる（普通の成功は何も出さない）
+        if wiki_rebuild_recovered(&res, retried.as_deref()) {
+            wiki_toast(&app, en, true, WIKI_REBUILT_FRESH.0, WIKI_REBUILT_FRESH.1, None);
+        }
+        if let Some(m) = wiki_rebuild_message(en, &res, retried.as_deref(), fail) {
+            wiki_error(&app, m, &at.root, &at.index);
+        }
+        wiki_emit(&app, "wiki-changed", WikiChangedEvent::new(&at.root, WikiChanged::everything()));
+        wiki_emit(&app, "wiki-state", ());
+    });
+}
+
+/// SQLite の主な結果コード（extended_code & 0xff = SQLite の公開の定数・版で変わらない）のうち、索引のファイルそのものの所為の物（純関数）:
+/// READONLY 8・IOERR 10・CORRUPT 11・FULL 13・CANTOPEN 14・NOTADB 26。BUSY 5 / LOCKED 6（別のプロセスが書いている最中）とそのほかは false
+pub(crate) fn wiki_index_fault_code(primary: i32) -> bool {
+    const READONLY: i32 = 8;
+    const IOERR: i32 = 10;
+    const CORRUPT: i32 = 11;
+    const FULL: i32 = 13;
+    const CANTOPEN: i32 = 14;
+    const NOTADB: i32 = 26;
+    matches!(primary, READONLY | IOERR | CORRUPT | FULL | CANTOPEN | NOTADB)
+}
+
+/// 作り直しの失敗が索引のファイルそのものの所為か（純関数 = エラーの種類で判定・文の字面で見ない・core の is_corrupt と同じ型）。
+/// SQLite の失敗（CoreError::Sqlite の SqliteFailure）の結果コードだけを見る = vault の読み（CoreError::Io = scan::walk・Drive のオフライン・
+/// TCC）・入力・そのほかの失敗は false（索引を消しても直らない = 消さない）
+pub(crate) fn wiki_index_file_fault(e: &openref_core::CoreError) -> bool {
+    match e {
+        openref_core::CoreError::Sqlite(s) => s.sqlite_error().is_some_and(|f| wiki_index_fault_code(f.extended_code & 0xff)),
+        _ => false,
+    }
+}
+
+/// 「索引を作り直す」（利用者が押した = command wiki_reindex の道だけ）の走査の段（AppHandle 無し）: 作り直す → 索引のファイルそのものの所為の
+/// 失敗（wiki_index_file_fault）なら索引のファイルを消して（remove = core の remove_index = 索引のロックを握って、このプロセスの接続を閉じてから
+/// -wal / -shm ごと消す）1 回だけやり直す（Settings › 索引を削除 の手もここに含む。退避（is_corrupt = CORRUPT / NOTADB）の外の
+/// 失敗 = READONLY・FULL・CANTOPEN（別のユーザー / sudo で作られた索引・権限の違う復元）は core が退避もやり直しもしない = 消さないと画面から戻れない）。
+/// 索引の所為でない失敗（BUSY / LOCKED = 別のプロセスが書いている最中・vault の読み・そのほか）は消さず、その失敗をそのまま返す。
+/// 別のプロセスが作り直し中（Ok(Rebuilding)）は失敗でない = 消さない（その作り直しを壊さない）・正常（Ok）も消さない。
+/// 消せない・やり直しても失敗 = Err（2 回目は無い）。消すのは索引のファイルだけ（設定・履歴・vault には触れない・.corrupt-* の退避は core のまま）。
+/// 監視は止めない（消す間は索引のロックで監視の取り込みが待つ・後の取り込みは新しいファイルへ = 続く作り直しが全部入れ直す）。
+/// rebuild = 作り直しの走査（本物は wiki_scan(Rebuild)）・remove = 索引のファイルを消す（本物は core の remove_index）= 試験が差し替える口。
+/// 戻り値 = (最後の結果, やり直したなら最初の失敗の文)
+pub(crate) fn wiki_rebuild_steps(
+    index: &Path,
+    rebuild: impl Fn() -> openref_core::Result<openref_core::wiki::Fresh>,
+    remove: impl Fn(&Path) -> openref_core::Result<()>,
+) -> (openref_core::Result<openref_core::wiki::Fresh>, Option<String>) {
+    let why = match rebuild() {
+        Err(e) if wiki_index_file_fault(&e) => e.to_string(),
+        r => return (r, None),
+    };
+    if let Err(e) = remove(index) {
+        return (Err(e), Some(why));
+    }
+    (rebuild(), Some(why))
+}
+
+/// 索引のファイルを消してやり直して直った（純関数）= そのときだけ成功の toast（WIKI_REBUILT_FRESH）を出す
+pub(crate) fn wiki_rebuild_recovered(res: &openref_core::Result<openref_core::wiki::Fresh>, retried: Option<&str>) -> bool {
+    retried.is_some() && matches!(res, Ok(openref_core::wiki::Fresh::Ok))
+}
+/// 消してやり直して直ったときの toast（ja, en）。wiki_toast が頭に ✓ を付ける
+pub(crate) const WIKI_REBUILT_FRESH: (&str, &str) = (
+    "OpenNote の索引を作り直しました（索引のファイルを消して作り直しました）",
+    "Rebuilt the OpenNote index (the index file was deleted and rebuilt)",
+);
+
+/// 作り直しの結果の知らせ（純関数）= wiki_scan_message に、やり直したことと最初の失敗を添える（握りつぶさない）
+pub(crate) fn wiki_rebuild_message(
+    en: bool,
+    res: &openref_core::Result<openref_core::wiki::Fresh>,
+    retried: Option<&str>,
+    fail: (&str, &str),
+) -> Option<String> {
+    let m = wiki_scan_message(en, res, fail)?;
+    Some(match (retried, res) {
+        (Some(why), Err(_)) => format!(
+            "{m}{}",
+            if en {
+                format!(" (also failed after deleting the index file and retrying; first error: {why})")
+            } else {
+                format!("（索引のファイルを消してやり直しても作れませんでした。最初の失敗: {why}）")
+            }
+        ),
+        _ => m,
+    })
 }
 
 fn wiki_watch_stop(rt: &WikiRuntime) {
@@ -735,10 +913,12 @@ fn wiki_watch_start(
                         "{}: {e}",
                         tr(
                             ui_en(&app),
-                            "ファイルの監視が失敗しました（変更はヘッダーの [再索引] で取り込めます）",
-                            "File watching failed (use Reindex in the header to pick up changes)"
+                            "ファイルの監視が失敗しました（変更はワークスペース名のメニューの「索引を作り直す」で取り込めます）",
+                            "File watching failed (use \"Rebuild index\" in the workspace name menu to pick up changes)"
                         )
                     ),
+                    &root,
+                    &ip,
                 )
             }
         }
@@ -774,6 +954,12 @@ struct FsPlan {
 }
 
 /// 監視のバッチの判定（純関数）: vault の外・`.` 始まりの区画（.obsidian・.git）は除く。
+/// 除外フォルダの配下のイベントは全走査の判定の**前に**捨てる（`cargo build` のたびに
+/// 全走査しない）。除外フォルダそのもののイベントは、前の走査が記録した除外フォルダ（known = meta `excluded`）なら捨て、
+/// 記録に無い（新しくできた・規則が変わった）ならフォルダのイベントとして残す = 全走査（約 1 秒）で記録に載る。除外の配下でも索引にある
+/// ページのイベント・親の除外の状態を記録と食い違わせる CACHEDIR.TAG の作成 / 削除は、規則と索引のずれ = 全走査。消えた除外フォルダは
+/// 祖先だけを見るので残る（索引に無いパスが消えた = 全走査）。excluded_at(rel, self_is_dir) = 上から辿って最初に除かれるフォルダ
+/// （`scan::Judge::excluded_at`・呼び手が 1 バッチの中だけ覚える）。
 /// フォルダ、または消えていて索引にも無いパス（消えたフォルダ）が混じれば全走査。root そのもののパスも全走査（フォルダの丸ごとの
 /// 差し替え・FSEvents の MustScanSubDirs = イベントが落ちた知らせは root のパス 1 件で届く = 中のファイルが個別に来ない）
 fn wiki_fs_plan(
@@ -782,6 +968,8 @@ fn wiki_fs_plan(
     paths: Vec<PathBuf>,
     kind: impl Fn(&Path) -> FsKind,
     indexed: impl Fn(&str) -> bool,
+    mut excluded_at: impl FnMut(&str, bool) -> Option<String>,
+    known: &[String],
 ) -> FsPlan {
     use openref_core::wiki::{paths::rel_inside, strip_root};
     let mut seen = std::collections::HashSet::new();
@@ -804,14 +992,47 @@ fn wiki_fs_plan(
             root_gone: true,
         };
     }
+    let mut kept: Vec<(String, PathBuf, FsKind)> = Vec::new();
+    // 規則と索引・記録がずれている印（除外の配下なのに索引にあるページ・CACHEDIR.TAG の増減で親の除外の状態が記録と違う）= 全走査で揃える
+    let mut drift = false;
+    for (rel, abs) in picked {
+        let k = kind(&abs);
+        let drop = match k {
+            FsKind::Dir => match excluded_at(&rel, true) {
+                Some(d) if d != rel => true,
+                Some(_) => known.contains(&rel),
+                None => false,
+            },
+            FsKind::File | FsKind::Missing => {
+                let at = excluded_at(&rel, false);
+                // CACHEDIR.TAG の作成・削除: 親フォルダが今除かれるか（祖先ではなく親そのもの）と、前の走査の記録が違えば全走査
+                if let Some((parent, "CACHEDIR.TAG")) = rel.rsplit_once('/') {
+                    drift |= (at.as_deref() == Some(parent)) != known.iter().any(|d| d == parent);
+                }
+                match at {
+                    // 除外の配下でも索引にあるページ = 規則が後から変わった（refresh_paths は除外の配下を無視する = 全走査でしか外れない）
+                    Some(_) if indexed(&rel) => {
+                        drift = true;
+                        true
+                    }
+                    Some(_) => true,
+                    None => false,
+                }
+            }
+        };
+        if !drop {
+            kept.push((rel, abs, k));
+        }
+    }
     let full = root_hit
-        || picked.iter().any(|(rel, abs)| match kind(abs) {
+        || drift
+        || kept.iter().any(|(rel, _, k)| match k {
             FsKind::Dir => true,
             FsKind::Missing => !indexed(rel),
             FsKind::File => false,
         });
     FsPlan {
-        picked,
+        picked: kept.into_iter().map(|(rel, abs, _)| (rel, abs)).collect(),
         full,
         root_gone: false,
     }
@@ -845,9 +1066,19 @@ fn wiki_fs_ingest(
     paths: Vec<PathBuf>,
     kind: impl Fn(&Path) -> FsKind,
 ) -> Result<FsOutcome, openref_core::CoreError> {
-    let plan = wiki_fs_plan(root, root.is_dir(), paths, kind, |rel| {
-        ix.page(rel).ok().flatten().is_some()
-    });
+    let known = ix.excluded()?;
+    let rules = ix.rules().clone();
+    // 判定は 1 バッチの中でだけ覚える（バッチをまたいで覚えない = 規則の変更がすぐ効く）
+    let mut judge = openref_core::wiki::scan::Judge::new(root, &rules);
+    let plan = wiki_fs_plan(
+        root,
+        root.is_dir(),
+        paths,
+        kind,
+        |rel| ix.page(rel).ok().flatten().is_some(),
+        |rel, self_is_dir| judge.excluded_at(rel, self_is_dir),
+        &known,
+    );
     if plan.root_gone {
         return Ok(FsOutcome::RootGone);
     }
@@ -868,13 +1099,122 @@ fn wiki_fs_ingest(
     })
 }
 
+/// wiki_exclude_set の dir の検査（root は canonical）: vault 相対（前後の `/` は落とす・NFC）・root でない・`.` 始まり / `..` の区画を
+/// 含まない・実在するフォルダ・途中にも symlink が無い（canonicalize が同じ vault 相対に戻る）。戻り値 = (vault 相対, 絶対パス)
+pub(crate) fn wiki_exclude_dir_check(root: &Path, dir: &str, en: bool) -> Result<(String, PathBuf), String> {
+    use openref_core::wiki::paths::{exclude_dir, ExcludeReject as R};
+    exclude_dir(root, dir).map_err(|r| {
+        let (ja, en_s) = match r {
+            R::Root => ("ワークスペースの root は索引から除けません", "The workspace root cannot be excluded from the index"),
+            R::BadSegment => ("`.` 始まりの区画・`..` を含むフォルダは指定できません", "Folders with `.`-prefixed or `..` segments cannot be used"),
+            R::NotDir => ("フォルダではありません（シンボリックリンクは除けません）", "Not a folder (symlinks cannot be excluded)"),
+            R::NotFound => ("フォルダが見つかりません", "Folder not found"),
+            R::ViaSymlink => ("途中にシンボリックリンクがあるフォルダは指定できません", "Folders reached through a symlink cannot be used"),
+        };
+        format!("{}: {dir}", tr(en, ja, en_s))
+    })
+}
+
+/// `wiki_exclude_set {dir, excluded, root?}`（GUI 専用・木の右クリックの「索引から除く」「索引に入れる」）: 設定 wiki_workspaces のこの root の
+/// exclude / include を書き（workspaces::set_excluded）、背景で stat 走査して "wiki-changed"（全部）と "wiki-state" を出す。
+/// 戻り値 = {dir（vault 相対）, excluded}
+pub(crate) fn wiki_exclude_set_now(app: &tauri::AppHandle, a: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let en = ui_en(app);
+    let root_arg = wiki_root_arg(a)?;
+    let dir = req_str(a, en, "wiki_exclude_set", "dir")?.to_string();
+    let excluded = a
+        .get("excluded")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| tr(en, "wiki_exclude_set: excluded は true / false で渡してください", "wiki_exclude_set: excluded must be true / false"))?;
+    let st = app.state::<AppState>();
+    let (note, r) = wiki_exclude_write(&st.db, wiki_ctx(app)?, root_arg.as_deref(), &dir, excluded, wiki_now(), en);
+    // 退避の知らせは成功・失敗のどちらでも先に出す（wiki_ws_with と同じ順 = 退避した後の失敗でも退避を知らせる）
+    wiki_ws_report(app, en, true, &note);
+    let (rel, at) = r?;
+    wiki_scan_bg(app.clone(), at, WikiScan::Refresh, None, WIKI_SCAN_FAIL_UPDATE, || {}, false);
+    Ok(serde_json::json!({"dir": rel, "excluded": excluded}))
+}
+
+/// wiki_exclude_set の設定の段（AppHandle に依らない = 試験が tempdir の DB で通す）: ctx（呼び手が DB から読んだ物）の root
+/// （root_arg で固定）で dir を検査 → 既定の規則に当たるかを判定 → wiki_workspaces の exclude / include を書く（wiki_ws_db = GUI の
+/// 他の設定の書込と同じ段取り）→ 書いた後の設定から索引の入口（Ready = 走査に使う規則）を組み直す。
+/// 戻り値 = (退避の記録, (vault 相対, Ready))。退避の記録は失敗のときも返す（呼び手が知らせてからエラーを返す）
+pub(crate) fn wiki_exclude_write(
+    db: &Mutex<openref_core::Db>,
+    ctx: openref_core::wiki::Ctx,
+    root_arg: Option<&str>,
+    dir: &str,
+    excluded: bool,
+    now: i64,
+    en: bool,
+) -> (WikiWsNote, Result<(String, openref_core::wiki::index::Ready), String>) {
+    let home = ctx.home.clone();
+    let canon = wiki_root_canon(&ctx);
+    let checked = (|| {
+        let at = wiki_ready(&wiki_pin(ctx, root_arg)?)?;
+        let (rel, abs) = wiki_exclude_dir_check(&at.root, dir, en)?;
+        Ok::<_, String>((at, rel, abs))
+    })();
+    let (at, rel, abs) = match checked {
+        Ok(v) => v,
+        Err(e) => return (WikiWsNote::default(), Err(e)),
+    };
+    let default_hit = openref_core::wiki::scan::Rules::default_excludes(&abs);
+    let key = at.root.to_string_lossy().into_owned();
+    let (r, note) = wiki_ws_db(db, now, en, canon.as_ref(), |m, _| {
+        if workspaces::set_excluded(m, &key, &rel, excluded, default_hit) {
+            Ok(())
+        } else {
+            Err(format!("{}: {dir}", tr(en, "このフォルダは指定できません", "This folder cannot be used")))
+        }
+    });
+    let r = r.and_then(|((), mut ctx)| {
+        // 書いた後の設定（Ctx::from_db を読み直した物）の規則 = Ctx::ready() と同じ。HOME は呼び手の物を保つ（試験は偽の HOME）
+        ctx.home = home;
+        let at = wiki_ready(&wiki_pin(ctx, root_arg)?)?;
+        Ok((rel, at))
+    });
+    (note, r)
+}
+
+/// このワークスペース（canonical な root）の除外の規則を設定から読む（監視のバッチごと = 規則の変更がすぐ効く。バッチをまたいで覚えない）
+pub(crate) fn wiki_rules_for(app: &tauri::AppHandle, root: &Path) -> Result<openref_core::wiki::scan::Rules, String> {
+    let st = app.state::<AppState>();
+    let db = lock(&st.db)?;
+    wiki_rules_from(&db, root)
+}
+
+/// wiki_rules_for の本体（AppHandle に依らない）: 設定 wiki_workspaces（Ctx::from_db と同じ読み = 壊れていれば空 = 既定の規則だけ）の
+/// この root の include / exclude
+pub(crate) fn wiki_rules_from(db: &openref_core::Db, root: &Path) -> Result<openref_core::wiki::scan::Rules, String> {
+    let ctx = openref_core::wiki::Ctx::from_db(db).map_err(err)?;
+    Ok(openref_core::wiki::workspaces::rules(&ctx.workspaces, &root.to_string_lossy()))
+}
+
+/// 監視の 1 バッチを、設定から読んだ規則で索引に取り込む（wiki_on_fs の AppHandle に依らない部分）
+fn wiki_on_fs_ingest(
+    ip: &Path,
+    root: &Path,
+    rules: openref_core::wiki::scan::Rules,
+    paths: Vec<PathBuf>,
+) -> Result<FsOutcome, openref_core::CoreError> {
+    let at = openref_core::wiki::index::Ready::new(ip, root, rules);
+    openref_core::wiki::with_index(&at, |ix| wiki_fs_ingest(ix, root, paths.clone(), wiki_fs_kind))
+}
+
 /// 監視が拾ったパス（絶対パス）を索引に取り込んで "wiki-changed"。root が消えた・改名されたら "wiki-error"。
 /// 戻り値 = 取り込めた（false = root が無い・取り込みの失敗 = 索引が古いかもしれない）
 fn wiki_on_fs(app: &tauri::AppHandle, ip: &Path, root: &Path, paths: Vec<PathBuf>) -> bool {
-    let res = openref_core::wiki::with_index(ip, root, |ix| {
-        wiki_fs_ingest(ix, root, paths.clone(), wiki_fs_kind)
-    });
     let en = ui_en(app);
+    // 規則を読めない = 取り込まない（既定の規則だけで取り込むと、利用者が除いたフォルダの中身を入れてしまう）
+    let rules = match wiki_rules_for(app, root) {
+        Ok(r) => r,
+        Err(e) => {
+            wiki_error(app, format!("{}: {e}", tr(en, "変更を索引に取り込めません", "Could not update the index")), root, ip);
+            return false;
+        }
+    };
+    let res = wiki_on_fs_ingest(ip, root, rules, paths);
     match res {
         Ok(FsOutcome::RootGone) => {
             wiki_error(
@@ -884,6 +1224,8 @@ fn wiki_on_fs(app: &tauri::AppHandle, ip: &Path, root: &Path, paths: Vec<PathBuf
                     tr(en, "ワークスペースのフォルダが見つかりません（消えた・改名された）。左の木のワークスペース名のメニューから最近のワークスペースを選ぶか、別のフォルダを選んでください", "The workspace folder is gone (deleted or renamed). Pick a recent workspace from the workspace name menu in the tree, or choose another folder"),
                     root.display()
                 ),
+                root,
+                ip,
             );
             false
         }
@@ -893,10 +1235,16 @@ fn wiki_on_fs(app: &tauri::AppHandle, ip: &Path, root: &Path, paths: Vec<PathBuf
             true
         }
         Err(e) => {
-            wiki_error(app, format!("{}: {e}", tr(en, "変更を索引に取り込めません", "Could not update the index")));
+            wiki_error(app, format!("{}: {e}", tr(en, "変更を索引に取り込めません", "Could not update the index")), root, ip);
             false
         }
     }
+}
+
+/// 有効にできるか（設定の root が検査を通るか）= 有効にする前の検査（純関数・失敗の文は wiki_ready = 名前まで）
+pub(crate) fn wiki_enable_check(mut ctx: openref_core::wiki::Ctx) -> Result<(), String> {
+    ctx.enabled = true;
+    wiki_ready(&ctx).map(|_| ())
 }
 
 /// 有効 / 無効を書いて揃える（wiki_enable_with の touch = true）
@@ -911,15 +1259,13 @@ pub(crate) fn wiki_enable_chores(on: bool, touch: bool) -> Option<bool> {
 }
 
 /// 有効 / 無効を書いて揃える。有効にするのは root が検査を通るときだけ（未設定・検査に落ちたら Err = 書かない）。有効化は起動時の家事を
-/// 回す（wiki_root を canonical に・touch = 現在の root を履歴に入れる・旧の索引の削除と wiki-index/ の掃除）。touch = false は直前に
+/// 回す（wiki_root を canonical に・touch = 現在の root を履歴に入れる・wiki-index/ の掃除）。touch = false は直前に
 /// wiki_choose_root が履歴に入れた経路（メニューの有効化のフォルダ選択）= 二重にしない。
 /// 戻り値 = このプロセスで vault の配信を始めていて、再起動まで続く（OFF にしたときだけ true になりうる）
 pub(crate) fn wiki_enable_with(app: &tauri::AppHandle, on: bool, touch: bool) -> Result<bool, String> {
     let _roots = wiki_root_lock(app);
     if on {
-        let mut ctx = wiki_ctx(app)?;
-        ctx.enabled = true;
-        ctx.ready().map_err(err)?;
+        wiki_enable_check(wiki_ctx(app)?)?;
     }
     if !save_setting(app, "wiki_enabled", if on { "1" } else { "0" }) {
         return Err(tr(
@@ -983,7 +1329,20 @@ impl RootChange {
 
 /// root の変更の設定の段（AppHandle 無し = 試験はこれで通す）: root を検査して canonical に → Front は履歴の鍵と照合（無ければ unknown_root）
 /// して設定 wiki_root を書くだけ・Choose は wiki_root_commit（wiki_root を書き・履歴の touch・上限で落ちた root の索引を消す）。戻り値 = 書いた root
+/// 失敗の文のパス（渡した path の綴りと canonical）はフォルダ名まで
 pub(crate) fn wiki_root_steps(
+    db: &Mutex<openref_core::Db>,
+    ctx: &openref_core::wiki::Ctx,
+    path: &Path,
+    how: RootChange,
+    now: i64,
+    en: bool,
+) -> (Result<PathBuf, String>, WikiWsNote) {
+    let (r, note) = wiki_root_steps_raw(db, ctx, path, how, now, en);
+    (r.map_err(|e| hide_paths(e, &[path])), note)
+}
+
+fn wiki_root_steps_raw(
     db: &Mutex<openref_core::Db>,
     ctx: &openref_core::wiki::Ctx,
     path: &Path,
@@ -1050,7 +1409,7 @@ fn wiki_change_root_locked(app: &tauri::AppHandle, path: &Path, how: RootChange)
         wiki_chat_emit_enabled(app);
     }
     if ctx.enabled {
-        wiki_apply(app, WikiScan::Refresh)?;
+        wiki_apply(app, WikiScan::Refresh).map_err(|e| hide_paths(e, &[path, &root]))?;
     } else {
         wiki_emit(app, "wiki-state", ());
     }
@@ -1070,13 +1429,18 @@ pub(crate) fn wiki_front_noop(live: &WikiLive, setting: Option<&str>, root: &str
     setting == Some(root) && live.plan(Some(root)) != WatchPlan::Off
 }
 
+/// タブの行き来の root が履歴にあるか（純関数・無ければ unknown_root = 手がかりを外し名前まで）
+pub(crate) fn wiki_front_check(ctx: &openref_core::wiki::Ctx, root: &str) -> Result<(), String> {
+    openref_core::wiki::commands::known_root(&ctx.workspaces, root).map_err(|e| wiki_err_in(e, &[Path::new(root)]))
+}
+
 /// 前面の OpenNote タブの root に設定 wiki_root と監視を揃える（GUI 専用 command wiki_front_root の本体 = RootChange::Front）。
 /// 履歴にある root だけ（無ければ unknown_root）・last_used は変えない・チャットの子は止めない・toast は出さない。既に揃っていれば何もしない
 /// （wiki_front_noop・restart = false）。戻り値 = wiki_choose_root と同じ
 pub(crate) fn wiki_front_workspace(app: &tauri::AppHandle, root: &str) -> Result<(PathBuf, bool), String> {
     let _roots = wiki_root_lock(app);
     let ctx = wiki_ctx(app)?;
-    openref_core::wiki::commands::known_root(&ctx.workspaces, root).map_err(wiki_err)?;
+    wiki_front_check(&ctx, root)?;
     if wiki_front_noop(&app.state::<WikiRuntime>().live, ctx.root.as_deref(), root) {
         return Ok((PathBuf::from(root), false));
     }
@@ -1146,6 +1510,11 @@ pub(crate) fn wiki_restart_note(en: bool, stale: bool) -> Option<String> {
     })
 }
 
+/// ワークスペースを選んだ / 切り替えた toast の detail（名前まで + 前の root の配信が残る一言）
+pub(crate) fn wiki_root_toast_detail(en: bool, root: &Path, stale: bool) -> String {
+    wiki_toast_detail(en, wiki_workspace_name(root), wiki_restart_note(en, stale))
+}
+
 /// toast の detail = 名前 + 一言（あれば括弧で）。toast は 1 枠（後の toast が前を消す）なので 2 つに分けない
 pub(crate) fn wiki_toast_detail(en: bool, name: String, note: Option<String>) -> String {
     match note {
@@ -1179,7 +1548,7 @@ pub(crate) fn wiki_toast(
 const WIKI_OFF_SERVED_JA: &str = "OpenNote を無効にしました（ワークスペースのファイルは OpenRef を再起動するまで画面から読める状態のままです）";
 const WIKI_OFF_SERVED_EN: &str = "OpenNote disabled (files in the workspace stay readable by the app until OpenRef is restarted)";
 
-/// Settings › OpenNote の操作（main thread の外で呼ぶ）
+/// Settings › OpenNote の操作（今は「有効」だけ = 索引の作り直しは画面のワークスペース名のメニュー。main thread の外で呼ぶ）
 pub(crate) fn wiki_menu(app: &tauri::AppHandle, id: &str, en: bool) {
     let items = app.state::<SettingsItems>();
     match id {
@@ -1267,99 +1636,23 @@ pub(crate) fn wiki_menu(app: &tauri::AppHandle, id: &str, en: bool) {
                 }
             }
         }
-        WIKI_REINDEX_ID => match wiki_reindex_now(app) {
-            Ok(()) => wiki_toast(
-                app,
-                en,
-                true,
-                "OpenNote の索引を作り直しています",
-                "Rebuilding the OpenNote index",
-                None,
-            ),
-            Err(e) => wiki_toast(
-                app,
-                en,
-                false,
-                "OpenNote の索引を作り直せません",
-                "Could not rebuild the OpenNote index",
-                Some(e),
-            ),
-        },
-        WIKI_DROP_INDEX_ID => {
-            // 削除の成否と、その後の張り直し（有効なときだけ）の成否は分けて出す
-            // 消すのは現在のワークスペースの索引だけ（ctx.ready() の置き場）。無効でも消せる（root の検査に落ちたら設定の文字列から）。
-            // 設定の読み → 監視の停止 → 削除 → 張り直しは root を変える段の鍵の中（揃えと同時に走っても監視が後勝ちにならない・
-            // wiki_menu は spawn_blocking = main thread の外）
-            let _roots = wiki_root_lock(app);
-            let removed = wiki_ctx(app).and_then(|mut ctx| {
-                let dir = ctx.app_dir.clone().ok_or_else(|| {
-                    tr(
-                        en,
-                        "in-memory の DB では索引の置き場がありません",
-                        "An in-memory database has no place for the index",
-                    )
-                })?;
-                let enabled = ctx.enabled;
-                ctx.enabled = true;
-                let ip = match (ctx.ready(), ctx.root.as_deref()) {
-                    (Ok((ip, _)), _) => ip,
-                    (Err(_), Some(r)) => openref_core::wiki::index::index_path(&dir, Path::new(r)),
-                    (Err(e), None) => return Err(err(e)),
-                };
-                wiki_watch_stop(&app.state::<WikiRuntime>());
-                openref_core::wiki::index::remove_index(&ip).map_err(err)?;
-                Ok(enabled)
-            });
-            match removed {
-                Ok(enabled) => {
-                    wiki_toast(
-                        app,
-                        en,
-                        true,
-                        "OpenNote の索引を削除しました",
-                        "OpenNote index deleted",
-                        None,
-                    );
-                    // 有効なら監視を張り直す（索引は次の読みで作り直る）
-                    if enabled {
-                        if let Err(e) = wiki_apply(app, WikiScan::None) {
-                            wiki_toast(
-                                app,
-                                en,
-                                false,
-                                "OpenNote の監視を張り直せません",
-                                "Could not restart OpenNote file watching",
-                                Some(e),
-                            );
-                        }
-                    }
-                }
-                Err(e) => wiki_toast(
-                    app,
-                    en,
-                    false,
-                    "OpenNote の索引を削除できません",
-                    "Could not delete the OpenNote index",
-                    Some(e),
-                ),
-            }
-        }
         _ => {}
     }
 }
 
-/// 再索引 = 監視を張り直してから中身を捨てて全走査（背景）。無効・root が使えなければ Err。root を変える段の鍵の中（揃えと
-/// 同時に走っても監視が後勝ちにならない。呼び手は command の blocking と wiki_menu の spawn_blocking = main thread の外）
+/// 索引を作り直す（画面のワークスペース名のメニュー = command wiki_reindex）= 監視を張り直してから中身を捨てて全走査（背景）。
+/// 無効・root が使えなければ Err。root を変える段の鍵の中（揃えと同時に走っても監視が後勝ちにならない。呼び手は command の blocking =
+/// main thread の外）
 pub(crate) fn wiki_reindex_now(app: &tauri::AppHandle) -> Result<(), String> {
     let _roots = wiki_root_lock(app);
-    wiki_ctx(app)?.ready().map_err(err)?;
-    wiki_apply(app, WikiScan::Rebuild)
+    wiki_ready(&wiki_ctx(app)?)?;
+    wiki_apply_with(app, WikiScan::Rebuild, true) // 失敗したら索引のファイルを消して 1 回だけやり直す（wiki_rebuild_steps）
 }
 
 // ---------- OpenNote: 最近のワークスペース（設定 wiki_workspaces = core::wiki::workspaces） ----------
 // 形 = { "<canonical な root>": { "last_used": <unix 秒>, "ref_dirs": [...] } }。書くのはここだけ（選び直し / 切替 / 起動時の
 // touch・[外す]・参照フォルダの追加 / 外す）。読み書きは 1 回の DB のロックの中（wiki_ws_tx = 読む → 壊れていれば退避して空から →
-// 旧キー wiki_ref_dirs の取り込み → 変える → 変わっていれば書く）。索引のファイルを消すのはロックの外（remove_index は索引のロックを待つ）
+// 変える → 変わっていれば書く）。索引のファイルを消すのはロックの外（remove_index は索引のロックを待つ）
 
 /// 今の unix 秒
 pub(crate) fn wiki_now() -> i64 {
@@ -1390,47 +1683,11 @@ pub(crate) fn wiki_broken_key(key: &str, secs: i64) -> String {
     format!("{key}.broken-{stamp}")
 }
 
-/// 旧キー wiki_ref_dirs の扱い（wiki_ref_dirs_migrate の戻り値）
-#[derive(Debug, PartialEq)]
-pub(crate) enum WikiLegacyRefs {
-    /// 触らない（旧キーが無い・現在の root が未設定 = 取り込む先が無いので残す）
-    Keep,
-    /// 消す。adopted = 現在の root の ref_dirs に取り込んだ（false = 既に ref_dirs があった・空だった）
-    Delete { adopted: bool },
-    /// 解釈できない = 退避してから消す（理由）
-    SetAside(String),
-}
-
-/// 旧キー wiki_ref_dirs（JSON の文字列の配列）を現在の root の ref_dirs へ（純関数）。現在の root に ref_dirs が無いときだけ採用する
-/// （二重に持たない = 旧キーはどの枝でも消す。読めない旧キーは退避してから消す）
-pub(crate) fn wiki_ref_dirs_migrate(
-    m: &mut workspaces::Map,
-    root: Option<&str>,
-    legacy: Option<&str>,
-    en: bool,
-) -> WikiLegacyRefs {
-    let (Some(root), Some(raw)) = (root, legacy) else {
-        return WikiLegacyRefs::Keep;
-    };
-    match wiki_ref_dirs_parse(Some(raw), en) {
-        Ok(dirs) => {
-            let adopted = !dirs.is_empty() && !workspaces::has_ref_dirs(m, root);
-            if adopted {
-                wiki_save_ref_dirs(m, root, &dirs);
-            }
-            WikiLegacyRefs::Delete { adopted }
-        }
-        Err(e) => WikiLegacyRefs::SetAside(e),
-    }
-}
-
 /// wiki_ws_tx がしたこと（知らせる分）
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct WikiWsNote {
     /// 壊れた値を退避した（元の鍵, 退避先の鍵, 理由）
     pub(crate) set_aside: Vec<(String, String, String)>,
-    /// 旧キー wiki_ref_dirs を現在の root の ref_dirs に取り込んだ
-    pub(crate) adopted_legacy: bool,
 }
 
 /// 設定 wiki_root の (生の値, canonical)。check_root が通れば（OpenNote の有効 / 無効は問わない）Some
@@ -1442,7 +1699,7 @@ pub(crate) fn wiki_root_canon(ctx: &openref_core::wiki::Ctx) -> Option<WikiRootC
     let raw = ctx.root.clone()?;
     let mut c = ctx.clone();
     c.enabled = true;
-    let (_, r) = c.ready().ok()?;
+    let r = c.ready().ok()?.root;
     Some((raw, r.to_string_lossy().into_owned()))
 }
 
@@ -1456,9 +1713,11 @@ fn wiki_ws_root(raw: Option<String>, canon: Option<&WikiRootCanon>) -> Option<St
 }
 
 /// 設定 wiki_workspaces の 1 回の読み書き（db = ロック済みの DB・この間だけ使う）: 読む → 壊れていれば生の値を
-/// `wiki_workspaces.broken-<UTC>` へ退避して空から → 旧キー wiki_ref_dirs の取り込み（wiki_ref_dirs_migrate）→ f（2 つめの引数 =
-/// 現在の root = 設定 wiki_root の canonical（canon・使えなければ生の値））→ 中身が変わっていれば書く → 旧キーを消す（書いた後 = 途中で
-/// 落ちても旧キーは残る）。f が Err なら f の変更は捨てる（退避と取り込みは書く）。f は I/O をしない（DB のロックの中で走る）
+/// `wiki_workspaces.broken-<UTC>` へ退避して空から → f（2 つめの引数 = 現在の root = 設定 wiki_root の canonical（canon・使えなければ
+/// 生の値））→ 中身が変わっていれば書く。f が Err なら f の変更は捨てる（退避は書く）。f は I/O をしない（DB のロックの中で走る）。
+/// 2.0.0 より前の旧キー wiki_ref_dirs は読まない・消さない（行が DB に残っていても触らない）。
+/// 全体を BEGIN IMMEDIATE で囲む（本棚の shelf::with_workspaces と同じ = 同じ DB を開いた別のプロセスの書込を失わない・
+/// 待ちきれなければ「database is locked」の Err で何も書かない）。f が Err でも退避と書き戻しは commit する（前と同じ）
 pub(crate) fn wiki_ws_tx<R>(
     db: &openref_core::Db,
     now: i64,
@@ -1504,8 +1763,8 @@ fn wiki_ws_tx_inner<R>(
     note: &mut WikiWsNote,
     f: impl FnOnce(&mut workspaces::Map, Option<&str>) -> Result<R, String>,
 ) -> Result<R, String> {
+    let tx = workspaces::begin_immediate(db).map_err(err)?;
     let raw = db.setting(workspaces::KEY).map_err(err)?;
-    let legacy = db.setting(WIKI_REF_DIRS_KEY).map_err(err)?;
     let root = wiki_ws_root(
         db.setting("wiki_root")
             .map_err(err)?
@@ -1522,10 +1781,6 @@ fn wiki_ws_tx_inner<R>(
             workspaces::Map::new()
         }
     };
-    let step = wiki_ref_dirs_migrate(&mut m, root.as_deref(), legacy.as_deref(), en);
-    if let WikiLegacyRefs::SetAside(why) = &step {
-        wiki_ws_set_aside(db, now, en, note, WIKI_REF_DIRS_KEY, legacy.as_deref().unwrap_or(""), why.clone())?;
-    }
     let before = m.clone();
     let r = f(&mut m, root.as_deref());
     if r.is_err() {
@@ -1549,14 +1804,7 @@ fn wiki_ws_tx_inner<R>(
                 )
             })?;
     }
-    if !matches!(step, WikiLegacyRefs::Keep) {
-        note.adopted_legacy = matches!(step, WikiLegacyRefs::Delete { adopted: true });
-        if let Err(e) = db.delete_setting(WIKI_REF_DIRS_KEY) {
-            eprintln!("openref-app: wiki: 旧キー {WIKI_REF_DIRS_KEY} を消せません: {e}");
-        } else if note.adopted_legacy {
-            eprintln!("openref-app: wiki: 旧キー {WIKI_REF_DIRS_KEY} を現在のワークスペースの参照フォルダに取り込みました");
-        }
-    }
+    tx.commit().map_err(err)?;
     r
 }
 
@@ -1809,15 +2057,6 @@ pub(crate) fn wiki_index_sweep_plan_at(
         .collect()
 }
 
-/// app_dir 直下の旧の索引（以前の `wiki-index.sqlite` の一族 = -wal / -shm / 退避）の名前（純関数）。DB（openref.sqlite）等には触らない
-pub(crate) fn wiki_legacy_index_plan(entries: &[String]) -> Vec<String> {
-    entries
-        .iter()
-        .filter(|n| wiki_index_family(n) == Some(openref_core::wiki::index::INDEX_FILE))
-        .cloned()
-        .collect()
-}
-
 fn wiki_dir_names(d: &Path) -> Vec<String> {
     std::fs::read_dir(d)
         .map(|rd| {
@@ -1826,37 +2065,6 @@ fn wiki_dir_names(d: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// 旧の索引を消す（rename で引き継がない・1 回だけ作り直しが走る）。本体と -wal / -shm は remove_index（プロセスの接続がこの索引なら
-/// 閉じてから）・退避は素の削除。戻り値 = 消したファイル
-pub(crate) fn wiki_drop_legacy_index(app_dir: &Path) -> Vec<PathBuf> {
-    let names = wiki_legacy_index_plan(&wiki_dir_names(app_dir));
-    let mut out = Vec::new();
-    if names.is_empty() {
-        return out;
-    }
-    let legacy = app_dir.join(openref_core::wiki::index::INDEX_FILE);
-    let (corrupt, main): (Vec<String>, Vec<String>) =
-        names.into_iter().partition(|n| n.contains(".corrupt-"));
-    if !main.is_empty() {
-        match openref_core::wiki::index::remove_index(&legacy) {
-            Ok(()) => out.extend(main.iter().map(|n| app_dir.join(n))),
-            Err(e) => eprintln!(
-                "openref-app: wiki: 旧の索引 {} を消せません: {e}",
-                legacy.display()
-            ),
-        }
-    }
-    for n in corrupt {
-        let p = app_dir.join(&n);
-        match std::fs::remove_file(&p) {
-            Ok(()) => out.push(p),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("openref-app: wiki: 旧の索引 {} を消せません: {e}", p.display()),
-        }
-    }
-    out
 }
 
 /// wiki-index/ の掃除（I/O）: wiki_index_sweep_plan_at（一族のどれかが started より後に変更されていれば一族ごと残す）。戻り値 = 消したファイル
@@ -1907,15 +2115,15 @@ pub(crate) struct WikiStartup {
     pub(crate) rewrote: Option<(String, String)>,
     /// 上限で落ちた root
     pub(crate) evicted: Vec<String>,
-    /// 消した索引のファイル（旧の置き場・落ちた root・孤児）
+    /// 消した索引のファイル（落ちた root・孤児）
     pub(crate) removed: Vec<PathBuf>,
 }
 
 /// 起動時の家事の段取り（AppHandle 無し）。enabled / raw_root = 設定 wiki_enabled / 起動時（有効化の時）に読んだ wiki_root・
-/// canon = wiki_root_canon（ロックの外で求めたもの）。(1) 旧の索引を消す（有効 / 無効を問わず）(2) ロックの中: 生 ≠ canonical で、設定
+/// canon = wiki_root_canon（ロックの外で求めたもの）。(1) ロックの中: 生 ≠ canonical で、設定
 /// wiki_root が今も生の値のまま（画面の揃え = wiki_front_root が先に書き換えていない）なら設定 wiki_root を canonical に書き直し、
 /// 履歴の生の鍵の項目を canonical の鍵へ寄せる（rekey）・有効で root が使えれば last_used を今に（初回 = 現在の root が 1 件入る = 既存の
-/// 利用者に移行は要らない）(3) ロックの外: 落ちた root の索引を消し、wiki-index/ の中で 履歴 ∪ 生の root ∪ canonical に無いものを消す
+/// 利用者に移行は要らない）(2) ロックの外: 落ちた root の索引を消し、wiki-index/ の中で 履歴 ∪ 生の root ∪ canonical に無いものを消す
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiki_startup_steps(
     db: &Mutex<openref_core::Db>,
@@ -1927,10 +2135,8 @@ pub(crate) fn wiki_startup_steps(
     en: bool,
     started: SystemTime,
 ) -> (Result<WikiStartup, String>, WikiWsNote) {
-    let mut out = WikiStartup {
-        removed: wiki_drop_legacy_index(app_dir),
-        ..WikiStartup::default()
-    };
+    // 2.0.0 より前の置き場（app_dir 直下の wiki-index.sqlite）は見ない（残っていても消さない・読まない）
+    let mut out = WikiStartup::default();
     let (r, note) = {
         let g = match lock(db) {
             Ok(g) => g,
@@ -2046,7 +2252,7 @@ fn wiki_chores(app: &tauri::AppHandle, root: Option<&str>, touch: Option<bool>) 
                 eprintln!("openref-app: wiki: 設定 wiki_root を canonical に書き直しました: {raw} → {c}");
             }
             for p in &s.removed {
-                eprintln!("openref-app: wiki: 索引 {} を消しました（旧の置き場・履歴に無いワークスペース）", p.display());
+                eprintln!("openref-app: wiki: 索引 {} を消しました（履歴に無いワークスペース）", p.display());
             }
             Some(s)
         }
@@ -2059,43 +2265,10 @@ fn wiki_chores(app: &tauri::AppHandle, root: Option<&str>, touch: Option<bool>) 
 
 // ---------- OpenNote: 参照フォルダと URL ----------
 // 参照フォルダ = vault の外の読み取り専用のルート（ワークスペースごと = 設定 wiki_workspaces[現在の root].ref_dirs。GUI 専用の
-// command で足す / 外す。旧キー wiki_ref_dirs = 1 本の JSON の文字列の配列は、読むときに現在の root の分として取り込んで消す）。
+// command で足す / 外す。2.0.0 より前の旧キー wiki_ref_dirs = 1 本の JSON の文字列の配列は読まない = 選び直す）。
 // その下の pdf / html / 画像 / 動画 / 音声への file:// リンクは、vault の中のファイルと同じ内蔵の表示で開く（wiki_read_ref）。
 // root と同じく asset scope に足すだけ（allow_directory は取り消せない = 外しても再起動まで配信される）で、索引・MCP の範囲は広げない。
 // URL（http(s)）は既定のブラウザで開く（wiki_url_checked で検査してから。OpenRef の別窓で開く設定は 3.0.0 で外した）
-
-/// 旧キー wiki_ref_dirs（JSON の文字列の配列・以前の形 = root を問わず 1 本）。読むのは取り込み（wiki_ref_dirs_migrate）だけ
-pub(crate) const WIKI_REF_DIRS_KEY: &str = "wiki_ref_dirs";
-
-/// 旧キー wiki_ref_dirs の値 → 参照フォルダ。未設定・空は空。JSON の文字列の配列として読めなければ Err（黙って空にしない = 退避して
-/// から消す = wiki_ref_dirs_migrate）
-pub(crate) fn wiki_ref_dirs_parse(v: Option<&str>, en: bool) -> Result<Vec<PathBuf>, String> {
-    let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let list: Vec<String> = serde_json::from_str(s).map_err(|e| {
-        format!(
-            "{}: {e}",
-            tr(
-                en,
-                "設定 wiki_ref_dirs を解釈できません（JSON の文字列の配列ではありません）",
-                "The wiki_ref_dirs setting could not be read (not a JSON array of strings)"
-            )
-        )
-    })?;
-    let mut out: Vec<PathBuf> = Vec::new();
-    for s in list {
-        if s.trim().is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(s);
-        // 重複は 1 つに（一覧の描画の key が重ならない）
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    Ok(out)
-}
 
 /// この root の参照フォルダ（生の一覧 = 検査前・純関数）
 pub(crate) fn wiki_ref_dirs_of(m: &workspaces::Map, root: Option<&str>) -> Vec<PathBuf> {
@@ -2116,18 +2289,32 @@ pub(crate) fn wiki_ws_target<'a>(
     cur: Option<&'a str>,
 ) -> Result<Option<&'a str>, String> {
     if let Some(r) = root {
-        openref_core::wiki::commands::known_root(m, r).map_err(wiki_err)?;
+        openref_core::wiki::commands::known_root(m, r).map_err(|e| wiki_err_in(e, &[Path::new(r)]))?;
     }
     Ok(root.or(cur))
 }
 
-/// root（画面のタブの root・履歴にあるものだけ。None = 設定 wiki_root）の参照フォルダの生の一覧と、その root に固定した Ctx
-/// （DB のロックは読み書きの間だけ。旧キーの取り込み・壊れた値の退避もここで = wiki_ws）。root が未設定なら空
+/// root（画面のタブの root・履歴にあるものだけ。None = 設定 wiki_root）の参照フォルダの生の一覧と、その root に固定した Ctx。
+/// 読むだけ = 書込の段取り（BEGIN IMMEDIATE・壊れた値の退避・toast）を通らない（wiki_ref_dirs_read）。root が未設定なら空
 pub(crate) fn wiki_ref_dirs_raw(
     app: &tauri::AppHandle,
     root: Option<&str>,
 ) -> Result<(Vec<PathBuf>, openref_core::wiki::Ctx), String> {
-    let (dirs, ctx, _) = wiki_ws(app, |m, cur| Ok(wiki_ref_dirs_of(m, wiki_ws_target(m, root, cur)?)))?;
+    let ctx = wiki_ctx(app)?;
+    let canon = wiki_root_canon(&ctx); // canonicalize = DB のロックの外
+    wiki_ref_dirs_read(ctx, canon.as_ref(), root)
+}
+
+/// wiki_ref_dirs_raw の本体（AppHandle 無し・I/O 無し）: 設定 wiki_workspaces は Ctx::from_db が解釈済みの ctx.workspaces
+/// （壊れていれば空 = 退避は次の書込か起動時の家事 = wiki_ws_tx）。現在の root は wiki_ws_tx と同じ規則（canon の生の値が設定と同じなら
+/// canonical = 履歴の鍵）・root（Some）は履歴にあるものだけ（wiki_ws_target）
+pub(crate) fn wiki_ref_dirs_read(
+    ctx: openref_core::wiki::Ctx,
+    canon: Option<&WikiRootCanon>,
+    root: Option<&str>,
+) -> Result<(Vec<PathBuf>, openref_core::wiki::Ctx), String> {
+    let cur = wiki_ws_root(ctx.root.clone().filter(|s| !s.trim().is_empty()), canon);
+    let dirs = wiki_ref_dirs_of(&ctx.workspaces, wiki_ws_target(&ctx.workspaces, root, cur.as_deref())?);
     Ok((dirs, wiki_pin(ctx, root)?))
 }
 
@@ -2233,13 +2420,10 @@ pub(crate) fn wiki_ref_dir_check(
     app_dir: Option<&Path>,
     en: bool,
 ) -> Result<PathBuf, String> {
-    let canon = openref_core::wiki::check_root(p, home, app_dir).map_err(|e| {
-        // check_root の理由（BadInput の中身）をそのまま、主語だけ替えて出す
-        let m = match e {
-            openref_core::CoreError::BadInput(m) => m,
-            e => e.to_string(),
-        };
-        m.replacen("ワークスペースのフォルダに", "参照フォルダに", 1)
+    // check_root の規則と理由（BadInput の中身）をそのまま、主語を「参照フォルダ」にして出す
+    let canon = openref_core::wiki::check_root_as(p, home, app_dir, "参照フォルダ").map_err(|e| match e {
+        openref_core::CoreError::BadInput(m) => m,
+        e => e.to_string(),
     })?;
     if root.is_some_and(|r| openref_core::wiki::strip_root(r, &canon).is_some()) {
         let c = canon.display();
@@ -2294,7 +2478,7 @@ pub(crate) fn wiki_ref_target(dirs: &[PathBuf], given: &str, en: bool) -> Result
             "{}: {given}",
             tr(
                 en,
-                "参照フォルダの外です（symlink）",
+                "参照フォルダの外です（シンボリックリンク）",
                 "outside the reference folder (symlink)"
             )
         ));
@@ -2339,14 +2523,31 @@ pub(crate) fn wiki_ref_show(
         return Ok(WikiRefShow::Media);
     }
     if len as i64 > index::BODY_MAX {
-        let max = index::BODY_MAX;
-        return Err(tr(
-            en,
-            &format!("{name} は大きすぎて読めません（{len} バイト・上限 {max} バイト）"),
-            &format!("{name} is too large to read ({len} bytes; limit {max} bytes)"),
-        ));
+        return Err(wiki_ref_too_large(name, len, en));
     }
     Ok(WikiRefShow::Html)
+}
+
+/// 参照フォルダの html が上限（索引の本文の上限 BODY_MAX）を超えているときの文
+fn wiki_ref_too_large(name: &str, len: u64, en: bool) -> String {
+    let max = openref_core::wiki::index::BODY_MAX;
+    tr(
+        en,
+        &format!("{name} は大きすぎて読めません（{len} バイト・上限 {max} バイト）"),
+        &format!("{name} is too large to read ({len} bytes; limit {max} bytes)"),
+    )
+}
+
+/// 参照フォルダの html の本文を読む。読むのは上限 + 1 バイトまで（wiki_ref_show が大きさを見た後に増えたファイルを丸ごと読まない =
+/// core の wiki_read と同じ read_file_capped）。超えていたら wiki_ref_show が大きさで断るときと同じ文の Err
+pub(crate) fn wiki_ref_html_bytes(path: &Path, name: &str, en: bool) -> Result<Vec<u8>, String> {
+    use openref_core::wiki::{commands::read_file_capped, index::BODY_MAX};
+    let bytes = read_file_capped(path, BODY_MAX as u64).map_err(err)?;
+    if bytes.len() as i64 > BODY_MAX {
+        let len = std::fs::metadata(path).map_or(bytes.len() as u64, |m| m.len());
+        return Err(wiki_ref_too_large(name, len, en));
+    }
+    Ok(bytes)
 }
 
 /// 参照フォルダの html の本文の欄: 題（`<title>` が空でなければ名前に代えて）・core の body_fields（chars・truncated・content）・
@@ -2376,394 +2577,32 @@ pub(crate) fn wiki_url_checked(url: &str, en: bool) -> Result<tauri::Url, String
     Ok(u)
 }
 
-// ---------- OpenNote（チャット = Claude Code CLI の子プロセス） ----------
-// 子プロセス・stream-json・変更の記録は wiki_chat.rs。ここは設定（wiki_chat_enabled）・メニュー・GUI 専用 command の本体（包みは main.rs）。
-// 有効にするのは画面の同意（説明のダイアログ）から wiki_chat_set_enabled {enabled: true} だけ。メニューの [チャット] で ON を選ぶと
-// 設定は変えずに "wiki-chat-consent" を出す（チェックは実際の設定に戻す）・OFF はそのまま無効にして子を止める。
-// 有効 / 無効が変わったら（メニュー・command・Wiki の ON/OFF・vault の切替）"wiki-chat" {type: "enabled", enabled} を出す（画面は
-// wiki_chat_status を読み直す）。{type: "state"} は子の状態だけ（wiki_chat.rs が出す）
-
-pub(crate) const WIKI_CHAT_ID: &str = "wiki_chat";
-/// 設定のキー（"1" = 有効・Wiki が有効なときだけ効く）
-pub(crate) const WIKI_CHAT_KEY: &str = "wiki_chat_enabled";
-/// 設定のキー（`--model` に渡す別名か model id。空 / 無し = Claude Code の既定）
-pub(crate) const WIKI_CHAT_MODEL_KEY: &str = "wiki_chat_model";
-
-/// 設定 wiki_chat_model（空なら None）
-fn wiki_chat_model(app: &tauri::AppHandle) -> Option<String> {
-    let st = app.state::<AppState>();
-    let db = lock(&st.db).ok()?;
-    db.setting(WIKI_CHAT_MODEL_KEY)
-        .ok()
-        .flatten()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
+/// command の必須の引数が無い・型が違うときの文 =「<cmd>: <key> は必須です」/「<cmd>: <key> is required」
+pub(crate) fn arg_missing(en: bool, cmd: &str, key: &str) -> String {
+    arg_missing_as(en, cmd, key, key)
 }
 
-/// 設定に書ける model の表記（別名 opus / sonnet 等・model id・Bedrock の ARN 風の `…/…`・`name@version`。shell を通さないが、引数の形は絞る）
-pub(crate) fn wiki_chat_model_ok(m: &str) -> bool {
-    m.is_empty()
-        || (m.len() <= 128
-            && !m.starts_with('-')
-            && m.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || matches!(c, '-' | '.' | '_' | ':' | '[' | ']' | '@' | '/')
-            }))
+/// arg_missing の key に型や中身の説明を添えるとき（ja / en で書き分ける。例: "enabled（true / false）" / "enabled (true / false)"）。
+/// ja は全角の閉じ括弧の後に空白を入れない（「enabled（true / false）は必須です」）
+pub(crate) fn arg_missing_as(en: bool, cmd: &str, key_ja: &str, key_en: &str) -> String {
+    let sep = if key_ja.ends_with('）') { "" } else { " " };
+    tr(en, &format!("{cmd}: {key_ja}{sep}は必須です"), &format!("{cmd}: {key_en} is required"))
 }
 
-pub(crate) fn wiki_chat_text(en: bool) -> &'static str {
-    if en {
-        "Chat"
-    } else {
-        "チャット"
-    }
+/// 必須の文字列の引数（無い・文字列でない = arg_missing）
+pub(crate) fn req_str<'a>(a: &'a serde_json::Value, en: bool, cmd: &str, key: &str) -> Result<&'a str, String> {
+    a.get(key).and_then(|v| v.as_str()).ok_or_else(|| arg_missing(en, cmd, key))
 }
 
-/// (Wiki の設定, チャットの設定, アプリの DB のパス)。Db のロックは読む間だけ
-pub(crate) fn wiki_chat_settings(
-    app: &tauri::AppHandle,
-) -> Result<(openref_core::wiki::Ctx, bool, Option<PathBuf>), String> {
-    let st = app.state::<AppState>();
-    let db = lock(&st.db)?;
-    let ctx = openref_core::wiki::Ctx::from_db(&db).map_err(err)?;
-    let on = db.setting(WIKI_CHAT_KEY).map_err(err)?.as_deref() == Some("1");
-    Ok((ctx, on, db.path.clone()))
-}
-
-/// メニューの [チャット] を設定に揃える（押せるのは Wiki が有効なときだけ）。[チャットのログ] も同じ条件で押せる
-fn wiki_chat_sync_menu(app: &tauri::AppHandle) {
-    let wiki_on = WIKI_ON.load(std::sync::atomic::Ordering::Relaxed);
-    let on = wiki_chat_settings(app)
-        .map(|(c, on, _)| c.enabled && on)
-        .unwrap_or(false);
-    if let Some(items) = app.try_state::<SettingsItems>() {
-        let _ = items
-            .wiki_chat
-            .set_enabled(wiki_on)
-            .and(items.wiki_chat.set_checked(on));
-        let _ = items.wiki_chat_log.set_enabled(wiki_on);
-    }
-}
-
-pub(crate) const WIKI_CHAT_LOG_ID: &str = "wiki_chat_log";
-/// 設定: "0" のときだけチャットのログ（ワークスペースの chat-log/）を残さない。既定 ON
-pub(crate) const WIKI_CHAT_LOG_KEY: &str = "wiki_chat_log";
-
-pub(crate) fn wiki_chat_log_text(en: bool) -> &'static str {
-    if en {
-        "Keep chat logs in chat-log/"
-    } else {
-        "チャットのログを chat-log/ に残す"
-    }
-}
-
-/// 設定 wiki_chat_log（ログを chat-log/ に残す・既定 ON）を読む（読めなければ既定 = ON）
-fn wiki_chat_log_enabled(app: &tauri::AppHandle) -> bool {
-    let st = app.state::<AppState>();
-    let Ok(db) = lock(&st.db) else { return true };
-    wiki_chat_log_on(db.setting(WIKI_CHAT_LOG_KEY).ok().flatten().as_deref())
-}
-
-/// 設定 wiki_chat_log の値 → ON か（未設定 = ON）
-pub(crate) fn wiki_chat_log_on(v: Option<&str>) -> bool {
-    v != Some("0")
-}
-
-/// 有効 / 無効の知らせ（子の有無によらず）
-fn wiki_chat_emit_enabled(app: &tauri::AppHandle) {
-    let on = wiki_chat_settings(app)
-        .map(|(c, on, _)| c.enabled && on)
-        .unwrap_or(false);
-    wiki_emit(
-        app,
-        "wiki-chat",
-        serde_json::json!({"type": "enabled", "enabled": on}),
-    );
-}
-
-pub(crate) fn wiki_chat_emit_state(app: &tauri::AppHandle) {
-    if let Some(c) = app.try_state::<wiki_chat::Chat>() {
-        wiki_emit(
-            app,
-            "wiki-chat",
-            serde_json::json!({"type": "state", "state": c.state().as_str(), "session_id": c.session_id()}),
-        );
-    }
-}
-
-/// 子プロセスを背景で止める（stdin を閉じる → 猶予 → SIGTERM → SIGKILL。呼び手を待たせない）
-fn wiki_chat_stop_bg(app: &tauri::AppHandle) {
-    if let Some(c) = app.try_state::<wiki_chat::Chat>() {
-        let c = c.inner().clone();
-        std::thread::spawn(move || c.stop(Duration::from_secs(3), Duration::from_secs(2)));
-    }
-}
-
-/// 有効 / 無効を書く。ON は Wiki が有効で vault が使えるときだけ・OFF は子を止める（待つ）
-pub(crate) fn wiki_chat_enable(app: &tauri::AppHandle, on: bool) -> Result<(), String> {
-    let en = ui_en(app);
-    if on {
-        let (ctx, _, _) = wiki_chat_settings(app)?;
-        if !ctx.enabled {
-            return Err(tr(
-                en,
-                "OpenNote が無効です（先に Settings › OpenNote › 有効）",
-                "OpenNote is disabled (enable it first in Settings › OpenNote)",
-            ));
-        }
-        ctx.ready().map_err(err)?;
-    }
-    if !save_setting(app, WIKI_CHAT_KEY, if on { "1" } else { "0" }) {
-        wiki_chat_sync_menu(app);
-        return Err(tr(
-            en,
-            "設定 wiki_chat_enabled を保存できません",
-            "Could not save the wiki_chat_enabled setting",
-        ));
-    }
-    if !on {
-        if let Some(c) = app.try_state::<wiki_chat::Chat>() {
-            c.stop(Duration::from_secs(3), Duration::from_secs(2));
-        }
-    }
-    wiki_chat_sync_menu(app);
-    wiki_chat_emit_enabled(app);
-    Ok(())
-}
-
-/// メニューの [チャット]（main thread の外で呼ぶ）
-pub(crate) fn wiki_chat_menu(app: &tauri::AppHandle, en: bool) {
-    let items = app.state::<SettingsItems>();
-    let checked = match items.wiki_chat.is_checked() {
-        Ok(c) => c,
-        Err(e) => return eprintln!("openref-app: メニューのチェック状態を読めません: {e}"),
-    };
-    if checked {
-        // ON は画面の同意を経てから（チェックは同意されるまで今の設定のまま）
-        wiki_chat_sync_menu(app);
-        wiki_emit(app, "wiki-chat-consent", ());
-        return;
-    }
-    if let Err(e) = wiki_chat_enable(app, false) {
-        wiki_toast(
-            app,
-            en,
-            false,
-            "チャットを無効にできません",
-            "Could not disable the chat",
-            Some(e),
-        );
-    }
-}
-
-/// チャットが使えない理由を決める材料（調べた結果だけ・I/O なし）
-#[derive(Debug, Default, Clone, PartialEq)]
-struct WikiChatProbe {
-    /// OpenNote が有効か
-    wiki_on: bool,
-    /// チャットの設定が ON か
-    chat_on: bool,
-    /// root が使えない理由（ready の Err）
-    ready_error: Option<String>,
-    /// claude コマンドが見つかったか
-    cli: bool,
-    /// ログインしているか（None = 分からない = 止めない）
-    logged_in: Option<bool>,
-    /// openref-mcp（wiki_write のある版）が見つかったか
-    mcp: bool,
-}
-
-/// 使えない理由（純関数）。優先順 = Wiki 無効 › チャット無効 › root が使えない › claude が無い › 未ログイン › openref-mcp が無い。
-/// None = 使える。ログインの有無が分からない（None）ときは止めない
-fn wiki_chat_reason(en: bool, p: &WikiChatProbe) -> Option<String> {
-    if !p.wiki_on {
-        return Some(tr(
-            en,
-            "OpenNote が無効です",
-            "OpenNote is disabled",
-        ));
-    }
-    if !p.chat_on {
-        return Some(tr(
-            en,
-            "チャットは無効です（Settings › OpenNote › チャット）",
-            "The chat is disabled (Settings › OpenNote › Chat)",
-        ));
-    }
-    if let Some(e) = &p.ready_error {
-        return Some(e.clone());
-    }
-    if !p.cli {
-        return Some(tr(
-            en,
-            "Claude Code（claude コマンド）が見つかりません。Claude Code をインストールしてください",
-            "Claude Code (the claude command) was not found. Install Claude Code",
-        ));
-    }
-    if p.logged_in == Some(false) {
-        return Some(tr(
-            en,
-            "Claude Code にログインしていません。[ログイン] でターミナルに claude auth login を開きます",
-            "Claude Code is not logged in. [Log in] opens claude auth login in Terminal",
-        ));
-    }
-    if !p.mcp {
-        return Some(tr(
-            en,
-            "openref-mcp が見つからないか古い版です（wiki_write がありません）。OpenRef を入れ直してください",
-            "openref-mcp was not found or is too old (no wiki_write). Reinstall OpenRef",
-        ));
-    }
-    None
-}
-
-/// 今の状態（types.ts の WikiChatStatus）。claude の検出・`--version`・`auth status`・openref-mcp の版の確認を走らせる（blocking）。
-/// `--version` は実体の mtime ごと・`auth status` は AUTH_TTL の間だけ覚えた分を使う（force = 覚えた分を使わずに読む = [再確認]）
-pub(crate) fn wiki_chat_status_now(app: &tauri::AppHandle, force: bool) -> Result<serde_json::Value, String> {
-    let en = ui_en(app);
-    let (ctx, on, db) = wiki_chat_settings(app)?;
-    let chat = app.state::<wiki_chat::Chat>();
-    // 無効なら何も調べない（claude の検出・auth status を起こさない）
-    if !(on && ctx.enabled) {
-        let reason = wiki_chat_reason(
-            en,
-            &WikiChatProbe {
-                wiki_on: ctx.enabled,
-                chat_on: on,
-                ..WikiChatProbe::default()
-            },
-        )
-        .unwrap_or_default();
-        return Ok(serde_json::json!({
-            "enabled": false, "cli": null, "version": null, "logged_in": null, "mcp": null,
-            "reason": reason, "state": chat.state().as_str(), "session_id": chat.session_id(),
-            "root": wiki_chat_root(&chat),
-        }));
-    }
-    let home = ctx.home.as_deref();
-    let cli = wiki_chat::find_cli(home, std::env::var_os("PATH").as_deref());
-    let version = cli.as_ref().and_then(wiki_chat::cli_version);
-    let auth = cli
-        .as_ref()
-        .and_then(|c| wiki_chat::cli_auth_cached(c, force));
-    let logged_in = auth.as_ref().map(|a| a.logged_in);
-    let mcp = db
-        .as_deref()
-        .and_then(|db| wiki_chat::find_mcp(&wiki_chat::mcp_candidates(home), db));
-    let ready = ctx.ready();
-    let reason = wiki_chat_reason(
-        en,
-        &WikiChatProbe {
-            wiki_on: ctx.enabled,
-            chat_on: on,
-            ready_error: ready.as_ref().err().map(|e| e.to_string()),
-            cli: cli.is_some(),
-            logged_in,
-            mcp: mcp.is_some(),
-        },
-    );
-    let session_id = chat.session_id().or_else(|| {
-        let (_, root) = ready.as_ref().ok()?;
-        wiki_chat::load_session(ctx.app_dir.as_deref()?, root)
-    });
-    let mut v = serde_json::json!({
-        "enabled": true,
-        "cli": cli.as_ref().map(|c| c.path.to_string_lossy().into_owned()),
-        "version": version,
-        "logged_in": logged_in,
-        "auth": auth,
-        "model": wiki_chat_model(app),
-        "mcp": mcp.map(|p| p.to_string_lossy().into_owned()),
-        "state": chat.state().as_str(),
-        "session_id": session_id,
-        "root": wiki_chat_root(&chat),
-    });
-    if let Some(r) = reason {
-        v["reason"] = serde_json::json!(r);
-    }
-    Ok(v)
-}
-
-/// チャットの [元に戻す] の Ctx = 記録した子の root（child）に固定する（設定 wiki_root は前面のタブの root で、子の root と
-/// 違いうる = 固定しないと undo_record が「別のワークスペース」で断る）。履歴から外した root は Err（文 = 戻さない理由）。child が無ければ設定のまま
-pub(crate) fn wiki_chat_undo_ctx(
-    mut ctx: openref_core::wiki::Ctx,
-    child: Option<&Path>,
-) -> Result<openref_core::wiki::Ctx, String> {
-    if let Some(r) = child {
-        ctx.pin(&r.to_string_lossy()).map_err(|e| e.to_string())?;
-    }
-    Ok(ctx)
-}
-
-/// チャットの子が動いている root（canonical な文字列・子が無ければ None） = wiki_chat_status の root（画面は前面のタブの root と
-/// 違う間は会話を隠す）
-fn wiki_chat_root(chat: &wiki_chat::Chat) -> Option<String> {
-    chat.root().map(|r| r.to_string_lossy().into_owned())
+/// 必須の整数（0 以上）の引数（無い・数でない = arg_missing）
+pub(crate) fn req_u64(a: &serde_json::Value, en: bool, cmd: &str, key: &str) -> Result<u64, String> {
+    a.get(key).and_then(|v| v.as_u64()).ok_or_else(|| arg_missing(en, cmd, key))
 }
 
 /// command の引数（`args: Option<Value>`）を object に揃える（無い・object でない = `{}`）。参照フォルダ・チャットの command が使う
 pub(crate) fn obj_args(args: Option<serde_json::Value>) -> serde_json::Value {
     args.filter(|a| a.is_object())
         .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// wiki_chat_status の {force: true}（画面の [再確認]）。true 以外（無い・false・文字列）は自動の読み直し
-pub(crate) fn wiki_chat_force(args: Option<serde_json::Value>) -> bool {
-    obj_args(args).get("force").and_then(|v| v.as_bool()) == Some(true)
-}
-
-/// root = 画面のタブの root（その root で子を起こす・履歴にあるものだけ）。None = 設定 wiki_root
-pub(crate) async fn wiki_chat_start_now(
-    app: tauri::AppHandle,
-    new: bool,
-    root: Option<String>,
-) -> Result<serde_json::Value, String> {
-    blocking(move || {
-        let en = ui_en(&app);
-        let (ctx, on, db) = wiki_chat_settings(&app)?;
-        if !(on && ctx.enabled) {
-            return Err(tr(en, "チャットは無効です（Settings › OpenNote › チャット）", "The chat is disabled (Settings › OpenNote › Chat)"));
-        }
-        let ctx = wiki_pin(ctx, root.as_deref())?;
-        let (_, root) = ctx.ready().map_err(err)?;
-        let no_db = || tr(en, "in-memory の DB ではチャットを使えません", "The chat is not available with an in-memory database");
-        let app_dir = ctx.app_dir.clone().ok_or_else(no_db)?;
-        // 相対の OPENREF_DB でも子（cwd = vault）が同じ DB を開くよう絶対パスに
-        let db = std::path::absolute(db.ok_or_else(no_db)?).map_err(err)?;
-        let home = ctx.home.as_deref();
-        let cli = wiki_chat::find_cli(home, std::env::var_os("PATH").as_deref())
-            .ok_or_else(|| tr(en, "Claude Code（claude コマンド）が見つかりません", "Claude Code (the claude command) was not found"))?;
-        // 起こす前は覚えた分を使わずに読む（読んだ結果は後の status の読み直しが使う）
-        if wiki_chat::cli_auth_cached(&cli, true).map(|a| a.logged_in) == Some(false) {
-            return Err(tr(en, "Claude Code にログインしていません（[ログイン] でターミナルに claude auth login を開きます）", "Claude Code is not logged in ([Log in] opens claude auth login in Terminal)"));
-        }
-        let mcp = wiki_chat::find_mcp(&wiki_chat::mcp_candidates(home), &db)
-            .ok_or_else(|| tr(en, "openref-mcp が見つからないか古い版です（wiki_write がありません）", "openref-mcp was not found or is too old (no wiki_write)"))?;
-        let saved = wiki_chat::load_session(&app_dir, &root);
-        // vault の CLAUDE.md（ふるまいの規則・user が編集する）が無ければ既定を置く。置いた / 置けなかった（規則の無いまま Claude が動く）は notice に
-        let md_notice = match wiki_chat::ensure_claude_md(&root) {
-            Ok(true) => Some(tr(en, "ワークスペースに CLAUDE.md（Claude のふるまいの規則）を置きました。自由に編集できます", "Placed CLAUDE.md (rules for Claude) in the workspace. Edit it freely")),
-            Ok(false) => None,
-            Err(e) => {
-                eprintln!("openref-app: wiki chat: ワークスペースに CLAUDE.md を置けません: {e}");
-                Some(tr(en, &format!("ワークスペースに CLAUDE.md（Claude のふるまいの規則）を置けませんでした: {e}"), &format!("Could not place CLAUDE.md (rules for Claude) in the workspace: {e}")))
-            }
-        };
-        let launch = wiki_chat::Launch { cli, mcp, db, root: root.clone(), model: wiki_chat_model(&app), log: wiki_chat_log_enabled(&app) };
-        let mut started = app.state::<wiki_chat::Chat>().start(&launch, saved, new, en)?;
-        if let Some(n) = md_notice {
-            started.notice = Some(match started.notice.take() {
-                Some(prev) => format!("{prev} · {n}"),
-                None => n,
-            });
-        }
-        if let Err(e) = wiki_chat::save_session(&app_dir, &root, &started.session_id) {
-            eprintln!("openref-app: wiki chat: 会話の id を保存できません（次の起動で続きになりません）: {e}");
-        }
-        serde_json::to_value(&started).map_err(err)
-    })
-    .await
 }
 
 #[cfg(test)]
@@ -2971,37 +2810,154 @@ mod wiki_err_contract {
 }
 
 #[cfg(test)]
-mod wiki_chat_model {
-    use super::wiki_chat_model_ok;
+mod args {
+    use super::{arg_missing, arg_missing_as, req_str, req_u64};
+    use serde_json::json;
 
-    /// `--model` に渡す表記: 別名・model id・Bedrock / Vertex 風の長い名前は通し、空白・引用・先頭の `-`（別のフラグに見える）は止める
+    /// 必須の引数が無いときの文は、関数に寄せる前の 12 か所の字と同じ（ja / en）
     #[test]
-    fn model_syntax() {
-        for ok in [
-            "",
-            "opus",
-            "fable",
-            "claude-sonnet-5",
-            "claude-opus-5-5[1m]",
-            "us.anthropic.claude-sonnet-5-5-v1:0",
-            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-x",
-            "model@2026",
-        ] {
-            assert!(wiki_chat_model_ok(ok), "{ok}");
+    fn missing_argument_texts_are_unchanged() {
+        let plain = [
+            ("wiki_switch_root", "root"),
+            ("wiki_forget_root", "root"),
+            ("wiki_front_root", "root"),
+            ("wiki_ref_dir_remove", "path"),
+            ("wiki_read_ref", "abs"),
+            ("wiki_exclude_set", "dir"),
+            ("wiki_chat_undo", "turn"),
+            ("wiki_chat_undo", "index"),
+        ];
+        for (cmd, key) in plain {
+            assert_eq!(arg_missing(false, cmd, key), format!("{cmd}: {key} は必須です"));
+            assert_eq!(arg_missing(true, cmd, key), format!("{cmd}: {key} is required"));
         }
-        for bad in [
-            " opus",
-            "opus sonnet",
-            "a'b",
-            "a\"b",
-            "a;b",
-            "a$b",
-            "-x",
-            "--model",
-            "日本",
-            &"x".repeat(129),
+        for (cmd, ja, en, want_ja, want_en) in [
+            ("wiki_chat_set_enabled", "enabled（true / false）", "enabled (true / false)",
+             "wiki_chat_set_enabled: enabled（true / false）は必須です", "wiki_chat_set_enabled: enabled (true / false) is required"),
+            ("wiki_chat_send", "text（空でない文字列）", "text (a non-empty string)",
+             "wiki_chat_send: text（空でない文字列）は必須です", "wiki_chat_send: text (a non-empty string) is required"),
+            ("wiki_chat_set_model", "model（文字列・空 = 既定）", "model (a string; empty = default)",
+             "wiki_chat_set_model: model（文字列・空 = 既定）は必須です", "wiki_chat_set_model: model (a string; empty = default) is required"),
+            ("wiki_chat_auth", "action（login）", "action (login)",
+             "wiki_chat_auth: action（login）は必須です", "wiki_chat_auth: action (login) is required"),
         ] {
-            assert!(!wiki_chat_model_ok(bad), "{bad}");
+            assert_eq!(arg_missing_as(false, cmd, ja, en), want_ja);
+            assert_eq!(arg_missing_as(true, cmd, ja, en), want_en);
+        }
+    }
+
+    /// req_str / req_u64: 在れば値・無い / 型が違えば arg_missing の文
+    #[test]
+    fn required_arguments() {
+        let a = json!({"s": "x", "n": 3, "neg": -1, "f": 1.5});
+        assert_eq!(req_str(&a, false, "c", "s"), Ok("x"));
+        assert_eq!(req_u64(&a, false, "c", "n"), Ok(3));
+        for key in ["missing", "n"] {
+            assert_eq!(req_str(&a, true, "c", key), Err(format!("c: {key} is required")));
+        }
+        for key in ["missing", "s", "neg", "f"] {
+            assert_eq!(req_u64(&a, false, "c", key), Err(format!("c: {key} は必須です")));
+        }
+    }
+}
+
+#[cfg(test)]
+mod ref_html {
+    use super::{wiki_ref_html_bytes, wiki_ref_show, WikiRefShow};
+    use crate::parity::{fn_body, squash};
+    use openref_core::wiki::{index::BODY_MAX, scan::Kind};
+
+    /// 参照フォルダの html: 上限までは中身を返す・大きさを見た後に上限を超えた（ここでは見ずに渡す）ら wiki_ref_show が
+    /// 大きさで断るときと同じ文の Err（画面は同じ Err の文を出す）・読めなければ Err
+    #[test]
+    fn html_is_read_up_to_the_limit() {
+        let dir = std::env::temp_dir().join(format!("openref-ref-html-{}-{}", std::process::id(), openref_core::keys::new_key()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("a.html");
+        std::fs::write(&small, "<title>t</title><p>本文</p>").unwrap();
+        assert_eq!(wiki_ref_html_bytes(&small, "a.html", false).unwrap(), std::fs::read(&small).unwrap());
+        let big = dir.join("big.html");
+        let edge = dir.join("edge.html");
+        std::fs::File::create(&edge).unwrap().set_len(BODY_MAX as u64).unwrap(); // 上限ちょうど = 読める（疎なファイル）
+        assert_eq!(wiki_ref_html_bytes(&edge, "edge.html", true).unwrap().len() as i64, BODY_MAX);
+        std::fs::File::create(&big).unwrap().set_len(BODY_MAX as u64 + 1).unwrap();
+        for en in [false, true] {
+            let e = wiki_ref_html_bytes(&big, "big.html", en).unwrap_err();
+            let shown = wiki_ref_show(Kind::Html, false, BODY_MAX as u64 + 1, "big.html", en);
+            assert_eq!(Err(e), shown.map(|_: WikiRefShow| ()), "大きさで断るときと同じ文");
+        }
+        assert!(wiki_ref_html_bytes(&dir.join("none.html"), "none.html", false).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// wiki_read_ref の html は wiki_ref_html_bytes で読む（丸ごと読む std::fs::read に戻さない）
+    #[test]
+    fn read_ref_reads_html_through_the_cap() {
+        let body = squash(&fn_body(include_str!("main.rs"), "fn wiki_read_ref_now("));
+        assert!(body.contains(&squash("let bytes = wiki_ref_html_bytes(&canon, &name, en)?;")), "{body}");
+        assert!(!body.contains("fs::read("), "{body}");
+        let read = squash(&fn_body(include_str!("wiki_gui.rs"), "pub(crate) fn wiki_ref_html_bytes("));
+        assert!(read.contains(&squash("read_file_capped(path, BODY_MAX as u64)")) && !read.contains("fs::read("), "{read}");
+    }
+}
+
+#[cfg(test)]
+mod scan_bg {
+    use super::{wiki_scan_message, WIKI_SCAN_FAIL_BUILD, WIKI_SCAN_FAIL_UPDATE};
+    use crate::parity::{fn_body, squash};
+    use openref_core::wiki::Fresh;
+
+    /// 背景の走査の知らせの文（2 か所に写してあった字と同じ）: Ok = 無し・作り直し中 = 進み具合つき・Err = 呼び手の前置き + 理由
+    #[test]
+    fn scan_messages_are_unchanged() {
+        let err = || -> openref_core::Result<Fresh> { Err(openref_core::CoreError::BadInput("x".into())) };
+        for fail in [WIKI_SCAN_FAIL_BUILD, WIKI_SCAN_FAIL_UPDATE] {
+            assert_eq!(wiki_scan_message(false, &Ok(Fresh::Ok), fail), None);
+            assert_eq!(wiki_scan_message(false, &Ok(Fresh::Rebuilding(42)), fail).as_deref(), Some("他のプロセスが索引を作り直し中です（42%）。終わると読めます"));
+            assert_eq!(
+                wiki_scan_message(true, &Ok(Fresh::Rebuilding(42)), fail).as_deref(),
+                Some("Another process is rebuilding the index (42%). It will be readable when done")
+            );
+        }
+        assert_eq!(wiki_scan_message(false, &err(), WIKI_SCAN_FAIL_BUILD).as_deref(), Some("索引を作れません: 入力を解釈できません: x"));
+        assert_eq!(wiki_scan_message(true, &err(), WIKI_SCAN_FAIL_BUILD).as_deref(), Some("Could not build the index: 入力を解釈できません: x"));
+        assert_eq!(wiki_scan_message(false, &err(), WIKI_SCAN_FAIL_UPDATE).as_deref(), Some("索引を更新できません: 入力を解釈できません: x"));
+        assert_eq!(wiki_scan_message(true, &err(), WIKI_SCAN_FAIL_UPDATE).as_deref(), Some("Could not update the index: 入力を解釈できません: x"));
+    }
+
+    /// 2 つの呼び手（有効化・切替 = 前に読んだ言語・成功で監視の印 / 除外 = 走査の後に読む言語）が同じ背景の走査を通り、
+    /// Rebuild だけが中身を捨てて全走査（runtime の中でしか動かない = 空白に依らない照合）。
+    /// 失敗で索引を消してやり直す（recover）のは利用者が押した「索引を作り直す」（wiki_reindex_now）だけ = 起動・切替・有効化・除外の走査は false
+    #[test]
+    fn both_scans_go_through_one_path() {
+        let src = include_str!("wiki_gui.rs");
+        let apply = squash(&fn_body(src, "pub(crate) fn wiki_apply("));
+        assert!(apply.ends_with("->Result<(),String>{wiki_apply_with(app,scan,false)"), "自動の走査（wiki_apply）で索引を消してやり直す: {apply}");
+        let with = squash(&fn_body(src, "fn wiki_apply_with("));
+        assert!(with.contains("wiki_scan_bg(app.clone(),at,scan,Some(en),WIKI_SCAN_FAIL_BUILD,on_ok,recover&&scan==WikiScan::Rebuild);") && with.contains("live.prime(g);"), "{with}");
+        let re = squash(&fn_body(src, "pub(crate) fn wiki_reindex_now("));
+        assert!(re.contains("wiki_apply_with(app,WikiScan::Rebuild,true)"), "「索引を作り直す」が消してやり直さない: {re}");
+        let body = src.split("#[cfg(test)]").next().unwrap(); // 試験の字面を数えない
+        assert_eq!(body.matches("wiki_apply_with(").count(), 3, "wiki_apply_with の呼び手が wiki_apply と wiki_reindex_now の外にもある（定義 + 2）");
+        let ex = squash(&fn_body(src, "pub(crate) fn wiki_exclude_set_now("));
+        assert!(ex.contains("wiki_scan_bg(app.clone(),at,WikiScan::Refresh,None,WIKI_SCAN_FAIL_UPDATE,||{},false);"), "{ex}");
+        let scan = squash(&fn_body(src, "pub(crate) fn wiki_scan("));
+        assert!(scan.contains("on_hold();ifscan==WikiScan::Rebuild{ix.rebuild()}else{ix.refresh()}"), "{scan}");
+        let bg = squash(&fn_body(src, "fn wiki_scan_bg("));
+        assert!(bg.contains("ifmatches!(res,Ok(openref_core::wiki::Fresh::Ok)){on_ok();}"), "成功のときだけ on_ok: {bg}");
+        // 消してやり直して直ったときの toast（判定 wiki_rebuild_recovered と、その中の呼び出し = 呼び出しを消す変異を落とす）
+        assert!(
+            bg.contains("ifwiki_rebuild_recovered(&res,retried.as_deref()){wiki_toast(&app,en,true,WIKI_REBUILT_FRESH.0,WIKI_REBUILT_FRESH.1,None);}"),
+            "直ったときの toast を呼ばない: {bg}"
+        );
+        assert!(
+            bg.contains("ifrecover{letrebuild=||wiki_scan(&at,WikiScan::Rebuild,||wiki_emit(&app,\"wiki-state\",()));wiki_rebuild_steps(&at.index,rebuild,openref_core::wiki::index::remove_index)}else{(wiki_scan(&at,scan,||wiki_emit(&app,\"wiki-state\",())),None)}"),
+            "recover の分かれ（本物の作り直し + 本物の remove_index）: {bg}"
+        );
+        let order = ["wiki_scan(&at,scan,||wiki_emit(&app,\"wiki-state\",()))", "on_ok();", "wiki_error(&app,m,&at.root,&at.index);", "wiki_emit(&app,\"wiki-changed\"", "wiki_emit(&app,\"wiki-state\",());"];
+        let mut at = 0;
+        for o in order {
+            at += bg[at..].find(o).unwrap_or_else(|| panic!("順が違う・無い: {o}: {bg}")) + 1;
         }
     }
 }

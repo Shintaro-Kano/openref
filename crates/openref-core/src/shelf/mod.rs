@@ -84,11 +84,17 @@ pub struct Ctx {
 impl Ctx {
     /// 設定 `shelf_workspaces` と `db.app_dir()`・環境変数 HOME。壊れた設定は Err（黙って空にしない・退避は GUI の仕事 = wiki::workspaces::parse と同じ）
     pub fn from_db(db: &Db) -> Result<Ctx> {
-        Ok(Ctx {
+        Ok(Ctx::from_parsed(db, workspaces::parse_for(KEY, db.setting(KEY)?.as_deref())?))
+    }
+
+    /// from_db の `shelf_workspaces` を解釈済みで渡す版（GUI が壊れた設定の判定で解釈した物を使い回す = 2 度解釈しない）。
+    /// 読み書きのモジュールの fn `with_workspaces`（BEGIN IMMEDIATE の中で f を呼ぶ）とは別物
+    pub fn from_parsed(db: &Db, workspaces: Map) -> Ctx {
+        Ctx {
             app_dir: db.app_dir(),
             home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
-            workspaces: workspaces::parse_for(KEY, db.setting(KEY)?.as_deref())?,
-        })
+            workspaces,
+        }
     }
 
     /// root が履歴（`shelf_workspaces` の鍵）と文字列で等しいか。canonicalize しない = symlink・末尾 `/` 等の生の綴りと空文字は拒否
@@ -97,7 +103,7 @@ impl Ctx {
         if self.workspaces.contains_key(root) {
             Ok(())
         } else {
-            Err(bad(format!("履歴に無い本棚です: {root}（root には shelf_status の root をそのまま渡す）")))
+            Err(unknown(root))
         }
     }
 
@@ -113,13 +119,18 @@ impl Ctx {
     }
 }
 
+/// エージェント向けの手がかり（MCP / CLI の文の末尾。GUI は CoreError::without_hint で外す）
+pub const ROOT_HINT: &str = "root には shelf_status の root をそのまま渡す";
+
+/// 履歴に無い本棚（Ctx::known と commands::set_opts が共有）
+pub(crate) fn unknown(root: &str) -> CoreError {
+    bad(format!("履歴に無い本棚です: {root}")).hint(ROOT_HINT)
+}
+
 /// 本棚の root として使えるかの検査（wiki::check_root と同じ規則 = asset scope に足す場所の規則）→ canonical。文言だけ本棚に
 pub fn check_root(path: &Path, ctx: &Ctx) -> Result<PathBuf> {
     let home = ctx.home.as_deref().ok_or_else(|| bad("HOME が未設定です"))?;
-    wiki::check_root(path, home, ctx.app_dir.as_deref()).map_err(|e| match e {
-        CoreError::BadInput(m) => bad(m.replacen("ワークスペースのフォルダに", "本棚のフォルダに", 1)),
-        e => e,
-    })
+    wiki::check_root_as(path, home, ctx.app_dir.as_deref(), "本棚のフォルダ")
 }
 
 /// 履歴の last_used を now に（無ければ作る・他の項目は保つ）。上限で落ちた root を古い順に返す
@@ -134,7 +145,7 @@ pub fn touch(m: &mut Map, root: &str, now: i64) -> Vec<String> {
 /// 設定 `shelf_workspaces` の 1 回の読み書き（BEGIN IMMEDIATE = GUI と CLI / MCP の別のプロセスの書込を混ぜない）。
 /// 読む → f → 中身が変わっていれば書く。壊れた設定は Err（f を呼ばない）・f が Err なら書かない
 pub fn with_workspaces<R>(db: &Db, f: impl FnOnce(&mut Map) -> Result<R>) -> Result<R> {
-    let tx = rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?;
+    let tx = workspaces::begin_immediate(db)?;
     let raw = db.setting(KEY)?;
     let before = workspaces::parse_for(KEY, raw.as_deref())?;
     let mut m = before.clone();
@@ -236,7 +247,7 @@ pub fn book_path(ctx: &Ctx, cache: &Cache, root: &str, id: &str) -> Result<(Path
         use paths::Reject::*;
         let why = match r {
             Missing(_) => "見つかりません（移動か削除された可能性）",
-            Escapes | Outside | DotDot => "本棚の外です（symlink）",
+            Escapes | Outside | DotDot => "本棚の外です（シンボリックリンク）",
             Root | Hidden(_) | DotStart(_) => "隠しフォルダの中です",
             NotFile(_) => "通常のファイルではありません",
         };
@@ -302,8 +313,8 @@ mod tests {
         std::os::unix::fs::symlink(&f.root, &link).unwrap();
         for bad_root in ["", " ", "/nope", &format!("{}/", f.root), &format!(" {}", f.root), &*link.to_string_lossy(), &format!("{}/解剖学", f.root)] {
             let e = f.ctx.known(bad_root).unwrap_err();
-            assert!(matches!(e, CoreError::BadInput(_)), "{bad_root:?}: {e:?}");
-            assert!(e.to_string().contains("履歴に無い本棚"), "{e}");
+            assert!(e.to_string().contains("履歴に無い本棚") && e.to_string().ends_with(&format!("（{ROOT_HINT}）")), "{e}");
+            assert!(matches!(e.without_hint(), CoreError::BadInput(_)), "{bad_root:?}");
         }
     }
 
@@ -486,7 +497,8 @@ mod tests {
         swap(&pdfin, &root.join("解剖学"));
         let msg = |p: &Path| book_path(&f.ctx, &c, &f.root, &id_for(p)).unwrap_err().to_string();
         assert!(msg(&a).contains("見つかりません"), "{}", msg(&a));
-        assert!(msg(&b).contains("本棚の外"), "{}", msg(&b));
+        // 英語の symlink を画面の日本語に混ぜない
+        assert!(msg(&b).ends_with("を開けません: 本棚の外です（シンボリックリンク）"), "{}", msg(&b));
         assert!(msg(&extra).contains("PDF ではありません"), "{}", msg(&extra));
         assert!(msg(&hid).contains("隠しフォルダ"), "{}", msg(&hid));
         assert!(msg(&pdfin).contains("通常のファイルではありません"), "{}", msg(&pdfin));

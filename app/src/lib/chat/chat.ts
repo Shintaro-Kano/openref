@@ -17,7 +17,7 @@
 //   index を 1 つ取る・system の status / thinking_tokens・rate_limit_event・control_response（interrupt の応答）も流れる・道具のエラーは
 //   tool_result の is_error: true（content は文字列のことがある）・中断の result = error_during_execution + terminal_reason "aborted_streaming"
 //   + errors ["[ede_diagnostic] …"]・user の行に tool_use_result（道具ごとの生の結果）が付く（使わない）
-// 画面の文言（日本語）はここに置かない: note は code で持ち、文は WikiChat が t() で組む
+// 画面の文言（日本語）はここに置かない: note は code で持ち、文は ChatPanel が t() で組む
 
 import type { WikiChatChange, WikiChatContext } from "../wiki/types";
 import { wikiLinksOf } from "../wiki/render/md.ts";
@@ -466,7 +466,7 @@ export function pageIndex(pages: { path: string }[]): PageIndex {
 }
 
 /** 応答の md の `[[名前]]`（描画と同じ走査 = md.ts の wikiLinksOf）を vault のページへ引き当てる（索引の解決の近似 = パスそのもの・拡張子の補い・ファイル名が 1 つに決まるもの）。
-    MdView に渡す links（WikiLink）にする。決まらなければ未解決のまま（推測で別のページへ飛ばさない） */
+    ShadowPage に渡す links（WikiLink）にする。決まらなければ未解決のまま（推測で別のページへ飛ばさない） */
 export function chatLinks(text: string, pages: { path: string }[]): { kind: "wiki" | "embed"; target: string; path: string | null; ambiguous: boolean }[] {
   const out: { kind: "wiki" | "embed"; target: string; path: string | null; ambiguous: boolean }[] = [];
   const seen = new Set<string>();

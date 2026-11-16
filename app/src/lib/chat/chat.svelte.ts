@@ -3,8 +3,9 @@
 // wiki_chat_undo / wiki_chat_set_model / wiki_chat_auth / wiki_chat_stop（invoke(name, { args })。stop は別のワークスペースの会話を替えるときだけ）・
 // Tauri event "wiki-chat"（line / stderr / state / changes / exit）と "wiki-chat-consent"。
 // stream-json の解釈は chat.ts の reduceChat（純粋）。OpenRef は会話本文を保存しない（この画面の表示は起動の間だけ）。
-// - 面はアプリ右端の柱 1 本（ChatDock・開閉 = タブ列右端のボタン / ⌘⌥C・ui_chat_dock）。中身は WikiChat 1 つ
-// - チャットが無効（status.enabled = false）の間は柱もボタンも出さない・子プロセスも起こさない（初回の送信で起こす）
+// - 面はアプリ右端の柱 1 本（ChatDock・開閉 = タブ列右端のボタン / ⌘⌥C・ui_chat_dock）。中身は ChatPanel 1 つ
+// - チャットが無効（status.enabled = false）の間は柱を出さない・子プロセスも起こさない（初回の送信で起こす）。タブ列のボタンは
+//   「無効」と分かったとき無効の絵で出す（押すと有効にする説明）。状態を読めていない間（null・読込の失敗）はボタンを出さない
 // - Wiki が無効の間は event を積まない・invoke しない
 // - 自動で起こし直さない（異常終了は知らせるだけ = 利用枠の嵐を作らない）
 // - ワークスペース: 子は 1 本・起こした root に縛られる（start / send に前面の root）。会話の root（chat.root）と前面の root
@@ -18,7 +19,7 @@ import { invoke } from "../wiki/ipc";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "../i18n.svelte";
 import { api } from "../api";
-import { app, toast } from "../state.svelte";
+import { app, covered, toast } from "../state.svelte";
 import { clampDockW, clipSelection, DOCK_W, emptyConv, parseDockPref, reduceChat, type ChatDockPref, type ChatInput, type Conv } from "./chat";
 import { clearViewingSelection, setViewingSelection, setViewingWanted, viewing, viewingKey, viewingSource } from "../viewing.svelte";
 import type {
@@ -32,6 +33,7 @@ import type {
   WikiChatUndoResult,
 } from "../wiki/types";
 import { shownRoot } from "../wiki/wiki.svelte";
+import { errText } from "../err";
 
 /** 診断（stderr）に持つ行数・1 行の長さの上限（古い行から捨てる・長い行は切る） */
 export const STDERR_MAX = 300;
@@ -47,7 +49,7 @@ export const chat = $state({
   statusError: null as string | null,
   /** 柱（ChatDock）の開閉と幅（ui_chat_dock = JSON で覚える。どのタブ種でも共通） */
   dock: { open: false, w: DOCK_W } as ChatDockPref,
-  /** 柱を開いた = 入力欄へ明示 focus する（WikiChat が mount の後でも拾う。WKWebView は autofocus が効かない） */
+  /** 柱を開いた = 入力欄へ明示 focus する（ChatPanel が mount の後でも拾う。WKWebView は autofocus が効かない） */
   focusPending: false,
   conv: emptyConv() as Conv,
   /** 今の会話の id（event の session_id と違えば別の会話 = 表示を新しくする） */
@@ -76,15 +78,17 @@ export const chat = $state({
   ctxOff: null as string | null,
   /** 新しい会話の確認中 */
   confirmNew: false,
-  /** Settings の [チャット] を ON にする前の説明（event wiki-chat-consent） */
+  /** Settings の [チャット] を ON にする前の説明（event wiki-chat-consent・タブ列のチャットのボタン） */
   consent: false,
+  /** 説明をタブ列のボタンから開いた = 同意したら柱を開く（Settings のメニューから開いたときは開かない）。 */
+  consentOpensDock: false,
 });
 
 function saveDock() {
-  api.setUiPref("ui_chat_dock", JSON.stringify(chat.dock)).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
+  api.setUiPref("ui_chat_dock", JSON.stringify(chat.dock)).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${errText(e, 160)}`));
 }
 
-/** 柱を開く / 閉じる（覚える）。開いたら入力欄へ明示 focus（focusPending = 柱の WikiChat が mount の後に受ける） */
+/** 柱を開く / 閉じる（覚える）。開いたら入力欄へ明示 focus（focusPending = 柱の ChatPanel が mount の後に受ける） */
 export function setDockOpen(open: boolean) {
   dockOpenTouched = true;
   chat.dock = { ...chat.dock, open };
@@ -132,9 +136,33 @@ export function usable(s: WikiChatStatus | null = chat.status): boolean {
   return !!s && s.enabled && !!s.cli && s.logged_in !== false && !!s.mcp;
 }
 
-/** チャットの柱とボタンを出すか（Wiki が有効・チャットが有効） */
+/** チャットの柱を出すか（Wiki が有効・チャットが有効）。⌘⌥C もこれ（無効の間は素通り） */
 export function chatShown(): boolean {
   return app.wikiOn && !!chat.status?.enabled;
+}
+
+/** チャットが無効と分かっている（状態を読めて enabled: false・読込の失敗ではない）。読込中（null）・読めない（statusError）は「分からない」= 無効と見せない */
+export function chatKnownOff(): boolean {
+  return app.wikiOn && chat.status?.enabled === false && !chat.statusError;
+}
+
+/** タブ列のチャットのボタンを出すか = 有効（柱を出せる）か、無効と分かっているとき（押すと有効にする説明）。OpenNote の門は変えない。
+    状態を読めていない間（起動直後の読込 = claude auth status を含み秒単位・読込の失敗）は出さない = 有効の利用者に「無効」の絵を見せない */
+export function chatEntryShown(): boolean {
+  return chatShown() || chatKnownOff();
+}
+
+/** タブ列のチャットのボタン: チャットが有効なら柱の開閉（⌘⌥C と同じ）・無効なら有効にする説明（ChatConsent = Settings › OpenNote › チャット と同じ窓）。
+    同意したら柱が開く・断ったら何も変えない。覆い（モーダル・エディタ・取込）の下では何もしない */
+export function openChatEntry() {
+  if (!app.wikiOn || covered()) return;
+  if (chatShown()) {
+    toggleDock();
+    return;
+  }
+  if (!chatKnownOff()) return; // 状態を読めていない = 「無効」と扱わない（説明を開かない）
+  chat.consentOpensDock = true;
+  chat.consent = true;
 }
 
 export function busy(): boolean {
@@ -206,11 +234,11 @@ async function loadDockPref() {
     if (dockOpenTouched || dockWTouched) saveDock();
   } catch (e) {
     prefsLoaded = false;
-    toast(`✗ ${t("表示設定を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("表示設定を読めません")}: ${errText(e, 160)}`);
   }
 }
 
-/** 立っている focusPending を el（WikiChat の入力欄）で受ける = focus して消費する。見えていない el は消費しない = 見えたときに受ける
+/** 立っている focusPending を el（ChatPanel の入力欄）で受ける = focus して消費する。見えていない el は消費しない = 見えたときに受ける
     （面は柱 1 つだが、明示の focus は残す = WKWebView は autofocus が効かない）。focus が移らなかったときも消費しない。
     見えているが disabled（使えない = 未ログイン等）なら focus せずに消費する（残すと、使えるようになった後の mount のし直しで
     エディタ等から focus を奪う） */
@@ -387,15 +415,20 @@ export async function undoChange(turn: number, index: number) {
 
 /** Settings の [チャット] の説明に答える（Rust の wiki-chat-consent）。有効にできなければ toast */
 export async function answerConsent(ok: boolean) {
+  const opensDock = chat.consentOpensDock;
   chat.consent = false;
+  chat.consentOpensDock = false;
   if (!ok) return;
   try {
     chat.status = await call<WikiChatStatus>("wiki_chat_set_enabled", { enabled: true });
     chat.statusError = null;
-    if (chat.status.enabled) void loadDockPref();
+    if (chat.status.enabled) {
+      if (opensDock) setDockOpen(true); // タブ列のボタンから = そのまま柱を開く（覚えた開閉より先に触る = loadDockPref は上書きしない）
+      void loadDockPref();
+    }
   } catch (e) {
     chat.statusError = String(e);
-    toast(`✗ ${t("チャットを有効にできません")}: ${String(e).slice(0, 160)}`, 8000);
+    toast(`✗ ${t("チャットを有効にできません")}: ${errText(e, 160)}`, 8000);
   }
 }
 
@@ -417,25 +450,22 @@ export async function setModel(model: string): Promise<boolean> {
     chat.model = null;
     return true;
   } catch (e) {
-    toast(`✗ ${t("モデルを変えられません")}: ${String(e).slice(0, 160)}`);
-    void loadChatStatus(); // 設定の値に <select> を戻す（status.model が変わらなくても WikiChat の {#key} が描き直す）
+    toast(`✗ ${t("モデルを変えられません")}: ${errText(e, 160)}`);
+    void loadChatStatus(); // 設定の値に <select> を戻す（status.model が変わらなくても ChatPanel の {#key} が描き直す）
     return false;
   }
 }
 
-/** ログイン(Terminal.app に claude auth login を開く)/ ログアウト(claude auth logout) */
-export async function authAction(action: "login" | "logout"): Promise<boolean> {
+/** ログイン(Terminal.app に claude auth login を開く)。ログアウトは画面から呼ばない（ターミナルで claude auth logout を案内）。
+    Rust の wiki_chat_auth も action は "login" だけを受け付ける（logout の枝は無い） */
+export async function authAction(action: "login"): Promise<boolean> {
   try {
     chat.status = await call<WikiChatStatus>("wiki_chat_auth", { action });
     chat.statusError = null;
-    if (action === "login") toast(t("ターミナルで claude auth login を開きました。終わったら [再確認] を押してください"), 10000);
-    else {
-      chat.model = null;
-      toast(t("Claude Code からログアウトしました"));
-    }
+    toast(t("ターミナルで claude auth login を開きました。終わったら [再確認] を押してください"), 10000);
     return true;
   } catch (e) {
-    toast(`✗ ${action === "login" ? t("ログインを開けません") : t("ログアウトできません")}: ${String(e).slice(0, 160)}`, 8000);
+    toast(`✗ ${t("ログインを開けません")}: ${errText(e, 160)}`, 8000);
     return false;
   }
 }
@@ -489,7 +519,7 @@ export function onChatEvent(ev: WikiChatEvent) {
       const expected = (expectExitAt > 0 && Date.now() - expectExitAt < EXPECT_EXIT_MS) || ev.signal === "SIGTERM";
       const abnormal = !expected && ((ev.code != null && ev.code !== 0) || !!ev.signal);
       expectExitAt = 0;
-      if (abnormal && app.wikiOn) apply({ t: "note", tone: "error", code: "exit", detail: ev.signal ? `signal ${ev.signal}` : `code ${ev.code ?? "?"}` });
+      if (abnormal && app.wikiOn) apply({ t: "note", tone: "error", code: "exit", detail: ev.signal ? `signal ${ev.signal}` : `code ${ev.code ?? "?"}` }); // 言語に依らない値（訳は ChatPanel の noteText）
       void loadChatStatus();
       return;
     }
@@ -509,9 +539,24 @@ export function initChat(): () => void {
   void on("wiki-state", () => void loadChatStatus());
   // Settings の [チャット] を ON にする前に説明を出す（Wiki が有効なときだけ）
   void on("wiki-chat-consent", () => {
-    if (app.wikiOn) chat.consent = true;
+    if (!app.wikiOn) return;
+    chat.consentOpensDock = false; // メニューから = 同意しても柱は開かない（前と同じ）
+    chat.consent = true;
   });
   const stopRoot = $effect.root(() => {
+    // 説明が開いている間に、有効になったと分かった（読込が終わった・別の道で有効にした = 有効でない → 有効に変わった）= 説明を閉じる
+    // （同意は要らない）。開いた時点で既に有効だった場合は閉じない（変わったときだけ見る）
+    let wasOn = !!chat.status?.enabled;
+    $effect(() => {
+      const on = !!chat.status?.enabled;
+      untrack(() => {
+        if (on && !wasOn && chat.consent) {
+          chat.consent = false;
+          chat.consentOpensDock = false;
+        }
+        wasOn = on;
+      });
+    });
     // Wiki が有効になった（起動時の設定の読込・Settings で ON）= チャットの状態を読む。柱の mount を待たない
     // （タブ列のボタンは chat.status で出る = 起動直後から出す）
     $effect(() => {

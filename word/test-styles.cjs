@@ -3,14 +3,12 @@
 // 実行: node word/test-styles.cjs
 const fs = require("fs");
 const path = require("path");
-const vm = require("vm");
 const assert = require("assert");
 
-const dir = __dirname;
-const fx = path.join(dir, "../app/harness/cite");
-vm.runInThisContext(fs.readFileSync(path.join(dir, "vendor/citeproc.js"), "utf8"));
-vm.runInThisContext(fs.readFileSync(path.join(dir, "cite-core.js"), "utf8"));
-const en = fs.readFileSync(path.join(dir, "vendor/locales-en-US.xml"), "utf8");
+const { loadCite } = require("./test-lib.cjs");
+
+const fx = path.join(__dirname, "../app/harness/cite");
+const en = loadCite().locale; // global に CSL・OpenRefCite
 const LOCALES = {
   "en-US": en,
   "de-DE": fs.readFileSync(path.join(fx, "locales-de-DE.xml"), "utf8"),

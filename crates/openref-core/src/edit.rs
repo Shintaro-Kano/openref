@@ -343,13 +343,28 @@ pub fn attach_auto_bytes(db: &Db, key: &str, filename: &str, bytes: &[u8]) -> Re
     attach_auto_with_md5(db, key, filename, bytes, &crate::pdffetch::md5_hex(bytes))
 }
 
-/// md5 を計算済みの呼び手（取込の重複判定・捕獲）用: 同じバイト列の md5 を取り直さない。`md5` = `bytes` の 16 進 md5
+/// md5 を計算済みの呼び手（取込の重複判定・捕獲）用: 同じバイト列の md5 を取り直さない。`md5` = `bytes` の 16 進 md5。
+/// 本文の抽出もこの中（= 呼び手のロックの中）で行う。ロックの外で抽出済みなら [`attach_auto_extracted`]
 pub fn attach_auto_with_md5(db: &Db, key: &str, filename: &str, bytes: &[u8], md5: &str) -> Result<Attached> {
+    attach_auto_extracted(db, key, filename, bytes, md5, None)
+}
+
+/// `attach_auto_with_md5` に、ロックの外で済ませた本文の抽出（`fulltext::extract_for_index`）を渡す版（2026-11-14）。
+/// 本文の行は添付の行の INSERT と同じロックの中で書く = 本文の無い添付が他の経路から見える隙・別の結果が先に入る隙は無い。
+/// `text` が None・抽出元の md5 が違う（呼び手の取り違え）ときは、今までどおりここで抽出する
+pub fn attach_auto_extracted(
+    db: &Db,
+    key: &str,
+    filename: &str,
+    bytes: &[u8],
+    md5: &str,
+    text: Option<&crate::fulltext::ExtractedText>,
+) -> Result<Attached> {
     if bytes.is_empty() {
         return Err(CoreError::BadInput("空のファイル".into()));
     }
     let (id, placement) = if db.pdf_write_mode()? != "drive" {
-        let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
+        let (att_id, path) = write_managed(db, key, filename, bytes, md5, text)?;
         (att_id, Placement::Managed(path))
     } else {
         let item = item_id(db, key)?;
@@ -370,12 +385,11 @@ pub fn attach_auto_with_md5(db: &Db, key: &str, filename: &str, bytes: &[u8], md
                     rusqlite::params![keys::new_key(), item, dest.to_string_lossy(), md5],
                 )?;
                 let att_id = db.conn.last_insert_rowid();
-                // 本文の全文索引（失敗しても添付は成立させる）。手元のバイト列から作る = 書いたファイルを読み直さない
-                crate::fulltext::index_bytes_quietly(&db.conn, att_id, bytes, &dest, md5);
+                index_new_attachment(db, att_id, bytes, &dest, md5, text);
                 (att_id, Placement::Drive(dest))
             }
             Err(reason) => {
-                let (att_id, path) = write_managed(db, key, filename, bytes, md5)?;
+                let (att_id, path) = write_managed(db, key, filename, bytes, md5, text)?;
                 (att_id, Placement::ManagedFallback { path, reason })
             }
         }
@@ -385,7 +399,14 @@ pub fn attach_auto_with_md5(db: &Db, key: &str, filename: &str, bytes: &[u8], md
 
 /// managed 添付の本体: storage/<添付key>/<filename> へ書き、行を入れ、手元のバイト列から本文を索引する。
 /// 戻り値 = (添付行 id, 書込先)
-fn write_managed(db: &Db, key: &str, filename: &str, bytes: &[u8], md5: &str) -> Result<(i64, std::path::PathBuf)> {
+fn write_managed(
+    db: &Db,
+    key: &str,
+    filename: &str,
+    bytes: &[u8],
+    md5: &str,
+    text: Option<&crate::fulltext::ExtractedText>,
+) -> Result<(i64, std::path::PathBuf)> {
     let id = item_id(db, key)?;
     let root = db
         .storage_root()
@@ -401,9 +422,64 @@ fn write_managed(db: &Db, key: &str, filename: &str, bytes: &[u8], md5: &str) ->
         rusqlite::params![att_key, id, dest.to_string_lossy(), md5],
     )?;
     let att_id = db.conn.last_insert_rowid();
-    // 本文の全文索引（失敗しても添付は成立させる）。手元のバイト列から作る = 書いたファイルを読み直さない
-    crate::fulltext::index_bytes_quietly(&db.conn, att_id, bytes, &dest, md5);
+    index_new_attachment(db, att_id, bytes, &dest, md5, text);
     Ok((att_id, dest))
+}
+
+/// 入れたばかりの添付行の本文索引（失敗しても添付は成立させる）。手元のバイト列から作る = 書いたファイルを読み直さない。
+/// ロックの外で抽出済み（md5 が同じ）ならそれを書くだけ・無ければここで抽出する
+fn index_new_attachment(
+    db: &Db,
+    att_id: i64,
+    bytes: &[u8],
+    dest: &Path,
+    md5: &str,
+    text: Option<&crate::fulltext::ExtractedText>,
+) {
+    match text {
+        Some(t) if t.md5() == md5 => crate::fulltext::store_extracted_quietly(&db.conn, att_id, t, md5),
+        other => {
+            if let Some(t) = other {
+                eprintln!("fulltext: 添付 {att_id} に渡された抽出は別のバイト列（md5 {}）→ ここで抽出し直す", t.md5());
+            }
+            crate::fulltext::index_bytes_quietly(&db.conn, att_id, bytes, dest, md5)
+        }
+    }
+}
+
+/// `attach_auto` の Mutex 版（DB を共有する呼び手 = Tauri の attach_pdf 用。2026-11-14）: 存在確認・DB 自身のファイルの
+/// 拒否は短いロックで、ファイルの読込・md5・本文の抽出はロックの外、添付（書込・行・本文の行）だけ再ロックして行う。
+/// 外側の Err は `lock` の失敗だけ
+pub fn attach_auto_unlocked<G, E>(lock: impl Fn() -> std::result::Result<G, E>, key: &str, src: &Path) -> std::result::Result<Result<Attached>, E>
+where
+    G: std::ops::Deref<Target = Db>,
+{
+    let checked = (|| -> Result<String> {
+        if !src.exists() {
+            return Err(CoreError::NotFound(format!("file {}", src.display())));
+        }
+        let fname = src
+            .file_name()
+            .ok_or_else(|| CoreError::BadInput(format!("ファイル名が取れません: {}", src.display())))?
+            .to_string_lossy()
+            .to_string();
+        Ok(fname)
+    })();
+    let fname = match checked {
+        Ok(f) => f,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = crate::db::reject_connection_file(&lock()?.conn, src) {
+        return Ok(Err(e));
+    }
+    let bytes = match std::fs::read(src) {
+        Ok(b) => b,
+        Err(e) => return Ok(Err(e.into())),
+    };
+    let md5 = crate::pdffetch::md5_hex(&bytes);
+    let text = if bytes.is_empty() { None } else { Some(crate::fulltext::extract_for_index(&bytes, &md5, Some(src))) };
+    let g = lock()?;
+    Ok(attach_auto_extracted(&g, key, &fname, &bytes, &md5, text.as_ref()))
 }
 
 #[cfg(test)]
@@ -437,10 +513,10 @@ mod tests {
         use serde_json::json;
         let mut db = Db::open_in_memory().unwrap();
         let old = json!({
-            "type": "article-journal", "title": "T", "author": [{"family": "Kano", "given": "S"}],
+            "type": "article-journal", "title": "T", "author": [{"family": "Kato", "given": "S"}],
             "container-title": "Radiology", "volume": "1", "PMID": "123",
             "issued": {"date-parts": [[2020]]},
-            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kano2020liver",
+            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kato2020liver",
             "custom": {"source": "zotero"}
         });
         db.conn
@@ -455,25 +531,25 @@ mod tests {
         // GUI の形（その型のカタログの欄だけ・空欄は送らない）: volume を空にし、PMID を外し、title を直す
         let before_key = bibkey(&db);
         update_csl(&mut db, "ITEM0001", &json!({
-            "type": "article-journal", "title": "T2", "author": [{"family": "Kano", "given": "S"}],
+            "type": "article-journal", "title": "T2", "author": [{"family": "Kato", "given": "S"}],
             "container-title": "Radiology", "issued": {"date-parts": [[2020]]}, "custom": {"subtype": "review"}
         })).unwrap();
         let c = get(&db);
         assert_eq!(c["title"], "T2");
         assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}), "accessed は残る");
-        assert_eq!(c["citation-key"], "kano2020liver", "citation-key は残る");
+        assert_eq!(c["citation-key"], "kato2020liver", "citation-key は残る");
         assert!(c.get("volume").is_none() && c.get("PMID").is_none(), "カタログ内のキーは入力から外すと消える");
         assert_eq!(c["custom"], json!({"source": "zotero", "subtype": "review"}));
-        assert_eq!(before_key, "kano2020liver");
+        assert_eq!(before_key, "kato2020liver");
         assert_eq!(bibkey(&db), before_key, "BibTeX の引用キーが変わらない");
 
         // MCP の形（get_item の csl を直して渡す）: 値を変えれば変わり、空にすれば消える
         let mut m = get(&db);
-        m["citation-key"] = json!("  kano2020b ");
+        m["citation-key"] = json!("  kato2020b ");
         m["accessed"] = json!(null);
         update_csl(&mut db, "ITEM0001", &m).unwrap();
         let c = get(&db);
-        assert_eq!(c["citation-key"], "kano2020b");
+        assert_eq!(c["citation-key"], "kato2020b");
         assert!(c.get("accessed").is_none(), "空値は明示の削除");
 
         // 型を変える: 旧型（article-journal）の欄で新型（webpage）に無いものは残らない。カタログ外の citation-key は残る
@@ -484,7 +560,7 @@ mod tests {
         let c = get(&db);
         assert_eq!(c["type"], "webpage");
         assert!(c.get("author").is_none(), "入力に無いカタログ内のキーは消える");
-        assert_eq!(c["citation-key"], "kano2020b");
+        assert_eq!(c["citation-key"], "kato2020b");
         // webpage の accessed（カタログ内）を入れてから article-journal へ戻すと、旧型の欄なので残らない
         let mut w = get(&db);
         w["accessed"] = json!({"date-parts": [[2025, 1, 2]]});
@@ -493,7 +569,7 @@ mod tests {
         update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2"})).unwrap();
         let c = get(&db);
         assert!(c.get("accessed").is_none() && c.get("URL").is_none(), "旧型の欄は新型に混ざらない");
-        assert_eq!(c["citation-key"], "kano2020b");
+        assert_eq!(c["citation-key"], "kato2020b");
         // カタログ外でも、元の CSL に無いキーは入れられない（混入防止は従来どおり）
         update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2", "bogus": "x"})).unwrap();
         assert!(get(&db).get("bogus").is_none());
@@ -510,7 +586,7 @@ mod tests {
         assert!(!types::is_valid_field("webpage", "citation-key") && !types::is_valid_field("article-journal", "citation-key"));
         let old = json!({
             "type": "article-journal", "title": "T", "URL": "https://example.org/a",
-            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kano2020liver"
+            "accessed": {"date-parts": [[2024, 5, 1]]}, "citation-key": "kato2020liver"
         });
         let put = |db: &Db, v: &Value| {
             db.conn.execute("DELETE FROM items WHERE key = 'ITEM0001'", []).unwrap();
@@ -526,7 +602,7 @@ mod tests {
         update_csl(&mut db, "ITEM0001", &json!({"type": "article-journal", "title": "T2"})).unwrap();
         let c = get(&db);
         assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}));
-        assert_eq!(c["citation-key"], "kano2020liver");
+        assert_eq!(c["citation-key"], "kato2020liver");
 
         // 型を変えて、新しい型の欄（accessed）を空で保存（= 入力に無い）→ 消える。どちらの型にも無い citation-key は温存
         put(&db, &old);
@@ -534,7 +610,7 @@ mod tests {
         let c = get(&db);
         assert_eq!(c["type"], "webpage");
         assert!(c.get("accessed").is_none(), "新しい型で見えている欄は入力が正 = 空なら消える");
-        assert_eq!(c["citation-key"], "kano2020liver", "新しい型にも無いキーは温存");
+        assert_eq!(c["citation-key"], "kato2020liver", "新しい型にも無いキーは温存");
 
         // 型を変えて accessed を入力に残す（エディタが旧値を欄に読んだまま保存）→ その値で残る
         put(&db, &old);
@@ -543,7 +619,7 @@ mod tests {
         })).unwrap();
         let c = get(&db);
         assert_eq!(c["accessed"], json!({"date-parts": [[2024, 5, 1]]}));
-        assert_eq!(c["citation-key"], "kano2020liver");
+        assert_eq!(c["citation-key"], "kato2020liver");
     }
 
     /// 型カタログに無い `article`（1.1.0 までの GUI 取込 stub・Zotero 移行の preprint）は document として編集・保存できる
@@ -553,7 +629,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         let old = json!({
             "type": "article", "title": "Preprint", "publisher": "medRxiv", "genre": "Preprint",
-            "number": "2024.01.01.1", "citation-key": "kano2024",
+            "number": "2024.01.01.1", "citation-key": "kato2024",
             "custom": {"source": "zotero"}
         });
         db.conn
@@ -571,7 +647,7 @@ mod tests {
         assert_eq!(c["type"], "document");
         assert_eq!(c["title"], "Preprint 2");
         assert_eq!((c["publisher"].as_str(), c["genre"].as_str(), c["number"].as_str()), (Some("medRxiv"), Some("Preprint"), Some("2024.01.01.1")));
-        assert_eq!(c["citation-key"], "kano2024", "どちらの型にも無いキーは温存");
+        assert_eq!(c["citation-key"], "kato2024", "どちらの型にも無いキーは温存");
         assert_eq!(c["custom"], json!({"source": "zotero"}));
 
         // 旧い型が article の item を document で保存し直しても、document の欄を空にすれば消える（旧型 = document 扱い）
@@ -588,7 +664,7 @@ mod tests {
         let c = get(&db);
         assert_eq!(c["type"], "article-journal");
         assert!(c.get("genre").is_none() && c.get("number").is_none() && c.get("publisher").is_none());
-        assert_eq!(c["citation-key"], "kano2024");
+        assert_eq!(c["citation-key"], "kato2024");
 
         // 手動作成・sanitize も同じ
         let created = create_manual(&mut db, &json!({"type": "article", "title": "New"})).unwrap();

@@ -1,14 +1,15 @@
 <script lang="ts">
   /* チャットの中身（柱 ChatDock の中に 1 つだけ）。状態と動詞は chat.svelte.ts、行の解釈は chat.ts。
-     上から: 状態と [新しい会話] / アカウント（ログイン・ログアウト）とモデルの選択 / 使えないときの案内 / 会話（発言・応答の逐次・道具の要約・ターンごとの変更の一覧）/ 診断（stderr）/
+     上から: 状態と [新しい会話] / モデルの選択と ⋯（ログイン済み = アカウント・再確認・版は ⋯ の中。未ログイン・確かめられない = [ログイン] ほかの行のまま。
+     ログアウトは画面から呼ばない = ⋯ にターミナルの claude auth logout を案内）/ 使えないときの案内 / 会話（発言・応答の逐次・道具の要約・ターンごとの変更の一覧）/ 診断（stderr）/
      文脈のチップ（見ている物 = viewing: 今のページ、または PDF のタブなら開いている文献・一覧のタブなら選んでいる文献・選択範囲 = × で外す。本棚と本はなし）と
      入力欄（Enter で送信・Shift+Enter で改行・IME の変換中は送らない）。見出しの右端の × は柱を閉じる（⌘⌥C と同じ）。
      スクロールは末尾に追従し、user が上へ戻したら追従しない */
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { composing } from "../input";
-  import { reveal } from "../state.svelte";
-  import WikiChatMd from "./ChatMd.svelte";
+  import { app, covered, reveal } from "../state.svelte";
+  import ChatMd from "./ChatMd.svelte";
   import { changeView, clipSelection, codePoints, groupByTurn, toolName, type ChatEntry } from "./chat";
   import { authAction, busy, chat, chatHidden, claimFocus, interrupt, loadChatStatus, newConversation, send, setDockOpen, setModel, undoChange, usable } from "./chat.svelte";
   import { clearViewingSelection, viewing, viewingKey, viewingSource } from "../viewing.svelte";
@@ -84,11 +85,46 @@
   async function onModel(e: Event) {
     if (!(await setModel((e.currentTarget as HTMLSelectElement).value))) modelKey++;
   }
-  /** [ログアウト] は 1 段の確認（子プロセスが止まり、ターミナルの Claude Code からもログアウトされる） */
-  let confirmLogout = $state(false);
-  async function logout() {
-    confirmLogout = false;
-    await authAction("logout");
+  /** ⋯（ログイン済みのときだけ）: アカウント（読むだけ）・Claude Code の版・[再確認]・ログアウトの案内。外を押す / Esc（覆いの下では効かない）で閉じる */
+  let moreOpen = $state(false);
+  let moreEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (st?.logged_in !== true) moreOpen = false; // 未ログインになった = 行が今の形に戻る（⋯ は無い）
+  });
+  // 前面の画面の種類（同じタブの中のモードの切替 = セグメントをキーで押した・PDF / 本の読み手）。mode.svelte.ts の modeOf と同じ見方を読むだけ
+  const frontKind = $derived.by(() => {
+    const tb = app.tabs.find((x) => x.id === app.tab);
+    return !tb ? "" : tb.viewer ? "pdf" : tb.shelfBook ? "book" : tb.wiki ? "wiki" : tb.shelf ? "shelf" : "list";
+  });
+  // 前面のタブ・前面の画面の種類が替わった（キー・メニュー・クリックのどれでも）・覆い（モーダル・エディタ・取込）が出た = ⋯ を閉じる
+  $effect(() => {
+    void app.tab;
+    void frontKind;
+    if (covered()) moreOpen = false;
+    untrack(() => (moreOpen = false));
+  });
+  $effect(() => {
+    if (!moreOpen) return;
+    const down = (e: PointerEvent) => {
+      if (moreEl && !moreEl.contains(e.target as Node)) moreOpen = false;
+    };
+    // capture = App の Esc の連鎖（柱を閉じる・PDF のタブを閉じる）より先に、⋯ だけを閉じる
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || composing(e) || covered()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      moreOpen = false;
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("keydown", key, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("keydown", key, true);
+    };
+  });
+  function toggleMore() {
+    if (covered()) return;
+    moreOpen = !moreOpen;
   }
   const accountText = $derived.by(() => {
     const a = st?.auth;
@@ -109,8 +145,16 @@
     else void reveal(v.open.item);
   }
 
+  /** 終了の注記の詳細（保存は言語に依らない "code 1" / "signal SIGKILL" / "signal 30" = chat.svelte.ts）→ 描くときに訳す（言語を切り替えても今の言語の字）。
+      前の版の Rust は名前の無いシグナルを "signal 30" と返した = 注記が "signal signal 30" → 重なった "signal " は描くときに 1 つにする */
+  function exitDetail(d: string): string {
+    const m = /^(code|signal) (.*)$/.exec(d);
+    if (!m) return d;
+    return m[1] === "code" ? `${t("終了コード")} ${m[2]}` : `${t("シグナル")} ${m[2].replace(/^signal /, "")}`;
+  }
+
   function noteText(e: Extract<ChatEntry, { k: "note" }>): string {
-    if (e.code === "exit") return `${t("Claude Code が終了しました")} (${e.detail}) · ${t("次の送信で起動し直します")}`;
+    if (e.code === "exit") return `${t("Claude Code が終了しました")} (${exitDetail(e.detail)}) · ${t("次の送信で起動し直します")}`;
     if (e.code === "send-failed") return `${t("送信できませんでした")}: ${e.detail}`;
     return e.detail;
   }
@@ -140,34 +184,45 @@
     <button class="wk-ch-btn wk-ch-close" title={t("チャットを閉じる（⌘⌥C）")} aria-label={t("チャットを閉じる（⌘⌥C）")} onclick={() => setDockOpen(false)}>×</button>
   </div>
 
+  {#snippet modelPicker()}
+    <label class="wk-ch-model">
+      <span>{t("モデル")}</span>
+      {#key modelKey}
+        <select value={st?.model ?? ""} disabled={isBusy || chat.sending} aria-label={t("モデル")} onchange={onModel}>
+          <option value="">{t("既定（Claude Code の設定）")}</option>
+          {#each MODELS as m (m)}<option value={m}>{modelLabel(m)}</option>{/each}
+          {#if st?.model && !MODELS.includes(st.model)}<option value={st.model}>{st.model}</option>{/if}
+        </select>
+      {/key}
+    </label>
+    {#if chat.model}<span class="wk-ch-dim wk-ch-model-now" title={t("今の会話で動いているモデル")}>{chat.model}</span>{/if}
+  {/snippet}
+
   {#if st?.enabled && st.cli}
     <div class="wk-ch-acct">
-      {#if confirmLogout}
-        <span class="wk-ch-ask">{t("Claude Code からログアウトしますか（ターミナルの claude も未ログインになります）")}</span>
-        <button class="wk-ch-btn" onclick={() => (confirmLogout = false)}>{t("キャンセル")}</button>
-        <button class="wk-ch-btn wk-ch-primary" onclick={() => void logout()}>{t("ログアウト")}</button>
-      {:else}
-        {#if st.logged_in}
-          <span class="wk-ch-acct-in" title={accountText}>{t("ログイン済み")}{accountText ? `: ${accountText}` : ""}</span>
-          <button class="wk-ch-btn" disabled={isBusy || chat.sending} title={t("claude auth logout を実行します")} onclick={() => (confirmLogout = true)}>{t("ログアウト")}</button>
-        {:else}
-          <span class="wk-ch-acct-out">{st.logged_in === false ? t("未ログイン") : t("ログイン状態を確認できません")}</span>
-          <button class="wk-ch-btn wk-ch-primary" title={t("ターミナルに claude auth login を開きます")} onclick={() => void authAction("login")}>{t("ログイン")}</button>
-        {/if}
-        <button class="wk-ch-btn" title={t("ログイン状態を読み直します")} onclick={() => void loadChatStatus({ force: true })}>{t("再確認")}</button>
-        {#if st.cli}<span class="wk-ch-dim wk-ch-cli" title={st.cli}>Claude Code {st.version ?? "?"}</span>{/if}
+      {#if st.logged_in === true}
+        <!-- ログイン済み = モデル ▾ と ⋯ だけ。異常（claude が無い・未ログイン・openref-mcp が無い）は下の案内と、未ログインの行で見える -->
+        {@render modelPicker()}
         <span class="wk-ch-sp"></span>
-        <label class="wk-ch-model">
-          <span>{t("モデル")}</span>
-          {#key modelKey}
-            <select value={st.model ?? ""} disabled={isBusy || chat.sending} aria-label={t("モデル")} onchange={onModel}>
-              <option value="">{t("既定（Claude Code の設定）")}</option>
-              {#each MODELS as m (m)}<option value={m}>{modelLabel(m)}</option>{/each}
-              {#if st.model && !MODELS.includes(st.model)}<option value={st.model}>{st.model}</option>{/if}
-            </select>
-          {/key}
-        </label>
-        {#if chat.model}<span class="wk-ch-dim wk-ch-model-now" title={t("今の会話で動いているモデル")}>{chat.model}</span>{/if}
+        <div class="wk-ch-morewrap" bind:this={moreEl}>
+          <button class="wk-ch-btn wk-ch-more" aria-haspopup="true" aria-expanded={moreOpen} title={t("アカウントと Claude Code")} aria-label={t("アカウントと Claude Code")} onclick={toggleMore}>⋯</button>
+          {#if moreOpen}
+            <div class="wk-ch-menu">
+              <p class="wk-ch-menu-acct" title={accountText}>{t("ログイン済み")}{accountText ? `: ${accountText}` : ""}</p>
+              <p class="wk-ch-dim wk-ch-cli" title={st.cli}>Claude Code {st.version ?? "?"}</p>
+              <button class="wk-ch-btn" title={t("ログイン状態を読み直します")} onclick={() => void loadChatStatus({ force: true })}>{t("再確認")}</button>
+              <p class="wk-ch-dim wk-ch-menu-note">{t("ログアウトはターミナルで claude auth logout を実行します")}</p>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <!-- 未ログイン・確かめられない = 今までの行（[ログイン]・[再確認]・版・モデル） -->
+        <span class="wk-ch-acct-out">{st.logged_in === false ? t("未ログイン") : t("ログイン状態を確認できません")}</span>
+        <button class="wk-ch-btn wk-ch-primary" title={t("ターミナルに claude auth login を開きます")} onclick={() => void authAction("login")}>{t("ログイン")}</button>
+        <button class="wk-ch-btn" title={t("ログイン状態を読み直します")} onclick={() => void loadChatStatus({ force: true })}>{t("再確認")}</button>
+        <span class="wk-ch-dim wk-ch-cli" title={st.cli}>Claude Code {st.version ?? "?"}</span>
+        <span class="wk-ch-sp"></span>
+        {@render modelPicker()}
       {/if}
     </div>
   {/if}
@@ -219,7 +274,7 @@
           </div>
         {:else if e.k === "text"}
           {#if e.final}
-            <WikiChatMd text={e.text} />
+            <ChatMd text={e.text} />
           {:else}
             <div class="wk-ch-stream">{e.text}<span class="wk-ch-caret" aria-hidden="true"></span></div>
           {/if}
@@ -349,6 +404,17 @@
     font: inherit; font-size: 11.5px; padding: 1px 4px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text);
   }
   .wk-ch-model-now { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; }
+  /* ⋯ とその中: 行の右端から下へ開く小さな板 */
+  .wk-ch-morewrap { position: relative; }
+  .wk-ch-more { padding: 0 8px; letter-spacing: 1px; }
+  .wk-ch-menu {
+    position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; width: max-content; max-width: min(300px, calc(100vw - 32px));
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 9px 11px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  }
+  .wk-ch-menu p { margin: 0; }
+  .wk-ch-menu-acct { color: var(--text); overflow-wrap: anywhere; }
+  .wk-ch-menu-note { font-size: 11px; }
   .wk-ch-user { align-self: flex-end; max-width: 92%; background: var(--accent-soft); border-radius: 10px 10px 2px 10px; padding: 6px 10px; }
   .wk-ch-user-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
   .wk-ch-user-ctx { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }

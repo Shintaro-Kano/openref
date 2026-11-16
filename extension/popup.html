@@ -5,7 +5,7 @@
   <style>
     :root {
       --bg: #f6f7f8; --panel: #fff; --border: #dfe3e6; --text: #1c2733;
-      --dim: #6b7a89; --accent: #1a73e8; --danger: #c0392b; --ok: #1e8e3e;
+      --dim: #6b7a89; --accent: #1a73e8; --danger: #c0392b; --ok: #1e8e3e; --warn: #b45309;
       font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; font-size: 13px;
     }
     * { box-sizing: border-box; margin: 0; }
@@ -29,8 +29,23 @@
     button.primary:disabled { opacity: 0.5; cursor: default; }
     #status { margin-top: 8px; font-size: 12px; color: var(--dim); white-space: pre-wrap; line-height: 1.5; min-height: 18px; }
     #status.err { color: var(--danger); }
-    #status.done { color: var(--ok); }
-    .warn { color: var(--danger); font-size: 11.5px; margin-top: 6px; }
+    /* 結果: 1 行目（書誌 ✓ ・ PDF ✓ / ✗）だけを色と太字で。緑 = PDF まで揃った・橙 = 何か足りない（バッジの ✓ / ! と同じ） */
+    #status.done, #status.warn { color: var(--text); }
+    #status.done::first-line { color: var(--ok); font-weight: 600; }
+    #status.warn::first-line { color: var(--warn); font-weight: 600; }
+    /* 別のタブの結果の 1 行（前の保存（題名）: …）。自分の結果と詳細の後ろ・区切りの線。色と太字は印（1 行目）だけ */
+    #note { margin-top: 6px; padding-top: 5px; border-top: 1px solid var(--border); font-size: 12px; color: var(--dim); white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; }
+    #note .mark.done { color: var(--ok); font-weight: 600; }
+    #note .mark.warn { color: var(--warn); font-weight: 600; }
+    #note .mark.err { color: var(--danger); font-weight: 600; }
+    #detail { margin-top: 4px; font-size: 11.5px; color: var(--dim); }
+    #detail summary { cursor: pointer; user-select: none; }
+    #detailtext { margin-top: 3px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; }
+    #winhint { margin-top: 4px; font-size: 11px; color: var(--dim); line-height: 1.4; }
+    button.sub {
+      width: 100%; margin-top: 8px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--accent);
+      font: inherit; background: var(--panel); color: var(--accent); cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -46,7 +61,11 @@
   <select id="collection"><option value="">フォルダなし</option></select>
   <button class="primary" id="save" disabled>OpenRef に保存</button>
   <div id="status"></div>
-  <div class="warn" id="keepopen" style="display:none">保存中はこのポップアップを閉じないでください（PDF 転送中）</div>
+  <details id="detail" style="display:none"><summary>詳細（段ごとの理由）</summary><div id="detailtext"></div></details>
+  <div id="note" style="display:none"></div>
+  <button class="sub" id="abort" style="display:none" title="走っている保存を止めます（書誌は保存済みのことがあります）。止めた後はすぐ次の保存ができます">この保存を中断</button>
+  <button class="sub" id="viaproxy" style="display:none" title="設定した大学プロキシの前置きで新しいタブを開きます。ログインしてから、そのタブで Capture してください">プロキシ経由で開く</button>
+  <div id="winhint" style="display:none"></div>
   <script src="pdfbytes.js"></script>
   <script src="popup.js"></script>
 </body>

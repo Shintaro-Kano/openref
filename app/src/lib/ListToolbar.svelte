@@ -35,7 +35,6 @@
     openStyleModal,
     pickListSort,
     styleTitle,
-    toggleDetail,
   } from "./state.svelte";
   import type { ListSortKey } from "./api";
 
@@ -201,9 +200,9 @@
       <button
         class="lb-btn danger"
         disabled={!any}
-        title={t("選択した item をライブラリから完全に削除（取り消せません）")}
+        title={t("選択した文献をライブラリから完全に削除（取り消せません）")}
         onclick={askPurgeChecked}>{t("✕ 完全に削除")}</button>
-      <button class="lb-btn" disabled={!any} title={t("選択した item を復元")} onclick={bulkRestore}>{t("↩ 復元")}</button>
+      <button class="lb-btn" disabled={!any} title={t("選択した文献を復元")} onclick={bulkRestore}>{t("↩ 復元")}</button>
     </div>
   {:else}
     <!-- フォルダ / ラベル / ゴミ箱 -->
@@ -248,7 +247,7 @@
           <div class="lb-pop lb-picker">
             <input
               bind:this={inputEl}
-              placeholder="Search or create new label"
+              placeholder={t("ラベルを検索・新規作成")}
               bind:value={q}
               onkeydown={(e) => onPickerKey(e, "label")} />
             <div class="pop-list">
@@ -259,20 +258,20 @@
                 </button>
               {/each}
               {#if canCreateLabel}
-                <button class="pop-row create" onclick={createLabel}>{t("＋ Create label「")}{q.trim()}{t("」")}</button>
+                <button class="pop-row create" onclick={createLabel}>{t("＋ ラベルを作成「")}{q.trim()}{t("」")}</button>
               {/if}
               {#if labelCands.length === 0 && !canCreateLabel}
                 <div class="lb-empty">{t("（ラベルなし）")}</div>
               {/if}
             </div>
             {#if changed}
-              <button class="lb-apply" onclick={applyLabels}>Apply changes</button>
+              <button class="lb-apply" onclick={applyLabels}>{t("変更を適用")}</button>
             {/if}
           </div>
         {/if}
       </div>
 
-      <button class="lb-btn danger" disabled={!any} title={t("選択した item をゴミ箱へ（復元可）")} onclick={bulkTrash}>{t("ゴミ箱")}</button>
+      <button class="lb-btn danger" disabled={!any} title={t("選択した文献をゴミ箱へ（復元可）")} onclick={bulkTrash}>{t("ゴミ箱")}</button>
     </div>
 
     <!-- Star / 引用 -->
@@ -281,10 +280,10 @@
         class="lb-btn lb-star"
         class:on={allStarred}
         disabled={!any}
-        title={allStarred ? t("選択した item の ★ を解除") : t("選択した item に ★")}
+        title={allStarred ? t("選択した文献の ★ を外す") : t("選択した文献に ★ を付ける")}
         onclick={() => bulkStar(!allStarred)}>★</button>
       <div class="lb-wrap">
-        <button class="lb-btn" disabled={!any} title={t("選択した item の引用をまとめてコピー")} onclick={() => toggleMenu("cite")}>
+        <button class="lb-btn" disabled={!any} title={t("選択した文献の引用をまとめてコピー")} onclick={() => toggleMenu("cite")}>
           {t("引用::button")} <span class="caret">▾</span>
         </button>
         {#if app.listMenu === "cite"}
@@ -334,19 +333,6 @@
       {/if}
     </div>
     <div class="lb-count">{tn(total, "件")}{#if any}<b> · {n} {t("選択")}</b>{/if}</div>
-    <button
-      class="lb-pane"
-      class:lb-pane-off={!app.detailOpen}
-      title={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-      aria-label={app.detailOpen ? t("右のペインを隠す（⌘⌥I）") : t("右のペインを表示（⌘⌥I）")}
-      aria-pressed={app.detailOpen}
-      onclick={toggleDetail}
-    >
-      <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true">
-        <rect x="0.75" y="0.75" width="14.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
-        <rect class="lb-pane-fill" x="10" y="1.5" width="4.5" height="11" fill="currentColor" />
-        <line x1="10" y1="1" x2="10" y2="13" stroke="currentColor" stroke-width="1.5" />
-      </svg>
-    </button>
+    <!-- 右ペインの開閉（▣）はアプリのヘッダーの右端（PaneToggle = 3 モードで同じ場所） -->
   </div>
 </div>

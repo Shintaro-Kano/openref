@@ -1,5 +1,5 @@
 /* OpenNote の遷移の部品テスト（node app/src/lib/wiki/nav.test.mjs・実部品 state.svelte.ts / wiki.svelte.ts / files.svelte.ts /
-   WikiHeader / WikiPage / MdView / WikiLinkMenu + jsdom・invoke は差し替え）。確かめること:
+   WikiHeader / WikiPage / ShadowPage / WikiLinkMenu + jsdom・invoke は差し替え）。確かめること:
    ① 戻る / 進む（タブの中の履歴）: 同じタブの遷移で前のページ（ホームも）とスクロール位置を積む・戻ると位置ごと戻る・進むで往復・
       新しい遷移で「進む」を捨てる・同じページ（見出しへの移動）と新しいタブは積まない・タブごとに別・上限 100・表示で着地・結果一覧を畳む
    ② 編集中の未保存は保存してから戻る・保存できず「破棄して移る」を断ったら移らない（履歴も崩さない）・保存を待つ間にタブを移った /
@@ -9,7 +9,7 @@
    ④ ヘッダーの ‹ ›（実部品 WikiHeader）: 押せないときは disabled・押すと戻る / 進む
    ⑤ ⌘[ / ⌘]（実部品 WikiPage）: 戻る / 進む・入力欄の中では奪わない（shadow の中の入力欄も）・覆い（参照エディタ等）の下では動かさない・
       ⌘⇧[ はタブの巡回（ここでは扱わない）・戻った先の位置に後から伸びる中身で届かなければ伸びるたびに追う（利用者の操作で止める）
-   ⑥ リンクの右クリック（実部品 MdView + WikiLinkMenu）: 既定のメニューを止めて種類ごとの項目（効く物だけ）・リンクの外は既定のまま・
+   ⑥ リンクの右クリック（実部品 ShadowPage + WikiLinkMenu）: 既定のメニューを止めて種類ごとの項目（効く物だけ）・リンクの外は既定のまま・
       「新しいタブで開く」= onNavigate(nav, true)・「リンクをコピー」= 書かれたまま・文字を選んでいれば頭に「コピー」・
       閉じる = Esc（背後へ流さない）/ 外側の左ボタン / 外側の右クリック（右ボタンの mousedown では閉じない）/ メニューを出した部品を動かすスクロール
       （別の箱のスクロール = チャットの自動追従では閉じない）
@@ -350,9 +350,9 @@ const hist = (w) => ({ back: (w.back ?? []).map((h) => [h.path, h.scrollTop]), f
   tests++;
 }
 
-// ---------- ⑥ リンクの右クリック（実部品 MdView + WikiLinkMenu）・⑦ 中クリック ----------
+// ---------- ⑥ リンクの右クリック（実部品 ShadowPage + WikiLinkMenu）・⑦ 中クリック ----------
 {
-  const { default: MdView } = await import("./MdView.svelte");
+  const { default: ShadowPage } = await import("./render/ShadowPage.svelte");
   const { default: Menu } = await import("./WikiLinkMenu.svelte");
   const copied = [];
   Object.defineProperty(navigator, "clipboard", { value: { writeText: async (s) => void copied.push(s) }, configurable: true });
@@ -365,7 +365,7 @@ const hist = (w) => ({ back: (w.back ?? []).map((h) => [h.path, h.scrollTop]), f
   ];
   const target = document.createElement("div");
   document.body.append(target);
-  const view = mount(MdView, { target, props: { page: { ...page("p.md", content), links }, root: "/v", refs: [], onNavigate: (n, nt) => navs.push([n, !!nt]), readPage: async () => page("x", "") } });
+  const view = mount(ShadowPage, { target, props: { mode: "md", page: { ...page("p.md", content), links }, root: "/v", refs: [], onNavigate: (n, nt) => navs.push([n, !!nt]), readPage: async () => page("x", "") } });
   const mtarget = document.createElement("div");
   document.body.append(mtarget);
   const menu = mount(Menu, { target: mtarget });
@@ -515,7 +515,7 @@ const hist = (w) => ({ back: (w.back ?? []).map((h) => [h.path, h.scrollTop]), f
   assert.deepEqual(got.at(-1), [{ kind: "ref", abs: "/r/x.pdf" }, false]);
   assert.deepEqual(labels(LM.linkItems({ t: "open", abs: "/r/x.key" }, "file:///r/x.key", c)), ["外部のアプリで開く", "—", "リンクをコピー"]);
   const item = LM.linkItems({ t: "item", key: "K1", page: 3, att: null }, "openref://item/K1?page=3", c);
-  assert.deepEqual(labels(item), ["MY LIBRARY に表示", "—", "リンクをコピー"]);
+  assert.deepEqual(labels(item), ["LIBRARY に表示", "—", "リンクをコピー"]);
   item[0].run();
   assert.deepEqual(got.at(-1), [{ kind: "item", key: "K1", page: 3 }, false]);
   assert.deepEqual(labels(LM.linkItems({ t: "none" }, "", c)), [], "コピーする物の無いリンクに空でないメニュー");

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { t } from "./i18n.svelte";
+  import { t, tn } from "./i18n.svelte";
   /* 引用スタイルの設定（Paperpile の Set citation style）。CSL リポジトリ約 1 万誌を検索 → 選択 → 保存。
      選択したスタイルは Rust がリポジトリから取得・キャッシュ（dependent は親で解決）し、
      チェック中の先頭 1 件でライブプレビューする。リポジトリに無い誌は手元の .csl を読み込む。
@@ -10,7 +10,9 @@
   import { api, type StyleEntry } from "./api";
   import { LOCALES, forgetStyle, formatBibliography, formatCitation, missingLocales, searchStyles, styleXml } from "./cite";
   import { composing } from "./input";
+  import Modal from "./Modal.svelte";
   import { app, checkedKeys, saveCitePrefs, toast } from "./state.svelte";
+  import { errText } from "./err";
 
   const open = $derived(app.modal === "citeStyle");
 
@@ -116,7 +118,7 @@
       // 自作（索引に無い）も検索対象に含める
       const pool = [...installed.filter((s) => s.custom), ...(catalog ?? [])];
       const hits = searchStyles(pool, q, 200);
-      return [{ title: `${t("検索結果")} ${hits.length === 200 ? "200+ " : hits.length} ${t("件")}`, items: hits }];
+      return [{ title: `${t("検索結果")} ${hits.length === 200 ? `200+ ${t("件::styles")}` : tn(hits.length, "件::styles")}`, items: hits }];
     }
     return installed.length ? [{ title: t("同梱・導入済み"), items: installed }] : [];
   });
@@ -207,7 +209,7 @@
     } catch (e) {
       if (my !== seq) return;
       preview = null;
-      previewErr = String(e).slice(0, 300);
+      previewErr = errText(e, 300);
     } finally {
       if (my === seq) previewBusy = false;
     }
@@ -226,7 +228,7 @@
       await saveCitePrefs(chosen, locale, doiAlways);
       app.modal = null;
     } catch (e) {
-      toast(t("✗ スタイルを保存できません: ") + String(e).slice(0, 200));
+      toast(t("✗ スタイルを保存できません: ") + errText(e, 200));
     } finally {
       saving = false;
     }
@@ -246,7 +248,7 @@
       queueMicrotask(scrollToCursor);
       toast(t("✓ 読み込みました: ") + e.title);
     } catch (e) {
-      toast(t("✗ CSL を読み込めません: ") + String(e).slice(0, 200));
+      toast(t("✗ CSL を読み込めません: ") + errText(e, 200));
     }
   }
 
@@ -255,107 +257,105 @@
   }
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    if (open && e.key === "Escape" && !composing(e)) {
-      e.stopPropagation();
-      close();
-    }
-  }} />
+<!-- 中のクリックは外へ伝えない（stopclicks）・覆いのクリックと Esc で閉じる（IME の変換中の Esc は骨格が見送る） -->
+<Modal
+  {open}
+  cls="sm-modal"
+  label={t("引用スタイルを設定")}
+  stopclicks
+  onbackdrop={close}
+  onescape={(e) => {
+    e.stopPropagation();
+    close();
+  }}>
+  <div class="modal-head">
+    <h3>{t("引用スタイルを設定")}</h3>
+    <button class="x" onclick={close}>×</button>
+  </div>
+  <div class="modal-body sm-body">
+    <input
+      class="sm-q"
+      bind:this={inputEl}
+      bind:value={query}
+      onkeydown={onQueryKey}
+      placeholder={t("誌名・スタイル名で検索（例: European Radiology / AJNR / Vancouver）")} />
 
-{#if open}
-  <div class="overlay" onclick={close} role="presentation">
-    <div class="modal sm-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-label={t("引用スタイルを設定")}>
-      <div class="modal-head">
-        <h3>{t("引用スタイルを設定")}</h3>
-        <button class="x" onclick={close}>×</button>
-      </div>
-      <div class="modal-body sm-body">
-        <input
-          class="sm-q"
-          bind:this={inputEl}
-          bind:value={query}
-          onkeydown={onQueryKey}
-          placeholder={t("誌名・スタイル名で検索（例: European Radiology / AJNR / Vancouver）")} />
-
-        <div class="sm-list" bind:this={listEl}>
-          {#if query.trim() && !catalog}
-            <div class="sm-empty">{catalogErr ? "✗ " + catalogErr : t("スタイル索引を読み込み中…")}</div>
-          {:else}
-            {#each sections as sec (sec.title)}
-              <div class="sm-sec">{sec.title}</div>
-              {#each sec.items as s (sec.title + s.id)}
-                {@const i = rows.indexOf(s)}
-                <button class="sm-row" class:cur={chosen === s.id} onclick={() => pick(s, i)} ondblclick={save}>
-                  <span class="sm-title">{s.title}</span>
-                  {#if s.short && s.short !== s.title}<span class="sm-short">{s.short}</span>{/if}
-                  <span class="sm-tags">
-                    {#if s.format}<span class="sm-tag">{fmtLabel(s.format)}</span>{/if}
-                    {#if s.builtin}<span class="sm-tag">{t("同梱")}</span>
-                    {:else if s.custom}<span class="sm-tag">{t("自作")}</span>
-                    {:else if installedIds.has(s.id)}<span class="sm-tag">{t("導入済")}</span>{/if}
-                    {#if app.cite.style === s.id}<span class="sm-cur">{t("✓ 既定")}</span>{/if}
-                  </span>
-                </button>
-              {/each}
-            {/each}
-            {#if query.trim() && rows.length === 0}
-              <div class="sm-empty">
-                {t("該当なし。リポジトリに無い誌は、出版社の汎用スタイル（例:")} <i>Springer Vancouver</i> / <i>Elsevier Vancouver</i> /
-                <i>American Medical Association</i>{t("）を検索するか、投稿規定に合う .csl を読み込んでください。")}
-              </div>
-            {/if}
-          {/if}
-        </div>
-
-        <div class="sm-opts">
-          <label>
-            {t("言語")}
-            <select bind:value={locale}>
-              {#each LOCALES as [code, label] (code)}<option value={code}>{code ? `${label} (${code})` : t("既定（スタイルに従う）")}</option>{/each}
-            </select>
-          </label>
-          <button class="sm-file" onclick={loadFile} title={t("リポジトリに無い誌・自作スタイル（.csl）を読み込む")}>{t(".csl を読み込む…")}</button>
-        </div>
-        <label
-          class="sm-doi"
-          title={t("スタイルが DOI を省く場合も、文献リストの各文献の末尾に DOI（DOI が無ければ URL）を付けます。書き方はスタイルの DOI 表記（無ければ https://doi.org/…）。DOI も URL も無い文献はそのまま")}>
-          <input type="checkbox" class="sm-switch" bind:checked={doiAlways} />
-          {t("DOI / URL を常に含める")}
-          <span class="sm-dim">{t("（スタイルが省く場合も末尾に付ける・DOI が無ければ URL）")}</span>
-        </label>
-
-        <div class="sm-preview">
-          <div class="sm-pv-head">
-            <b>{chosenEntry.title}</b>
-            {#if shown?.base && (chosenEntry.dep || chosenEntry.parent)}
-              <span class="sm-base" title={t("この誌名スタイルは書式の本体（親スタイル）を参照しています")}>{t("書式:")} {shown.base}</span>
-            {/if}
-            <span class="sm-pv-src">{sample?.label() ?? ""}</span>
+    <div class="sm-list" bind:this={listEl}>
+      {#if query.trim() && !catalog}
+        <div class="sm-empty">{catalogErr ? "✗ " + catalogErr : t("スタイル索引を読み込み中…")}</div>
+      {:else}
+        {#each sections as sec (sec.title)}
+          <div class="sm-sec">{sec.title}</div>
+          {#each sec.items as s (sec.title + s.id)}
+            {@const i = rows.indexOf(s)}
+            <button class="sm-row" class:cur={chosen === s.id} onclick={() => pick(s, i)} ondblclick={save}>
+              <span class="sm-title">{s.title}</span>
+              {#if s.short && s.short !== s.title}<span class="sm-short">{s.short}</span>{/if}
+              <span class="sm-tags">
+                {#if s.format}<span class="sm-tag">{fmtLabel(s.format)}</span>{/if}
+                {#if s.builtin}<span class="sm-tag">{t("同梱")}</span>
+                {:else if s.custom}<span class="sm-tag">{t("自作")}</span>
+                {:else if installedIds.has(s.id)}<span class="sm-tag">{t("導入済")}</span>{/if}
+                {#if app.cite.style === s.id}<span class="sm-cur">{t("✓ 既定")}</span>{/if}
+              </span>
+            </button>
+          {/each}
+        {/each}
+        {#if query.trim() && rows.length === 0}
+          <div class="sm-empty">
+            {t("該当なし。リポジトリに無い誌は、出版社の汎用スタイル（例:")} <i>Springer Vancouver</i> / <i>Elsevier Vancouver</i> /
+            <i>American Medical Association</i>{t("）を検索するか、投稿規定に合う .csl を読み込んでください。")}
           </div>
-          {#if previewErr}
-            <div class="sm-err">✗ {previewErr}</div>
-          {:else if shown}
-            <div class="sm-pv-row"><span class="sm-pv-k">{t("本文中")}</span><span class="sm-pv-v">{shown.cite}</span></div>
-            <div class="sm-pv-row"><span class="sm-pv-k">{t("文献リスト")}</span><span class="sm-pv-v">{shown.bib}</span></div>
-            {#if shown.missing.length}
-              <div class="sm-dim">{t("※ 言語")} {shown.missing.join(", ")} {t("の語彙を取得できず、英語（en-US）で代用しています")}</div>
-            {/if}
-            {#if shown.doi && sampleNoIds}
-              <div class="sm-dim">{t("※ この文献には DOI も URL も無いため、付け足すものがありません")}</div>
-            {/if}
-          {:else}
-            <div class="sm-dim">{previewBusy || chosen ? t("スタイルを取得中…") : ""}</div>
-          {/if}
-        </div>
+        {/if}
+      {/if}
+    </div>
+
+    <div class="sm-opts">
+      <label>
+        {t("言語")}
+        <select bind:value={locale}>
+          {#each LOCALES as [code, label] (code)}<option value={code}>{code ? `${label} (${code})` : t("既定（スタイルに従う）")}</option>{/each}
+        </select>
+      </label>
+      <button class="sm-file" onclick={loadFile} title={t("リポジトリに無い誌・自作スタイル（.csl）を読み込む")}>{t(".csl を読み込む…")}</button>
+    </div>
+    <label
+      class="sm-doi"
+      title={t("スタイルが DOI を省く場合も、文献リストの各文献の末尾に DOI（DOI が無ければ URL）を付けます。書き方はスタイルの DOI 表記（無ければ https://doi.org/…）。DOI も URL も無い文献はそのまま")}>
+      <input type="checkbox" class="sm-switch" bind:checked={doiAlways} />
+      {t("DOI / URL を常に含める")}
+      <span class="sm-dim">{t("（スタイルが省く場合も末尾に付ける・DOI が無ければ URL）")}</span>
+    </label>
+
+    <div class="sm-preview">
+      <div class="sm-pv-head">
+        <b>{chosenEntry.title}</b>
+        {#if shown?.base && (chosenEntry.dep || chosenEntry.parent)}
+          <span class="sm-base" title={t("この誌名スタイルは書式の本体（親スタイル）を参照しています")}>{t("書式:")} {shown.base}</span>
+        {/if}
+        <span class="sm-pv-src">{sample?.label() ?? ""}</span>
       </div>
-      <div class="modal-foot">
-        <span class="sm-foot-note">{t("保存したスタイルは引用コピーと Word アドインの一覧で使えます")}</span>
-        <button onclick={close}>{t("キャンセル")}</button>
-        <button class="primary" disabled={!canSave} onclick={save}>
-          {saving ? t("保存中…") : t("保存")}
-        </button>
-      </div>
+      {#if previewErr}
+        <div class="sm-err">✗ {previewErr}</div>
+      {:else if shown}
+        <div class="sm-pv-row"><span class="sm-pv-k">{t("本文中")}</span><span class="sm-pv-v">{shown.cite}</span></div>
+        <div class="sm-pv-row"><span class="sm-pv-k">{t("文献リスト")}</span><span class="sm-pv-v">{shown.bib}</span></div>
+        {#if shown.missing.length}
+          <div class="sm-dim">{t("※ 言語")} {shown.missing.join(", ")} {t("の語彙を取得できず、英語（en-US）で代用しています")}</div>
+        {/if}
+        {#if shown.doi && sampleNoIds}
+          <div class="sm-dim">{t("※ この文献には DOI も URL も無いため、付け足すものがありません")}</div>
+        {/if}
+      {:else}
+        <div class="sm-dim">{previewBusy || chosen ? t("スタイルを取得中…") : ""}</div>
+      {/if}
     </div>
   </div>
-{/if}
+  <div class="modal-foot">
+    <span class="sm-foot-note">{t("保存したスタイルは引用コピーと Word アドインの一覧で使えます")}</span>
+    <button onclick={close}>{t("キャンセル")}</button>
+    <button class="primary" disabled={!canSave} onclick={save}>
+      {saving ? t("保存中…") : t("保存")}
+    </button>
+  </div>
+</Modal>

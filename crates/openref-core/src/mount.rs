@@ -304,7 +304,7 @@ mod tests {
         std::fs::write(&src, b"%PDF-1.4 test").unwrap();
         db.conn
             .execute_batch(
-                "INSERT INTO items (key, csl) VALUES ('ITEM0001', '{\"title\":\"Mount test\",\"type\":\"article-journal\",\"author\":[{\"family\":\"Kano\"}],\"issued\":{\"date-parts\":[[2026]]}}')",
+                "INSERT INTO items (key, csl) VALUES ('ITEM0001', '{\"title\":\"Mount test\",\"type\":\"article-journal\",\"author\":[{\"family\":\"Kato\"}],\"issued\":{\"date-parts\":[[2026]]}}')",
             )
             .unwrap();
         db.conn
@@ -321,7 +321,7 @@ mod tests {
         let db = Db::open(&dir.join("db.sqlite")).unwrap();
         for i in 0..n {
             let csl = format!(
-                "{{\"title\":\"Race {i}\",\"type\":\"article-journal\",\"author\":[{{\"family\":\"Kano\"}}],\"issued\":{{\"date-parts\":[[2026]]}}}}"
+                "{{\"title\":\"Race {i}\",\"type\":\"article-journal\",\"author\":[{{\"family\":\"Kato\"}}],\"issued\":{{\"date-parts\":[[2026]]}}}}"
             );
             db.conn.execute("INSERT INTO items (key, csl) VALUES (?1, ?2)", (format!("ITEM{i:04}"), &csl)).unwrap();
             let src = dir.join(format!("src{i}.pdf"));

@@ -52,7 +52,13 @@ const DRIVE_ROOTS: &[&str] = &["My Drive", "Shared drives", "Other computers", "
 /// `home` と `app_dir` は呼び手が渡す（テストは tempdir を渡す）。両者も canonicalize してから比べる（読めなければ与えられたまま）。
 /// app_dir が None でも、既定の置き場 `~/Library/Application Support/OpenRef` は `~/Library` の規則で守られる
 pub fn check_root(root: &Path, home: &Path, app_dir: Option<&Path>) -> Result<PathBuf> {
-    let bad = |why: &str| Err(CoreError::BadInput(format!("ワークスペースのフォルダに {} は使えません（{why}）", root.display())));
+    check_root_as(root, home, app_dir, "ワークスペースのフォルダ")
+}
+
+/// check_root と同じ規則で、理由の文の主語（「<noun>に <path> は使えません（理由）」）を呼び手が渡す版
+/// （本棚 = 「本棚のフォルダ」・参照フォルダ = 「参照フォルダ」。文を文字列置換で付け替えない）
+pub fn check_root_as(root: &Path, home: &Path, app_dir: Option<&Path>, noun: &str) -> Result<PathBuf> {
+    let bad = |why: &str| Err(CoreError::BadInput(format!("{noun}に {} は使えません（{why}）", root.display())));
     if !root.is_absolute() {
         return bad("絶対パスではありません");
     }
@@ -137,7 +143,7 @@ fn allowed(canon: &Path, home: &Path, app: Option<&Path>) -> std::result::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, check_root};
+    use super::{allowed, check_root, check_root_as};
     use std::path::{Path, PathBuf};
     use unicode_normalization::UnicodeNormalization;
 
@@ -163,6 +169,19 @@ mod tests {
     fn mk(p: &Path) -> &Path {
         std::fs::create_dir_all(p).unwrap();
         p
+    }
+
+    /// 理由の文の主語: check_root =「ワークスペースのフォルダに」・check_root_as は呼び手の主語（規則と理由は同じ）
+    #[test]
+    fn check_root_subject() {
+        let h = home("subject");
+        let hidden = mk(&h.0.join(".x")).to_path_buf();
+        let why = "`.` で始まるフォルダ（隠しフォルダ）の中です";
+        let msg = |noun: &str| format!("入力を解釈できません: {noun}に {} は使えません（{why}）", hidden.display());
+        assert_eq!(check_root(&hidden, &h.0, None).unwrap_err().to_string(), msg("ワークスペースのフォルダ"));
+        assert_eq!(check_root_as(&hidden, &h.0, None, "本棚のフォルダ").unwrap_err().to_string(), msg("本棚のフォルダ"));
+        let ok = mk(&h.0.join("notes")).to_path_buf();
+        assert_eq!(check_root_as(&ok, &h.0, None, "参照フォルダ").unwrap(), check_root(&ok, &h.0, None).unwrap());
     }
 
     fn rejected(root: &Path, h: &Path, app: Option<&Path>) -> String {

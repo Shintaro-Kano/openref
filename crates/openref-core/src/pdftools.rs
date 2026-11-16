@@ -19,6 +19,7 @@ const CANDIDATES: &[&str] = &[
     "/opt/local/bin/pdftotext",
 ];
 
+#[derive(Debug)]
 pub struct Extracted {
     /// 1 要素 = 1 ページ（要求範囲内）
     pub pages: Vec<String>,

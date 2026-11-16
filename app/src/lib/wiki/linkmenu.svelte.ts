@@ -9,6 +9,7 @@ import type { WikiNav } from "./types";
 import type { Nav } from "./render/sanitize";
 import { absOf } from "./render/asset";
 import { opensInNewTab } from "./wiki.svelte";
+import { errText } from "../err";
 
 /** メニューの 1 行（null = 区切り） */
 export interface LinkMenuItem {
@@ -71,7 +72,7 @@ export interface LinkCtx {
 /** リンクの右クリックのメニューの項目。n = リンクの分類（navOf）・written = 書かれたままのリンク（data-wk-href = `[[名前]]` / URL / 相対パス）。
     並び = 開く系 → 区切り → リンクをコピー（書かれたまま = `[[名前]]` と URL はどのページに貼っても同じリンク・相対パスは書いたページからの相対）。
     md のページ = 開く / 新しいタブで開く。md 以外（PDF・html・画像等 = いつも自分のタブで開く）と参照フォルダのファイル = 開く / 外部のアプリで開く。
-    内蔵で開けないファイル = 外部のアプリで開く。文献 = MY LIBRARY に表示（いつも新しいタブ）。URL = ブラウザで開く。同じページの見出し = 移動 */
+    内蔵で開けないファイル = 外部のアプリで開く。文献 = LIBRARY に表示（いつも新しいタブ）。URL = ブラウザで開く。同じページの見出し = 移動 */
 export function linkItems(n: Nav, written: string, c: LinkCtx): (LinkMenuItem | null)[] {
   const copy: LinkMenuItem = { label: t("リンクをコピー"), run: () => copyText(written) };
   const tail = written ? [null, copy] : [];
@@ -87,7 +88,7 @@ export function linkItems(n: Nav, written: string, c: LinkCtx): (LinkMenuItem | 
     case "open":
       return [external(n.abs), ...tail];
     case "item":
-      return [open(t("MY LIBRARY に表示")), ...tail];
+      return [open(t("LIBRARY に表示")), ...tail];
     case "ext":
       return [open(t("ブラウザで開く")), ...tail];
     case "anchor":
@@ -109,6 +110,6 @@ export async function copyText(text: string) {
     await navigator.clipboard.writeText(text);
     toast(t("コピーしました"));
   } catch (e) {
-    toast(`✗ ${t("コピーできませんでした")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("コピーできませんでした")}: ${errText(e, 160)}`);
   }
 }

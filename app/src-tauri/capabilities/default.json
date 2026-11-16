@@ -1,6 +1,12 @@
 {
   "identifier": "default",
-  "description": "OpenRef main window",
+  "description": "OpenRef main window. 画面と Tauri が実際に呼ぶ物だけ（csp: null で vault の HTML を描く = 到達面を狭く）。足すときは main.rs の試験 capabilities の表も足す",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:webview:allow-internal-toggle-devtools",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
 }

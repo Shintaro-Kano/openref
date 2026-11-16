@@ -4,7 +4,7 @@
    偽物は履歴に無い args.root を unknown_root で拒む。確かめること:
    ① タブの行き来（A のページ ⇄ B のホーム）: どちらもホームに戻らない・木 / 箱 / 参照フォルダが各 root・読みは全部その root（args.root）・
       設定は前面に揃う（wiki_front_root・明示の切替は呼ばない = last_used を変えない）・戻ると A の写しを即座に描いて読み直しで追いつく・題名は写しから
-   ② 明示の切替（メニュー / ホームの [開く] = wiki_switch_root・別のフォルダを選ぶ… = wiki_pick_root）は前面のタブだけ = 戻り値の root のホームへ・
+   ② 明示の切替（名前のメニューの行 = wiki_switch_root・別のフォルダを選ぶ… = wiki_pick_root）は前面のタブだけ = 戻り値の root のホームへ・
       他のタブは触らない・front_root は呼ばない・前面のタブの root なら何もしない・取り消し / 失敗は何もしない（console.warn だけ）・未保存は先に保存
    ③ 状態の読み直し（wiki-state）は画面の root で読み、status の root から切替を推測しない・✓ = 画面の root・
       wiki-changed の root が画面の root と違えば捨てる（root の無い payload は受ける）
@@ -15,9 +15,11 @@
       履歴に無い root のタブは設定の root のホームへ + toast 1 回・前面の root が設定と違えば揃える（中身は保つ）・揃うまで門を開けない
    ⑦ 新しい OpenNote タブは前面の OpenNote タブの root を継ぐ（⌘T・⌘クリック）・前面が一覧なら最後の OpenNote の root（ItemDetail の節・セグメント）
    ⑧ 仮の状態のまま状態の読みが失敗 → 明示の切替は戻り値で前面のタブを替える（root の分からないタブはホーム = 新しい root で前の相対パスを開かない）
-   ⑨ WikiInfo のホーム: ワークスペースの節（参照フォルダの上・件数・✓・[開く] / [外す]・無いフォルダは dim）・押下の command・
-      [外す] はどれかのタブが使っている root では出さない（閉じれば出る）・forgetWorkspace も呼ばない
-   ⑩ WikiDialogs の vault メニュー（見出し・履歴の行・✓ = disabled・無い = dim で disabled・「別のフォルダを選ぶ…」・履歴が無くても現在の行）・WikiSidebar の高さの見積もり
+   ⑨ 名前のメニューの × = 履歴から外す（前は右ペインのホームの [外す]）: × はどれかのタブが使っている root（現在を含む）には出さない
+      （閉じれば出る）・forgetWorkspace も呼ばない・押下 = wiki_forget_root {args:{root}}・メニューは開いたまま・キーの焦点は行の外の隣へ・
+      一覧の読み直しに追随・右ペインのホームは概要だけ（ワークスペース・参照フォルダ・除外フォルダの節が無い）
+   ⑩ WikiDialogs の vault メニュー（ホーム → 見出し → 履歴の行（×）→ 別のフォルダを選ぶ… → フォルダの設定…・全項目にチェックの欄 = 字の頭が揃う・
+      ✓ = disabled・無い = dim で disabled・履歴が無くても現在の行）・WikiSidebar の高さの見積もり
    ⑪ TabStrip の OpenNote タブの tooltip =「{path}\n{name} · {root}」・前面でない root のタブも題名が出る
    ⑫ 画面の root が履歴から外れた（上限で落ちた等 = wiki_status {root} が unknown_root）= 設定の root で読み直し・そのタブを設定の root のホームへ + toast・
       画面は設定の root（前の root の木を残さない）・他のタブは触らない・読み直しを繰り返さない
@@ -30,7 +32,14 @@
    ⑯ 履歴にあるが今は無いフォルダ（exists: false = 未接続のディスク等）の root のタブは戻さない（root と path を保つ・ui_tabs にも残る）・
       前面にすると揃えが core の文（…見つかりません）で失敗し、ヘッダーの警告（⚠ ワークスペースを切り替えられません・title = core の文）と toast に出る
    ⑱ 起動: 前面の root = 設定でも wiki_front_root を 1 回通し、ページの読み（WikiPage）はその後
-   ⑰ チャットの子が使っている root（wiki_chat_status.root）にも [外す] を出さない・forgetWorkspace も呼ばない
+   ⑰ チャットの子が使っている root（wiki_chat_status.root）にも × を出さない・forgetWorkspace も呼ばない
+   ⑲ 写しの表（SHELF）は 1 つ: 表の項目ごとに目印を置き、初めての root = 空・戻る = 同じ物 / 同じ中身・OFF = 空（status だけ残す）を表から回して確かめる・
+      wk の項目は表か「写さない」一覧のどちらか（分けない項目を足すと落ちる）・OFF で前は戻していなかった 8 項目
+   ㉑ 「索引を作り直す」は名前のメニューの 1 か所: 押すと wiki_reindex 1 回・command を待つ間 / 作り直しの間は押せない・2 回目を呼ばない・
+      覆いの下では呼ばない・ヘッダーに [再索引] が無い・ヘッダーの状態の表示（作成中 N%・状態を読めない・自動反映が止まった）は残る
+   ⑳ 「フォルダの設定…」の窓（実部品 WikiDialogs + WikiFolders）: メニューから開く（メニューは閉じる）・焦点は [閉じる]・閉じたら開く前の焦点へ・
+      Esc で閉じる・参照フォルダ（一覧 = 絶対パスを先頭側で省略・title に全体・外す / 追加… = 今の command）・除外フォルダ（一覧 = wk.excluded の
+      vault 相対 + /・索引に入れる = 木の右クリックと同じ wiki_exclude_set）・0 件の文・覆いの下では開かない
    出力 = `wiki workspaces: ok (N tests)`（N = 列 0 のブロックの数） */
 import assert from "node:assert/strict";
 import { setupHarness } from "./test-harness.mjs";
@@ -41,6 +50,7 @@ let tests = 0;
 const { mount, unmount, flushSync } = await import("svelte");
 const S = await import("../state.svelte.ts");
 const W = await import("./wiki.svelte.ts");
+const M = await import("../mode.svelte.ts"); // セグメントの切替（wiki.svelte から分けた）
 const E = await import("./edit.svelte.ts");
 
 /** invoke の生の payload（harness の calls は payload.args ?? payload に均す = { args } で包んだかは見えない）。契約 = invoke(name, { args: {...} }) */
@@ -227,7 +237,10 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
 // ---- ② 明示の切替は前面のタブだけ（戻り値の root）----
 {
   const [t1, t2, t3] = await reset([["notes/x.md", "/ws/a"], ["a-only.md", "/ws/a"], [null, "/ws/b"]], 0);
+  W.wk.tocOpen = false; // 目次を畳んだまま明示の切替（切替で開き直さない）
   await W.switchWorkspace("/ws/c");
+  assert.equal(W.wk.tocOpen, false, "ワークスペースを替えたら目次が開き直った（畳んだ状態は全ワークスペースで共通）");
+  W.wk.tocOpen = true;
   assert.deepEqual(rawOf("wiki_switch_root"), [{ args: { root: "/ws/c" } }], "args で包んでいない");
   assert.deepEqual({ ...t1.wiki }, HOME("/ws/c"), "前面のタブが戻り値の root のホームにならない");
   assert.deepEqual([t2.wiki.path, t2.wiki.root], ["a-only.md", "/ws/a"], "他のタブ（同じ A）を触った");
@@ -298,6 +311,10 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   await W.switchWorkspace("/ws/b");
   assert.deepEqual(writesAndSwitch(), ["wiki_save"], `保存できないのに切り替えた: ${names()}`);
   assert.equal(t1.wiki.root, "/ws/a");
+  // 「別のフォルダを選ぶ…」も同じ門（canLeave）= 保存できない間はダイアログを出さない（門を飛ばす変異を捕まえる）
+  calls.length = 0;
+  await W.pickRoot();
+  assert.ok(!names().includes("wiki_pick_root"), `保存できないのに別のフォルダを選ぶダイアログを出した: ${names()}`);
   E.detach(ed2.h);
   E.ed.dialog = false;
   E.discardEdit();
@@ -336,6 +353,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   W.wk.open.add("notes");
   W.wk.titleOverrides.set("notes/x.md", "X の覚え");
   W.wk.newDirs.add("empty-a");
+  W.wk.excluded = ["app/node_modules"];
   W.wk.q = "foo";
   W.wk.qTags = ["t-a"];
   W.wk.showResults = true;
@@ -348,41 +366,28 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   W.wk.headings = [{ id: "h", text: "H", level: 1 }];
   W.wk.scrollTo = { id: "h", nonce: 1 };
   W.wk.menu = { kind: "file", path: "notes/x.md", x: 0, y: 0 };
-  const snap = () => ({
-    status: [W.wk.status?.root, W.wk.status?.pages],
-    pages: W.wk.pages,
-    treeError: W.wk.treeError,
-    tags: W.wk.tags,
-    tagsTotal: W.wk.tagsTotal,
-    inbox: W.wk.inbox,
-    inboxTotal: W.wk.inboxTotal,
-    chatLog: W.wk.chatLog,
-    chatLogTotal: W.wk.chatLogTotal,
-    open: [...W.wk.open],
-    titleOverrides: [...W.wk.titleOverrides],
-    newDirs: [...W.wk.newDirs],
-    q: W.wk.q,
-    qTags: [...W.wk.qTags],
-    showResults: W.wk.showResults,
-    results: W.wk.results,
-    resultsTotal: W.wk.resultsTotal,
-    sel: W.wk.sel,
-    searchError: W.wk.searchError,
-    error: W.wk.error,
-    refDirs: [...W.wk.refDirs],
-  });
+  // 写しの全項目（表 SHELF の鍵から = 項目を表に足せば自動でここにも入る）。そのまま預ける配列は同じ物かを比べる（複製しない）・Set / Map と複製する配列は中身
+  const snap = () =>
+    Object.fromEntries(
+      W.SHELF_KEYS.map((k) => {
+        const v = W.wk[k];
+        if (k === "status") return [k, [v?.root, v?.pages]];
+        if (W.SHELF[k].copy === "same" && Array.isArray(v)) return [k, v];
+        return [k, v instanceof Set || v instanceof Map || Array.isArray(v) ? [...v] : v];
+      })
+    );
   const a = snap();
-  assert.deepEqual(Object.keys(a).sort(), [...W.SHELF_KEYS].sort(), "試験の写しの項目が SHELF_KEYS と違う（試験を追随させる）");
   const gen = W.wk.embedGen;
-  const prefs0 = [W.wk.infoOpen, W.wk.headColors, W.wk.split];
+  const prefs0 = [W.wk.infoOpen, W.wk.headColors, W.wk.split, W.wk.tocOpen];
   W.wk.infoOpen = !prefs0[0];
   W.wk.split = !prefs0[2];
+  W.wk.tocOpen = !prefs0[3]; // 右ペインの目次の開閉も共通 = 畳んだまま切り替えても畳んだまま
   W.enterRoot("/ws/b"); // 同期で入れ替える（行き来の rootGuard と同じ）
   const b = snap();
   assert.equal(W.wk.status.root, "/ws/b");
   assert.deepEqual(
-    [b.pages, b.tags, b.inbox, b.chatLog, b.open, b.titleOverrides, b.newDirs, b.q, b.qTags, b.showResults, b.results, b.error, b.treeError, b.refDirs],
-    [[], [], [], [], [], [], [], "", [], false, [], null, null, []],
+    [b.pages, b.excluded, b.tags, b.inbox, b.chatLog, b.open, b.titleOverrides, b.newDirs, b.q, b.qTags, b.showResults, b.results, b.error, b.treeError, b.refDirs],
+    [[], [], [], [], [], [], [], [], "", [], false, [], null, null, []],
     "初めての root に前の root の状態が残った"
   );
   assert.deepEqual(W.wk.status.workspaces.map((w) => w.root), be.hist, "履歴を引き継がない（ワークスペースによらない）");
@@ -390,7 +395,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   assert.deepEqual([W.wk.page, W.wk.headings, W.wk.scrollTo, W.wk.menu], [null, [], null, null]);
   assert.ok(W.wk.embedGen > gen, "埋め込みの読みの世代を進めていない");
   // 表示の好みは共通
-  assert.deepEqual([W.wk.infoOpen, W.wk.headColors, W.wk.split], [!prefs0[0], prefs0[1], !prefs0[2]], "表示の好みを root ごとにした");
+  assert.deepEqual([W.wk.infoOpen, W.wk.headColors, W.wk.split, W.wk.tocOpen], [!prefs0[0], prefs0[1], !prefs0[2], !prefs0[3]], "表示の好みを root ごとにした");
   // A のタブの題名は A の写しから（覚えた題名 → 索引）
   assert.equal(W.wikiTabTitle(t1.wiki), "X の覚え");
   assert.equal(W.wikiTabTitle({ path: "a-only.md", root: "/ws/a", scrollTop: 0, editing: false }), "A だけ");
@@ -400,8 +405,10 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   const back = snap();
   for (const k of ["pages", "tags", "inbox", "chatLog", "results"]) assert.equal(back[k], a[k], `${k} を戻さない（同じ配列 = 複製しない）`);
   assert.deepEqual(back, a, "A の写しが戻らない");
+  assert.equal(W.wk.tocOpen, !prefs0[3], "元の root へ戻ったら目次の開閉が変わった");
   W.wk.infoOpen = prefs0[0];
   W.wk.split = prefs0[2];
+  W.wk.tocOpen = prefs0[3];
   // 戻ったら読み直しで追いつく（状態・木・参照フォルダ・検索の結果）
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_list") && calls.some((c) => c.name === "wiki_search")), `読み直さない: ${names()}`);
   for (const n of ["wiki_status", "wiki_list", "wiki_ref_dirs_get", "wiki_search"]) assert.equal(calls.find((c) => c.name === n)?.args?.root, "/ws/a", `${n} の root`);
@@ -409,7 +416,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   const LEAVE_ROOT = ["open", "titleOverrides", "newDirs", "page", "pageError", "headings", "scrollTo", "error", "embedGen", "pages", "treeError", "tags", "tagsTotal", "inbox", "inboxTotal", "chatLog", "chatLogTotal", "q", "qTags", "sel", "showResults", "results", "resultsTotal", "searching", "searchError", "dialog", "menu"];
   const RESET = ["page", "pageError", "headings", "scrollTo", "embedGen", "dialog", "menu", "searching"];
   for (const k of LEAVE_ROOT) assert.ok(W.SHELF_KEYS.includes(k) || RESET.includes(k), `leaveRoot の ${k} を写しにも捨てる側にも入れていない`);
-  for (const k of ["pages", "tags", "inbox", "chatLog", "open", "titleOverrides", "newDirs", "q", "qTags", "results", "showResults", "sel", "error", "treeError", "refDirs", "status"]) {
+  for (const k of ["pages", "excluded", "tags", "inbox", "chatLog", "open", "titleOverrides", "newDirs", "q", "qTags", "results", "showResults", "sel", "error", "treeError", "refDirs", "status"]) {
     assert.ok(W.SHELF_KEYS.includes(k), `${k} が写しに無い`);
   }
   for (const k of ["infoOpen", "headColors", "split", "page"]) assert.ok(!W.SHELF_KEYS.includes(k), `共通の ${k} を写しに入れた`);
@@ -539,15 +546,15 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   await S.activateTab(t2.id);
   await W.openWikiPage("b2.md", true); // ⌘クリック
   assert.deepEqual([S.app.tabs.at(-1).wiki.path, S.app.tabs.at(-1).wiki.root], ["b2.md", "/ws/b"]);
-  // 前面が一覧のタブ（ItemDetail の Wiki 節・セグメント MY LIBRARY → MY NOTE）= 最後に前面だった OpenNote の root
+  // 前面が一覧のタブ（ItemDetail の Wiki 節・セグメント LIBRARY → NOTE）= 最後に前面だった OpenNote の root
   S.app.tabs.push(mkTab(null));
   const lib = S.app.tabs.at(-1);
   await S.activateTab(lib.id);
   await W.openWikiPage("from-item.md", true);
   assert.deepEqual([S.app.tabs.at(-1).wiki.path, S.app.tabs.at(-1).wiki.root], ["from-item.md", "/ws/b"], "ItemDetail の節のタブが最後の OpenNote の root を継がない");
   await S.activateTab(lib.id);
-  await W.switchMode("wiki");
-  assert.deepEqual({ ...lib.wiki }, HOME("/ws/b"), "セグメントの MY NOTE が最後の OpenNote の root を継がない");
+  await M.switchMode("wiki");
+  assert.deepEqual({ ...lib.wiki }, HOME("/ws/b"), "セグメントの NOTE が最後の OpenNote の root を継がない");
   tests++;
 }
 
@@ -577,78 +584,102 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   tests++;
 }
 
-// ---- ⑨ WikiInfo のホームのワークスペースの節・[外す] はタブが使っている root では出さない ----
+// ---- ⑨ 名前のメニューの × = 履歴から外す・× はタブが使っている root では出さない・右ペインのホームは概要だけ ----
 {
   const [, tb] = await reset([[null, "/ws/cur"], ["x.md", "/ws/b"]], 0, "/ws/cur");
-  Object.assign(be, { hist: ["/ws/cur", "/ws/blog", "/ws/b", "/vol/gone"], gone: ["/vol/gone"] });
+  Object.assign(be, { hist: ["/ws/cur", "/ws/site", "/ws/b", "/vol/gone"], gone: ["/vol/gone"] });
   await W.loadWikiStatus();
   await settle();
+  // 右ペインのホーム = 概要だけ（ワークスペース・参照フォルダ・除外フォルダの節は名前のメニューへ移した）
   const { default: WikiInfo } = await import("./WikiInfo.svelte");
   W.wk.page = null;
   W.wk.refDirs = ["/ref"];
+  W.wk.excluded = ["archive"];
+  const infoT = document.createElement("div");
+  document.body.append(infoT);
+  const info = mount(WikiInfo, { target: infoT });
+  flushSync();
+  const heads = [...infoT.querySelectorAll("h3")].map((h) => h.textContent.trim());
+  assert.deepEqual(heads, ["OpenNote"], `右ペインのホームに概要の外の節が残った: ${heads}`);
+  assert.equal(infoT.querySelectorAll("button").length, 0, `右ペインのホームにボタンが残った: ${[...infoT.querySelectorAll("button")].map((b) => b.textContent)}`);
+  assert.ok(infoT.textContent.includes("/ws/cur"), "概要の root が無い");
+  unmount(info);
+  infoT.remove();
+  W.wk.excluded = [];
+  const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
   const target = document.createElement("div");
   document.body.append(target);
-  const cmp = mount(WikiInfo, { target });
-  flushSync();
-  const heads = [...target.querySelectorAll("h3")].map((h) => h.textContent.trim());
-  const iWs = heads.findIndex((h) => h.startsWith("ワークスペース"));
-  const iRef = heads.findIndex((h) => h.startsWith("参照フォルダ"));
-  assert.ok(iWs >= 0, `ワークスペースの節が無い: ${heads}`);
-  assert.ok(iWs < iRef, `ワークスペースの節が参照フォルダの上に無い: ${heads}`);
-  assert.equal(heads[iWs], "ワークスペース4", `件数のバッジ: ${heads[iWs]}`);
-  const rows = () => [...target.querySelectorAll(".wk-ws")];
-  const row = (name) => rows().find((r) => r.querySelector(".wk-ws-name").textContent === name);
-  const btns = (r) => [...r.querySelectorAll("button")].map((b) => b.textContent.trim());
+  const cmp = mount(WikiDialogs, { target });
+  const open = () => {
+    W.wk.menu = { kind: "vault", path: W.wk.status.root, x: 10, y: 20 };
+    flushSync();
+  };
+  open();
+  const rows = () => [...target.querySelectorAll(".wk-menu-wsrow")];
+  const row = (name) => rows().find((r) => r.querySelector(".wk-menu-name").textContent === name);
+  const x = (name) => row(name)?.querySelector(".wk-menu-x") ?? null;
   assert.equal(rows().length, 4);
-  // 画面の root = ✓・ボタンなし
-  assert.equal(row("cur").querySelector(".wk-ws-cur")?.textContent, "✓");
-  assert.deepEqual(btns(row("cur")), []);
-  assert.ok(row("cur").querySelector(".wk-ref-path").textContent.includes("/ws/cur"), "パスが出ない");
-  // どのタブも使っていない = [開く] [外す]
-  assert.deepEqual(btns(row("blog")), ["開く", "外す"]);
-  assert.ok(!row("blog").classList.contains("wk-ws-gone"));
-  // 別のタブが使っている = [外す] なし
-  assert.deepEqual(btns(row("b")), ["開く"], "タブが使っている root に [外す] が出た");
+  // 画面の root = ✓・× なし・別のタブが使っている = × なし・どのタブも使っていない / 無いフォルダ = ×
+  assert.equal(x("cur"), null, "現在のワークスペースに × が出た");
+  assert.equal(x("b"), null, "タブが使っている root に × が出た");
+  assert.ok(x("site") && x("gone"), "使っていない root に × が無い");
+  assert.equal(x("gone").getAttribute("role"), "menuitem", "× がキーで届かない（menuitem でない）");
+  assert.match(x("gone").getAttribute("aria-label"), /^このワークスペースを履歴から外す.*: gone$/, "× の読み上げに名前が無い");
+  assert.ok(x("gone").title.includes("/vol/gone"), `× の title に root が無い: ${x("gone").title}`);
   calls.length = 0;
   await W.forgetWorkspace("/ws/b");
   assert.ok(!names().includes("wiki_forget_root"), "タブが使っている root を外した");
-  // 無い = dim・[開く] なし・title に「見つかりません」
-  assert.deepEqual(btns(row("gone")), ["外す"]);
-  assert.ok(row("gone").classList.contains("wk-ws-gone"), "無いフォルダが dim でない");
-  assert.ok(row("gone").title.includes("見つかりません"), `title: ${row("gone").title}`);
-  // 押下: [外す] = wiki_forget_root {args:{root}}
+  // 押下: × = 確認なしで外す・メニューを閉じて名前のボタン（opener）へ焦点・wiki_forget_root {args:{root}} を 1 回
   calls.length = 0;
   raw.length = 0;
-  row("gone").querySelector("button").click();
-  assert.ok(await waitFor(() => calls.length > 0));
-  assert.deepEqual(calls, [{ name: "wiki_forget_root", args: { root: "/vol/gone" } }]);
-  assert.deepEqual(rawOf("wiki_forget_root"), [{ args: { root: "/vol/gone" } }], "args で包んでいない");
-  // B のタブを閉じる = [外す] が出る
-  await S.closeTab(tb.id);
+  const forgets = () => calls.filter((c) => c.name === "wiki_forget_root");
+  // 消える物を title と読み上げで言う（確認は無いが嘘は書かない = 参照フォルダ・除外フォルダの設定と索引）
+  for (const w of ["参照フォルダ", "除外フォルダ", "索引", "最近開いたページ"]) {
+    assert.ok(x("gone").title.includes(w), `× の title に「${w}」が無い: ${x("gone").title}`);
+    assert.ok(x("gone").getAttribute("aria-label").includes(w), `× の読み上げに「${w}」が無い`);
+  }
+  const opener = document.createElement("button");
+  opener.className = "wk-vault-stub";
+  document.body.append(opener);
+  W.wk.menu = { ...W.wk.menu, opener };
   flushSync();
-  assert.deepEqual(btns(row("b")), ["開く", "外す"], "タブを閉じても [外す] が出ない");
-  // [開く] = 前面のタブだけ切替（wiki_switch_root {args:{root}}）
-  calls.length = 0;
-  [...row("blog").querySelectorAll("button")].find((b) => b.textContent.trim() === "開く").click();
-  assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_switch_root")), "[開く] が wiki_switch_root を呼ばない");
-  assert.deepEqual(calls.find((c) => c.name === "wiki_switch_root").args, { root: "/ws/blog" });
+  let release = () => {};
+  const forgetWas = handlers.wiki_forget_root;
+  handlers.wiki_forget_root = (a) => new Promise((r) => (release = () => r(forgetWas(a))));
+  const goneX = x("gone");
+  goneX.focus();
+  goneX.click();
+  flushSync();
+  assert.equal(W.wk.menu, null, "× でメニューが閉じない（行が詰まって 2 回目の押下が下の行に当たる）");
+  assert.ok(document.activeElement === opener, `× の後の焦点が名前のボタンに無い: ${document.activeElement?.className}`);
+  assert.ok(!target.querySelector(".overlay"), "× で確認の窓が出た（確認なしのはず）");
+  assert.ok(await waitFor(() => forgets().length === 1), "× で wiki_forget_root を呼ばない");
+  // 二度押し（ダブルクリックの 2 回目・Enter の連打）: 閉じたメニューの × と、実行中の forgetWorkspace の 2 回目 = どちらも外さない
+  goneX.click();
+  void W.forgetWorkspace("/vol/gone");
   await settle();
-  flushSync();
-  assert.equal(target.querySelector(".wk-ws-cur")?.closest(".wk-ws")?.querySelector(".wk-ws-name").textContent, "blog", "✓ が切り替えた root に移らない");
-  const pick = [...target.querySelectorAll("button")].find((b) => b.textContent.trim() === "別のフォルダを選ぶ…");
-  assert.ok(pick, "[別のフォルダを選ぶ…] が無い");
-  calls.length = 0;
-  pick.click();
-  assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_pick_root")), "[別のフォルダを選ぶ…] が wiki_pick_root を呼ばない");
+  assert.equal(forgets().length, 1, `二度押しで 2 回外した（${forgets().length} 回）`);
+  release();
+  await settle();
+  handlers.wiki_forget_root = forgetWas;
+  assert.deepEqual(rawOf("wiki_forget_root"), [{ args: { root: "/vol/gone" } }], "args で包んでいない / 2 回外した");
+  opener.remove();
+  open();
+  // B のタブを閉じる = × が出る
+  await S.closeTab(tb.id);
+  open();
+  assert.ok(x("b"), "タブを閉じても × が出ない");
   // 一覧の読み直し（wiki-state → wk.status の置き換え）に追随する
   W.wk.status = { ...W.wk.status, workspaces: W.wk.status.workspaces.slice(0, 2) };
   flushSync();
   assert.equal(rows().length, 2, "一覧の変化に追随しない");
+  W.wk.menu = null;
+  flushSync();
   // workspaceName = root の最後の区画（vaultName は画面の root で同じ規則）
   assert.equal(W.workspaceName("/Users/u/notes/wiki"), "wiki");
   assert.equal(W.workspaceName("/a/b/"), "b");
   assert.equal(W.workspaceName(""), "");
-  assert.equal(W.vaultName(), "blog");
+  assert.equal(W.vaultName(), "cur");
   unmount(cmp);
   target.remove();
   tests++;
@@ -657,7 +688,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
 // ---- ⑩ WikiDialogs の vault メニュー・WikiSidebar のメニューの位置 ----
 {
   await reset([[null, "/ws/cur"]], 0, "/ws/cur");
-  Object.assign(be, { hist: ["/ws/cur", "/ws/blog", "/vol/gone"], gone: ["/vol/gone"] });
+  Object.assign(be, { hist: ["/ws/cur", "/ws/site", "/vol/gone"], gone: ["/vol/gone"] });
   await W.loadWikiStatus();
   await settle();
   const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
@@ -672,26 +703,45 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   assert.ok(menu.textContent.includes("最近のワークスペース"), "見出しが無い");
   assert.ok(!menu.textContent.includes("選び直す"), "旧い文言が残った");
   const ws = [...target.querySelectorAll(".wk-menu-ws")];
-  assert.deepEqual(ws.map((b) => b.querySelector(".wk-menu-name").textContent), ["cur", "blog", "gone"]);
-  // 並び: ホーム → 見出し → 履歴 → 別のフォルダを選ぶ… → 参照フォルダを追加…
-  assert.deepEqual(items(), ["ホーム（参照フォルダ・ページ情報）", "✓cur", "blog", "gone", "別のフォルダを選ぶ…", "参照フォルダ（読み取り専用）を追加…"]);
-  const [cur, blog, gone] = ws;
+  assert.deepEqual(ws.map((b) => b.querySelector(".wk-menu-name").textContent), ["cur", "site", "gone"]);
+  // 並び: ホーム → 見出し → 履歴（使っていない root に ×）→ 別のフォルダを選ぶ… → フォルダの設定…（参照フォルダの追加は窓の中）
+  assert.deepEqual(items(), ["ホーム", "✓cur", "site", "×", "gone", "×", "別のフォルダを選ぶ…", "フォルダの設定…", "索引を作り直す"]);
+  // 字の頭が揃う: × の外の全項目にチェックの欄・見出しも同じ字下げ（ページの [⋯] と同じ）
+  const main = [...target.querySelectorAll(".wk-menu button:not(.wk-menu-x)")];
+  assert.ok(main.every((b) => b.firstElementChild?.classList.contains("wk-menu-check")), `チェックの欄の無い項目: ${main.filter((b) => !b.firstElementChild?.classList.contains("wk-menu-check")).map((b) => b.textContent)}`);
+  assert.ok([...target.querySelectorAll(".wk-menu-head")].every((h) => h.classList.contains("wk-menu-head-ind")), "見出しの字の頭が項目と揃わない");
+  const [cur, site, gone] = ws;
   assert.equal(cur.disabled, true, "現在の行が押せる");
   assert.equal(cur.querySelector(".wk-menu-check").textContent, "✓");
   assert.equal(cur.title, "/ws/cur");
-  assert.equal(blog.disabled, false);
-  assert.equal(blog.querySelector(".wk-menu-check").textContent, "");
+  assert.equal(site.disabled, false);
+  assert.equal(site.querySelector(".wk-menu-check").textContent, "");
   assert.equal(gone.disabled, true, "無いフォルダの行が押せる");
   assert.ok(gone.classList.contains("wk-menu-gone"), "無いフォルダが dim でない");
   assert.ok(gone.title.includes("見つかりません") && gone.title.includes("/vol/gone"), `title: ${gone.title}`);
+  // ホーム = 前面のタブをホームへ（openWikiPage(null)）・別のフォルダを選ぶ… = wiki_pick_root
+  S.frontWiki().path = "notes/x.md";
+  [...target.querySelectorAll(".wk-menu button")].find((b) => b.textContent.trim() === "ホーム").click();
+  assert.ok(await waitFor(() => S.frontWiki()?.path === null), "ホームでホームへ移らない");
+  assert.equal(W.wk.menu, null);
+  W.wk.menu = { kind: "vault", path: "/ws/cur", x: 10, y: 20 };
+  flushSync();
+  calls.length = 0;
+  [...target.querySelectorAll(".wk-menu button")].find((b) => b.textContent.trim() === "別のフォルダを選ぶ…").click();
+  assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_pick_root")), "[別のフォルダを選ぶ…] が wiki_pick_root を呼ばない");
+  assert.equal(W.wk.menu, null);
+  await settle();
+  W.wk.menu = { kind: "vault", path: "/ws/cur", x: 10, y: 20 };
+  flushSync();
+  const site2 = [...target.querySelectorAll(".wk-menu-ws")].find((b) => b.querySelector(".wk-menu-name").textContent === "site");
   // 押下 = メニューを閉じて切り替える（前面のタブだけ）
   calls.length = 0;
-  blog.click();
+  site2.click();
   flushSync();
   assert.equal(W.wk.menu, null, "押下でメニューが閉じない");
   assert.ok(await waitFor(() => calls.some((c) => c.name === "wiki_switch_root")));
-  assert.deepEqual(calls.find((c) => c.name === "wiki_switch_root").args, { root: "/ws/blog" });
-  assert.ok(await waitFor(() => S.frontWiki()?.root === "/ws/blog"), "メニューの切替で前面のタブが替わらない");
+  assert.deepEqual(calls.find((c) => c.name === "wiki_switch_root").args, { root: "/ws/site" });
+  assert.ok(await waitFor(() => S.frontWiki()?.root === "/ws/site"), "メニューの切替で前面のタブが替わらない");
   await settle();
   // 履歴が無い（現在だけ）= 見出しと ✓ の行は出す
   W.wk.status = { enabled: true, root: "/only/one" };
@@ -705,7 +755,7 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   W.wk.menu = null;
   flushSync();
 
-  // WikiSidebar の vault 行: メニューの y の上限 = 窓の高さ − 見積もり（165 + 28 × 件数）
+  // WikiSidebar の vault 行: メニューの y の上限 = 窓の高さ − 見積もり（197 + 28 × 件数 = 「索引を作り直す」の 1 行を含む）
   const { default: WikiSidebar } = await import("./WikiSidebar.svelte");
   W.wk.status = { enabled: true, root: "/ws/cur", workspaces: workspaces() };
   W.wk.pages = [];
@@ -719,8 +769,54 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   vault.click();
   flushSync();
   assert.equal(W.wk.menu?.kind, "vault");
-  assert.equal(W.wk.menu.y, ih - (165 + 28 * 3), `y の上限が件数の見積もりでない: ${W.wk.menu.y} (innerHeight ${ih})`);
+  assert.equal(W.wk.menu.y, ih - (197 + 28 * 3), `y の上限が件数の見積もりでない: ${W.wk.menu.y} (innerHeight ${ih})`);
   W.wk.menu = null;
+  flushSync();
+  // キーで開く（前は keyboard / opener を付けず、Enter で開いても焦点は名前の行に残り ↑↓ が効かなかった）:
+  // 名前のボタンの Enter / Space / ↓ = 開いて最初の項目へ・↓ で次へ・Esc で閉じて名前のボタンへ。マウスのクリック（detail 1）は焦点を動かさない
+  const tick2 = async () => {
+    flushSync();
+    await sleep(0);
+    flushSync();
+  };
+  const inMenu = () => !!target.querySelector(".wk-menu")?.contains(document.activeElement);
+  for (const key of ["Enter", " ", "ArrowDown"]) {
+    vault.focus();
+    const ev = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    vault.dispatchEvent(ev);
+    await tick2();
+    assert.ok(ev.defaultPrevented, `${JSON.stringify(key)} の既定を止めていない（click で開き直す）`);
+    assert.equal(W.wk.menu?.kind, "vault", `${JSON.stringify(key)} で名前のメニューが開かない`);
+    assert.ok(W.wk.menu.keyboard === true && W.wk.menu.opener === vault, `${JSON.stringify(key)} で開いたメニューがキーの扱いでない`);
+    assert.ok(inMenu() && document.activeElement.textContent.trim() === "ホーム", `${JSON.stringify(key)} で開いたら最初の項目へ焦点が行かない: ${document.activeElement?.textContent}`);
+    const first = document.activeElement;
+    first.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    await tick2();
+    assert.ok(inMenu() && document.activeElement !== first, "↓ で次の項目へ移らない");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await tick2();
+    assert.equal(W.wk.menu, null, "Esc で閉じない");
+    assert.ok(document.activeElement === vault, `Esc で名前のボタンへ戻らない: ${document.activeElement?.className}`);
+  }
+  // キーの click（detail 0）もキーの扱い・マウスの click（detail 1）は焦点を動かさない
+  vault.focus();
+  vault.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
+  await tick2();
+  assert.ok(W.wk.menu?.kind === "vault" && !W.wk.menu.keyboard && document.activeElement === vault, "マウスで開いたのに焦点を動かした");
+  W.wk.menu = null;
+  await tick2();
+  vault.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 0 }));
+  await tick2();
+  assert.ok(W.wk.menu?.keyboard === true && inMenu(), "キーの click（detail 0）で最初の項目へ焦点が行かない");
+  W.wk.menu = null;
+  // 覆いの間は開かない
+  S.app.importJob = { files: [], running: false, cancel: false };
+  vault.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  vault.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
+  await tick2();
+  assert.equal(W.wk.menu, null, "覆いの間に名前のメニューが開いた");
+  S.app.importJob = null;
+  flushSync();
   unmount(side);
   unmount(cmp);
   target.remove();
@@ -954,20 +1050,21 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   calls.length = 0;
   await W.forgetWorkspace("/ws/b");
   assert.ok(!names().includes("wiki_forget_root"), "チャットの子の root を外した");
-  const { default: WikiInfo } = await import("./WikiInfo.svelte");
-  W.wk.page = null;
+  const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
   const target = document.createElement("div");
   document.body.append(target);
-  const cmp = mount(WikiInfo, { target });
+  const cmp = mount(WikiDialogs, { target });
+  W.wk.menu = { kind: "vault", path: W.wk.status.root, x: 10, y: 20 };
   flushSync();
-  const row = (name) => [...target.querySelectorAll(".wk-ws")].find((r) => r.querySelector(".wk-ws-name").textContent === name);
-  const btns = (r) => [...r.querySelectorAll("button")].map((b) => b.textContent.trim());
-  assert.deepEqual(btns(row("b")), ["開く"], "チャットの子の root に [外す] が出た");
-  assert.deepEqual(btns(row("c")), ["開く", "外す"]);
+  const hasX = (name) => !![...target.querySelectorAll(".wk-menu-wsrow")].find((r) => r.querySelector(".wk-menu-name").textContent === name)?.querySelector(".wk-menu-x");
+  assert.equal(hasX("b"), false, "チャットの子の root に × が出た");
+  assert.equal(hasX("c"), true);
   // 子が止まった（root = null）= 出る
   CH.chat.status = { ...CH.chat.status, state: "off", root: null };
   flushSync();
-  assert.deepEqual(btns(row("b")), ["開く", "外す"], "子が止まっても [外す] が出ない");
+  assert.equal(hasX("b"), true, "子が止まっても × が出ない");
+  W.wk.menu = null;
+  flushSync();
   unmount(cmp);
   target.remove();
   CH.chat.status = null;
@@ -1025,6 +1122,315 @@ const HOME = (root) => ({ path: null, root, scrollTop: 0, editing: false });
   assert.ok(await waitFor(() => be.front.length >= 2, 1500), `起動の揃えの失敗を揃え直さない: ${be.front}`);
   assert.ok(await waitFor(() => !W.wk.status?.frontError, 1000), "揃え直せたのに警告が残った");
   W.wikiCfg.frontRetry = retry0;
+  tests++;
+}
+
+// ---- ⑲ 写しの表（SHELF）は 1 つ: 表の項目は 退避 / 復元 / 初めての root / OFF の全部に効く・wk の項目は「写す」か「写さない」のどちらかに分けてある ----
+// 前は同じ 22 項目を 5 か所（型・SHELF_KEYS・takeShelf・blankShelf・putShelf）+ OFF の初期化に手で並べていた（OFF は 8 項目を戻していなかった）
+{
+  await reset([[null, "/ws/a"], [null, "/ws/b"]], 0);
+  const W_ = W.wk;
+  // OFF で戻していなかった項目（前は再び ON にしたとき、読み直しが済むまで / 読めなければずっと前の値が残った）
+  const OFF_MISSED = { tagsTotal: 0, inboxTotal: 0, chatLogTotal: 0, resultsTotal: 0, treeError: null, searchError: null, refDirs: [], sel: 0 };
+  Object.assign(W_, { tagsTotal: 3, inboxTotal: 4, chatLogTotal: 5, resultsTotal: 6, treeError: "木", searchError: "検索", refDirs: ["/ref-x"], sel: 2 });
+  handlers.wiki_status = () => ({ enabled: false, root: "/ws/a" });
+  await W.loadWikiStatus();
+  assert.equal(S.app.wikiOn, false);
+  const plain = (v) => (v instanceof Set || v instanceof Map ? [...v] : Array.isArray(v) ? [...v] : v && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
+  for (const [k, want] of Object.entries(OFF_MISSED)) assert.deepEqual(plain(W_[k]), want, `OFF で ${k} を戻さない`);
+  assert.deepEqual(plain(W_.status), { enabled: false, root: "/ws/a" }, "OFF の status は読んだ状態（戻さない）");
+
+  await reset([[null, "/ws/a"], [null, "/ws/b"]], 0);
+  // wk の項目の全部 = 写す（SHELF_KEYS）か、写さない（前面のページ・表示の好み・進行中の印・メニューとダイアログ = 下の一覧）のどちらか。
+  // 新しい項目を wk に足したら、表に足すかこの一覧に足すかを決めないと落ちる
+  const NOT_SHELVED = ["treeLoading", "page", "pageError", "headings", "scrollTo", "findRequest", "stamp", "changed", "embedGen", "infoOpen", "headColors", "reindexing", "tocOpen", "prefsReady", "searching", "split", "dialog", "menu"];
+  assert.deepEqual(Object.keys(W_).sort(), [...W.SHELF_KEYS, ...NOT_SHELVED].sort(), "wk の項目が写しの表とも写さない一覧とも合わない");
+  assert.deepEqual(W.SHELF_KEYS, Object.keys(W.SHELF), "SHELF_KEYS が表の順でない");
+  // 表の項目ごとに目印を置く（型は表の空の値から決める = 表に足した項目は自動でここに入る）
+  const mark = (k) => {
+    const b = W.SHELF[k].blank("/x");
+    if (k === "status") return { ...W_.status, pages: 4242 };
+    if (b instanceof Set) return new b.constructor([`M-${k}`]);
+    if (b instanceof Map) return new b.constructor([[`M-${k}`, k]]);
+    if (Array.isArray(b)) return [`M-${k}`];
+    if (typeof b === "number") return 42;
+    if (typeof b === "boolean") return !b;
+    if (typeof b === "string" || b === null) return `M-${k}`;
+    throw new Error(`目印の作り方が無い型: ${k}（試験の mark に足す）`);
+  };
+  const put = {};
+  for (const k of W.SHELF_KEYS) W_[k] = put[k] = mark(k);
+  const held = Object.fromEntries(W.SHELF_KEYS.map((k) => [k, W_[k]])); // wk に入った物（proxy の配列なら proxy）
+  // 期待値は試験が持つ（表から作らない = 表の空の値・写し方を書き間違えたら落ちる）。表に足したばかりでここに無い項目だけは表の空の値で見る
+  const BLANK = {
+    pages: [], excluded: [], treeError: null, tags: [], tagsTotal: 0, inbox: [], inboxTotal: 0, chatLog: [], chatLogTotal: 0, open: [], titleOverrides: [], newDirs: [],
+    q: "", qTags: [], showResults: false, results: [], resultsTotal: 0, sel: 0, searchError: null, error: null, refDirs: [],
+  };
+  const blankOf = (k) => (Object.hasOwn(BLANK, k) ? BLANK[k] : plain(W.SHELF[k].blank("/x")));
+  // 複製して預ける項目（A を離れた後で前の物を書き換えても、A の写しは変わらない）。status は snapshot（同じく変わらない）。ほかは同じ物を預ける
+  const COPIED = ["excluded", "qTags", "refDirs"];
+  // 初めての root = 全項目が空
+  W.enterRoot("/ws/b");
+  for (const k of W.SHELF_KEYS) {
+    if (k === "status") assert.deepEqual([W_.status.root, W_.status.pages], ["/ws/b", undefined], "初めての root の status");
+    else assert.deepEqual(plain(W_[k]), blankOf(k), `初めての root に ${k} の前の値が残った`);
+  }
+  // A を離れた後に、A で使っていた物（wk に入っていた物）を書き換える = 複製・snapshot の項目は A の写しに映らない
+  for (const k of COPIED) held[k].push("後から足した");
+  held.status.pages = 999;
+  // 離れている間に履歴（workspaces）が変わった = 戻すとき今の履歴に差し替える（写しの中の履歴は古い）
+  const ws0 = JSON.parse(JSON.stringify(W_.status.workspaces));
+  W_.status = { ...W_.status, workspaces: [...ws0, { ...ws0[0], root: "/ws/後から" }] };
+  // 戻る = 全項目が戻る（同じ物を預ける項目は同じ物・複製する項目は預けたときの中身）
+  W.enterRoot("/ws/a");
+  for (const k of W.SHELF_KEYS) {
+    if (k === "status") {
+      assert.equal(W_.status.root, "/ws/a");
+      assert.equal(W_.status.pages, 4242, "status を snapshot で預けていない（離れた後の書換えが写しに映った）");
+      assert.deepEqual(W_.status.workspaces.map((w) => w.root), [...ws0.map((w) => w.root), "/ws/後から"], "戻すとき履歴を今の物に差し替えない");
+    } else if (COPIED.includes(k)) {
+      assert.deepEqual(plain(W_[k]), [`M-${k}`], `${k} を複製して預けていない（離れた後の書換えが写しに映った）`);
+      assert.notEqual(W_[k], held[k], `${k} が同じ物のまま戻った`);
+    } else assert.ok(W_[k] === held[k] || W_[k] === put[k], `${k} を同じ物で戻さない`);
+  }
+  // OFF = 写しの全項目を空に（status だけは OFF の状態を読んだ物 = 戻さない）
+  handlers.wiki_status = () => ({ enabled: false, root: "/ws/a" });
+  await W.loadWikiStatus();
+  for (const k of W.SHELF_KEYS) {
+    if (k === "status") assert.deepEqual(plain(W_.status), { enabled: false, root: "/ws/a" }, "OFF の status");
+    else assert.deepEqual(plain(W_[k]), blankOf(k), `OFF で ${k} を戻さない`);
+  }
+  assert.deepEqual(W.SHELF_KEYS.filter((k) => W.SHELF[k].off === "keep"), ["status"], "OFF で戻さない項目は status だけ");
+  tests++;
+}
+
+// ---- ⑳ 「フォルダの設定…」の窓: 参照フォルダと除外フォルダの一覧・今の command・焦点の出入り・0 件・覆い ----
+{
+  await reset([[null, "/ws/a"]], 0);
+  await settle();
+  const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
+  const target = document.createElement("div");
+  document.body.append(target);
+  const cmp = mount(WikiDialogs, { target });
+  handlers.wiki_ref_dir_remove = (a) => ({ dirs: W.wk.refDirs.filter((d) => d !== a.path), restart: false });
+  handlers.wiki_ref_dir_add = () => ({ dirs: [...W.wk.refDirs, "/Users/u/added"], added: "/Users/u/added" });
+  handlers.wiki_exclude_set = (a) => ({ dir: a.dir, excluded: a.excluded });
+  const long = "/Users/u/Library/CloudStorage/GoogleDrive-x/My Drive/very/deep/reference/folder/papers";
+  W.wk.refDirs = ["/Users/u/ref", long];
+  W.wk.excluded = ["archive", "notes/old 2024"];
+  // メニューから開く = メニューを閉じて窓・焦点は [閉じる]
+  const opener = document.createElement("button");
+  document.body.append(opener);
+  opener.focus();
+  W.wk.menu = { kind: "vault", path: "/ws/a", x: 10, y: 20 };
+  flushSync();
+  [...target.querySelectorAll(".wk-menu button")].find((b) => b.textContent.trim() === "フォルダの設定…").click();
+  flushSync();
+  assert.equal(W.wk.menu, null, "フォルダの設定… でメニューが閉じない");
+  assert.equal(W.wk.dialog?.kind, "folders");
+  const modal = () => target.querySelector(".modal");
+  assert.ok(modal()?.querySelector("h3")?.textContent.includes("フォルダの設定"), "窓の題が無い");
+  await sleep(5);
+  assert.ok(document.activeElement?.textContent.trim() === "閉じる" && modal().contains(document.activeElement), `焦点が窓の [閉じる] に無い: ${document.activeElement?.textContent}`);
+  // 並び = 参照フォルダ → 除外フォルダ・説明の文は窓の中
+  const secs = [...modal().querySelectorAll("h4")].map((h) => h.textContent.trim());
+  assert.deepEqual(secs, ["参照フォルダ2", "除外フォルダ2"], `節の並び: ${secs}`);
+  assert.ok(modal().textContent.includes("ワークスペースの外のフォルダ。その中の PDF・html・画像へのリンクを内蔵の表示で開きます"), "参照フォルダの説明が窓に無い");
+  const rows = (i) => [...modal().querySelectorAll(".wk-fs-sec")[i].querySelectorAll(".wk-fs-row")];
+  // 参照フォルダ = 絶対パス（先頭側を省略する rtl の型）・title に全体・[外す]
+  assert.deepEqual(rows(0).map((r) => r.querySelector(".wk-fs-path").title), ["/Users/u/ref", long]);
+  assert.ok(rows(0)[1].querySelector(".wk-fs-path").classList.contains("wk-fs-abs"), "長いパスを先頭側で省略しない");
+  // 除外フォルダ = vault 相対 + /（フルパスを出さない）・title = 相対パス
+  assert.deepEqual(rows(1).map((r) => r.querySelector(".wk-fs-path").textContent), ["archive/", "notes/old 2024/"]);
+  assert.ok(!modal().querySelectorAll(".wk-fs-sec")[1].textContent.includes("/ws/a"), "除外フォルダに絶対パスを出した");
+  // 外す / 追加… / 索引に入れる = 今の command（参照フォルダは画面の root・除外は木の右クリックと同じ wiki_exclude_set）
+  calls.length = 0;
+  raw.length = 0;
+  const n = (name) => calls.filter((c) => c.name === name).length;
+  // [外す]: 応答を待つ間の二度押しで 2 回呼ばない
+  let releaseRm = () => {};
+  const rmWas = handlers.wiki_ref_dir_remove;
+  handlers.wiki_ref_dir_remove = (a) => new Promise((r) => (releaseRm = () => r(rmWas(a))));
+  const rm = rows(0)[0].querySelector("button");
+  rm.click();
+  flushSync();
+  rm.click();
+  assert.ok(await waitFor(() => n("wiki_ref_dir_remove") > 0));
+  assert.ok(rm.disabled, "応答を待つ間に [外す] が押せる");
+  releaseRm();
+  handlers.wiki_ref_dir_remove = rmWas;
+  assert.deepEqual(rawOf("wiki_ref_dir_remove"), [{ args: { path: "/Users/u/ref", root: "/ws/a" } }], "二度押しで 2 回外した / args");
+  assert.ok(await waitFor(() => (flushSync(), rows(0).length === 1)), "外した参照フォルダが一覧に残った");
+  // 追加…: 取り消し（dirs: null・added: null）は一覧を変えず知らせない・選んだら一覧が替わる
+  const addWas = handlers.wiki_ref_dir_add;
+  handlers.wiki_ref_dir_add = () => ({ dirs: null, added: null });
+  S.app.toast = "";
+  [...modal().querySelectorAll("button")].find((b) => b.textContent.trim() === "追加…").click();
+  assert.ok(await waitFor(() => n("wiki_ref_dir_add") === 1), "追加… が wiki_ref_dir_add を呼ばない");
+  await settle();
+  flushSync();
+  assert.deepEqual(W.wk.refDirs, [long], "追加を取り消したのに一覧が変わった");
+  assert.equal(S.app.toast, "", `追加を取り消したのに知らせた: ${S.app.toast}`);
+  handlers.wiki_ref_dir_add = addWas;
+  [...modal().querySelectorAll("button")].find((b) => b.textContent.trim() === "追加…").click();
+  assert.ok(await waitFor(() => (flushSync(), rows(0).length === 2)), "追加した参照フォルダが一覧に出ない");
+  assert.deepEqual(rawOf("wiki_ref_dir_add"), [{ args: { root: "/ws/a" } }, { args: { root: "/ws/a" } }]);
+  // 索引に入れる: 一覧が追う（背景の走査の後）まで押せない = 二度押しで 2 回呼ばない
+  const inc = rows(1)[1].querySelector("button");
+  inc.click();
+  flushSync();
+  inc.click();
+  assert.ok(await waitFor(() => n("wiki_exclude_set") > 0), "索引に入れる が wiki_exclude_set を呼ばない");
+  await settle();
+  flushSync();
+  assert.ok(inc.disabled, "一覧が追う前に「索引に入れる」が押せる");
+  inc.click();
+  await settle();
+  assert.equal(n("wiki_exclude_set"), 1, `二度押しで 2 回 wiki_exclude_set（${n("wiki_exclude_set")} 回）`);
+  assert.deepEqual(calls.find((c) => c.name === "wiki_exclude_set").args, { dir: "notes/old 2024", excluded: false, root: "/ws/a" });
+  W.wk.excluded = ["archive"]; // 一覧が追った（wiki-changed → 木の読み直し）
+  flushSync();
+  assert.deepEqual(rows(1).map((r) => r.querySelector(".wk-fs-path").textContent), ["archive/"]);
+  // 失敗（wiki_exclude_set が投げる）= 押せるように戻す
+  const exWas = handlers.wiki_exclude_set;
+  handlers.wiki_exclude_set = () => {
+    throw new Error("書けない");
+  };
+  const inc2 = rows(1)[0].querySelector("button");
+  inc2.click();
+  assert.ok(await waitFor(() => (flushSync(), !inc2.disabled && n("wiki_exclude_set") === 2)), "失敗の後に「索引に入れる」が押せないまま");
+  handlers.wiki_exclude_set = exWas;
+  assert.equal(W.wk.dialog?.kind, "folders", "一覧の操作で窓が閉じた");
+  // 0 件の文
+  W.wk.refDirs = [];
+  W.wk.excluded = [];
+  flushSync();
+  assert.ok(modal().textContent.includes("参照フォルダはありません") && modal().textContent.includes("除外フォルダはありません"), "0 件の文が無い");
+  assert.deepEqual([...modal().querySelectorAll("h4")].map((h) => h.textContent.trim()), ["参照フォルダ0", "除外フォルダ0"]);
+  // [閉じる] = 閉じて開く前の焦点へ
+  [...modal().querySelectorAll("button")].find((b) => b.textContent.trim() === "閉じる").click();
+  flushSync();
+  await sleep(5);
+  assert.equal(W.wk.dialog, null, "[閉じる] で閉じない");
+  assert.ok(document.activeElement === opener, `閉じた後の焦点が開く前の所へ戻らない: ${document.activeElement?.tagName}`);
+  // Esc でも閉じる
+  W.openFolderSettings();
+  flushSync();
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  flushSync();
+  assert.equal(W.wk.dialog, null, "Esc で閉じない");
+  // 覆いの下では開かない（覆いが出たらメニューも閉じる = 今の決まり）
+  S.app.importJob = { files: [], running: false, cancel: false };
+  W.openFolderSettings();
+  flushSync();
+  assert.equal(W.wk.dialog, null, "覆いの下でフォルダの設定の窓が開いた");
+  W.wk.menu = { kind: "vault", path: "/ws/a", x: 10, y: 20 };
+  flushSync();
+  assert.equal(W.wk.menu, null, "覆いの下で名前のメニューが開いたまま");
+  S.app.importJob = null;
+  flushSync();
+  opener.remove();
+  unmount(cmp);
+  target.remove();
+  tests++;
+}
+
+// ---- ㉑ 「索引を作り直す」は名前のメニューの 1 か所・ヘッダーに [再索引] が無い・ヘッダーの状態の表示は残る ----
+{
+  await reset([[null, "/ws/a"]], 0);
+  await settle();
+  const { default: WikiDialogs } = await import("./WikiDialogs.svelte");
+  const { default: WikiHeader } = await import("./WikiHeader.svelte");
+  const target = document.createElement("div");
+  document.body.append(target);
+  const cmp = mount(WikiDialogs, { target });
+  const head = document.createElement("div");
+  document.body.append(head);
+  const hdr = mount(WikiHeader, { target: head });
+  flushSync();
+  const reindexes = () => calls.filter((c) => c.name === "wiki_reindex").length;
+  const open = () => {
+    W.wk.menu = { kind: "vault", path: "/ws/a", x: 10, y: 20 };
+    flushSync();
+  };
+  const item = () => [...target.querySelectorAll(".wk-menu button")].find((b) => b.textContent.trim() === "索引を作り直す");
+  // ヘッダーに [再索引] が無い（入口は名前のメニューだけ）・[＋ 新規] と ▣ は残る
+  const hbtns = [...head.querySelectorAll("button")].map((b) => b.textContent.trim());
+  assert.ok(!hbtns.some((t) => t.includes("再索引") || t.includes("索引")), `ヘッダーに再索引の入口が残った: ${hbtns}`);
+  assert.ok(head.querySelector(".wk-head-new") && head.querySelector(".pn-toggle"), "ヘッダーの [＋ 新規] / ▣ が無い");
+  // 名前のメニューの「索引を作り直す」= 字の頭を揃える（チェックの欄）・title・押すと閉じて wiki_reindex 1 回（command を待つ間は押せない・2 回目を呼ばない）
+  open();
+  assert.ok(item(), "名前のメニューに「索引を作り直す」が無い");
+  assert.ok(item().firstElementChild?.classList.contains("wk-menu-check"), "「索引を作り直す」の字の頭が揃わない");
+  assert.match(item().title, /索引を作り直す/);
+  let release = () => {};
+  handlers.wiki_reindex = () => new Promise((r) => (release = () => r(null)));
+  calls.length = 0;
+  W.wk.error = "監視が止まった";
+  item().click();
+  flushSync();
+  assert.equal(W.wk.menu, null, "押してもメニューが閉じない");
+  assert.equal(reindexes(), 1, "押しても wiki_reindex を呼ばない");
+  assert.deepEqual(rawOf("wiki_reindex"), [undefined], `wiki_reindex の引数が前と違う（引数なし = 設定の root）: ${JSON.stringify(rawOf("wiki_reindex"))}`);
+  assert.equal(W.wk.error, null, "作り直しで監視の失敗の印を消さない（前の [再索引] と同じ）");
+  open();
+  assert.equal(item().disabled, true, "command を待つ間に「索引を作り直す」が押せる");
+  void W.reindex();
+  await settle();
+  assert.equal(reindexes(), 1, `command を待つ間に 2 回 wiki_reindex（${reindexes()} 回）`);
+  release();
+  assert.ok(await waitFor(() => (flushSync(), item()?.disabled === false)), "command が返っても押せない");
+  // 作り直しの間（wiki_status.rebuilding）= 押せない・ヘッダーに進捗
+  W.wk.status = { ...W.wk.status, rebuilding: { percent: 40 } };
+  flushSync();
+  assert.equal(item().disabled, true, "作り直しの間に「索引を作り直す」が押せる");
+  void W.reindex();
+  await settle();
+  assert.equal(reindexes(), 1, "作り直しの間に wiki_reindex を呼んだ");
+  assert.match(head.textContent, /索引を作成中… 40%/, "ヘッダーの作り直しの進捗が消えた");
+  W.wk.status = { ...W.wk.status, rebuilding: null, statusError: "読めない" };
+  flushSync();
+  assert.match(head.textContent, /OpenNote の状態を読めません/, "ヘッダーの「状態を読めない」が消えた");
+  W.wk.status = { ...W.wk.status, statusError: undefined };
+  W.wk.error = "監視が止まった";
+  flushSync();
+  assert.match(head.textContent, /変更の自動反映が止まっています/, "ヘッダーの「自動反映が止まった」が消えた");
+  W.wk.error = null;
+  // ワークスペースを揃えられない間（frontError）= 押せない・title で理由・reindex も呼ばない（command は設定の root = 前のワークスペースを作り直す）
+  W.wk.status = { ...W.wk.status, frontError: "…見つかりません" };
+  open();
+  assert.equal(item().disabled, true, "ワークスペースを切り替えられない間に「索引を作り直す」が押せる");
+  assert.match(item().title, /切り替えられない間は作り直せません/, `押せない理由が title に無い: ${item().title}`);
+  calls.length = 0;
+  void W.reindex();
+  await settle();
+  assert.equal(reindexes(), 0, "ワークスペースを切り替えられない間に wiki_reindex を呼んだ");
+  W.wk.status = { ...W.wk.status, frontError: undefined };
+  W.wk.menu = null;
+  flushSync();
+  // 失敗 = toast・押せるように戻る
+  handlers.wiki_reindex = () => {
+    throw new Error("作れない");
+  };
+  S.app.toast = "";
+  open();
+  item().click();
+  assert.ok(await waitFor(() => S.app.toast.includes("OpenNote の索引を作り直せません")), `失敗の toast が無い: ${S.app.toast}`);
+  assert.equal(W.wk.reindexing, false, "失敗の後も押せないまま");
+  // 覆いの下では呼ばない（メニューは覆いで閉じる = 今の決まり・reindex 自身の門）
+  handlers.wiki_reindex = () => null;
+  S.app.importJob = { files: [], running: false, cancel: false };
+  calls.length = 0;
+  void W.reindex();
+  await settle();
+  assert.equal(reindexes(), 0, "覆いの下で wiki_reindex を呼んだ");
+  S.app.importJob = null;
+  flushSync();
+  W.wk.menu = null;
+  unmount(hdr);
+  head.remove();
+  unmount(cmp);
+  target.remove();
   tests++;
 }
 

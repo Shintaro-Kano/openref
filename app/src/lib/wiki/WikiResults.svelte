@@ -1,11 +1,12 @@
 <script lang="ts">
   /* OpenNote の中央の検索結果。ヘッダーの検索欄（WikiSearch・語）と Tags 箱（tag の AND）の結果 = wiki_search。
-     行 = 題名・パス・抜粋（一致箇所を <mark>）・tags。クリック = そのページを開いて結果を畳む（条件は残る）・⌘クリック = 新しいタブ。
+     行 = 題名・パス・抜粋（一致箇所を <mark>）・tags。しばらく乗せるとプレビュー（preview.svelte.ts）。クリック = そのページを開いて結果を畳む（条件は残る）・⌘クリック = 新しいタブ。
      行の tag のクリック = その tag を絞込に足す。Esc（検索欄で）/ × = 検索を消して木（ページ）に戻る */
   import { tick } from "svelte";
-  import { t } from "../i18n.svelte";
+  import { t, tn } from "../i18n.svelte";
   import { wk } from "./wiki.svelte";
   import { clearSearch, openHit, toggleTag } from "./search.svelte";
+  import { closePreview, hoverRow } from "./preview.svelte";
 
   let list = $state<HTMLDivElement | null>(null);
 
@@ -24,6 +25,7 @@
   }
 
   function pick(e: MouseEvent, path: string) {
+    closePreview();
     if (e.button === 1 || e.metaKey) {
       e.preventDefault();
       void openHit(path, true);
@@ -57,11 +59,11 @@
       {#if wk.searching && !wk.results.length}
         {t("検索中…")}
       {:else}
-        {`${wk.resultsTotal} ${t("件")}${wk.resultsTotal > wk.results.length ? ` · ${t("先頭")} ${wk.results.length}` : ""}`}
+        {`${tn(wk.resultsTotal, "件::results")}${wk.resultsTotal > wk.results.length ? ` · ${t("先頭")} ${wk.results.length}` : ""}`}
       {/if}
     </span>
     {#each wk.qTags as tg (tg)}
-      <button class="wk-res-chip" title={t("この tag の絞込を外す")} onclick={() => toggleTag(tg)}>#{tg} ×</button>
+      <button class="wk-res-chip" title={t("このタグの絞込を外す")} onclick={() => toggleTag(tg)}>#{tg} ×</button>
     {/each}
     <span class="wk-res-gap"></span>
     <button class="wk-res-close" title={t("検索を消す（Esc）")} onclick={clearSearch}>{t("検索を閉じる")}</button>
@@ -83,7 +85,11 @@
         onclick={(e) => pick(e, h.path)}
         onauxclick={(e) => pick(e, h.path)}
         onkeydown={(e) => e.key === "Enter" && void openHit(h.path, e.metaKey)}
-        onmouseenter={() => hover(i)}>
+        onmouseenter={(e) => {
+          hover(i);
+          hoverRow(e, h.path);
+        }}
+        onmouseleave={(e) => hoverRow(e, h.path)}>
         <div class="wk-hit-head">
           <span class="wk-hit-title">{h.title}</span>
           {#if h.kind !== "md"}<span class="wk-hit-kind">{kindLabel(h.kind)}</span>{/if}

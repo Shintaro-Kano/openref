@@ -288,6 +288,24 @@ pub(crate) fn wiki_not_regular_file(en: bool, p: impl std::fmt::Display) -> Stri
     )
 }
 
+/// wiki_open_path の開く先の解決（純関数に近い）: reveal = Finder で表示（中だけ・フォルダも可 = open -R は表示するだけ = 拡張子の
+/// 許可は要らない）・他は wiki_open_target。失敗の文のパスは名前まで（ワークスペースの root = フォルダ名・本文の file:// の
+/// 絶対パス = ファイル名）。戻り値 = (実体の絶対パス, Finder で表示する)
+pub(crate) fn wiki_open_resolve(root: &Path, path: &str, reveal: bool, en: bool) -> Result<(PathBuf, bool), String> {
+    let r = if reveal {
+        // 中だけ（`..`・`.` 始まり・外・外を指す symlink は拒否）
+        openref_core::wiki::commands::resolve_entry(root, path, true).map(|(_, abs)| (abs, true)).map_err(err)
+    } else {
+        wiki_open_target(root, path, en)
+    };
+    let given = Path::new(path.trim());
+    let mut paths = vec![root];
+    if given.is_absolute() {
+        paths.push(given);
+    }
+    r.map_err(|e| crate::hide_paths(e, &paths))
+}
+
 /// wiki_open_path の開く先（純関数に近い = ファイルシステムを読むだけ）。戻り値 = (実体の絶対パス, open せず Finder で表示する)。
 /// - vault 相対 / vault の中の絶対パス: core の resolve_path の検査（`..`・隠し・symlink の外出し・実在・ファイル）
 /// - vault の外の絶対パス（本文の `file://`）: canonicalize して実在する通常ファイルだけ（ディレクトリ・.app 等の

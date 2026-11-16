@@ -1,10 +1,11 @@
 <script lang="ts">
-  /* 見出しのメニュー: ✓ 文献 / 本棚の履歴 / 別のフォルダを本棚として開く… / 本棚のとき collapse・Finder・履歴から外す。
-     文献はフォルダを選ばない = 1 クリック。無いフォルダは灰色で押せない（外すのはその本棚を開いている間だけ = 無いフォルダのタブは開ける） */
-  import { untrack } from "svelte";
+  /* 本棚の左バーの見出しのメニュー（本棚の選択）: 本棚の履歴 / 別のフォルダを本棚として開く… / 今の本棚の collapse・Finder・履歴から外す。
+     文献へ戻るのは最上段のセグメント（✓ 文献 の行は無い）。無いフォルダは灰色で押せない（外すのはその本棚を開いている間だけ =
+     無いフォルダのタブは開ける） */
+  import { onDestroy, untrack } from "svelte";
   import { t } from "../i18n.svelte";
   import { app, frontShelf } from "../state.svelte";
-  import { backToLibrary, forgetShelf, pickShelf, revealBook, setCollapse, sh, switchShelf } from "./shelf.svelte";
+  import { forgetShelf, pickShelf, revealBook, setCollapse, sh, switchShelf } from "./shelf.svelte";
 
   const s = $derived(frontShelf());
   const cur = $derived(s ? sh.shelves.find((x) => x.root === s.root) : undefined);
@@ -15,6 +16,9 @@
     app.tab;
     untrack(() => (sh.menu = null));
   });
+  // 本棚の左バーごと外れる（同じタブで別のモードへ・本棚でないタブへ）= 閉じる（メニューは本棚の左バーにしか無い =
+  // 開いたまま外れると、次に本棚へ戻ったときに古い位置で開いて出る）
+  onDestroy(() => (sh.menu = null));
 
   function onKey(e: KeyboardEvent) {
     if (e.key !== "Escape") return;
@@ -28,10 +32,6 @@
 
 {#if sh.menu}
   <div class="lmenu sh-menu" style="top:{sh.menu.y}px;left:{sh.menu.x}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-    <button class="lmenu-item" role="menuitemradio" aria-checked={!s} onclick={() => void backToLibrary()}>
-      <span><span class="lmenu-check">{s ? "" : "✓"}</span>{t("文献")}</span>
-    </button>
-    <div class="lmenu-sep"></div>
     <div class="sh-menu-label">{t("本棚")}</div>
     {#each sh.shelves as r (r.root)}
       <button

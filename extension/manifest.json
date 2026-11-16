@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "OpenRef Capture",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "論文ページから 1 クリックで OpenRef へ取込。識別子（DOI/PMID）→ PubMed/Crossref で書誌確定、PDF はページ内 fetch（認証済み session）で取得。取れないときは DOI ページを背景タブで開いて取得（初回に全サイト許可を求める・任意・実験的）。",
-  "permissions": ["activeTab", "scripting", "storage", "alarms"],
+  "permissions": ["activeTab", "scripting", "storage", "alarms", "webRequest", "declarativeNetRequestWithHostAccess"],
   "host_permissions": ["http://127.0.0.1/*"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "action": {
@@ -21,5 +21,24 @@
   },
   "background": {
     "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["stopped.html"],
+      "matches": ["http://*/*", "https://*/*"],
+      "use_dynamic_url": true
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      }
+    }
   }
 }

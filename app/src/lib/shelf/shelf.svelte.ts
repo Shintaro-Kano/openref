@@ -9,6 +9,7 @@ import {
   breadcrumbOf,
   collectBooks,
   dirOf,
+  hideRootParents,
   indexDirs,
   indexFolders,
   indexParents,
@@ -21,6 +22,7 @@ import {
   type ShelfSortKey,
   type ShelfTab,
 } from "./tree";
+import { errText } from "../err";
 
 /** root の走査結果 + 索引。木は大きい（数千冊の本棚もある）= 読むだけの生の値で持つ（$state の proxy を通さない） */
 export interface ShelfIndex {
@@ -62,7 +64,10 @@ export const sh = new ShelfStore();
 /** 読書位置（ui_shelf_pos = {"<id>": page}・上限 500）。読み手が書く間は画面に出ない = 反応させない */
 let pos: Record<string, number> = {};
 
-const fail = (e: unknown) => toast(`✗ ${String(e).slice(0, 200)}`);
+const fail = (e: unknown) => toast(`✗ ${errText(e, 200)}`);
+/** root の本棚の操作の失敗 = Rust の文の root をフォルダ名に（失敗の案内にフルパスを出さない。Rust の殻も畳む = 二重でも同じ字）。
+    切る前に畳む（先に 200 字で切ると root の途中で切れて畳めない） */
+const failAt = (root: string) => (e: unknown) => fail(hideRootParents(String(e), root));
 const parse = (raw: string | null): unknown => {
   try {
     return raw ? JSON.parse(raw) : null;
@@ -86,11 +91,11 @@ async function reloadShelves() {
   try {
     await loadShelves();
   } catch (e) {
-    toast(`✗ ${t("本棚の履歴を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("本棚の履歴を読めません")}: ${errText(e, 160)}`);
   }
 }
 
-/** 起動時: 履歴と ui_shelf_*（タブの復元の前 = 新しいタブの並び）。読めなければ空のまま（本棚はメニューの 1 行だけ） */
+/** 起動時: 履歴と ui_shelf_*（タブの復元の前 = 新しいタブの並び）。読めなければ空のまま（SHELF はフォルダの選択へ進む） */
 export async function loadShelf() {
   try {
     sh.shelves = (await shelfIpc.status())?.shelves ?? [];
@@ -101,7 +106,7 @@ export async function loadShelf() {
     const p = parse(savedPos);
     if (p && typeof p === "object" && !Array.isArray(p)) pos = Object.fromEntries(Object.entries(p).filter(([, v]) => typeof v === "number")) as Record<string, number>;
   } catch (e) {
-    toast(`✗ ${t("本棚の履歴を読めません")}: ${String(e).slice(0, 160)}`);
+    toast(`✗ ${t("本棚の履歴を読めません")}: ${errText(e, 160)}`);
   }
 }
 
@@ -153,8 +158,9 @@ function frontTab(): Tab | undefined {
   return app.tabs.find((x) => x.id === app.tab);
 }
 
-/** root の本棚を開く。中身は常に 1 つ: 前面が一覧 / 本棚のタブならそのタブを本棚に（一覧の選択を外す = 文脈のチップが見えない文献を指さない）、
-    PDF・OpenNote・読み手のタブなら新しいタブで（走査を待つ間に MY NOTE を押した・PDF のタブの下の見出しから開いた = PDF のタブから MY NOTE を押したときと同じ） */
+/** root の本棚を開く（見出しのメニュー = 本棚のタブから）。中身は常に 1 つ: 前面が一覧 / 本棚のタブならそのタブを本棚に（一覧の選択を外す =
+    文脈のチップが見えない文献を指さない）、PDF・OpenNote・読み手のタブなら新しいタブで（走査を待つ間に NOTE を押した・別のタブへ移った =
+    PDF のタブからセグメントを押したときと同じ） */
 async function enter(root: string) {
   const tab = frontTab();
   if (!tab) return;
@@ -163,21 +169,41 @@ async function enter(root: string) {
     return;
   }
   tab.shelf = shelfHome(root);
+  tab.shelfAway = null; // 戻る先は本棚が無い間だけ（mode.svelte の switchMode と同じ）
   clearChecks();
+}
+
+/** 履歴の本棚へ切り替える（走査し直す = Rust が last_used を進める）→ 木と履歴を読み直す。
+    切り替えられない（Drive の readdir 拒否・走査の失敗 = 失敗の toast は Rust）ときも、呼び手はその本棚に入る:
+    木は必ず読み直す（loadTree は前に読めた木を今の結果で置き換える）= 読めなければ中央に理由と案内（ShelfGrid）が出て、本棚の左バーの
+    メニュー（ほかの本棚・別のフォルダ…・この本棚を履歴から外す）に届く。入らないと、本棚のメニューは本棚の左バーにしか無い = 行き止まりになる */
+async function useRoot(root: string) {
+  warmed.delete(root);
+  await shelfIpc.switchRoot(root).catch(() => {}); // 失敗しても入る（上）
+  await loadTree(root);
+  await reloadShelves();
+}
+
+/** 「別のフォルダを本棚として開く…」の native の選択 → 木と履歴を読む。取り消し・失敗 = null（失敗の toast は Rust） */
+async function pickRoot(): Promise<string | null> {
+  let root: string | null;
+  try {
+    root = (await shelfIpc.openRoot()).root;
+  } catch {
+    return null;
+  }
+  if (!root) return null;
+  warmed.delete(root);
+  await loadTree(root);
+  await reloadShelves();
+  return root;
 }
 
 /** メニューの本棚の行: 履歴の本棚へ（走査し直す）。今の本棚なら読み直しだけ（開いているフォルダはそのまま） */
 export async function switchShelf(root: string) {
   sh.menu = null;
   const tab = app.tab;
-  try {
-    await shelfIpc.switchRoot(root); // 失敗の toast は Rust
-  } catch {
-    return;
-  }
-  warmed.delete(root);
-  await loadTree(root);
-  await reloadShelves();
+  await useRoot(root);
   if (app.tab === tab && frontShelf()?.root !== root) await enter(root);
 }
 
@@ -185,32 +211,33 @@ export async function switchShelf(root: string) {
 export async function pickShelf() {
   sh.menu = null;
   const tab = app.tab;
-  let root: string | null;
-  try {
-    root = (await shelfIpc.openRoot()).root; // 失敗の toast は Rust
-  } catch {
-    return;
-  }
-  if (!root) return;
-  warmed.delete(root);
-  await loadTree(root);
-  await reloadShelves();
-  if (app.tab === tab) await enter(root);
+  const root = await pickRoot();
+  if (root && app.tab === tab) await enter(root);
 }
 
-/** メニューの「文献」= 前面のタブを文献へ */
-export async function backToLibrary() {
-  sh.menu = null;
-  const tab = frontTab();
-  if (!tab?.shelf) return;
-  tab.shelf = null;
-  await setView({ kind: "all" });
+/** セグメントの SHELF の行き先（入るのは mode.svelte の switchMode）: タブ tab が覚えた本棚（tab.shelfAway・履歴にある物 =
+    無いフォルダでも = 無いフォルダのタブは開ける）はそのまま（走査しない = 開いていたフォルダ・並び・位置）→ 履歴の新しい順で最初の
+    実在する本棚（走査し直す = 見出しのメニューの行と同じ・開けなくても入る = useRoot）→ 本棚が 1 つも無ければ「別のフォルダを本棚として開く…」。
+    フォルダの選択の取り消し・失敗 = null（呼び手は何も変えない）。履歴は先に読み直す（見出しのメニューを開くときと同じ・読めなければ持っている物で） */
+export async function shelfTarget(tab: Tab | null): Promise<ShelfTab | null> {
+  await loadShelves().catch(() => {});
+  const away = tab?.shelfAway; // 読み直しで履歴から消えた本棚は dropTabs が外している
+  if (away && sh.shelves.some((s) => s.root === away.root)) return away;
+  const r = sh.shelves.find((s) => s.exists);
+  if (r) {
+    await useRoot(r.root); // 開けなくても入る（中央に理由・左バーのメニューで逃げられる）
+    return shelfHome(r.root);
+  }
+  const root = await pickRoot();
+  return root ? shelfHome(root) : null;
 }
 
 /** pred の root の本棚 / 読み手のタブを全部文献の「すべて」へ（履歴から外した・押し出された） */
 async function dropTabs(pred: (root: string) => boolean) {
   let front = false;
   for (const tab of app.tabs) {
+    // OpenNote のタブが覚えている「戻る先の本棚」も外す（戻すと「すべて」）
+    if (tab.shelfAway && pred(tab.shelfAway.root)) tab.shelfAway = null;
     const r = tab.shelf?.root ?? tab.shelfBook?.root;
     if (!r || !pred(r)) continue;
     tab.shelf = null;
@@ -249,7 +276,7 @@ export async function setCollapse(root: string, on: boolean) {
     await loadTree(root);
     await loadShelves();
   } catch (e) {
-    fail(e);
+    failAt(root)(e);
   }
 }
 
@@ -284,7 +311,7 @@ export function setSort(sort: ShelfSortKey) {
 }
 
 function savePref(key: string, value: string) {
-  api.setUiPref(key, value).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${String(e).slice(0, 160)}`));
+  api.setUiPref(key, value).catch((e) => toast(`✗ ${t("表示設定を保存できません")}: ${errText(e, 160)}`));
 }
 
 /** タブの題名 = 本棚名（すべての本）/ フォルダ名 */
@@ -319,11 +346,11 @@ export async function openBook(root: string, b: ShelfBook) {
 
 export function revealBook(root: string, id?: string) {
   sh.menu = null;
-  shelfIpc.reveal(root, id).catch(fail);
+  shelfIpc.reveal(root, id).catch(failAt(root));
 }
 
 export function openExternal(root: string, id: string) {
-  shelfIpc.openExternal(root, id).catch(fail);
+  shelfIpc.openExternal(root, id).catch(failAt(root));
 }
 
 // ---- 表紙: 見えたカードの分（asset の 404 → 作る）を先に、残りは温めで。shelf_thumb は Rust の鍵で直列 = 待ちを 1 本にする ----

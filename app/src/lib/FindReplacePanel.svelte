@@ -20,9 +20,9 @@
 </script>
 
 <div class="ml-find">
-  <input placeholder={t("Find（大小無視）")} use:focusMe bind:value={m.findText} />
+  <input placeholder={t("検索する文字（大小無視）")} use:focusMe bind:value={m.findText} />
   <span class="dim">→</span>
-  <input placeholder="Replace with" bind:value={m.replaceText} />
+  <input placeholder={t("置換後の文字")} bind:value={m.replaceText} />
 </div>
 {#if m.findText}
   <div class="ml-preview">
@@ -41,13 +41,13 @@
   </div>
 {/if}
 <div class="ml-pfoot">
-  <button class="ml-btn" onclick={() => (m.panel = null)}>Cancel</button>
+  <button class="ml-btn" onclick={() => (m.panel = null)}>{t("キャンセル")}</button>
   <button
     class="ml-btn primary"
     disabled={m.busy || m.willRename === 0 || m.sending.size > 0 || m.previewing}
     onpointerdown={() => m.armReplace()}
     onkeydown={() => m.armReplace()}
     onclick={() => m.doFindReplace()}>
-    Replace{m.willRename ? `${t("（")}${tn(m.willRename, "個）")}` : ""}
+    {t("置換")}{m.willRename ? `${t("（")}${tn(m.willRename, "個）")}` : ""}
   </button>
 </div>

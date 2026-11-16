@@ -28,6 +28,7 @@ Not established: stable IDs after changes, full-library ZIP coverage,
 folder/note formats, empty folders, supplementary PDFs, independent notes
 or PDFs, custom organization settings, embedded annotation rendering.
 
-The ignored `current_paperpile_real_export_preview` test accepts explicit
-`OPENREF_TEST_PAPERPILE_JSON` and `OPENREF_TEST_PAPERPILE_FILES` paths. It is only
-for the original 3-record/2-PDF sample. It never discovers a production DB.
+The ignored `real_paperpile_copy_roundtrip_in_scratch_database` test
+(`import_apply.rs`) accepts explicit `OPENREF_TEST_PAPERPILE_JSON` and
+`OPENREF_TEST_PAPERPILE_FILES` paths. It expects the original 3-record/2-PDF
+sample and writes only to a scratch DB. It never discovers a production DB.

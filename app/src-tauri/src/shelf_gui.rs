@@ -8,7 +8,7 @@
 //! Db のロックは設定の読み書きの間だけ。走査・表紙・open はロックの外
 
 use crate::wiki_gui::{tr, ui_en, wiki_broken_key, wiki_now, wiki_pick_folder_titled, wiki_toast};
-use crate::{drop_dir_part, err, lock, open_file, AppState};
+use crate::{err, hide_paths, hide_roots, lock, open_file, reveal_in_finder, AppState};
 use openref_core::shelf::{self, thumbs};
 use openref_core::wiki::workspaces;
 use openref_core::{CoreError, Db};
@@ -27,22 +27,31 @@ pub(crate) struct ShelfRuntime {
 }
 
 /// core の失敗 → 画面の文（「入力を解釈できません」等の前置きを重ねない）
+/// エージェント向けの手がかり（「root には shelf_status の root をそのまま渡す」等）は外す（CoreError::without_hint）
 pub(crate) fn shelf_err(e: CoreError) -> String {
-    match e {
+    match e.without_hint() {
         CoreError::BadInput(m) | CoreError::NotFound(m) => m,
         CoreError::Io(e) => err(e),
         e => err(e),
     }
 }
 
+/// 画面へ返す Err の root を畳む（crate::hide_paths = フォルダ名まで）。core の文（check_root_as・Ctx::known）は変えない =
+/// MCP / CLI の agent は渡した root をそのまま受け取る（畳むのは画面へ出す殻だけ）
+fn hidden<T>(r: Result<T, String>, root: &Path) -> Result<T, String> {
+    r.map_err(|e| hide_paths(e, &[root]))
+}
+
 /// asset scope の足し方（試験は差し替える）
 type Allow<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
 
-/// 解釈できない設定 shelf_workspaces を `shelf_workspaces.broken-<UTC>` へ退避して消す。戻り値 = 退避先の鍵
-fn shelf_heal(db: &Db, now: i64, en: bool) -> Result<Option<String>, String> {
+/// 解釈できない設定 shelf_workspaces を `shelf_workspaces.broken-<UTC>` へ退避して消す。戻り値 = (退避先の鍵, 解釈した設定 =
+/// 退避したら空 = 消した後に読み直したときと同じ)
+fn shelf_heal(db: &Db, now: i64, en: bool) -> Result<(Option<String>, workspaces::Map), String> {
     let raw = db.setting(shelf::KEY).map_err(err)?;
-    let Err(why) = workspaces::parse_for(shelf::KEY, raw.as_deref()) else {
-        return Ok(None);
+    let why = match workspaces::parse_for(shelf::KEY, raw.as_deref()) {
+        Ok(m) => return Ok((None, m)),
+        Err(why) => why,
     };
     let to = wiki_broken_key(shelf::KEY, now);
     db.set_setting(&to, raw.as_deref().unwrap_or("")).map_err(|e| {
@@ -55,7 +64,7 @@ fn shelf_heal(db: &Db, now: i64, en: bool) -> Result<Option<String>, String> {
     })?;
     db.delete_setting(shelf::KEY).map_err(err)?;
     eprintln!("openref-app: shelf: 設定 {} を解釈できないので {to} に退避しました: {why}", shelf::KEY);
-    Ok(Some(to))
+    Ok((Some(to), workspaces::Map::new()))
 }
 
 /// 設定を読む（壊れていれば先に退避）。戻り値 = (Ctx, 退避先の鍵)。ロックはこの間だけ
@@ -65,8 +74,8 @@ pub(crate) fn shelf_ctx_db(
     en: bool,
 ) -> Result<(shelf::Ctx, Option<String>), String> {
     let g = lock(db)?;
-    let set_aside = shelf_heal(&g, now, en)?;
-    Ok((shelf::Ctx::from_db(&g).map_err(shelf_err)?, set_aside))
+    let (set_aside, workspaces) = shelf_heal(&g, now, en)?;
+    Ok((shelf::Ctx::from_parsed(&g, workspaces), set_aside))
 }
 
 /// shelf_ctx_db を AppState の DB で（退避したら Rust が知らせる）
@@ -126,10 +135,15 @@ pub(crate) fn shelf_open_steps(
     now: i64,
     allow: Allow,
 ) -> Result<String, String> {
-    let canon = shelf::check_root(given, ctx).map_err(shelf_err)?;
-    let root = canon.to_string_lossy().into_owned();
-    shelf_enter(db, cache, ctx, &root, &canon, now, allow)?;
-    Ok(root)
+    hidden(
+        (|| {
+            let canon = shelf::check_root(given, ctx).map_err(shelf_err)?;
+            let root = canon.to_string_lossy().into_owned();
+            shelf_enter(db, cache, ctx, &root, &canon, now, allow)?;
+            Ok(root)
+        })(),
+        given,
+    )
 }
 
 /// 履歴の本棚へ切り替える（AppHandle 無し）: 履歴にある物だけ・走査し直す
@@ -141,8 +155,7 @@ pub(crate) fn shelf_switch_steps(
     now: i64,
     allow: Allow,
 ) -> Result<(), String> {
-    let canon = ctx.ready(root).map_err(shelf_err)?;
-    shelf_enter(db, cache, ctx, root, &canon, now, allow)
+    hidden(ctx.ready(root).map_err(shelf_err).and_then(|canon| shelf_enter(db, cache, ctx, root, &canon, now, allow)), Path::new(root))
 }
 
 /// 履歴から外す（AppHandle 無し）: 履歴の項目・走査結果の表・表紙を消す。戻り値 = shelf_drop_thumbs の値。
@@ -153,7 +166,7 @@ pub(crate) fn shelf_forget_steps(
     ctx: &shelf::Ctx,
     root: &str,
 ) -> Result<(usize, bool), String> {
-    ctx.known(root).map_err(shelf_err)?;
+    ctx.known(root).map_err(|e| hide_roots(shelf_err(e), &[root.to_string()]))?;
     let dropped = shelf_drop_thumbs(ctx, cache, root);
     {
         let g = lock(db)?;
@@ -251,15 +264,20 @@ pub(crate) fn shelf_forget(app: &tauri::AppHandle, root: &str) -> Result<Value, 
 
 /// 履歴の本棚を画面が読めるようにする（走査しない・last_used を変えない）= 再起動で戻したタブ（読み手は走査なしで戻す）。→ {root}
 pub(crate) fn shelf_front(app: &tauri::AppHandle, root: &str) -> Result<Value, String> {
-    let canon = shelf_ctx(app)?.ready(root).map_err(shelf_err)?;
-    shelf_allow_dir(app, &canon)?;
+    hidden(
+        (|| {
+            let canon = shelf_ctx(app)?.ready(root).map_err(shelf_err)?;
+            shelf_allow_dir(app, &canon)
+        })(),
+        Path::new(root),
+    )?;
     Ok(json!({"root": root}))
 }
 
 /// 走査結果の JSON + 表紙の置き場（AppHandle 無し）。thumbs_dir = canonical（asset scope は canonical で足してある = app_dir が symlink を
 /// 含むと、綴りのままではまだ無い表紙が 404 でなく 403 になり、画面の「404 → shelf_thumb」が組めない）
 fn shelf_tree_steps(ctx: &shelf::Ctx, cache: &shelf::Cache, root: &str) -> Result<Value, String> {
-    let s = cache.get_or_scan(ctx, root).map_err(shelf_err)?;
+    let s = hidden(cache.get_or_scan(ctx, root).map_err(shelf_err), Path::new(root))?;
     let mut v = shelf::commands::tree_json(root, &s, None).map_err(shelf_err)?;
     v["thumbs_dir"] = match ctx.app_dir.as_deref() {
         Some(d) => json!(shelf_thumbs_ready(d).map_err(err)?),
@@ -272,8 +290,8 @@ fn shelf_tree_steps(ctx: &shelf::Ctx, cache: &shelf::Cache, root: &str) -> Resul
 /// thumbs_dir = 表紙の置き場（画面は `<thumbs_dir>/<id>-<mtime>.png` を asset:// で描き、404 なら shelf_thumb で作る）
 pub(crate) fn shelf_tree_of(app: &tauri::AppHandle, root: &str) -> Result<Value, String> {
     let ctx = shelf_ctx(app)?;
-    let canon = ctx.ready(root).map_err(shelf_err)?;
-    shelf_allow_dir(app, &canon)?;
+    let canon = hidden(ctx.ready(root).map_err(shelf_err), Path::new(root))?;
+    hidden(shelf_allow_dir(app, &canon), Path::new(root))?;
     let rt = app.state::<ShelfRuntime>();
     shelf_tree_steps(&ctx, &rt.cache, root)
 }
@@ -282,12 +300,12 @@ pub(crate) fn shelf_tree_of(app: &tauri::AppHandle, root: &str) -> Result<Value,
 fn shelf_book(app: &tauri::AppHandle, root: &str, id: &str) -> Result<PathBuf, String> {
     let ctx = shelf_ctx(app)?;
     let rt = app.state::<ShelfRuntime>();
-    Ok(shelf::book_path(&ctx, &rt.cache, root, id).map_err(shelf_err)?.0)
+    Ok(hidden(shelf::book_path(&ctx, &rt.cache, root, id).map_err(shelf_err), Path::new(root))?.0)
 }
 
 /// 表紙の png（AppHandle 無し）。無ければ作る。戻り値は canonical（thumbs_dir と同じ綴り）
 fn shelf_thumb_steps(ctx: &shelf::Ctx, cache: &shelf::Cache, root: &str, id: &str, en: bool) -> Result<PathBuf, String> {
-    let (pdf, mtime) = shelf::book_path(ctx, cache, root, id).map_err(shelf_err)?;
+    let (pdf, mtime) = hidden(shelf::book_path(ctx, cache, root, id).map_err(shelf_err), Path::new(root))?;
     let app_dir = ctx.app_dir.as_deref().ok_or_else(|| tr(en, "表紙の置き場がありません（in-memory の DB）", "No place for covers (in-memory DB)"))?;
     let dir = shelf_thumbs_ready(app_dir).map_err(err)?;
     thumbs::ensure_thumb(&dir, &pdf, id, mtime).map_err(shelf_err)
@@ -312,10 +330,11 @@ pub(crate) fn shelf_reveal_id(args: &Value) -> Result<Option<String>, String> {
 
 /// Finder で表示する先（AppHandle 無し）: id なし = 本棚のフォルダ自身（履歴にある root だけ）・あり = 本の実体
 fn shelf_reveal_steps(ctx: &shelf::Ctx, cache: &shelf::Cache, root: &str, id: Option<&str>) -> Result<PathBuf, String> {
-    match id {
-        Some(id) => Ok(shelf::book_path(ctx, cache, root, id).map_err(shelf_err)?.0),
-        None => ctx.ready(root).map_err(shelf_err),
-    }
+    let r = match id {
+        Some(id) => shelf::book_path(ctx, cache, root, id).map(|(p, _)| p),
+        None => ctx.ready(root),
+    };
+    hidden(r.map_err(shelf_err), Path::new(root))
 }
 
 /// Finder で表示（GUI 専用 command shelf_reveal の本体）。失敗の文からパスを落とす
@@ -323,13 +342,7 @@ pub(crate) fn shelf_reveal_book(app: &tauri::AppHandle, root: &str, id: Option<&
     let ctx = shelf_ctx(app)?;
     let rt = app.state::<ShelfRuntime>();
     let p = shelf_reveal_steps(&ctx, &rt.cache, root, id)?;
-    let out = std::process::Command::new("/usr/bin/open").arg("-R").arg(&p).output().map_err(err)?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let line = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("open -R failed");
-    Err(drop_dir_part(line.to_string()))
+    reveal_in_finder(&p)
 }
 
 /// 既定のアプリで開く（GUI 専用 command shelf_open_external の本体）。失敗の文からパスを落とす = open_file
@@ -562,6 +575,19 @@ mod tests {
         assert!(f.cache.forget(&roots[0]).is_none());
     }
 
+    /// 壊れていない設定: shelf_ctx_db の Ctx は core の Ctx::from_db と同じ（解釈は 1 回 = heal の結果を使い回す）
+    #[test]
+    fn healthy_setting_gives_the_same_ctx() {
+        let f = fix("healthy");
+        let g = f.db.lock().unwrap();
+        g.set_setting(shelf::KEY, r#"{"/a": {"last_used": 3}, "/b": {"last_used": 1, "sort": "name"}, "bad": 1}"#).unwrap();
+        drop(g);
+        let (ctx, to) = shelf_ctx_db(&f.db, 0, false).unwrap();
+        assert_eq!(to, None);
+        let want = shelf::Ctx::from_db(&f.db.lock().unwrap()).unwrap();
+        assert_eq!((ctx.workspaces, ctx.app_dir, ctx.home), (want.workspaces, want.app_dir, want.home));
+    }
+
     /// 壊れた設定: 退避して空から（値は `.broken-<UTC>` に残る）・その後の開くは通る・wiki の設定には触らない
     #[test]
     fn broken_setting_is_set_aside() {
@@ -693,6 +719,105 @@ mod tests {
         }
         println!("thumbs 2nd: {:?}", t2.elapsed());
         println!("files in shelf-thumbs: {}", std::fs::read_dir(&dir).unwrap().count());
+    }
+
+    /// 失敗の文の root → フォルダ名（境界の 13 通り = 画面の tree.ts hideRootParents と同じ規則）。理由の文（`/` を含む物も）は欠けない
+    #[test]
+    fn hide_roots_keeps_name_and_reason() {
+        let h = |msg: &str, roots: &[&str]| hide_roots(msg.to_string(), &roots.iter().map(|r| r.to_string()).collect::<Vec<_>>());
+        let cloud = "iCloud Drive / CloudStorage の最上位です。その中のフォルダを選んでください";
+        for (msg, roots, want) in [
+            // 1. 普通のフォルダ
+            ("本棚のフォルダに /Users/me/本棚 は使えません（見つかりません）", &["/Users/me/本棚"][..], "本棚のフォルダに 本棚 は使えません（見つかりません）".to_string()),
+            // 2. 末尾の /
+            ("履歴に無い本棚です: /Users/me/books/（root には shelf_status の root をそのまま渡す）", &["/Users/me/books/"], "履歴に無い本棚です: books（root には shelf_status の root をそのまま渡す）".into()),
+            // 3. 日本語と空白
+            ("本棚のフォルダに /Users/me/My Books 教科書 は使えません（見つかりません）", &["/Users/me/My Books 教科書"], "本棚のフォルダに My Books 教科書 は使えません（見つかりません）".into()),
+            // 4. / に似た字（全角の ／・除算の ∕）は区切りにしない
+            ("x /Users/me/A／B∕C y", &["/Users/me/A／B∕C"], "x A／B∕C y".into()),
+            // 5. 2 回出る
+            ("/Users/me/b と /Users/me/b", &["/Users/me/b"], "b と b".into()),
+            // 6. 文に root が無い = そのまま
+            ("本棚 b を読めません: Permission denied", &["/Users/me/b"], "本棚 b を読めません: Permission denied".into()),
+            // 7. 空の root = そのまま
+            ("本棚のフォルダに /x は使えません（見つかりません）", &[""], "本棚のフォルダに /x は使えません（見つかりません）".into()),
+            // 8. root が / そのもの = 隠す親が無い（理由の文の / を壊さない）
+            (&*format!("本棚のフォルダに / は使えません（{cloud}）"), &["/"], format!("本棚のフォルダに / は使えません（{cloud}）")),
+            // 9. 理由の文の / は残る
+            (&*format!("本棚のフォルダに /Users/me/Library/CloudStorage は使えません（{cloud}）"), &["/Users/me/Library/CloudStorage"], format!("本棚のフォルダに CloudStorage は使えません（{cloud}）")),
+            // 10. Drive のパス = アカウント名（メールアドレス）が消える
+            ("本棚のフォルダに /Users/me/Library/CloudStorage/GoogleDrive-user@example.com/マイドライブ/本 は使えません（見つかりません）",
+             &["/Users/me/Library/CloudStorage/GoogleDrive-user@example.com/マイドライブ/本"], "本棚のフォルダに 本 は使えません（見つかりません）".into()),
+            // 11. 2 つの綴り（渡した物と canonical）がどちらも出る
+            ("/Users/me/link → /Users/me/real/books", &["/Users/me/link", "/Users/me/real/books"], "link → books".into()),
+            // 12. 一方の綴りが他方の接頭辞 = 長い方から畳む = 長い方もその名前まで（短い方から畳むと「b/c」になる）
+            ("/Users/me/b/c と /Users/me/b", &["/Users/me/b", "/Users/me/b/c"], "c と b".into()),
+            // 13. root が別のパスの接頭辞（/books と /books2）= 親は残らない
+            ("/Users/me/books2/x.pdf", &["/Users/me/books"], "books2/x.pdf".into()),
+            // 14. パスの途中から始まる一致は置き換えない（canonical を取れない `/var/x/vault` が文の `/private/var/x/vault` の中に
+            // ある = 崩して `/privatevault` にしない。canonical の綴りが渡れば畳む = 15）
+            ("ワークスペースに /private/var/x/vault は使えません", &["/var/x/vault"], "ワークスペースに /private/var/x/vault は使えません".into()),
+            ("ワークスペースに /private/var/x/vault は使えません", &["/var/x/vault", "/private/var/x/vault"], "ワークスペースに vault は使えません".into()),
+        ] {
+            assert_eq!(h(msg, roots), want, "{msg:?} / {roots:?}");
+            assert_eq!(h(&want, roots), want, "二重に畳むと変わる: {want:?}");
+            assert!(!h(msg, roots).contains("/Users/me/") || roots.iter().all(|r| r.is_empty()), "親が残る: {msg:?}");
+            assert!(!h(msg, roots).contains("/privatevault"), "崩れる: {msg:?}");
+        }
+    }
+
+    /// 本棚の道の失敗（開く・切替・外す・木・表紙・Finder の先）の文に、本棚のフォルダの親のパスが出ない。フォルダ名と理由は残る
+    #[test]
+    fn failures_hide_root_parents() {
+        let f = fix("x21");
+        let base = f.base.to_string_lossy().into_owned();
+        let ok = |e: &str, name: &str, why: &str| {
+            assert!(!e.contains(&base), "親のパスが残る: {e}");
+            assert!(e.contains(name) && e.contains(why), "名前 {name} / 理由 {why} が欠ける: {e}");
+        };
+        let ctx = f.ctx();
+        let allow_ok = |_: &Path| Ok(());
+        // 開く: 見つからない・隠し・iCloud / CloudStorage の最上位（理由に / を含む）
+        let e = shelf_open_steps(&f.db, &f.cache, &ctx, &f.home.join("無い 本棚"), 1, &allow_ok).unwrap_err();
+        ok(&e, "本棚のフォルダに 無い 本棚 は使えません", "見つかりません");
+        std::fs::create_dir_all(f.home.join(".秘密/x")).unwrap();
+        let e = shelf_open_steps(&f.db, &f.cache, &ctx, &f.home.join(".秘密/x"), 1, &allow_ok).unwrap_err();
+        ok(&e, "本棚のフォルダに x は使えません", "隠しフォルダ");
+        std::fs::create_dir_all(f.home.join("Library/CloudStorage")).unwrap();
+        let e = shelf_open_steps(&f.db, &f.cache, &ctx, &f.home.join("Library/CloudStorage"), 1, &allow_ok).unwrap_err();
+        ok(&e, "本棚のフォルダに CloudStorage は使えません", "iCloud Drive / CloudStorage の最上位です");
+        // 開く: symlink 越し = canonical の綴りが文に出る（asset scope の失敗）も畳む
+        let real = f.shelf("実体");
+        std::os::unix::fs::symlink(&real, f.home.join("近道")).unwrap();
+        let e = shelf_open_steps(&f.db, &f.cache, &ctx, &f.home.join("近道"), 1, &|d| Err(format!("{} を配信できません", d.display()))).unwrap_err();
+        ok(&e, "実体 を配信できません", "配信できません");
+        // 切替・外す・木・表紙・Finder の先: 履歴に無い / 無くなった本棚
+        let root = f.open(&real, 2).unwrap();
+        let ctx = f.ctx();
+        let id = shelf::id_for(&Path::new(&root).join("a.pdf"));
+        // エージェント向けの手がかり（shelf_status の root をそのまま渡す）は画面の文に出さない = 文はここで終わる
+        let e = shelf_switch_steps(&f.db, &f.cache, &ctx, &format!("{root}/"), 3, &allow_ok).unwrap_err();
+        assert_eq!(e, "履歴に無い本棚です: 実体");
+        let e = shelf_forget_steps(&f.db, &f.cache, &ctx, &format!("{root}/")).unwrap_err();
+        assert_eq!(e, "履歴に無い本棚です: 実体");
+        // 表示の設定（main.rs の command shelf_set_opts = core set_opts → shelf_err）も手がかりを外す・core の文（MCP）は持つ
+        // 表示の設定の失敗の root も名前まで（切替 / 外すと同じ・command shelf_set_opts の shelf_hide_arg_root）
+        let args = json!({"root": format!("{base}/消えた 本棚"), "collapse_single": true});
+        let core = shelf::commands::set_opts(&f.db.lock().unwrap(), &args).unwrap_err();
+        assert!(core.to_string().ends_with(&format!("（{}）", shelf::ROOT_HINT)) && core.to_string().contains(&base), "{core}");
+        assert_eq!(crate::shelf_hide_arg_root(shelf_err(core), &args), "履歴に無い本棚です: 消えた 本棚");
+        std::fs::remove_dir_all(&real).unwrap();
+        let e = shelf_switch_steps(&f.db, &f.cache, &ctx, &root, 3, &allow_ok).unwrap_err();
+        ok(&e, "本棚のフォルダに 実体 は使えません", "見つかりません");
+        f.cache.forget(&root);
+        let e = shelf_tree_steps(&ctx, &f.cache, &root).unwrap_err();
+        ok(&e, "本棚のフォルダに 実体 は使えません", "見つかりません");
+        let e = shelf_thumb_steps(&ctx, &f.cache, &root, &id, false).unwrap_err();
+        ok(&e, "本棚のフォルダに 実体 は使えません", "見つかりません");
+        for id in [None, Some(id.as_str())] {
+            let e = shelf_reveal_steps(&ctx, &f.cache, &root, id).unwrap_err();
+            ok(&e, "本棚のフォルダに 実体 は使えません", "見つかりません");
+        }
     }
 
     /// 実フォルダでの手動試験: real_folder の本棚を履歴から外す（表紙も消える）

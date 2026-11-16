@@ -1,7 +1,7 @@
 // OpenNote のエディタ: 「/」で機能を挿すメニュー（CodeMirror の autocompletion を候補の出し方だけ借りる）。
 // 行の頭か空白の後の `/` で開き、続けて打った文字で候補を絞る（日本語のラベル・英語の別名の両方に当たる）。
 // 候補は Markdown の記号を入れるだけ（WYSIWYG は作らない = format.ts と同じ方針）。文字色は入れない（描画側で style を
-// 許す必要がある）。「画像・PDF を埋め込む…」だけはファイル選択（呼び出し側 = edit.svelte の pickFiles）。
+// 許す必要がある）。「画像・PDF を埋め込む…」はファイル選択（呼び出し側 = edit.svelte の pickFiles）・「文献を引用…」は蔵書の検索の窓（WikiCite）。
 // データベースのビュー（表 / カレンダーの切替）は Markdown に無いので対象外（普通の表まで）。
 // コード（fence・インライン）と frontmatter の中では開かない。
 
@@ -30,6 +30,8 @@ export interface SlashItem {
 export interface SlashOptions {
   /** 「画像・PDF を埋め込む…」= ファイル選択 → 取込 → caret に `![[…]]`（無ければ候補に出さない） */
   onPickFiles?: () => void;
+  /** 「文献を引用…」= 蔵書の検索の窓（呼び出し側。無ければ候補に出さない） */
+  onCite?: () => void;
 }
 
 /** 候補の一覧（t() は呼ぶたびに引く = 言語の切替に追随するよう、開くときに作る） */
@@ -70,6 +72,10 @@ export function slashItems(o: SlashOptions): SlashItem[] {
     { label: t("目次::slash"), detail: "[toc]", keys: ["toc", "contents", "outline"], template: "[toc]\n${}", block: true, gap: true },
     { label: t("ページへのリンク"), detail: "[[ ]]", keys: ["link", "page", "wikilink"], template: "[[${}]]" },
   ];
+  if (o.onCite) {
+    const cite = o.onCite;
+    items.push({ label: t("文献を引用…"), detail: "openref://", keys: ["cite", "citation", "reference", "ref", "paper"], action: () => cite() });
+  }
   if (o.onPickFiles) {
     const pick = o.onPickFiles;
     items.push({ label: t("画像・PDF を埋め込む…"), detail: "![[ ]]", keys: ["image", "pdf", "embed", "file", "attach", "video"], action: () => pick() });

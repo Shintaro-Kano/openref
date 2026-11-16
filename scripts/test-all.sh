@@ -28,6 +28,8 @@ run "viewer util" node app/src/lib/viewer/util.test.mjs
 run "viewer embedded" node app/src/lib/viewer/embedded.test.mjs
 # PDF ビューアの右バーの開閉(実部品 PdfViewer + jsdom・pdf.js は偽物): ボタン / 既定は開 / 閉じた状態の ⌘F・⌕ で開いて検索欄へ / 隠れたビューアは開かない
 run "viewer side" node app/src/lib/viewer/side.test.mjs
+# PDF ビューアのヘッダーの段: 読めた後は出さない・読込中と失敗は題名と ×・診断はツールバー・詳細の「この添付を読む」は 2 本目以降だけ
+run "viewer head" node app/src/lib/viewer/head.test.mjs
 run "i18n" node app/src/lib/i18n.test.mjs
 # フォルダ・ラベルの名前順 / 件数順の比較関数(core の COLLATE NOCASE と同じ並び)
 run "sort" node app/src/lib/sort.test.mjs
@@ -42,10 +44,12 @@ run "wiki links" node app/src/lib/wiki/links.test.mjs
 run "wiki mediaview" node app/src/lib/wiki/mediaview.test.mjs
 # OpenNote の編集(実部品 + 実 CodeMirror + jsdom・invoke は差し替え): 自動保存の debounce・conflict の分岐・外部の書換え・caret への挿入・保存に失敗したまま閉じない・PICK_EXT = core の media_kind
 run "wiki edit" node app/src/lib/wiki/edit.test.mjs
-# OpenNote のチャット(実部品 + jsdom・invoke と event "wiki-chat" は差し替え): stream-json の reducer・送信と文脈・変更の一覧と元に戻す・診断と異常終了・右端の柱(ChatDock)= OFF でボタンなし・幅とつまみ
+# OpenNote のチャット(実部品 + jsdom・invoke と event "wiki-chat" は差し替え): stream-json の reducer・送信と文脈・変更の一覧と元に戻す・診断と異常終了・右端の柱(ChatDock)= OpenNote OFF / 状態を読めない間はボタンなし・チャット無効は破線の絵で押すと同意の窓・幅とつまみ
 run "wiki chat" node app/src/lib/chat/chat.test.mjs
-# App の組立て(実部品 App.svelte + jsdom): 一覧の右ペインの開閉(2 列・ListToolbar のボタン・⌘⌥I の振り分け)・行の選択で開かない・reveal は行を見せる・チャットの入力欄の Esc・PDF のタブ
+# App の組立て(実部品 App.svelte + jsdom): 一覧の右ペインの開閉(2 列・ヘッダーの ▣ = PaneToggle・⌘⌥I の振り分け)・行の選択で開かない・reveal は行を見せる・チャットの入力欄の Esc・PDF のタブ
 run "app shell" node app/src/lib/app.test.mjs
+# 窓の中に Tab の焦点を留める（lib/focusTrap.ts = 骨格 Modal と自前の枠の窓が同じ関数）
+run "focus trap" node app/src/lib/focustrap.test.mjs
 # 本棚: 純関数(検索 NFKC + AND・並び・dir の索引・上限つきの設定・asset の区間)と組立て(実部品 App.svelte + jsdom): 見出しのメニュー・タブの永続と復元・⌘N / ⌘A / Esc / `/` / ドロップの遮断・表紙と温め。
 # range = 読み手の読み方(偽の fetch): 1 区間の上限を Rust の MAX_LEN と結ぶ・素の GET を出さない・no-store・同時 16・閉じた後は呼ばない
 run "shelf tree" node app/src/lib/shelf/tree.test.mjs
@@ -58,11 +62,24 @@ run "wiki ime" node app/src/lib/wiki/ime.test.mjs
 run "wiki ipc" node app/src/lib/wiki/ipc.test.mjs
 # ワークスペースの切替(実部品 wiki.svelte.ts + jsdom・invoke は差し替え): 一覧(新しい順・現在は ✓)・切替は先に保存してからタブをホームへ・履歴から外す・仮の状態からの最初の読みは変化と見ない
 run "wiki workspaces" node app/src/lib/wiki/workspaces.test.mjs
-# 遷移(実部品 wiki.svelte.ts / WikiHeader / WikiPage / MdView / WikiLinkMenu + jsdom): タブの中の戻る / 進む(位置ごと・保存してから・改名とゴミ箱の追随・‹ ›・⌘[ ⌘])・リンクの右クリックのメニュー・中クリック = 新しいタブ
+# 遷移(実部品 wiki.svelte.ts / WikiHeader / WikiPage / ShadowPage / WikiLinkMenu + jsdom): タブの中の戻る / 進む(位置ごと・保存してから・改名とゴミ箱の追随・‹ ›・⌘[ ⌘])・リンクの右クリックのメニュー・中クリック = 新しいタブ
 run "wiki nav" node app/src/lib/wiki/nav.test.mjs
-# Word: citeproc 実整形(同梱スタイル・型・誌名スタイル)・OpenRef.dotm の整形とダイアログ・dotm の生成器
+# リンクのプレビュー(実部品 preview.svelte.ts / WikiPreview / ShadowPage / WikiResults / WikiInfo / ChatMd + jsdom): 乗せると浮き窓・離れる / Esc / 外側で閉じる・まだ無いページ・中のリンク・#見出し・大きなページの loading=lazy
+run "wiki preview" node app/src/lib/wiki/preview.test.mjs
+# 画像を大きく見る覆い(実部品 lightbox.svelte.ts / WikiLightbox / ShadowPage + jsdom): 押すと覆い・← →・Esc・リンクで包んだ画像はリンクが勝つ・⌘ / 中クリック = 新しいタブ・幅合わせ / 等倍・ホイール・ドラッグ
+run "wiki lightbox" node app/src/lib/wiki/lightbox.test.mjs
+# 最近開いたページ(実部品 recent.svelte.ts / WikiSearch / WikiPage + jsdom): ui_wiki_recent の読み書き(壊れた JSON・読めない間は書かない・上限・外したワークスペース)・検索欄の下に重ねる一覧・× ・開く・旗を下ろす・IME・本文とエディタを隠さない・結果一覧から戻ると位置へ
+run "wiki recent" node app/src/lib/wiki/recent.test.mjs
+# 右ペインの目次の開閉を覚える(実部品 wiki.svelte.ts / WikiInfo + jsdom): 既定は開く・ui_wiki_toc だけを書く・起動し直しても畳んだまま(子のプロセス)・前の版の読み方との往復
+run "wiki toc" node app/src/lib/wiki/toc.test.mjs
+# 左の列の幅(実部品 App / SidebarGrip / sidebarw.svelte.ts + jsdom): 離したときに 1 回だけ確定・モードごと(ui_sidebar_w)・範囲・ダブルクリック・キー・集中モードでは出さない・本棚にも(shelf の鍵・前の版との読み書き)・壊れた JSON
+run "sidebar width" node app/src/lib/sidebarw.test.mjs
+# 書く道具(実部品 WikiPage / WikiCite + 実 CodeMirror + jsdom): 文献の引用(リンクの形・貼り付けの判定の順・貼った DOI / PubMed の URL のメニュー・蔵書の検索・窓)・字数・見出しで畳む・表の中の Tab
+run "wiki write" node app/src/lib/wiki/write.test.mjs
+# 集中モード(実部品 App.svelte + jsdom): ⌘⌥S / ボタン / 札・木と右ペインとヘッダーを隠す・設定に書かない・集中中の ⌘⌥I と / は効かず ⌘⌥C は効く
+run "wiki focus" node app/src/lib/wiki/focus.test.mjs
+# Word: citeproc 実整形(同梱スタイル・型・誌名スタイル。citeproc と cite-core の読込は word/test-lib.cjs)・OpenRef.dotm の整形とダイアログ・dotm の生成器
 run "word cite" node word/test-cite.cjs
-run "word types" node word/test-types.cjs
 run "word styles" node word/test-styles.cjs
 run "word dotm-render" node word/test-dotm-render.cjs
 run "word dialog-dotm" node word/test-dialog-dotm.cjs
@@ -71,7 +88,7 @@ run "dotm build" python3 word/dotm/test-build.py
 # Chrome 拡張(OpenRef Capture)
 run "capture extension" node --test extension/tests/capture.test.cjs
 # 配布物のシェルの構文(bash -n は最初のファイルしか見ないので 1 本ずつ)・インストーラの Claude Desktop 登録(偽 HOME・偽 ps)・依存のライセンス
-for f in site/install.sh site/uninstall.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh scripts/test-all.sh scripts/test-install-desktop-mcp.sh; do
+for f in site/install.sh site/uninstall.sh scripts/bundle-dist.sh scripts/bundle-word.sh scripts/build-dialog-host.sh word/dotm/e2e/run.sh scripts/test-all.sh scripts/test-install-desktop-mcp.sh; do
   run "shell syntax $f" bash -n "$f"
 done
 run "install desktop-mcp" /bin/bash scripts/test-install-desktop-mcp.sh   # /bin/bash 3.2 = curl | bash の利用者が使う bash
@@ -79,7 +96,7 @@ run "licenses" python3 scripts/check-licenses.py
 # pdf.js の補助データ(cmaps / standard_fonts / wasm / iccs)を写せるか = pdfjs-dist の配置が変わったらここで止まる
 run "pdf assets" node scripts/copy-pdf-assets.mjs
 # 任意の追加検査(ファイルが無ければ飛ばす)
-if [ -f scripts/dev-checks.sh ]; then run "dev checks" bash scripts/dev-checks.sh; fi
+if [ -f scripts/dev-checks.sh ]; then run "dev checks self-test" bash scripts/dev-checks.sh --self-test; run "dev checks" bash scripts/dev-checks.sh; fi
 
 echo
 if [ ${#FAILED[@]} -gt 0 ]; then

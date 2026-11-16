@@ -8,7 +8,8 @@
 //! 文献リストに載っているのでガードを通ってしまい、自分の DOI の代わりに採用される（別論文の書誌を
 //! 付けるキメラレコードになる）。resolver の失敗（doi.org 404 等）も後続へ進まない（GUI / CLI は Err・
 //! connectd = `stub_on_fail=false` は `NoIdentifier` + `fail` で受けて stub にする）。
-//! 蔵書の実測（`title_guard_survey`・題名は Paperpile 由来）: 先頭 DOI = item の DOI、全文ガードの誤拒否 0
+//! 実際の論文 PDF での一度きりの測定（試験としては残していない）:
+//! 先頭 DOI = item の DOI、全文ガードの誤拒否 0
 //! （lenient は照合対象外。冒頭 3000 字に絞ると Springer 系で題名が 3000〜4800 字目にあり誤拒否するので全文に広げた）。
 //! この母集団では「別論文を登録する」退行は原理的に検出できないので、その系統は自作 PDF で確かめる。
 //! 識別子が無ければタイトルを推定して Crossref 書誌検索 → 本文テキストとの照合で
@@ -75,6 +76,9 @@ pub struct IngestReport {
     pub info_title: Option<String>,
     /// 入力バイト列の 16 進 md5（1 度だけ計算したもの。connectd は要確認 stub の添付にそのまま渡す）
     pub md5: String,
+    /// ② でロックの外で済ませた全頁の抽出（`NoIdentifier` のときだけ入る = connectd が要確認 stub の添付に渡す。
+    /// 他の結果では ③ が使い終えている）
+    pub text: Option<crate::fulltext::ExtractedText>,
 }
 
 /// 「要確認」ラベル名（stub 登録時に付与・色は橙）
@@ -109,7 +113,7 @@ fn read_pdf_file(pdf: &Path) -> Result<(Vec<u8>, String)> {
 /// `src_name` = 元ファイル名（csl_filename=false の添付名・要確認 stub の題名の既定）。
 /// `file` = 同じ内容が置いてあるファイル（pdftotext fallback 用。None なら必要なときだけ一時ファイルに落とす）。
 /// DB を Mutex で共有する呼び手（Tauri・connectd）は `ingest_pdf_bytes_unlocked` を使う
-pub fn ingest_pdf_bytes_report(
+pub(crate) fn ingest_pdf_bytes_report(
     db: &mut Db,
     bytes: &[u8],
     src_name: &str,
@@ -132,7 +136,8 @@ fn bytes_report_with(
         Prepared::Duplicate(report) => return Ok(report),
     };
     let analyzed = analyze_with(net, bytes, file, opts);
-    ingest_pdf_commit(db, plan, analyzed, bytes, src_name, opts)
+    let text = crate::fulltext::extract_for_index(bytes, &plan.md5, file);
+    ingest_pdf_commit(db, plan, analyzed, bytes, src_name, opts, Some(text))
 }
 
 // ---------- 3 段 API（pdffetch の fetch_pdf_prepare / download / attach と同型）----------
@@ -141,7 +146,8 @@ fn bytes_report_with(
 // 「① md5 照合（DB 読取）→ ② ロック外で抽出・識別子・resolver・題名照合 → ③ 再ロックして登録・添付」に分ける。
 // ① と ③ の間に同じファイルが別経路で入った場合は、③ の md5 再照合が ① と同じ DuplicateFile で受ける
 // （DOI / PMID の重複は add_item の Duplicate → 既存 item への添付判断 = 1 段のときと同じ枝）。
-// ③ の添付（edit::write_managed のファイル書込と本文索引）はロックの中のまま。
+// 本文の全頁抽出（索引用）も ② でロックの外に済ませ、③ は本文の行を書くだけ（2026-11-14）。
+// ③ のファイル書込（edit::write_managed / Drive）はロックの中のまま。
 
 /// ① の結果: 計画（② へ進む）か、同一ファイルが添付済みで完了か
 enum Prepared {
@@ -172,7 +178,7 @@ fn ingest_pdf_prepare(db: &Db, md5: String) -> Result<Prepared> {
 }
 
 fn duplicate_file_report(key: String, md5: String) -> IngestReport {
-    IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings: Vec::new(), reason: None, fail: None, info_title: None, md5 }
+    IngestReport { outcome: PdfIngestOutcome::DuplicateFile { key }, warnings: Vec::new(), reason: None, fail: None, info_title: None, md5, text: None }
 }
 
 /// ③ 再ロックして登録・添付。② の間にロックを離していたので、まず md5 を取り直す（同じファイルが別経路で
@@ -184,6 +190,7 @@ fn ingest_pdf_commit(
     bytes: &[u8],
     src_name: &str,
     opts: &IngestOpts,
+    text: Option<crate::fulltext::ExtractedText>,
 ) -> Result<IngestReport> {
     let file_md5 = plan.md5;
     if let Some(key) = find_item_by_md5(db, &file_md5)? {
@@ -195,7 +202,7 @@ fn ingest_pdf_commit(
         // connectd は stub を自分で作る（題名の既定・URL・source が違う）ので、失敗の文・Info /Title・md5 を返す（呼び手が PDF を読み直さない）
         Err(e) if !opts.stub_on_fail => {
             let outcome = PdfIngestOutcome::NoIdentifier;
-            return Ok(IngestReport { outcome, warnings: Vec::new(), reason: None, fail: Some(e.to_string()), info_title, md5: file_md5 });
+            return Ok(IngestReport { outcome, warnings: Vec::new(), reason: None, fail: Some(e.to_string()), info_title, md5: file_md5, text });
         }
         Err(e) => return Err(e),
     };
@@ -205,24 +212,24 @@ fn ingest_pdf_commit(
         let reason = reason.unwrap_or_default();
         if !opts.stub_on_fail {
             let outcome = PdfIngestOutcome::NoIdentifier;
-            return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5 });
+            return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5, text });
         }
         let origin = StubOrigin::File { name: src_name };
-        let (key, _) = create_review_stub(db, &origin, info_title.as_deref(), bytes, &file_md5, &reason, &mut warnings)?;
+        let (key, _) = create_review_stub(db, &origin, info_title.as_deref(), bytes, &file_md5, &reason, &mut warnings, text.as_ref())?;
         let outcome = PdfIngestOutcome::NeedsReview { key };
-        return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5 });
+        return Ok(IngestReport { outcome, warnings, reason: Some(reason), fail: None, info_title, md5: file_md5, text: None });
     };
     let outcome = match ingest::add_item(db, &resolved) {
         Ok(added) => {
             // resolver の警告（PubMed の照合に失敗して doi.org で代用 = 抄録・MeSH・撤回を見ていない）は登録に使ったときだけ添える
             warnings.extend(resolved.warnings.iter().cloned());
             let name = if opts.csl_filename { crate::pdffetch::suggest_filename(&resolved.csl) } else { src_name.to_string() };
-            note_placement(edit::attach_auto_with_md5(db, &added.key, &name, bytes, &file_md5)?.placement, &mut warnings);
+            note_placement(edit::attach_auto_extracted(db, &added.key, &name, bytes, &file_md5, text.as_ref())?.placement, &mut warnings);
             PdfIngestOutcome::Added { key: added.key }
         }
         Err(CoreError::Duplicate { existing_key, .. }) => {
             let name = attach_name(db, &existing_key, src_name, opts)?;
-            let (o, a) = attach_or_skip_with_md5(db, &existing_key, &name, bytes, &file_md5)?;
+            let (o, a) = attach_or_skip_with_md5(db, &existing_key, &name, bytes, &file_md5, text.as_ref())?;
             if let Some(a) = a {
                 note_placement(a.placement, &mut warnings);
             }
@@ -230,7 +237,7 @@ fn ingest_pdf_commit(
         }
         Err(e) => return Err(e),
     };
-    Ok(IngestReport { outcome, warnings, reason: None, fail: None, info_title, md5: file_md5 })
+    Ok(IngestReport { outcome, warnings, reason: None, fail: None, info_title, md5: file_md5, text: None })
 }
 
 /// DB を Mutex で共有する呼び手（Tauri・connectd）向け: ①と③だけ `lock` でロックを取り、② はロックの外で行う。
@@ -291,8 +298,9 @@ where
         }
     };
     let analyzed = analyze_with(net, bytes, file, opts); // ② ロックの外
+    let text = crate::fulltext::extract_for_index(bytes, &plan.md5, file); // ② ロックの外（索引用の全頁）
     let mut g = lock()?;
-    let res = ingest_pdf_commit(&mut g, plan, analyzed, bytes, src_name, opts);
+    let res = ingest_pdf_commit(&mut g, plan, analyzed, bytes, src_name, opts, Some(text));
     Ok((g, res))
 }
 
@@ -339,7 +347,7 @@ fn identify(net: &dyn Lookup, ex: &pdftools::Extracted, opts: &IngestOpts) -> Re
                         resolver::AddInput::Pmid(p) => format!("PMID {p}"),
                     };
                     let why = format!(
-                        "本文の {label} の題名「{}」が本文に見当たらず不採用（別論文の識別子の可能性。DOI/PMID を確認して書誌を引き直してください）",
+                        "本文の {label} の題名「{}」が本文に見当たらず不採用（別の文献の識別子の可能性。DOI/PMID を確認して書誌を引き直してください）",
                         model::truncate_chars(&model::strip_markup(title), 120)
                     );
                     (None, Some(why))
@@ -431,9 +439,10 @@ pub fn is_cjk_heavy(text: &str) -> bool {
     cjk >= 20 && cjk * 10 >= cjk + latin
 }
 
-/// 「要確認」ラベルが付いている item か（capture / 一括取込 / 旧 Connector standalone（3.0.0 で外した）が識別子なしで作った stub）。
+/// 「要確認」ラベルが付いている item か（capture / 一括取込 / 旧 Connector standalone（3.0.0 で外した）が識別子なしで作った stub と、
+/// `/capture/save` の題名のみ document = ページの書誌メタで結べなかった物。後者にもラベルを付ける = 2026-11-11 に決めた）。
 /// duplicate の案内文に使う。ラベルで判定するので、user が編集で書誌を引き直してラベルを外せば案内は消える
-/// （custom.source で判定すると修正後も案内が出続け、`/capture/save` の題名のみ document まで stub 扱いになる）
+/// （custom.source で判定すると修正後も案内が出続ける）
 /// 数えられなければ Err（「stub でない」= 案内なしに畳まない。呼び手が案内の代わりに理由を出す）
 pub fn is_review_stub(db: &Db, key: &str) -> Result<bool> {
     Ok(db
@@ -489,12 +498,12 @@ fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
         Ok(O::AttachedToExisting { key }) => ImportSummary {
             status: "attached",
             key: Some(key),
-            message: "同じ論文が登録済み（PDF 未添付）だったので添付しました".into(),
+            message: "同じ文献が登録済み（PDF 未添付）だったので添付しました".into(),
         },
         Ok(O::AttachedAdditional { key }) => ImportSummary {
             status: "attached_additional",
             key: Some(key),
-            message: "同じ論文が登録済み。別ファイル（md5 不一致）なので 2 本目として添付しました".into(),
+            message: "同じ文献が登録済み。別ファイル（md5 不一致）なので 2 本目として添付しました".into(),
         },
         Ok(O::DuplicateFile { key }) => {
             let hint = match is_review_stub(db, &key) {
@@ -528,7 +537,7 @@ fn summarize_import(db: &Db, res: Result<IngestReport>) -> ImportSummary {
         Err(CoreError::Duplicate { existing_key, field }) => ImportSummary {
             status: "duplicate",
             key: Some(existing_key),
-            message: format!("登録済みの論文と重複（{field}）"),
+            message: format!("登録済みの文献と重複（{field}）"),
         },
         Err(e) => ImportSummary { status: "error", key: None, message: e.to_string() },
     };
@@ -600,7 +609,7 @@ pub fn attach_or_skip(db: &Db, key: &str, pdf: &Path) -> Result<PdfIngestOutcome
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "file.pdf".into());
-    attach_or_skip_with_md5(db, key, &filename, &bytes, &crate::pdffetch::md5_hex(&bytes)).map(|(o, _)| o)
+    attach_or_skip_with_md5(db, key, &filename, &bytes, &crate::pdffetch::md5_hex(&bytes), None).map(|(o, _)| o)
 }
 
 /// `attach_or_skip` のバイト列版。添付したときは行 id・md5・置き場所（Drive / managed 降格）も返す。
@@ -612,6 +621,7 @@ pub fn attach_or_skip_with_md5(
     filename: &str,
     bytes: &[u8],
     new_md5: &str,
+    text: Option<&crate::fulltext::ExtractedText>,
 ) -> Result<(PdfIngestOutcome, Option<edit::Attached>)> {
     let rows: Vec<(i64, String, Option<String>)> = {
         let mut stmt = db.conn.prepare(
@@ -621,7 +631,7 @@ pub fn attach_or_skip_with_md5(
         it.collect::<std::result::Result<Vec<_>, _>>()?
     };
     if rows.is_empty() {
-        let a = edit::attach_auto_with_md5(db, key, filename, bytes, new_md5)?;
+        let a = edit::attach_auto_extracted(db, key, filename, bytes, new_md5, text)?;
         return Ok((PdfIngestOutcome::AttachedToExisting { key: key.to_string() }, Some(a)));
     }
     for (id, path, stored) in rows {
@@ -643,7 +653,7 @@ pub fn attach_or_skip_with_md5(
             return Ok((PdfIngestOutcome::DuplicateFile { key: key.to_string() }, None));
         }
     }
-    let a = edit::attach_auto_with_md5(db, key, filename, bytes, new_md5)?;
+    let a = edit::attach_auto_extracted(db, key, filename, bytes, new_md5, text)?;
     Ok((PdfIngestOutcome::AttachedAdditional { key: key.to_string() }, Some(a)))
 }
 
@@ -784,7 +794,12 @@ pub fn normalize(s: &str) -> String {
 /// 通過が複数（同題の quiz / 正誤表 / プレプリント等）のときは journal-article を優先し、
 /// ある DOI が他の DOI の接頭辞なら最短（本体）を採用、それでも割れれば誤帰属を避けて None。
 pub fn pick_match(cands: &[Candidate], text: &str) -> Option<TitleMatch> {
-    let passing = passing_candidates(cands, text);
+    choose_passing(passing_candidates(cands, text))
+}
+
+/// 照合を通った候補（Crossref の関連度順）から 1 件を選ぶ（`pick_match` と `pick_evidence_match` の共通）:
+/// 1 件ならそれ。複数なら journal-article を優先し、ある DOI が他の DOI の接頭辞なら最短（本体）、それでも割れれば None
+fn choose_passing(passing: Vec<(TitleMatch, Option<String>)>) -> Option<TitleMatch> {
     if passing.is_empty() {
         return None;
     }
@@ -806,6 +821,18 @@ pub fn pick_match(cands: &[Candidate], text: &str) -> Option<TitleMatch> {
         });
     }
     None
+}
+
+/// 照合の理由（例: 「題名一致・年+筆頭著者一致」。`title` = 題名の通り方）。year_ok か author_ok の少なくとも一方が真のときだけ呼ぶ
+fn match_reason(title: &str, year_ok: bool, author_ok: bool) -> String {
+    format!(
+        "題名{title}・{}",
+        match (year_ok, author_ok) {
+            (true, true) => "年+筆頭著者一致",
+            (true, false) => "年一致",
+            _ => "筆頭著者一致",
+        }
+    )
 }
 
 /// 閾値を満たす候補をすべて集める（順序は Crossref の関連度順のまま）
@@ -837,24 +864,135 @@ fn passing_candidates(cands: &[Candidate], text: &str) -> Vec<(TitleMatch, Optio
             .map(|f| norm_text.contains(&f))
             .unwrap_or(false);
         if year_ok || author_ok {
-            out.push((
-                TitleMatch {
-                    doi: c.doi.clone(),
-                    reason: format!(
-                        "題名{}・{}",
-                        if contained { "一致" } else { "語彙 90%+" },
-                        match (year_ok, author_ok) {
-                            (true, true) => "年+筆頭著者一致",
-                            (true, false) => "年一致",
-                            _ => "筆頭著者一致",
-                        }
-                    ),
-                },
-                c.kind.clone(),
-            ));
+            let how = if contained { "一致" } else { "語彙 90%+" };
+            out.push((TitleMatch { doi: c.doi.clone(), reason: match_reason(how, year_ok, author_ok) }, c.kind.clone()));
         }
     }
     out
+}
+
+// ---------- ページの書誌メタとの照合（`/capture/save`・識別子の無いページ）----------
+
+/// 識別子の無いページが**自分について**宣言した書誌メタ（Capture 拡張の evidence = citation_* / dc.* / 1 件だけの JSON-LD）。
+/// Crossref の候補を欄ごとに比べる証拠にだけ使い、保存しない（保存するのは resolver の書誌だけ）
+#[derive(Debug, Clone, Default)]
+pub struct PageEvidence {
+    pub title: Option<String>,
+    /// 筆頭著者（ページの表記のまま。"Family, Given" か "Given Family"）
+    pub first_author: Option<String>,
+    /// 日付の最初の 4 桁の年（`PageEvidence::year_of`）
+    pub year: Option<i64>,
+}
+
+impl PageEvidence {
+    /// 日付の文字列（"2026/12/01"・"2026-08-01"・"Aug 2026" 等）の最初の 4 桁の数（前後に数字が続かない物）
+    pub fn year_of(date: &str) -> Option<i64> {
+        let mut run = String::new();
+        for c in date.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_digit() {
+                run.push(c);
+                continue;
+            }
+            if run.len() == 4 {
+                return run.parse().ok();
+            }
+            run.clear();
+        }
+        None
+    }
+
+    /// 筆頭著者の姓（表記のまま）: "Family, Given" ならカンマの前。カンマが無ければ、漢字・かな・ハングルを含む名は最初の語
+    /// （「山田 花子」）・最後の語が 1〜3 字の大文字（頭文字。"Smith J"・"Smith JA"・"Smith J.A."）なら最初の語・それ以外は最後の語
+    /// （"Alice Brandão"）
+    pub fn first_family(&self) -> Option<&str> {
+        let a = self.first_author.as_deref()?.trim();
+        let f = match a.split_once(',') {
+            Some((family, _)) => family.trim(),
+            None => {
+                let toks: Vec<&str> = a.split_whitespace().collect();
+                let (first, last) = (*toks.first()?, *toks.last()?);
+                let initials = |t: &str| {
+                    let n = t.chars().filter(|c| *c != '.').count();
+                    (1..=3).contains(&n) && t.chars().filter(|c| *c != '.').all(|c| c.is_alphabetic() && c.is_uppercase())
+                };
+                if a.chars().any(|c| model::is_cjk(c) || is_hangul(c)) || initials(last) {
+                    first
+                } else {
+                    last
+                }
+            }
+        };
+        (!f.is_empty()).then_some(f)
+    }
+
+    /// Crossref の検索語 = 題名 + 筆頭著者の姓 + 年（題名が無ければ None = 検索しない）
+    pub fn query(&self) -> Option<String> {
+        let title = self.title.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+        let mut q = vec![title.to_string()];
+        q.extend(self.first_family().map(str::to_string));
+        q.extend(self.year.map(|y| y.to_string()));
+        Some(q.join(" "))
+    }
+}
+
+/// ハングル（音節・字母）
+fn is_hangul(c: char) -> bool {
+    matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F)
+}
+
+/// 題名から副題を除いた主題名（最初の ":" か "：" より前）。区切りが無ければ None
+fn main_title(t: &str) -> Option<&str> {
+    t.find([':', '：']).map(|i| &t[..i])
+}
+
+fn word_count(norm: &str) -> usize {
+    norm.split(' ').filter(|w| !w.is_empty()).count()
+}
+
+/// ページの題名と候補の題名（どちらも表記のまま）: 正規化して等しい → Some(true)。片方の副題（`main_title`）を除いて等しく、
+/// 残った主題名が 6 語以上 → Some(false)。それ以外は None（含む・語彙の割合では通さない = ページの題名は本文と違って短く、
+/// 総説の題名に含まれる短い題名・"Erratum: …"・"Comment on: …"・書名を含む章の題名が通ってしまう）。
+/// 候補の題名が正規化後 20 字未満なら None（`pick_match` と同じ下限 = 和文の短い題名は照合しない）
+fn evidence_title_match(cand: &str, page: &str) -> Option<bool> {
+    let (c, p) = (normalize(cand), normalize(page));
+    if c.chars().count() < 20 {
+        return None;
+    }
+    if c == p {
+        return Some(true);
+    }
+    let main_equals = |full: &str, other: &str| main_title(full).map(normalize).is_some_and(|m| m == other && word_count(&m) >= 6);
+    (main_equals(cand, &p) || main_equals(page, &c)).then_some(false)
+}
+
+/// Crossref の候補をページの書誌メタと**欄ごとに**照合する（連結した文字列には比べない = 検索語と照合相手が同じ題名から来るので
+/// ほぼ自明に通ってしまう）。採る条件 = 題名が一致（`evidence_title_match`）**かつ**（筆頭著者の姓が normalize 後に等しい・3 字以上
+/// **または**（年が等しく、題名が副題を除かずに完全一致で 6 語以上））。短い・ありふれた題名は著者が要り、年だけで結ぶのは長い題名の完全一致だけ。
+/// ページと候補の**両方**に 3 字以上の姓があって違えば、その候補は採らない（年だけの一致にも割れたときの規則にも進まない =
+/// 書名と同じ題名・同じ年の書評や論説）。年だけで結ぶのは、どちらかに使える姓が無いときだけ。
+/// 割れたときの規則は `pick_match` と同じ（`choose_passing`）
+pub fn pick_evidence_match(cands: &[Candidate], ev: &PageEvidence) -> Option<TitleMatch> {
+    let page = ev.title.as_deref()?;
+    let long = word_count(&normalize(page)) >= 6;
+    let usable = |f: String| (f.chars().count() >= 3).then_some(f);
+    let family = ev.first_family().map(normalize).and_then(usable);
+    let mut passing = Vec::new();
+    for c in cands {
+        let Some(exact) = evidence_title_match(&c.title, page) else {
+            continue;
+        };
+        let year_ok = matches!((c.year, ev.year), (Some(a), Some(b)) if a == b);
+        let author_ok = match (c.first_author_family.as_deref().map(normalize).and_then(usable), &family) {
+            (Some(f), Some(page)) if &f == page => true,
+            (Some(_), Some(_)) => continue, // 両方に姓があって違う = 別の著者の物（年だけでは結ばない）
+            _ => false,
+        };
+        if author_ok || (year_ok && exact && long) {
+            let how = if exact { "一致" } else { "一致（副題を除く）" };
+            passing.push((TitleMatch { doi: c.doi.clone(), reason: match_reason(how, year_ok, author_ok) }, c.kind.clone()));
+        }
+    }
+    choose_passing(passing)
 }
 
 // ---------- 要確認 stub ----------
@@ -883,6 +1021,7 @@ pub fn create_review_stub(
     md5: &str,
     note: &str,
     warnings: &mut Vec<String>,
+    text: Option<&crate::fulltext::ExtractedText>,
 ) -> Result<(String, String)> {
     let info_title = info_title.filter(|t| plausible_title(t)).map(str::to_string);
     // 型は document。型カタログ（types.rs の 9 型）に無い型だと編集の sanitize が「未知の参照タイプ」で弾き、
@@ -915,17 +1054,21 @@ pub fn create_review_stub(
     // retracted: None なので source は使われない（撤回の印を書くときだけの値）
     let resolved = resolver::Resolved { csl, retracted: None, source: "pdf-import", warnings: vec![] };
     let added = ingest::add_item(db, &resolved)?;
-    note_placement(edit::attach_auto_with_md5(db, &added.key, &filename, bytes, md5)?.placement, warnings);
+    note_placement(edit::attach_auto_extracted(db, &added.key, &filename, bytes, md5, text)?.placement, warnings);
     // 一覧から見つけられるよう「要確認」ラベル
-    let labeled = tags::ensure_tag(db, REVIEW_TAG, Some(REVIEW_TAG_COLOR))
-        .map_err(|e| ("要確認ラベル作成失敗", e))
-        .and_then(|tid| tags::attach_tag(db, &added.key, tid).map_err(|e| ("要確認ラベル付与失敗", e)));
-    match (labeled, origin) {
+    match (attach_review_label(db, &added.key), origin) {
         (Ok(_), _) => {}
         (Err((_, e)), StubOrigin::File { .. }) => return Err(e),
         (Err((what, e)), StubOrigin::Page { .. }) => warnings.push(format!("{what} {e}")),
     }
     Ok((added.key, title))
+}
+
+/// 「要確認」ラベル（色 peach）を付ける。要確認 stub と、`/capture/save` の結べなかった題名のみ document が使う。
+/// Err = (どの段か, 理由)（呼び手が Err にするか警告にするかを決める）
+pub fn attach_review_label(db: &Db, key: &str) -> std::result::Result<(), (&'static str, CoreError)> {
+    let tid = tags::ensure_tag(db, REVIEW_TAG, Some(REVIEW_TAG_COLOR)).map_err(|e| ("要確認ラベル作成失敗", e))?;
+    tags::attach_tag(db, key, tid).map_err(|e| ("要確認ラベル付与失敗", e))
 }
 
 /// タブ題名のヒントから拡張子を落とす（Chrome の PDF タブ題名はファイル名のことが多い）
@@ -941,7 +1084,16 @@ pub fn strip_pdf_suffix(t: &str) -> String {
 
 /// managed 添付のファイル名用（Drive モードでは drive_layout が CSL から命名するので使われない）
 pub fn safe_filename_stem(title: &str) -> String {
-    let s: String = title
+    let s = sanitize_filename_chars(title).trim().to_string();
+    if s.is_empty() { "attachment".into() } else { s }
+}
+
+/// 添付のファイル名の無害化の共通部（`safe_filename_stem` と `pdffetch::suggest_filename` の 2 つが使う。2026-11-14 に 1 つに）:
+/// ファイル名に使えない字を空白に・空白を畳む・140 字で切る・末尾の `.` を落とす。その後の扱いは呼び手ごとに違い、揃えていない
+/// （`safe_filename_stem` は前後の空白を落として空なら "attachment"・`suggest_filename` はそのまま `.pdf` を付ける）。
+/// Drive の Paperpile 互換の名前（`drive_layout::sanitize_component`）は別規則 = ここを通らない
+pub(crate) fn sanitize_filename_chars(s: &str) -> String {
+    let s: String = s
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
@@ -949,14 +1101,57 @@ pub fn safe_filename_stem(title: &str) -> String {
         })
         .collect();
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = model::truncate_chars(&s, 140);
-    let s = s.trim_end_matches('.').trim().to_string();
-    if s.is_empty() { "attachment".into() } else { s }
+    model::truncate_chars(&s, 140).trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 無害化を `sanitize_filename_chars` 1 つにした前後で、`safe_filename_stem` と `suggest_filename` の後半の出力が
+    /// 同じ（旧実装を字のまま写して比べる）。入力 = 和文・記号・長い名前（140 字の境目）・前後の点と空白・予約名・`/` `:`・空
+    #[test]
+    fn filename_sanitizer_unchanged_by_k14() {
+        fn old_safe(title: &str) -> String {
+            let s: String = title
+                .chars()
+                .map(|c| match c {
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
+                    c => c,
+                })
+                .collect();
+            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let s = model::truncate_chars(&s, 140);
+            let s = s.trim_end_matches('.').trim().to_string();
+            if s.is_empty() { "attachment".into() } else { s }
+        }
+        fn old_suggest_tail(name: &str) -> String {
+            let name: String = name
+                .chars()
+                .map(|c| match c {
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
+                    c => c,
+                })
+                .collect();
+            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            let name = model::truncate_chars(&name, 140);
+            format!("{}.pdf", name.trim_end_matches('.'))
+        }
+        let long_a = "a".repeat(200);
+        let long_dots = format!("{}. . .", "b".repeat(136));
+        let long_ja = "膵癌の画像診断：".repeat(30);
+        let edge139 = format!("{} .", "c".repeat(137));
+        let inputs: Vec<&str> = vec![
+            "", " ", "   ", ".", "..", "...", " . ", "a .", "a . ", ". a", " a. ", "CON", "NUL", "com1", "aux.txt", "LPT9",
+            "膵臓癌の MRI 所見", "胆道：解剖と変異／総説", "Ａ／Ｂ：Ｃ", "a/b", "a:b", "a: b", "a\\b", "a*b?c", "\"quoted\"", "<tag>|pipe",
+            "line1\nline2\r", "tab\tsep", "  lead and trail  ", "trailing dots...", "…", "x…", "emoji 🧠 brain",
+            &long_a, &long_dots, &long_ja, &edge139, "Smith et al. 2024 - Title.", " 2024 - untitled", "et al.  - .",
+        ];
+        for t in inputs {
+            assert_eq!(safe_filename_stem(t), old_safe(t), "safe_filename_stem({t:?})");
+            assert_eq!(format!("{}.pdf", sanitize_filename_chars(t)), old_suggest_tail(t), "suggest_filename の後半({t:?})");
+        }
+    }
     use crate::resolver::AddInput;
 
     #[test]
@@ -991,7 +1186,7 @@ mod tests {
         let wiley = "Journal of Magnetic Resonance Imaging\nMRI of the Liver: Current Techniques in Clinical Practice\nAuthor";
         assert_eq!(guard_first_candidate("<scp>MRI</scp> of the Liver: Current Techniques in Clinical Practice", wiley, false), Guard::Accept);
         // 和文判定: CJK 20 字以上かつ 10% 以上
-        assert!(is_cjk_heavy("日本小児放射線学会雑誌 症例報告 片側眼瞼下垂と弱視を契機にKallmann症候群と診断した3歳男児例 要旨 症例は3歳男児"));
+        assert!(is_cjk_heavy("日本小児放射線学会雑誌 症例報告 片側の架空所見を契機にExample症候群と診断した3歳男児例 要旨 症例は3歳男児"));
         assert!(!is_cjk_heavy("Imaging of the pancreas (張三, 李四) in a large cohort of patients with chronic pancreatitis and other diseases"), "著者名の漢字数文字では発火しない");
         assert!(!is_cjk_heavy("plain english text"));
         // 空白主体（グリフ未抽出の和文 PDF。例: 空白 95%・CJK 0）→ lenient。通常の英文（空白 15%）は違う
@@ -1072,6 +1267,189 @@ mod tests {
         // 先に不一致候補が並んでいても後ろの一致候補を拾う
         let m = pick_match(&[cand("10.1/n", "Something Completely Different About Livers", Some(2026), None), c], text).unwrap();
         assert_eq!(m.doi, "10.1148/rg.250127");
+    }
+
+    // ---------- ページの書誌メタとの照合（`/capture/save`）----------
+
+    fn ev(title: &str, author: Option<&str>, year: Option<i64>) -> PageEvidence {
+        PageEvidence { title: Some(title.into()), first_author: author.map(String::from), year }
+    }
+
+    /// 9 語の題名（年だけで結べる長さ）
+    const LONG: &str = "Imaging of Deep Endometriosis Involving Lateral Pelvic Structures";
+    /// 5 語・20 字以上の題名（著者が要る）
+    const SHORT: &str = "Pancreatic Cystic Neoplasms: An Update";
+
+    #[test]
+    fn evidence_match_long_exact_title_and_year_or_author() {
+        let c = cand("10.1148/rg.250127", LONG, Some(2026), Some("Brandão"));
+        // 長い題名の完全一致 + 年（著者はページに無い）
+        let m = pick_evidence_match(&[c.clone()], &ev(LONG, None, Some(2026))).unwrap();
+        assert_eq!(m.doi, "10.1148/rg.250127");
+        assert_eq!(m.reason, "題名一致・年一致");
+        // 完全一致 + 筆頭著者（年は版の差で違う）。"Family, Given"・"Given Family" の表記・大小・アクセントは吸収
+        for author in ["Brandao, Alice", "Alice Brandão", "BRANDÃO, A.", "Brandão AC"] {
+            let m = pick_evidence_match(&[c.clone()], &ev(LONG, Some(author), Some(2025))).unwrap();
+            assert_eq!(m.reason, "題名一致・筆頭著者一致", "{author}");
+        }
+        assert_eq!(pick_evidence_match(&[c.clone()], &ev(LONG, Some("Brandão, Alice"), Some(2026))).unwrap().reason, "題名一致・年+筆頭著者一致");
+        // 題名は一致するが年も著者も一致しない・ページに年も著者も無い → 不採用
+        assert!(pick_evidence_match(&[c.clone()], &ev(LONG, Some("Smith, John"), Some(2019))).is_none());
+        assert!(pick_evidence_match(&[c.clone()], &ev(LONG, None, None)).is_none());
+        // 題名が無い（検索もしない）
+        assert!(pick_evidence_match(&[c.clone()], &PageEvidence { title: None, first_author: Some("Brandão".into()), year: Some(2026) }).is_none());
+        // 姓が 3 字未満は著者の一致に数えない（長い完全一致なら年で結べる）
+        let li = cand("10.1/s", LONG, Some(2020), Some("Li"));
+        assert!(pick_evidence_match(&[li.clone()], &ev(LONG, Some("Li, Wei"), Some(2026))).is_none());
+        assert!(pick_evidence_match(&[li], &ev(LONG, Some("Li, Wei"), Some(2020))).is_some());
+    }
+
+    /// 短い題名（6 語未満）は完全一致でも著者が要る（年だけでは結ばない）
+    #[test]
+    fn evidence_match_short_title_needs_the_author() {
+        let c = cand("10.1/pcn", SHORT, Some(2024), Some("Tanaka"));
+        let m = pick_evidence_match(&[c.clone()], &ev(SHORT, Some("Tanaka, Hiroshi"), Some(2024))).unwrap();
+        assert_eq!(m.reason, "題名一致・年+筆頭著者一致");
+        assert!(pick_evidence_match(&[c.clone()], &ev(SHORT, Some("Hiroshi Tanaka"), None)).is_some());
+        assert!(pick_evidence_match(&[c.clone()], &ev(SHORT, None, Some(2024))).is_none(), "短い題名 + 年だけ");
+        assert!(pick_evidence_match(&[c], &ev(SHORT, Some("Suzuki, Ken"), Some(2024))).is_none());
+    }
+
+    /// 欄ごとに比べる: 年・筆頭著者の姓がページの**題名の中**にあるだけでは数えない（題名・著者・年を連結した文字列への照合にしない）
+    #[test]
+    fn evidence_match_does_not_use_the_title_for_year_or_author() {
+        let t = "Brandão sign in lateral pelvic endometriosis on MRI: RSNA 2026 consensus";
+        let c = cand("10.1/c", "Brandão sign in lateral pelvic endometriosis on MRI", Some(2026), Some("Brandão"));
+        assert!(pick_evidence_match(&[c.clone()], &ev(t, Some("Smith, John"), Some(2024))).is_none());
+        assert!(pick_evidence_match(&[c.clone()], &ev(t, None, None)).is_none());
+        let m = pick_evidence_match(&[c], &ev(t, Some("Brandão, Alice"), Some(2024))).unwrap();
+        assert_eq!(m.reason, "題名一致（副題を除く）・筆頭著者一致", "対照: 姓が著者の欄で一致すれば通る");
+    }
+
+    #[test]
+    fn evidence_match_title_rules() {
+        // 短い題名（正規化後 20 字未満 = 和文の短い題名）は除外（`pick_match` と同じ下限。CJK 用の照合は作らない）
+        let ja = cand("10.20844/zzzz.42.1_5", "小児の架空症例の画像所見", Some(2026), Some("山田"));
+        assert!(pick_evidence_match(&[ja], &ev("小児の架空症例の画像所見", Some("山田 太郎"), Some(2026))).is_none());
+        // ページの題名に副題: 候補 = 主題名（6 語以上）+ 著者 → 通る。年だけ（完全一致でない）→ 通らない
+        let main = cand("10.1/main", LONG, Some(2026), Some("Brandão"));
+        let page = format!("{LONG}: A Pictorial Review for the General Radiologist");
+        let m = pick_evidence_match(&[main.clone()], &ev(&page, Some("Brandão, Alice"), Some(2026))).unwrap();
+        assert_eq!((m.doi.as_str(), m.reason.as_str()), ("10.1/main", "題名一致（副題を除く）・年+筆頭著者一致"));
+        assert!(pick_evidence_match(&[main.clone()], &ev(&page, None, Some(2026))).is_none());
+        // 全角の "：" も副題の区切り
+        assert!(pick_evidence_match(&[main], &ev(&format!("{LONG}：総説"), Some("Brandão, Alice"), None)).is_some());
+        // 候補に副題があり、ページは主題名（6 語以上）だけ → 著者で通る
+        let sub = cand("10.1/sub", &format!("{LONG}: A Pictorial Review"), Some(2026), Some("Brandão"));
+        assert!(pick_evidence_match(&[sub], &ev(LONG, Some("Brandão, Alice"), None)).is_some());
+        // 主題名が 6 語未満なら副題を除いた一致は認めない
+        let liver = cand("10.1/liver", "Liver MRI: A Practical Guide to Protocols, Sequences and Artifacts", Some(2026), Some("Ito"));
+        assert!(pick_evidence_match(&[liver], &ev("Liver MRI", Some("Ito, Ken"), Some(2026))).is_none());
+        // 語彙の割合では通さない（ハイフン改行で 1 語だけ崩れた題名も、ページの題名なら不一致）
+        let near = cand("10.2/a", "Multimodal large language model with knowledge retrieval using flowchart embedding for forming follow-up recommendations", Some(2026), Some("Kim"));
+        assert!(pick_evidence_match(&[near], &ev("Multimodal large language model with knowledge retrieval using flowchart embed-ding for forming follow-up recommendations", Some("Kim, J"), Some(2026))).is_none());
+    }
+
+    /// 含む・年だけの規則で通っていた誤った結合（2026-11-12 に再現した物）の回帰試験
+    #[test]
+    fn evidence_match_qa_wrong_links() {
+        // ページの題名（副題付き）に短い候補の題名が含まれる・年は同じ・著者は別
+        let p1 = cand("10.1/ai", "Artificial intelligence in radiology", Some(2025), Some("Lee"));
+        assert!(pick_evidence_match(&[p1], &ev("Artificial Intelligence in Radiology: Opportunities and Challenges for the Next Decade", Some("Smith, John"), Some(2025))).is_none(), "副題付きの題名に含まれる短い題名");
+        // ありふれた短い題名・同題の論説が 3 年分・著者は別 → 同じ年の物にも結ばない
+        let g = "Highlights of the Radiology Year";
+        let eds: Vec<Candidate> = [(2023, "Adams"), (2024, "Baker"), (2025, "Clark")].iter().map(|(y, f)| cand(&format!("10.1/ed{y}"), g, Some(*y), Some(f))).collect();
+        assert!(pick_evidence_match(&eds, &ev(g, Some("Doe, Jane"), Some(2024))).is_none(), "同題の論説が年ごとにある");
+        assert!(pick_evidence_match(&eds, &ev(g, None, Some(2024))).is_none(), "同題の論説が年ごとにある（著者なし）");
+        // 候補は "Erratum: <題名>" だけ / "Comment on: <題名>" だけ
+        let mut err = cand("10.1/err", &format!("Erratum: {LONG}"), Some(2026), Some("Brandão"));
+        err.kind = Some("journal-article".into());
+        assert!(pick_evidence_match(&[err], &ev(LONG, Some("Brandão, Alice"), Some(2026))).is_none(), "Erratum");
+        let com = cand("10.1/com", &format!("Comment on: {LONG}"), Some(2026), Some("Brandão"));
+        assert!(pick_evidence_match(&[com], &ev(LONG, Some("Brandão, Alice"), Some(2026))).is_none(), "Comment on");
+        // 章のページの題名が書名を含む → 書籍（book）に結ばない
+        let mut book = cand("10.1007/978-3-031-82750-1", "Imaging of Endometriosis", Some(2025), Some("Chamié"));
+        book.kind = Some("book".into());
+        assert!(pick_evidence_match(&[book], &ev("Imaging of Endometriosis: Lateral Deep Pelvic Endometriosis Over the Parietal Fascia", Some("Chamié, Luciana"), Some(2025))).is_none(), "章のページと書籍");
+    }
+
+    /// 書籍のページ（著者 Rossi）・候補 = 書籍と、書名と同じ題名・同じ年の書評（筆頭著者 Garcia・journal-article）。
+    /// 両方に姓があって違う候補は採らない → 書評に結ばない（journal-article の優先で書評が選ばれていた）
+    #[test]
+    fn evidence_match_rejects_a_different_first_author() {
+        let t = "Diagnostic Imaging of the Pediatric Abdomen and Pelvis";
+        let book = |fam: &str| {
+            let mut b = cand("10.1007/978-3-030-11111-1", t, Some(2021), Some(fam));
+            b.kind = Some("book".into());
+            b
+        };
+        let review = cand("10.1148/radiol.2021219001", t, Some(2021), Some("Garcia"));
+        let page = ev(t, Some("Rossi, Marco"), Some(2021));
+        // 書籍の筆頭著者が Rossi なら書籍・違えば None（どちらでも書評には結ばない）
+        let m = pick_evidence_match(&[book("Rossi"), review.clone()], &page).unwrap();
+        assert_eq!((m.doi.as_str(), m.reason.as_str()), ("10.1007/978-3-030-11111-1", "題名一致・年+筆頭著者一致"), "書籍の筆頭著者が一致");
+        assert!(pick_evidence_match(&[book("Bianchi"), review.clone()], &page).is_none(), "書籍の著者も別");
+        // 候補は書評だけ（書籍の DOI が上位 5 件に無い）→ None
+        assert!(pick_evidence_match(&[review.clone()], &page).is_none(), "候補は書評だけ");
+        // ページに著者が無く、候補は書評だけ → 長い題名の完全一致 + 年で書評に結ぶ。
+        // 規則上の残りのリスク（受け入れ済み）: 年だけの一致は、どちらかに使える姓が無いときに残る。変えるなら意図して変える
+        assert_eq!(pick_evidence_match(&[review], &ev(t, None, Some(2021))).map(|m| m.doi).as_deref(), Some("10.1148/radiol.2021219001"), "著者なし・候補は書評だけ");
+    }
+
+    #[test]
+    fn evidence_match_tie_break_is_pick_match() {
+        // 同題の quiz（Crossref の dataset）と本体 → journal-article の本体
+        let mut quiz = cand("10.1148/rg.250127.quiz", LONG, Some(2026), None);
+        quiz.kind = Some("dataset".into());
+        let body = cand("10.1148/rg.250127", LONG, Some(2026), Some("Brandão"));
+        let m = pick_evidence_match(&[quiz.clone(), body.clone()], &ev(LONG, Some("Brandão, Alice"), Some(2026))).unwrap();
+        assert_eq!(m.doi, "10.1148/rg.250127");
+        assert!(m.reason.contains("同題 1 件中の本体"), "{}", m.reason);
+        // 正誤表（同題・接頭辞関係・両方 journal-article）→ 最短の本体
+        let erratum = cand("10.1148/rg.250127.err", LONG, Some(2026), Some("Brandão"));
+        assert_eq!(pick_evidence_match(&[erratum, body.clone()], &ev(LONG, None, Some(2026))).unwrap().doi, "10.1148/rg.250127");
+        // 無関係な 2 つの DOI が両方通る → 誤帰属を避けて None
+        let other = cand("10.9999/other.123", LONG, Some(2026), Some("Brandão"));
+        assert!(pick_evidence_match(&[other, body], &ev(LONG, None, Some(2026))).is_none());
+    }
+
+    #[test]
+    fn evidence_year_family_and_query() {
+        for (d, y) in [("2026/12/01", Some(2026)), ("2026-08-01", Some(2026)), ("12/01/2025", Some(2025)), ("Aug 2024", Some(2024)),
+            ("20261201", None), ("vol 12", None), ("", None)]
+        {
+            assert_eq!(PageEvidence::year_of(d), y, "{d}");
+        }
+        let fam = |a: &str| ev("t", Some(a), None).first_family().map(str::to_string);
+        for (a, f) in [("Brandão, Alice", "Brandão"), ("Alice Brandão", "Brandão"), ("Alice Pires Franco", "Franco"), ("Smith J", "Smith"),
+            ("Smith JA", "Smith"), ("Smith J.A.", "Smith"), ("Smith ABCD", "ABCD"), ("山田 花子", "山田"), ("山田花子", "山田花子"),
+            ("김 민수", "김"), ("Brandão", "Brandão")]
+        {
+            assert_eq!(fam(a).as_deref(), Some(f), "{a}");
+        }
+        assert_eq!(fam("  "), None);
+        assert_eq!(ev("A title", Some("Brandão, Alice"), Some(2026)).query().as_deref(), Some("A title Brandão 2026"));
+        assert_eq!(ev("A title", Some("Smith JA"), None).query().as_deref(), Some("A title Smith"));
+        assert_eq!(ev("A title", Some("山田 花子"), None).query().as_deref(), Some("A title 山田"));
+        assert_eq!(ev(" A title ", None, None).query().as_deref(), Some("A title"));
+        assert_eq!(ev("  ", Some("X"), Some(2026)).query(), None);
+        assert_eq!(PageEvidence::default().query(), None);
+    }
+
+    /// Crossref の応答（`query.bibliographic` = 題名 + 姓 + 年・rows 5・select は `search_bibliographic` と同じ。
+    /// ORCID・所属・3 人目以降の著者を落とした）を `parse_candidates` に通す: quiz / q1 / q2（dataset・著者なし）が本体より先に来る
+    #[test]
+    fn evidence_match_on_a_real_crossref_response() {
+        let cands = resolver::parse_candidates(&serde_json::from_str(include_str!("resolver/fixtures/crossref-search-rg-250127.json")).unwrap());
+        assert_eq!(cands.len(), 5);
+        assert_eq!(cands[3].first_author_family.as_deref(), Some("Brandão"));
+        // 年だけ（長い題名の完全一致 = quiz 3 件も通る）→ journal-article の本体
+        assert_eq!(pick_evidence_match(&cands, &ev(LONG, None, Some(2026))).unwrap().doi, "10.1148/rg.250127");
+        // 年が違い著者だけ → 本体だけが通る
+        let m = pick_evidence_match(&cands, &ev(LONG, Some("Brandão, Alice"), Some(2025))).unwrap();
+        assert_eq!((m.doi.as_str(), m.reason.as_str()), ("10.1148/rg.250127", "題名一致・筆頭著者一致"));
+        // 書籍の章（"Lateral Deep Pelvic Endometriosis. Over Parietal Fascia: …"）は題名が違うので通らない
+        assert!(pick_evidence_match(&cands[4..], &ev(LONG, Some("Brandão, Alice"), Some(2025))).is_none());
     }
 
     #[test]
@@ -1340,7 +1718,7 @@ mod tests {
         // ② の間に別の取込が同じファイルを入れる
         let other = bytes_report_with(&no_gate(), &mut db, bytes, "other.pdf", None, &opts).unwrap();
         let PdfIngestOutcome::Added { key: other_key } = other.outcome else { panic!("{:?}", other.outcome) };
-        let r = ingest_pdf_commit(&mut db, plan, analyzed, bytes, "late.pdf", &opts).unwrap();
+        let r = ingest_pdf_commit(&mut db, plan, analyzed, bytes, "late.pdf", &opts, None).unwrap();
         assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == other_key), "{:?}", r.outcome);
         assert_eq!(r.md5, md5);
         let n_att = |db: &Db| db.conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get::<_, i64>(0)).unwrap();
@@ -1354,13 +1732,13 @@ mod tests {
             Prepared::Duplicate(_) => panic!("まだ入っていない"),
         };
         let (plan_a, plan_b) = (fresh(&db), fresh(&db));
-        let r = ingest_pdf_commit(&mut db, plan_a, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
+        let r = ingest_pdf_commit(&mut db, plan_a, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts, None).unwrap();
         assert!(matches!(r.outcome, PdfIngestOutcome::NoIdentifier), "{:?}", r.outcome);
         assert!(r.fail.as_deref().is_some_and(|f| f.contains("404")), "入っていなければ失敗のまま: {:?}", r.fail);
         assert_eq!(r.md5, md5e);
         let stub = ingest::add_item(&mut db, &Resolved { csl: json!({ "type": "document", "title": "stub" }), retracted: None, source: "test", warnings: vec![] }).unwrap();
         edit::attach_auto_with_md5(&db, &stub.key, "s.pdf", err_bytes, &md5e).unwrap();
-        let r = ingest_pdf_commit(&mut db, plan_b, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts).unwrap();
+        let r = ingest_pdf_commit(&mut db, plan_b, analyze_with(&no_gate(), err_bytes, None, &opts), err_bytes, "e.pdf", &opts, None).unwrap();
         assert!(matches!(&r.outcome, PdfIngestOutcome::DuplicateFile { key } if *key == stub.key), "{:?}", r.outcome);
         assert_eq!(n_att(&db), 2);
         std::fs::remove_dir_all(&dir).ok();
@@ -1484,7 +1862,7 @@ mod tests {
         for db in [&mut a, &mut *b.lock().unwrap()] {
             let mut w = Vec::new();
             let origin = StubOrigin::File { name: "dup.pdf" };
-            create_review_stub(db, &origin, None, &dup_bytes, &crate::pdffetch::md5_hex(&dup_bytes), "test", &mut w).unwrap();
+            create_review_stub(db, &origin, None, &dup_bytes, &crate::pdffetch::md5_hex(&dup_bytes), "test", &mut w, None).unwrap();
         }
         let strip = |s: ImportSummary| (s.status, s.key.is_some(), s.message.replace(&dir_a.display().to_string(), "<A>").replace(&dir_b.display().to_string(), "<B>"));
         for (name, pa, pb) in [
@@ -1523,7 +1901,7 @@ mod tests {
         for (i, (origin, info, csl, file)) in cases.iter().enumerate() {
             let bytes = crate::pdftools::minimal_pdf(&format!("stub body {i}"), None);
             let mut w = Vec::new();
-            let (key, title) = create_review_stub(&mut db, origin, *info, &bytes, &crate::pdffetch::md5_hex(&bytes), "n", &mut w).unwrap();
+            let (key, title) = create_review_stub(&mut db, origin, *info, &bytes, &crate::pdffetch::md5_hex(&bytes), "n", &mut w, None).unwrap();
             assert!(w.is_empty(), "{w:?}");
             let (got_csl, path, tags): (String, String, String) = db
                 .conn

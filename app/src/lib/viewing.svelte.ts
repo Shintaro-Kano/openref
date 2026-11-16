@@ -8,7 +8,7 @@
 // chat → viewing → wiki.svelte → chat の環があるので、module の評価時には wk / app に触らない（関数の中だけ）
 
 import { untrack } from "svelte";
-import { app, frontShelf, frontShelfBook, frontViewer, frontWiki } from "./state.svelte";
+import { app, frontKind, frontViewer } from "./state.svelte";
 import { inPage, selectionText } from "./wiki/selection";
 import { wk } from "./wiki/wiki.svelte";
 
@@ -30,12 +30,13 @@ export function setViewingWanted(fn: (() => boolean) | null) {
 
 /** 今見ている物（前面のタブで決まる）。本棚のタブ・本のタブは null（一覧で選んでいた文献を返さない = 取り違えない） */
 export function viewingSource(): ViewingSource | null {
-  if (frontShelf() || frontShelfBook()) return null;
+  const kind = frontKind();
+  if (kind === "shelf" || kind === "book") return null;
   const v = frontViewer();
   if (v) return { kind: "item", key: v.itemKey, title: v.title };
   // 一覧のタブ: 選んでいる文献。見えていない Wiki のページは元にしない。
   // 別の行を読み込む間（app.detail がまだ前の行）は元なし = 選んでいない文献を添えない
-  if (app.tabs.length && !frontWiki()) {
+  if (app.tabs.length && kind !== "wiki") {
     const d = app.detail;
     return d && d.key === app.selected ? { kind: "item", key: d.key, title: d.csl?.title ?? "" } : null;
   }

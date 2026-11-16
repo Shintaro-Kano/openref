@@ -1,10 +1,10 @@
 <script lang="ts">
-  /* 本棚のサイドバー: セグメント・見出し（ShelfHead）・すべての本 + フォルダの木・温めの進捗の 1 行。LABELS・ゴミ箱・＋・… は描かない（本棚に無い物を見せない）。
+  /* 本棚のサイドバー（SHELF）: セグメント・見出し（ShelfHead = 本棚の選択・足す / 外す）・すべての本 + フォルダの木・温めの進捗の 1 行。LABELS・ゴミ箱・＋・… は描かない（本棚に無い物を見せない）。
      本棚を離れる = ここが消える = 温めを止める（読み手のタブも本棚を離れた扱い） */
   import { onDestroy } from "svelte";
   import { t, tn } from "../i18n.svelte";
   import { frontShelf } from "../state.svelte";
-  import WikiSegment from "../wiki/WikiSegment.svelte";
+  import ModeSegment from "../ModeSegment.svelte";
   import ShelfHead from "./ShelfHead.svelte";
   import ShelfMenu from "./ShelfMenu.svelte";
   import ShelfNode from "./ShelfNode.svelte";
@@ -39,8 +39,8 @@
   }
 </script>
 
-<nav class="sidebar">
-  <WikiSegment />
+<nav class="ls-nav sidepane">
+  <ModeSegment />
   <div class="sep sec-head"><ShelfHead /></div>
   <button class:active={s?.dir === null && !s?.query} onclick={all} onauxclick={allAux}>
     <span>{t("すべての本")}</span><span class="n">{ix?.tree.totalBooks ?? ""}</span>

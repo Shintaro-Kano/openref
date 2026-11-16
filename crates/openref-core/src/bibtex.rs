@@ -168,9 +168,9 @@ mod tests {
         assert!(b.contains("doi = {10.1148/rg.230216}"));
         // citekey なし → 生成
         let csl2 = json!({"type": "article-journal", "title": "T",
-            "author": [{"family": "Kano"}], "issued": {"date-parts": [[2026]]}});
+            "author": [{"family": "Kato"}], "issued": {"date-parts": [[2026]]}});
         let b2 = item_to_bibtex(&csl2, "WXYZ6789");
-        assert!(b2.starts_with("@article{Kano2026-6789,"), "{b2}");
+        assert!(b2.starts_with("@article{Kato2026-6789,"), "{b2}");
         let explicit = json!({"citation-key":"Exported2026","custom":{"paperpile":{"citekey":""}}});
         assert_eq!(citekey(&explicit, "ABCD2345"), "Exported2026");
     }

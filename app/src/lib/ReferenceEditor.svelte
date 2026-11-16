@@ -6,6 +6,7 @@
   import { formatBibliography } from "./cite";
   import { app, closeEditor, refreshAll, reloadDetail, reveal, toast } from "./state.svelte";
   import { onEnter } from "./input";
+  import Modal from "./Modal.svelte";
 
   let types = $state<TypeDef[]>([]);
   let subs = $state<string[]>([]);
@@ -117,86 +118,84 @@
 </script>
 
 <!-- 背景のクリックでは閉じない（× / キャンセルのみ）: 入力中の書誌を 1 クリックで捨てない・入力欄のドラッグ選択を外で離しても閉じない -->
-<div class="overlay" role="presentation">
-  <div class="modal editor" role="dialog" aria-label="reference editor">
-    <div class="modal-head">
-      <h3>{app.editorKey ? t("参照を編集") : t("参照を新規作成")}</h3>
-      <div class="head-tools">
-        <input
-          class="lookup"
-          placeholder={t("DOI / PMID / URL から自動入力")}
-          bind:value={lookupInput}
-          onkeydown={(e) => onEnter(e, doLookup)}
-        />
-        <button onclick={doLookup} disabled={busy || !lookupInput.trim()}>{t("取得")}</button>
-        <button class="x" onclick={closeEditor}>×</button>
-      </div>
-    </div>
-
-    <div class="modal-body">
-      <div class="grid">
-        <span class="lbl">{t("種類")}</span>
-        <select bind:value={typeId} onchange={() => { extraFields = filledExtras(types, typeId, values); updatePreview(); }}>
-          {#each types as tp (tp.id)}
-            <option value={tp.id}>{tt(tp.label)} — {tt(tp.desc)}</option>
-          {/each}
-        </select>
-
-        <span class="lbl">{t("サブタイプ")}</span>
-        <select bind:value={subtype}>
-          <option value="">{t("（なし）")}</option>
-          {#each subs as s (s)}<option value={s}>{s}</option>{/each}
-        </select>
-
-        {#each shown as f (f.key)}
-          <span class="lbl">{tt(f.label)}</span>
-          {#if f.kind === "multiline"}
-            <textarea rows="3" bind:value={values[f.key]} oninput={updatePreview}></textarea>
-          {:else if f.kind === "names"}
-            <textarea
-              rows="3"
-              placeholder={t("1 行 1 名（Gaballah, Ayman H ／ 山田太郎 ／ 日本医学放射線学会）")}
-              bind:value={values[f.key]}
-              oninput={updatePreview}
-            ></textarea>
-          {:else if f.kind === "date"}
-            <input
-              placeholder="2026 / 2026-07 / 2026-07-25"
-              bind:value={values[f.key]}
-              oninput={updatePreview}
-            />
-          {:else}
-            <input bind:value={values[f.key]} oninput={updatePreview} />
-          {/if}
-        {/each}
-
-        {#if addable.length}
-          <span class="lbl">{t("＋")}</span>
-          <select bind:value={addPick} onchange={addField}>
-            <option value="">{t("フィールドを追加…")}</option>
-            {#each addable as f (f.key)}<option value={f.key}>{tt(f.label)}</option>{/each}
-          </select>
-        {/if}
-      </div>
-
-      <div class="preview">
-        <div class="pv-head">
-          <span>{t("引用プレビュー")}</span>
-          <select bind:value={previewStyle} onchange={updatePreview}>
-            {#each app.cite.installed as s (s.id)}<option value={s.id}>{s.title}</option>{/each}
-          </select>
-        </div>
-        <div class="pv-body">{preview || t("（タイトルを入力すると表示されます）")}</div>
-      </div>
-
-      {#if err}<div class="err">{err}</div>{/if}
-    </div>
-
-    <div class="modal-foot">
-      <button onclick={closeEditor}>{t("キャンセル")}</button>
-      <button class="primary" onclick={save} disabled={busy || !String(values.title ?? "").trim()}>
-        {app.editorKey ? t("保存") : t("作成")}
-      </button>
+<Modal open cls="editor" label={t("文献の編集")}>
+  <div class="modal-head">
+    <h3>{app.editorKey ? t("文献を編集") : t("文献を手動で作成")}</h3>
+    <div class="head-tools">
+      <input
+        class="lookup"
+        placeholder={t("DOI / PMID / URL から自動入力")}
+        bind:value={lookupInput}
+        onkeydown={(e) => onEnter(e, doLookup)}
+      />
+      <button onclick={doLookup} disabled={busy || !lookupInput.trim()}>{t("取得")}</button>
+      <button class="x" onclick={closeEditor}>×</button>
     </div>
   </div>
-</div>
+
+  <div class="modal-body">
+    <div class="grid">
+      <span class="lbl">{t("種類")}</span>
+      <select bind:value={typeId} onchange={() => { extraFields = filledExtras(types, typeId, values); updatePreview(); }}>
+        {#each types as tp (tp.id)}
+          <option value={tp.id}>{tt(tp.label)} — {tt(tp.desc)}</option>
+        {/each}
+      </select>
+
+      <span class="lbl">{t("サブタイプ")}</span>
+      <select bind:value={subtype}>
+        <option value="">{t("（なし）")}</option>
+        {#each subs as s (s)}<option value={s}>{s}</option>{/each}
+      </select>
+
+      {#each shown as f (f.key)}
+        <span class="lbl">{tt(f.label)}</span>
+        {#if f.kind === "multiline"}
+          <textarea rows="3" bind:value={values[f.key]} oninput={updatePreview}></textarea>
+        {:else if f.kind === "names"}
+          <textarea
+            rows="3"
+            placeholder={t("1 行 1 名（Gaballah, Ayman H ／ 山田太郎 ／ 日本医学放射線学会）")}
+            bind:value={values[f.key]}
+            oninput={updatePreview}
+          ></textarea>
+        {:else if f.kind === "date"}
+          <input
+            placeholder="2026 / 2026-07 / 2026-07-25"
+            bind:value={values[f.key]}
+            oninput={updatePreview}
+          />
+        {:else}
+          <input bind:value={values[f.key]} oninput={updatePreview} />
+        {/if}
+      {/each}
+
+      {#if addable.length}
+        <span class="lbl">{t("＋")}</span>
+        <select bind:value={addPick} onchange={addField}>
+          <option value="">{t("フィールドを追加…")}</option>
+          {#each addable as f (f.key)}<option value={f.key}>{tt(f.label)}</option>{/each}
+        </select>
+      {/if}
+    </div>
+
+    <div class="preview">
+      <div class="pv-head">
+        <span>{t("引用プレビュー")}</span>
+        <select bind:value={previewStyle} onchange={updatePreview}>
+          {#each app.cite.installed as s (s.id)}<option value={s.id}>{s.title}</option>{/each}
+        </select>
+      </div>
+      <div class="pv-body">{preview || t("（タイトルを入力すると表示されます）")}</div>
+    </div>
+
+    {#if err}<div class="err">{err}</div>{/if}
+  </div>
+
+  <div class="modal-foot">
+    <button onclick={closeEditor}>{t("キャンセル")}</button>
+    <button class="primary" onclick={save} disabled={busy || !String(values.title ?? "").trim()}>
+      {app.editorKey ? t("保存") : t("作成")}
+    </button>
+  </div>
+</Modal>

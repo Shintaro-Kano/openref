@@ -61,12 +61,15 @@ pub fn search_bibliographic(q: &str, rows: usize) -> Result<Vec<Candidate>> {
         .query("select", "DOI,title,author,issued,container-title,type");
     let body = with_crossref_gate(|pace| call_with_retry_paced(req, "crossref search", pace))?;
     let v: Value = serde_json::from_str(&body)?;
-    let items = v
-        .pointer("/message/items")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(items
+    Ok(parse_candidates(&v))
+}
+
+/// Crossref `works` の一覧応答（`message.items`）を候補にする（DOI・題名の無い物は落とす）。試験は Crossref の応答の形をここに通す
+pub fn parse_candidates(v: &Value) -> Vec<Candidate> {
+    let Some(items) = v.pointer("/message/items").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    items
         .iter()
         .filter_map(|it| {
             let doi = it.get("DOI")?.as_str()?.to_lowercase();
@@ -84,7 +87,7 @@ pub fn search_bibliographic(q: &str, rows: usize) -> Result<Vec<Candidate>> {
             let kind = it.get("type").and_then(|t| t.as_str()).map(|s| s.to_string());
             Some(Candidate { doi, title, year, first_author_family, kind })
         })
-        .collect())
+        .collect()
 }
 
 /// Crossref 由来の CSL の揺れを正す:
@@ -110,15 +113,21 @@ fn normalize(mut v: Value) -> Value {
         if let Some(d) = o.get("DOI").and_then(|d| d.as_str()).map(|d| d.to_lowercase()) {
             o.insert("DOI".into(), json!(d));
         }
-        // 医書.jp の DOI negotiation は type を省略し、号を number で返す。
-        // CSL の issue に写し、誌名・巻・頁がある同社の DOI だけ雑誌論文と補完する。
+        // 医書.jp・JaLC（J-STAGE 等）の DOI negotiation は type を省略し、号を number で返す。
+        // CSL の issue に写し、誌名・巻・頁・ISSN がそろう物（または医書.jp の DOI）を雑誌論文とみなす。
+        // ISSN 付きの JaLC の会議録などは誤りうる（既にある type は上書きしない）。
         if !o.contains_key("issue") {
             if let Some(number) = o.get("number").cloned() {
                 o.insert("issue".into(), number);
             }
         }
+        let has_issn = match o.get("ISSN") {
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(Value::Array(a)) => a.iter().any(|e| e.as_str().is_some_and(|s| !s.is_empty())),
+            _ => false,
+        };
         if !o.contains_key("type")
-            && o.get("DOI").and_then(Value::as_str).is_some_and(|d| d.starts_with("10.18885/"))
+            && (has_issn || o.get("DOI").and_then(Value::as_str).is_some_and(|d| d.starts_with("10.18885/")))
             && ["container-title", "volume", "page"].iter().all(|k| o.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
         {
             o.insert("type".into(), json!("article-journal"));
@@ -168,8 +177,8 @@ mod tests {
 
     #[test]
     fn normalize_isho_metadata() {
-        let v = json!({"DOI":"10.18885/CI.0000000612", "title":"頭蓋底の正常変異と側頭骨領域の先天奇形",
-            "author":[{"family":"安藤","given":"知広"},{"family":"加藤","given":"博基"},{"family":"松尾","given":"政之"}],
+        let v = json!({"DOI":"10.18885/CI.0000000000", "title":"架空の題名：頭部画像の正常変異の例",
+            "author":[{"family":"山田","given":"太郎"},{"family":"佐藤","given":"花子"},{"family":"鈴木","given":"一郎"}],
             "container-title":"臨床画像", "issued":{"date-parts":[[2021,4,1]]},
             "volume":"37", "number":"13", "page":"28-41"});
         let n = normalize(v.clone());
@@ -177,7 +186,7 @@ mod tests {
         assert_eq!(n["issue"], "13");
         assert_eq!(n["author"], v["author"]);
         assert_eq!(n["issued"], v["issued"]);
-        assert_eq!(n["DOI"], "10.18885/ci.0000000612");
+        assert_eq!(n["DOI"], "10.18885/ci.0000000000");
         let mut existing = v.clone();
         existing["type"] = json!("book-chapter");
         existing["issue"] = json!("special");
@@ -185,6 +194,38 @@ mod tests {
         assert_eq!(n["type"], "book-chapter");
         assert_eq!(n["issue"], "special");
         assert!(normalize(json!({"DOI":"10.18885/other"})).get("type").is_none());
+    }
+
+    #[test]
+    fn normalize_jalc_metadata_with_issn() {
+        // doi.org の内容交渉が返す JaLC（J-STAGE）の CSL を縮めた物（J-STAGE の記事の型。type なし・号は number）
+        let v = json!({"DOI":"10.20844/zzzz.42.1_5", "title":"小児の架空症例の画像所見",
+            "container-title":"日本小児放射線学会雑誌", "ISSN":["12345678","87654321"],
+            "issued":{"date-parts":[[2026]]}, "volume":"42", "number":"1", "page":"5-15", "language":"ja"});
+        let n = normalize(v.clone());
+        assert_eq!(n["type"], "article-journal", "ISSN のある JaLC の DOI は雑誌論文");
+        assert_eq!(n["issue"], "1");
+        assert_eq!(n["DOI"], "10.20844/zzzz.42.1_5");
+        let mut one = v.clone();
+        one["ISSN"] = json!("1234-5678");
+        assert_eq!(normalize(one)["type"], "article-journal", "ISSN が文字列 1 つでも補う");
+        // ISSN が無い・空のときは補わない
+        let mut no_issn = v.clone();
+        no_issn.as_object_mut().unwrap().remove("ISSN");
+        assert!(normalize(no_issn).get("type").is_none(), "ISSN なし・10.18885/ 以外は type を補わない");
+        for empty in [json!([]), json!(""), json!([""])] {
+            let mut e = v.clone();
+            e["ISSN"] = empty.clone();
+            assert!(normalize(e).get("type").is_none(), "空の ISSN {empty} では補わない");
+        }
+        // 誌名・巻・頁のどれかが欠ければ ISSN があっても補わない
+        let mut no_page = v.clone();
+        no_page.as_object_mut().unwrap().remove("page");
+        assert!(normalize(no_page).get("type").is_none());
+        // 既にある type は上書きしない
+        let mut existing = v.clone();
+        existing["type"] = json!("paper-conference");
+        assert_eq!(normalize(existing)["type"], "paper-conference");
     }
 
     #[test]

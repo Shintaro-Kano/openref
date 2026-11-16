@@ -10,8 +10,39 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 import { renderMarkdown } from "./render/md.ts";
-import { purify, finish, collectLinks, classifyDest } from "./render/sanitize.ts";
+import { purify, finish, classifyDest } from "./render/sanitize.ts";
+import { schemeOf } from "./render/asset.ts";
 import { chatLinks } from "../chat/chat.ts";
+
+/** 描画した DOM で拾ったリンク: 出現順の (kind, target)。finish が付ける印（data-wk-href / data-wk-src・埋め込みの class）を読む
+    （試験だけが使う = 本体の bundle に置かない。render/sanitize.ts から移した・中身は同じ） */
+function collectLinks(frag) {
+  const out = [];
+  const els = frag.querySelectorAll("[data-wk-href], [data-wk-src], .wk-embed, .wk-embed-link, .wk-embed-page-title, .wk-media");
+  for (const el of Array.from(els)) {
+    const wiki = el.getAttribute("data-wk-href");
+    if (el.classList.contains("wk-embed-page-title") || el.classList.contains("wk-embed-link") || el.classList.contains("wk-media") || el.classList.contains("wk-embed")) {
+      const t = el.getAttribute("data-wk-target") ?? el.getAttribute("data-wk-embed");
+      if (t) out.push({ kind: "embed", target: t });
+      continue;
+    }
+    if (wiki != null) {
+      if (wiki.startsWith("[[") && wiki.endsWith("]]")) out.push({ kind: "wiki", target: wiki.slice(2, -2) });
+      else {
+        const s = schemeOf(wiki);
+        if (wiki.startsWith("#") || !wiki.trim()) continue;
+        out.push({ kind: s === "openref" ? "openref" : s === "file" ? "file" : s ? "external" : "md", target: wiki });
+      }
+      continue;
+    }
+    const src = el.getAttribute("data-wk-src");
+    if (src != null) {
+      const s = schemeOf(src);
+      out.push({ kind: s === "file" ? "file" : s ? "external" : "md", target: src });
+    }
+  }
+  return out;
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = JSON.parse(readFileSync(join(here, "../../../../crates/openref-core/tests/fixtures/wiki-links.json"), "utf8"));

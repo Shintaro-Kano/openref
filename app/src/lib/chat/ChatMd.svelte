@@ -1,8 +1,8 @@
 <script lang="ts">
-  /* チャットの応答 1 ブロックの md（確定した本文だけ）。描画は既存の MdView（markdown-it + DOMPurify + shadow DOM）を通す =
+  /* チャットの応答 1 ブロックの md（確定した本文だけ）。描画は既存の ShadowPage（markdown-it + DOMPurify + shadow DOM）を通す =
      独自の innerHTML を持たない。`[[名前]]` は vault のページ一覧で引き当て（chat.ts の chatLinks）、リンクの遷移は Wiki の navigate */
   import { untrack } from "svelte";
-  import MdView from "../wiki/MdView.svelte";
+  import ShadowPage from "../wiki/render/ShadowPage.svelte";
   import { chatLinks } from "./chat";
   import type { WikiPageData } from "../wiki/types";
   import { navigate, readPage, wk } from "../wiki/wiki.svelte";
@@ -29,7 +29,7 @@
 </script>
 
 <div class="wk-ch-md">
-  <MdView {page} root={wk.status?.root ?? ""} refs={wk.refDirs} onNavigate={navigate} {readPage} />
+  <ShadowPage {page} root={wk.status?.root ?? ""} refs={wk.refDirs} onNavigate={navigate} {readPage} mode="md" />
 </div>
 
 <style>

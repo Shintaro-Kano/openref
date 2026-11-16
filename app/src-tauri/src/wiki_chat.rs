@@ -408,31 +408,11 @@ fn cli_auth_cached_at(cli: &Cli, force: bool, now: Instant) -> Option<Auth> {
     a
 }
 
-/// 覚えた `claude auth status` を捨てる（login / logout / チャットの有効・無効の切替）。読み中の分も覚えさせない
+/// 覚えた `claude auth status` を捨てる（login / チャットの有効・無効の切替）。読み中の分も覚えさせない
 pub fn forget_auth() {
     let mut seen = AUTH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     seen.0 += 1;
     seen.1 = None;
-}
-
-/// `claude auth logout`（終了コード 0 で成功）
-pub fn cli_logout(cli: &Cli, en: bool) -> Result<(), String> {
-    let mut c = Command::new(&cli.path);
-    c.args(["auth", "logout"]);
-    child_env(&mut c, &cli.path_env);
-    match probe(c) {
-        Some((Some(0), _)) => Ok(()),
-        Some((code, out)) => Err(format!(
-            "claude auth logout: exit {} {}",
-            code.map_or("?".into(), |c| c.to_string()),
-            last_line(out.trim())
-        )),
-        None => Err(tr(
-            en,
-            "claude auth logout: 応答がありません",
-            "claude auth logout: no response",
-        )),
-    }
 }
 
 /// ターミナルで実行するログインのコマンド（パスは単引用で shell に渡す）
@@ -453,23 +433,18 @@ pub fn login_script(cli: &Path) -> String {
 pub fn open_login_terminal(cli: &Cli, app_dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let p = app_dir.join("claude-login.command");
-    std::fs::write(&p, login_script(&cli.path)).map_err(|e| format!("{}: {e}", p.display()))?;
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("{}: {e}", p.display()))?;
-    let out = Command::new("/usr/bin/open")
-        .arg("-a")
-        .arg("Terminal")
-        .arg(&p)
-        .output()
-        .map_err(|e| format!("open: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "open -a Terminal: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
+    // 失敗の文はファイル名まで（app_dir はホームのパス = 利用者名を含む）
+    let fail = |e: std::io::Error| crate::hide_paths(format!("{}: {e}", p.display()), &[&p]);
+    std::fs::write(&p, login_script(&cli.path)).map_err(fail)?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).map_err(fail)?;
+    // 失敗の文はディレクトリ部分を落とす（app_dir はホームのパス = 利用者名を含む）
+    crate::open_cmd(&login_open_args(&p))
+        .map_err(|e| format!("open -a Terminal: {}", crate::drop_dir_part(e)))
+}
+
+/// ログインのスクリプトを Terminal.app で開く open の引数（`-a Terminal <script>`）
+pub(crate) fn login_open_args(p: &Path) -> [&std::ffi::OsStr; 3] {
+    [std::ffi::OsStr::new("-a"), std::ffi::OsStr::new("Terminal"), p.as_os_str()]
 }
 
 /// openref-mcp の候補（順に）。release: 配布版 `~/Library/Application Support/OpenRef/bin/`（install.sh が置く。開発機の release の
@@ -1011,8 +986,8 @@ pub fn undo_record(
     trash_item: impl FnOnce(&str) -> Result<(), String>,
 ) -> Undo {
     let root = match ctx.ready() {
-        Ok((_, r)) => r,
-        Err(e) => return Undo::Refused(e.to_string()),
+        Ok(r) => r.root,
+        Err(e) => return Undo::Refused(crate::wiki_gui::wiki_ready_err(ctx, e)),
     };
     if rec.root.as_ref().is_some_and(|r| *r != root) {
         return Undo::Refused(tr(
@@ -1058,7 +1033,28 @@ fn edited_text(en: bool, path: &str) -> String {
 /// 1 件を戻す。ファイルは今の sha256 が Claude の書いた sha256_after と同じときだけ（user がその後に編集していたら戻さない）。
 /// write = backup（`<app_dir>/wiki-history/` の中のものだけ）の内容を core の書込（照合付き = if_sha256・上書き前の Claude の版も
 /// 退避される）で戻す / create = trash（ゴミ箱へ）/ move = 逆の move / item = trash_item
+/// 戻さない理由の文のパスは名前まで（ワークスペースの root = フォルダ名・退避 = ファイル名・wiki-history = その名から）
 pub fn undo_change(
+    ctx: &Ctx,
+    c: &Change,
+    en: bool,
+    trash: impl FnOnce(&Path) -> Result<String, String>,
+    trash_item: impl FnOnce(&str) -> Result<(), String>,
+) -> Undo {
+    match undo_change_raw(ctx, c, en, trash, trash_item) {
+        Undo::Refused(s) => {
+            let hist = ctx.app_dir.as_deref().map(|a| a.join(edit::HISTORY_DIR));
+            let mut paths: Vec<&Path> = ctx.root.iter().map(Path::new).chain(hist.as_deref()).chain(ctx.app_dir.as_deref()).collect();
+            if let Change::Write { backup, .. } = c {
+                paths.push(Path::new(backup));
+            }
+            Undo::Refused(crate::hide_paths(s, &paths))
+        }
+        done => done,
+    }
+}
+
+fn undo_change_raw(
     ctx: &Ctx,
     c: &Change,
     en: bool,
@@ -1067,8 +1063,8 @@ pub fn undo_change(
 ) -> Undo {
     let refused = |s: String| Undo::Refused(s);
     let root = match ctx.ready() {
-        Ok((_, r)) => r,
-        Err(e) => return refused(e.to_string()),
+        Ok(r) => r.root,
+        Err(e) => return refused(crate::wiki_gui::wiki_ready_err(ctx, e)),
     };
     let gone = |path: &str| {
         tr(
@@ -1399,6 +1395,11 @@ fn log_writer(ui: Arc<Queue<Out>>) -> impl FnMut((LogOp, bool)) + Send + 'static
         };
         if let Err(e) = r {
             eprintln!("openref-app: wiki chat: ログを書けません: {e}");
+            // 画面の文のワークスペースのパスはフォルダ名まで（stderr はフルパスのまま）
+            let e = match &log {
+                Some(lg) => crate::hide_paths(e, &[lg.root.as_path()]),
+                None => e,
+            };
             ui.push(
                 Out::Emit(json!({"type": "stderr", "text": tr(
                     en,
@@ -1549,7 +1550,7 @@ impl Chat {
         }
         // 中の stop が進める分だけ進んでいること = その間に外から stop が来ていない（来ていたら起こさない）
         let epoch = self.lock().stop_epoch + 1;
-        self.stop(STOP_GRACE, TERM_GRACE);
+        self.stop_now();
         let stopped = || {
             tr(
                 en,
@@ -1683,9 +1684,10 @@ impl Chat {
             .stderr(Stdio::piped())
             .process_group(0);
         child_env(&mut cmd, &l.cli.path_env);
+        // 失敗の文は CLI のファイル名まで（~/.local/bin 等 = 利用者名を含む）
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("{}: {e}", l.cli.path.display()))?;
+            .map_err(|e| crate::hide_paths(format!("{}: {e}", l.cli.path.display()), &[l.cli.path.as_path()]))?;
         let pid = child.id() as i32;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -1795,7 +1797,7 @@ impl Chat {
                 }
             }
         }
-        // stdout の終わり = この子の tool_result / result はもう来ない = 結果の来なかった tool_use を捨てる（A-44）。on_exit は
+        // stdout の終わり = この子の tool_result / result はもう来ない = 結果の来なかった tool_use を捨てる。on_exit は
         // stderr しか待たない（stop の後に子が出すそのターンの tool_result を読み手が読む前に捨てない）
         let mut st = self.lock();
         if st.gen == gen {
@@ -2096,6 +2098,12 @@ impl Chat {
         write_line(&stdin, &line).map_err(|e| e.to_string())
     }
 
+    /// 既定の猶予で止める（stdin を閉じて STOP_GRACE → SIGTERM → TERM_GRACE → SIGKILL）。GUI の停止（停止ボタン・
+    /// チャットを無効に・モデルの変更・ログアウト・Wiki の OFF）はどれもこれ = 猶予の値はここだけ
+    pub fn stop_now(&self) {
+        self.stop(STOP_GRACE, TERM_GRACE);
+    }
+
     /// 子を終える: stdin を閉じる → grace 待つ → SIGTERM（プロセスグループ）→ term 待つ → SIGKILL。子が無ければ何もしない
     /// （起動の確認を待つ start には stop_epoch で伝わる）。stdin が書込中（send が詰まっている）なら閉じずに SIGTERM へ進む
     pub fn stop(&self, grace: Duration, term: Duration) {
@@ -2270,6 +2278,8 @@ fn last_line(s: &str) -> &str {
         .trim()
 }
 
+/// 子を止めたシグナルの名前（exit の event の "signal"）。表に無い番号は番号だけ（"30"）= 画面が "signal " を付けて描く
+/// （chat.svelte.ts の注記 "signal <これ>"。"signal 30" を返すと画面で「signal signal 30」と重なる）
 fn signal_name(n: i32) -> String {
     match n {
         libc::SIGTERM => "SIGTERM".into(),
@@ -2279,7 +2289,7 @@ fn signal_name(n: i32) -> String {
         libc::SIGPIPE => "SIGPIPE".into(),
         libc::SIGSEGV => "SIGSEGV".into(),
         libc::SIGABRT => "SIGABRT".into(),
-        n => format!("signal {n}"),
+        n => n.to_string(),
     }
 }
 
@@ -2905,7 +2915,7 @@ mod tests {
     // ---- 擬似の claude（stream-json を吐く sh）で子プロセスの部品を通す ----
 
     /// 擬似の claude: initialize に応答し、user の行ごとに wiki_write の tool_use / tool_result と result を返す。
-    /// 発言の本文が "slow" なら result を出さずに待ち、interrupt で result を出す。"huge" なら巨大な行。"die" なら stderr に書いて終わる。
+    /// 発言の本文が "slow" なら result を出さずに待ち、interrupt で result を出す。"huge" なら巨大な行。"die" なら stderr に書いて終わる。"usr1" なら SIGUSR1（表に名前の無いシグナル）で自分を止める。
     /// "many" なら n = 1..150 の行と result。"pend" なら結果の来ない wiki_write の tool_use を出して待つ
     const FAKE: &str = r#"#!/bin/sh
 case "$*" in *--resume=bad*) echo "No conversation found with session ID: bad" >&2; echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0}'; exit 1;; esac
@@ -2920,6 +2930,7 @@ while IFS= read -r line; do
     *'"text":"pend'*) echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"p1","name":"mcp__openref__call","input":{"name":"wiki_write","args":{"path":"b.md","content":"x"}}}]}}';;
     *'"text":"huge'*) head -c 3000 /dev/zero | tr '\0' 'x'; echo; echo 'not json at all'; echo '{"type":"result","subtype":"success"}';;
     *'"text":"die'*) echo "fatal: boom" >&2; exit 3;;
+    *'"text":"usr1'*) kill -USR1 $$;;
     *'"text":"sid'*) echo '{"type":"system","subtype":"init","session_id":"other-id","tools":["Read"]}'; echo '{"type":"result","subtype":"success","session_id":"other-id"}';;
     *'"type":"user"'*)
       echo '{"type":"system","subtype":"init","tools":["Read","Glob","Grep","mcp__openref__call"],"mcp_servers":[{"name":"openref","status":"connected"}]}'
@@ -3064,7 +3075,7 @@ done
             )
             .unwrap();
         assert!(wait_for(&r.events, |_| r.chat.state() == State::Idle));
-        // 追記は書き手スレッド（A-15）= 書き終えるのを待ってから読む
+        // 追記は書き手スレッド = 書き終えるのを待ってから読む
         assert!(r.chat.flush(Duration::from_secs(30)));
         let files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap()
@@ -3244,6 +3255,33 @@ done
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
+    /// 表に名前の無いシグナルで子が終わった = event の signal は番号だけ（画面が "signal " を付ける = 重ならない）
+    #[test]
+    fn fake_child_killed_by_an_unnamed_signal_reports_the_number_only() {
+        let r = rig("usr1");
+        r.chat.start(&r.launch, None, false, false).unwrap();
+        r.chat.send("usr1", None, None, false).unwrap();
+        let want = libc::SIGUSR1.to_string(); // macOS 30・Linux 10
+        assert!(
+            wait_for(&r.events, |e| has(e, "exit", |x| x["signal"] == want.as_str())),
+            "{:?}",
+            r.events.lock().unwrap().iter().filter(|e| e["type"] == "exit").collect::<Vec<_>>()
+        );
+        assert_eq!(r.chat.state(), State::Off);
+        r.chat.stop(Duration::from_secs(3), Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    /// 名前のある物は前の字のまま・名前の無い番号は番号だけ（"signal " を付けない）
+    #[test]
+    fn signal_names() {
+        for (n, want) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGKILL, "SIGKILL"), (libc::SIGINT, "SIGINT"), (libc::SIGHUP, "SIGHUP"), (libc::SIGPIPE, "SIGPIPE"), (libc::SIGSEGV, "SIGSEGV"), (libc::SIGABRT, "SIGABRT")] {
+            assert_eq!(signal_name(n), want);
+        }
+        assert_eq!(signal_name(libc::SIGUSR1), libc::SIGUSR1.to_string());
+        assert_eq!(signal_name(77), "77");
+    }
+
     /// (e) 未ログイン = `claude auth status` が {"loggedIn": false} + 終了コード 1（実物のログイン済みは {"loggedIn": true, …} + 0 を
     /// 実機で確認。未ログインには戻さないので擬似）・読めない出力は None（案内を出さず起動で確かめる）
     #[test]
@@ -3343,7 +3381,7 @@ done
         assert_eq!(runs(), 2);
         assert!(cli_auth_cached_at(&c, false, t1 + AUTH_TTL).is_some());
         assert_eq!(runs(), 3, "AUTH_TTL を過ぎても読み直さない");
-        // forget_auth（[再確認] = status {force: true}・login / logout・有効 / 無効の切替）= 次は起こす
+        // forget_auth（[再確認] = status {force: true}・login・有効 / 無効の切替）= 次は起こす
         forget_auth();
         let t2 = t1 + AUTH_TTL + Duration::from_secs(1);
         assert!(cli_auth_cached_at(&c, false, t2).is_some());
@@ -3824,7 +3862,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
             LINE_MAX + 1,
         );
         assert_eq!(r.chat.state(), State::Idle);
-        // emit は書き手スレッドが出す（A-15）= 届くのを待つ
+        // emit は書き手スレッドが出す = 届くのを待つ
         assert!(wait_for(&r.events, |ev| has(ev, "stderr", |e| e["text"]
             .as_str()
             .unwrap()
@@ -3833,7 +3871,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
-    // ---- A-15: emit とログの追記を Inner の lock の外（書き手スレッド）で ----
+    // ---- emit とログの追記を Inner の lock の外（書き手スレッド）で ----
 
     /// 詰まる時間（emit / 追記 1 回）と、その間に state / session_id / root / stop が返る上限
     const STALL: Duration = Duration::from_secs(3);
@@ -3874,7 +3912,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         r.chat.stop(Duration::from_secs(5), Duration::from_secs(1));
         let stop = t.elapsed();
         let stalled = gate.load(Ordering::SeqCst) && entered.load(Ordering::SeqCst);
-        eprintln!("A-15 emit stall: state {state:?} / session_id+root {status:?} / stop {stop:?} (stall {STALL:?})");
+        eprintln!("emit stall: state {state:?} / session_id+root {status:?} / stop {stop:?} (stall {STALL:?})");
         assert!(stalled && state < QUICK && status < QUICK && stop < QUICK, "emit の詰まりを待った: state {state:?} status {status:?} stop {stop:?}");
         assert_eq!(r.chat.state(), State::Off);
         gate.store(false, Ordering::SeqCst);
@@ -3918,7 +3956,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         let t = Instant::now();
         r.chat.stop(Duration::from_secs(5), Duration::from_secs(1));
         let stop = t.elapsed();
-        eprintln!("A-15 log stall: send {send:?} / state {state:?} / session_id+root {status:?} / screen to idle {ui:?} / stop {stop:?} (stall {STALL:?} per append)");
+        eprintln!("log stall: send {send:?} / state {state:?} / session_id+root {status:?} / screen to idle {ui:?} / stop {stop:?} (stall {STALL:?} per append)");
         assert!(send < QUICK && state < QUICK && status < QUICK && stop < QUICK && ui < QUICK + Duration::from_millis(500), "追記の詰まりを待った: send {send:?} state {state:?} status {status:?} screen {ui:?} stop {stop:?}");
         assert!(r.chat.flush(Duration::from_secs(30)), "書き切らない");
         crate::wiki_chat_log::SLOW_APPEND
@@ -4009,7 +4047,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed 's/.*"request_id":"\(
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
-    // ---- A-44: 結果の来ない tool_use と記録の上限 ----
+    // ---- 結果の来ない tool_use と記録の上限 ----
 
     /// result の行（中断も）・子の終了で、結果の来なかった tool_use を捨てる。記録は直近 KEEP_TURNS ターンに刈るが、
     /// 画面が [元に戻す] を出せる直近のターンの記録は残り、戻せる
@@ -4217,6 +4255,41 @@ done
         edit::write_agent(ctx, &json!({"path": path, "content": content})).unwrap()
     }
 
+    /// 戻さない理由の文 = 退避はファイル名まで・ワークスペースのパスはフォルダ名から（app_dir・vault の親のパスを出さない）。
+    /// 実際に断らせる: 退避が刈り込まれた・退避の置き場の外・ゴミ箱へ移せない（core の失敗の文に vault の絶対パス）
+    #[test]
+    fn undo_refusals_hide_full_paths() {
+        let (d, ctx) = vault_ctx("undo-x29");
+        let dd = d.to_string_lossy().into_owned();
+        let no_trash = |_: &Path| -> Result<String, String> { panic!("呼ばない") };
+        let no_item = |_: &str| -> Result<(), String> { panic!("呼ばない") };
+        let refused = |u: Undo| match u {
+            Undo::Refused(s) => {
+                assert!(!s.contains(&dd), "親のパスが残る: {s}");
+                s
+            }
+            other => panic!("断らない: {other:?}"),
+        };
+        let w = agent_write(&ctx, "p.md", "claude");
+        let sha = w["sha256"].as_str().unwrap().to_string();
+        let hist = ctx.app_dir.as_ref().unwrap().join("wiki-history");
+        let pruned = hist.join("2026-01-01T000000/p.md");
+        let c = Change::Write { path: "p.md".into(), sha256_after: sha.clone(), backup: pruned.to_string_lossy().into() };
+        let s = refused(undo_change(&ctx, &c, false, no_trash, no_item));
+        assert!(s.contains("退避（p.md）が古い世代として刈り込まれて"), "{s}");
+        let secret = d.join("secret.txt");
+        std::fs::write(&secret, "x").unwrap();
+        let c = Change::Write { path: "p.md".into(), sha256_after: sha.clone(), backup: secret.to_string_lossy().into() };
+        let s = refused(undo_change(&ctx, &c, false, no_trash, no_item));
+        assert!(s.contains("退避の置き場（wiki-history）の外なので戻しません: secret.txt"), "{s}");
+        // core の失敗の文（ゴミ箱へ移せない = trash の文に vault の絶対パス）
+        let c = Change::Create { path: "p.md".into(), sha256_after: sha };
+        let deny = |p: &Path| -> Result<String, String> { Err(format!("{}: 移せません", p.display())) };
+        let s = refused(undo_change(&ctx, &c, false, deny, no_item));
+        assert!(s.contains("vault/p.md: 移せません"), "{s}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn undo_write_create_move_item() {
         let (d, ctx) = vault_ctx("undo");
@@ -4364,8 +4437,10 @@ done
             sha256_after: w["sha256"].as_str().unwrap().into(),
             backup: sneaky.to_string_lossy().into(),
         };
+        // 断る文は退避のファイル名まで（app_dir のフルパスを出さない）
+        let app_dir = ctx.app_dir.as_ref().unwrap().to_string_lossy().into_owned();
         assert!(
-            matches!(undo_change(&ctx, &c, false, no_trash, no_item), Undo::Refused(s) if s.contains("wiki-history"))
+            matches!(undo_change(&ctx, &c, false, no_trash, no_item), Undo::Refused(s) if s.contains("secret.txt") && !s.contains(&app_dir))
         );
         // 別の vault の記録
         let w2 = agent_write(&ctx, "p.md", "claude 2");
