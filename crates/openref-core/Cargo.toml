@@ -27,6 +27,12 @@ base64 = "0.22"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# 本棚の表紙をプロセス内の QuickLook（QLThumbnailGenerator）で作る（shelf/thumbs.rs）。版は Tauri 経由で Cargo.lock にある物
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSError"] }
+
 [dev-dependencies]
 # 登録表の応答のクエリ数を数えるテスト用（rusqlite の profile）
 rusqlite = { workspace = true, features = ["trace"] }

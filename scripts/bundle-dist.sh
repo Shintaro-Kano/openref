@@ -48,7 +48,11 @@ fi
 if [ "$MODE" = check ]; then exit 0; fi
 
 # 2. build(--locked = Cargo.lock を書き換えない。古ければ止まる)
+# 配布物に build した人のホームのパスを入れない: 依存の crate のソースの場所(<CARGO_HOME>/registry/src/…)が panic の場所の
+# 文字列としてバイナリに入る = rustc の --remap-path-prefix で置き換える(組み立ての後に 4 つのバイナリを検査する)。
+# RUSTFLAGS が変わると全部の crate を作り直す(普段の cargo build --release と行き来するたびに作り直しになる)
 if [ "$MODE" = all ]; then
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=cargo-home"
   cargo build --release --locked -p openref-cli -p openref-mcp -p openref-connectd
   (cd app && npm run tauri build -- --bundles app)
 fi
@@ -69,6 +73,14 @@ for bin in openref openref-mcp openref-connectd; do
   cp "target/release/$bin" "$STAGE/bundle/bin/$bin"
   codesign --force -s - "$STAGE/bundle/bin/$bin"
   codesign -v "$STAGE/bundle/bin/$bin"
+done
+# 安全網: 4 つのバイナリに build した人のホームのパスが無いこと(--no-build で普段の build を組み立てたときもここで止まる)
+for bin in "$STAGE/bundle/OpenRef.app/Contents/MacOS/openref-app" "$STAGE/bundle/bin/openref" "$STAGE/bundle/bin/openref-mcp" "$STAGE/bundle/bin/openref-connectd"; do
+  [ -f "$bin" ] || fail "検査するバイナリが無い: $bin"
+  N="$(strings "$bin" | grep -c -F "$HOME/" || true)"
+  if [ "$N" != 0 ]; then
+    fail "$bin に build した人のホームのパスが $N 個ある(--remap-path-prefix を付けた build で作り直す = --no-build を外す)"
+  fi
 done
 # 拡張の試験(extension/tests)は配布しない = 利用者に要らない(公開 repo には残る = CI が回す)
 rsync -a --exclude ".DS_Store" --exclude "/tests" extension/ "$STAGE/bundle/extension/"
